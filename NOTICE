@@ -1,0 +1,11 @@
+SparkDream Chain Launcher
+Copyright 2026 SparkDream
+
+Licensed under the Apache License, Version 2.0.
+
+This product includes software derived from Akash Console
+(https://github.com/akash-network/console), licensed under the
+Apache License, Version 2.0, Copyright Akash Network. Derived
+portions include, among others: Akash transaction message
+construction, SDL/deployment-data utilities, and the provider-proxy
+client service.

@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+
+# launcher runtime state — never commit
+*.sqlite
+*.sqlite-*
+data/
+.env
+.env.*
+
+# secrets that must never land in git
+*.pem
+*.key
+*key.json
+launch.local.yaml
+
+# machine-local Claude context (absolute paths)
+CLAUDE.md
+.claude/
