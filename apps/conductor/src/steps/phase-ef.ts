@@ -1,0 +1,254 @@
+import fs from "node:fs";
+import path from "node:path";
+import { nodes, resolveTopology, tunnelPort } from "@sparkdream/launch-spec";
+import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
+import { updateDeploymentMsgs } from "../akash/update.js";
+import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
+import { loadCert, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import type { SshTarget } from "../services.js";
+
+const NODE_HOME = "/root/.sparkdream";
+const UPLOAD_MARKER = `${NODE_HOME}/.node-data-uploaded`;
+
+function nodeTarget(ctx: StepCtx, key: string): SshTarget {
+  const ssh = ctx.output<SshEndpoints>("send-manifests");
+  const ep = ssh?.perNode[key];
+  if (!ep) throw new Error(`no SSH endpoint for ${key}`);
+  return sshTarget(ctx, ep.host, ep.port);
+}
+
+// --- Phase E ---
+
+export const uploadNodeDataStep: StepDef = {
+  name: "upload-node-data",
+  async run(ctx) {
+    for (const node of nodes(ctx.spec)) {
+      const target = nodeTarget(ctx, node.key);
+      const marker = await ctx.services.ssh.exec(target, `test -f ${UPLOAD_MARKER} && echo yes || echo no`);
+      if (marker.stdout.trim() === "yes") continue; // idempotent (§5 step 16)
+      const bundle = path.join(ctx.dirs.bundles, `${node.key}.tgz`);
+      await ctx.services.ssh.upload(target, bundle, "/tmp/node-data.tgz");
+      await ctx.services.ssh.exec(
+        target,
+        `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME} && touch ${UPLOAD_MARKER}`,
+      );
+    }
+    return { uploaded: nodes(ctx.spec).map((n) => n.key) };
+  },
+};
+
+export interface MeshTable {
+  /** node key → tailnet IPv4. */
+  ips: Record<string, string>;
+}
+
+export const awaitMeshStep: StepDef = {
+  name: "await-mesh",
+  async run(ctx): Promise<MeshTable> {
+    const ips: Record<string, string> = {};
+    const maxAttempts = 30;
+    for (const node of nodes(ctx.spec)) {
+      const target = nodeTarget(ctx, node.key);
+      for (let attempt = 1; ; attempt++) {
+        const res = await ctx.services.ssh.exec(
+          target,
+          `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`,
+        );
+        const ip = res.stdout.trim().split("\n")[0];
+        if (ip && /^100\./.test(ip)) {
+          ips[node.key] = ip;
+          break;
+        }
+        if (attempt >= maxAttempts) throw new Error(`${node.key} never joined the mesh`);
+        await ctx.services.sleep(5000);
+      }
+    }
+    return { ips };
+  },
+};
+
+export const wireTunnelsStep: StepDef = {
+  name: "wire-tunnels",
+  async run(ctx) {
+    const mesh = ctx.output<MeshTable>("await-mesh")!;
+    const topo = resolveTopology(ctx.spec);
+    for (let s = 0; s < ctx.spec.topology.sentries.count; s++) {
+      const target = nodeTarget(ctx, `sentry-${s}`);
+      // replace boot-time placeholder tunnels with real validator IPs (§5 step 18)
+      await ctx.services.ssh.exec(target, "pkill -f 'socat TCP-LISTEN' || true");
+      for (const v of topo.sentryValidators[s] ?? []) {
+        const port = tunnelPort(v);
+        const ip = mesh.ips[`val-${v}`];
+        if (!ip) throw new Error(`no tailnet IP for val-${v}`);
+        await ctx.services.ssh.exec(
+          target,
+          `nohup socat TCP-LISTEN:${port},fork,reuseaddr ` +
+            `EXEC:"tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock nc ${ip} 26656" ` +
+            `>/dev/null 2>&1 & sleep 1 && nc -z 127.0.0.1 ${port}`,
+        );
+      }
+    }
+    return { wired: true };
+  },
+};
+
+export const patchValidatorPeersStep: StepDef = {
+  name: "patch-validator-peers",
+  async run(ctx) {
+    const mesh = ctx.output<MeshTable>("await-mesh")!;
+    const topo = resolveTopology(ctx.spec);
+    for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
+      const target = nodeTarget(ctx, `val-${v}`);
+      for (const s of topo.validatorSentries[v] ?? []) {
+        const token = placeholder.tailnetIp(`sentry-${s}`);
+        const ip = mesh.ips[`sentry-${s}`];
+        if (!ip) throw new Error(`no tailnet IP for sentry-${s}`);
+        await ctx.services.ssh.exec(
+          target,
+          `sed -i 's|${token}|${ip}|g' ${NODE_HOME}/config/config.toml`,
+        );
+      }
+    }
+    return { patched: true };
+  },
+};
+
+export const awaitSignerStep: StepDef = {
+  name: "await-signer",
+  async run(ctx) {
+    if (ctx.spec.security.keyMode !== "tmkms") return { skipped: true };
+    const mesh = ctx.output<MeshTable>("await-mesh")!;
+    const stanzas: Record<string, string> = {};
+    for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
+      stanzas[`val-${v}`] =
+        `[[validator]]\nchain_id = "${ctx.spec.network.name}-${ctx.spec.network.chainIdSuffix}"\n` +
+        `addr = "tcp://${mesh.ips[`val-${v}`]}:26659"\nprotocol_version = "v0.34"\n`;
+    }
+    // Probe the privval keepalive port on each validator; pause until all pass.
+    for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
+      const target = nodeTarget(ctx, `val-${v}`);
+      const probe = await ctx.services.ssh.exec(
+        target,
+        "nc -z 127.0.0.1 26660 && echo ok || echo no",
+      );
+      if (probe.stdout.trim() !== "ok") {
+        throw new AwaitUser(
+          "await-signer",
+          `connect your tmkms signer(s), then resume.\n${Object.values(stanzas).join("\n")}`,
+        );
+      }
+    }
+    return { stanzas };
+  },
+};
+
+// --- Phase F ---
+
+export const startChainStep: StepDef = {
+  name: "start-chain",
+  async run(ctx) {
+    const start = async (key: string) => {
+      const target = nodeTarget(ctx, key);
+      const running = await ctx.services.ssh.exec(target, "pgrep -x sparkdreamd >/dev/null && echo yes || echo no");
+      if (running.stdout.trim() === "yes") return;
+      await ctx.services.ssh.exec(
+        target,
+        `nohup sparkdreamd start --home ${NODE_HOME} > ${NODE_HOME}/sparkdreamd.log 2>&1 &`,
+      );
+    };
+    // validators near-simultaneously (>2/3 must be online for block 1), then sentries
+    await Promise.all(
+      Array.from({ length: ctx.spec.topology.validators.count }, (_, v) => start(`val-${v}`)),
+    );
+    for (let s = 0; s < ctx.spec.topology.sentries.count; s++) await start(`sentry-${s}`);
+    return { started: true };
+  },
+};
+
+export const persistStartStep: StepDef = {
+  name: "persist-start",
+  async run(ctx) {
+    if (ctx.spec.network.type === "devnet") return { skipped: true };
+    const plan = ctx.output<DeploymentPlan>("create-deployments")!;
+    const assignments = ctx.output<Assignments>("collect-bids")!;
+    const mesh = ctx.output<MeshTable>("await-mesh")!;
+    const addr = ctx.db.getLaunch(ctx.launchId)!.owner;
+
+    // Flip WAIT_FOR_CONFIG + persist real tunnel targets into the SDL env (§5 step 20b)
+    const { msgs, manifests } = updateDeploymentMsgs({
+      spec: ctx.spec,
+      owner: addr,
+      sdlDir: ctx.dirs.sdl,
+      plan,
+      mesh: mesh.ips,
+    });
+    await ctx.requireTx("persist-start", msgs);
+    const cert = loadCert(ctx);
+    for (const [key, manifestJson] of Object.entries(manifests)) {
+      const a = assignments.perNode[key]!;
+      await ctx.services.provider.sendManifest(cert, a.hostUri, plan.perNode[key]!.dseq, manifestJson);
+    }
+    return { persisted: Object.keys(manifests) };
+  },
+};
+
+export const verifyChainStep: StepDef = {
+  name: "verify-chain",
+  async run(ctx) {
+    const assignments = ctx.output<Assignments>("collect-bids")!;
+    // sentry RPC must be up with height increasing (§5 step 21)
+    const sentryKeys = Object.keys(assignments.perNode).filter((k) => k.startsWith("sentry-"));
+    const checks: Record<string, { height: number }> = {};
+    for (const key of sentryKeys) {
+      const hostUri = assignments.perNode[key]!.hostUri;
+      const rpcUrl = `${new URL(hostUri).protocol}//${new URL(hostUri).hostname}:26657`;
+      const first = await ctx.services.rpc.status(rpcUrl);
+      await ctx.services.sleep(6000);
+      const second = await ctx.services.rpc.status(rpcUrl);
+      if (second.latestBlockHeight <= first.latestBlockHeight) {
+        throw new Error(`${key}: block height not increasing (${first.latestBlockHeight})`);
+      }
+      checks[key] = { height: second.latestBlockHeight };
+    }
+    return { sentries: checks };
+  },
+};
+
+export const finalizeStep: StepDef = {
+  name: "finalize",
+  async run(ctx) {
+    const assignments = ctx.output<Assignments>("collect-bids")!;
+    const keys = ctx.output<GenerateKeysOutput>("generate-keys")!;
+    const reminders = [
+      "sweep generated mnemonics to hardware custody",
+      "stash the age identity offline",
+      "rotate headscale preauth keys",
+      "export + stash the fleet bundle",
+      "optionally strip SSH from validator SDLs",
+    ];
+    return {
+      components: Object.fromEntries(
+        Object.entries(assignments.perNode).map(([key, a]) => [
+          key,
+          { provider: a.provider, price: a.price },
+        ]),
+      ),
+      ageRecipient: keys.ageRecipient,
+      reminders,
+    };
+  },
+};
+
+export function phaseEFSteps(): StepDef[] {
+  return [
+    uploadNodeDataStep,
+    awaitMeshStep,
+    wireTunnelsStep,
+    patchValidatorPeersStep,
+    awaitSignerStep,
+    startChainStep,
+    persistStartStep,
+    verifyChainStep,
+    finalizeStep,
+  ];
+}

@@ -1,0 +1,42 @@
+# Litestream config — streams /var/lib/headscale/db.sqlite to S3-compatible
+# object storage. Credentials and bucket details are injected at runtime via
+# environment variables set in the SDL.
+#
+# Provision a bucket-scoped key (NOT a root key) — the Akash provider sees
+# these env vars when receiving the manifest.
+#
+# All WAL frames and snapshots are encrypted client-side with age before
+# upload. The bucket operator (IPFS peers, anyone who finds the CID) sees
+# opaque blobs only. AGE_RECIPIENT (public key) is used to encrypt;
+# AGE_IDENTITY (private key) is used to decrypt on restore. Lose
+# AGE_IDENTITY and every backup is permanently undecryptable — keep an
+# offline copy.
+
+dbs:
+  - path: /var/lib/headscale/db.sqlite
+    replicas:
+      - type: s3
+        endpoint: ${LITESTREAM_S3_ENDPOINT}
+        bucket: ${LITESTREAM_S3_BUCKET}
+        path: ${LITESTREAM_S3_PATH}
+        region: ${LITESTREAM_S3_REGION}
+        access-key-id: ${LITESTREAM_S3_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_S3_SECRET_ACCESS_KEY}
+        # some S3-compat gateways require path-style URLs
+        # (endpoint/bucket/key) instead of virtual-hosted-style
+        # (bucket.endpoint/key). AWS S3 itself doesn't need this.
+        force-path-style: true
+        # Poll for new WAL frames every 1m (RPO ≈ 1m of admin actions).
+        # Headscale writes are mostly low-volume `last_seen` refreshes that
+        # don't matter on restore; raising from the 10s default trades a tiny
+        # RPO for fewer wake-ups with no measurable cost difference.
+        sync-interval: 1m
+        # Keep 72h of WAL history before consolidating into snapshots.
+        retention: 72h
+        # Take a fresh full snapshot every 6h.
+        snapshot-interval: 6h
+        age:
+          identities:
+            - ${AGE_IDENTITY}
+          recipients:
+            - ${AGE_RECIPIENT}

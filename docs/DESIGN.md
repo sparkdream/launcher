@@ -203,7 +203,8 @@ network:
   name: sparkdream            # → chainId sparkdream-1, monikers sparkdream-val-0…
   type: testnet               # devnet | testnet | mainnet → defaults profile
   chainIdSuffix: 1            # bump for relaunches: sparkdream-2
-  bech32Prefix: spark
+  bech32Prefix: sprkdrm       # must match the binary's baked-in prefix;
+                              # the conductor fails fast on mismatch
 
 token:
   baseDenom: uspark.sparkdreamtest   # bond + fee denom (bondDenom override allowed)
@@ -214,7 +215,7 @@ token:
 accounts:
   initial:
     - name: treasury
-      address: spark1...             # or generate: true
+      address: sprkdrm1...           # or generate: true
       amount: "500000000000000"
     - name: team
       generate: true

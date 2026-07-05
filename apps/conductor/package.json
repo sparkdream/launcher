@@ -1,0 +1,30 @@
+{
+  "name": "@sparkdream/conductor",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cosmjs/proto-signing": "^0.39.0",
+    "@cosmjs/stargate": "^0.39.0",
+    "@sparkdream/launch-spec": "workspace:*",
+    "@sparkdreamnft/sparkdreamjs": "^0.0.29",
+    "better-sqlite3": "^11.7.0",
+    "fastify": "^5.2.0",
+    "js-yaml": "^4.1.0",
+    "ssh2": "^1.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.0",
+    "@types/ssh2": "^1.15.1",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}

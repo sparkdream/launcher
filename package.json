@@ -1,0 +1,16 @@
+{
+  "name": "sparkdream-launcher",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "sync-vendor": "bash scripts/sync-vendor.sh"
+  }
+}

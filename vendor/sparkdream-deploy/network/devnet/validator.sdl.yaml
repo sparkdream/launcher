@@ -1,0 +1,71 @@
+---
+version: "2.0"
+services:
+  sparkdreamd:
+    image: sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.24
+    expose:
+      # SSH for emergency access (can be removed once Tailscale SSH works)
+      - port: 2222
+        as: 2222
+        proto: tcp
+        to:
+          - global: true
+      # No public P2P or RPC — all communication via Tailscale mesh
+    env:
+      - "SSH_PUBLIC_KEY=ssh-ed25519 YOUR_PUBLIC_KEY_HERE"
+      # Headscale coordination server URL (provider:forwarded_port)
+      - "HEADSCALE_URL=http://HEADSCALE_PROVIDER:PORT"
+      # Pre-auth key from: headscale preauthkeys create --user sparkdream --reusable --expiration 8760h
+      - "TS_AUTHKEY=CHANGE_ME"
+      # Hostname for this node on the Tailscale mesh
+      - "TS_HOSTNAME=validator"
+      # Tailscale state directory (on persistent storage)
+      - "TS_STATE_DIR=/root/.sparkdream/tailscale"
+      # Seconds to wait before starting the node (lets Tailscale + TMKMS connect)
+      - "STARTUP_DELAY=20"
+      # Set to "true" for initial deploy to upload chain data
+      - "WAIT_FOR_CONFIG=true"
+      # --- Privval keepalive proxy (remote signer over Tailscale userspace) ---
+      # Required when tmkms is on the other end of a DERP-relayed Tailscale
+      # tunnel and the privval TCP connection drops between sign requests,
+      # causing CometBFT to miss prevote/precommit rounds. socat owns the
+      # public port and keeps the TCP connection warm with kernel keepalives.
+      # ALSO update config.toml on the persistent volume:
+      #   priv_validator_laddr = "tcp://127.0.0.1:26660"
+      # so sparkdreamd binds to the backend port instead of the public one.
+      - "PRIVVAL_KEEPALIVE_PORT=26659"
+      # - "PRIVVAL_BACKEND_PORT=26660"   # optional, default 26660
+      # - "PRIVVAL_KEEPIDLE=10"          # optional, default 10
+      # - "PRIVVAL_KEEPINTVL=5"          # optional, default 5
+      # - "PRIVVAL_KEEPCNT=3"            # optional, default 3
+    params:
+      storage:
+        data:
+          mount: /root/.sparkdream
+          readOnly: false
+profiles:
+  compute:
+    sparkdreamd:
+      resources:
+        cpu:
+          units: 1
+        memory:
+          size: 8Gi
+        storage:
+          - size: 5Gi
+          - name: data
+            size: 50Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        sparkdreamd:
+          denom: uact
+          amount: 100000
+deployment:
+  sparkdreamd:
+    dcloud:
+      profile: sparkdreamd
+      count: 1

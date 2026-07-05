@@ -1,0 +1,100 @@
+---
+# Headscale on Akash mainnet, with Litestream continuous backup.
+#
+# The image (sparkdreamnft/headscale:v0.28.0) bundles headscale +
+# litestream. On startup the entrypoint restores /var/lib/headscale/db.sqlite
+# from the configured S3 replica if the persistent volume is empty, then runs
+# `litestream replicate -exec "headscale serve"` so every WAL frame is shipped
+# to object storage in near-real-time.
+#
+# Disaster recovery: if the provider goes offline, redeploy this SDL on a new
+# provider. The fresh PVC triggers a restore from S3 and the mesh comes back
+# with the same node IPs / preauth keys / ACLs intact. RPO ≈ 10s.
+#
+# WARNING: env vars are sent to the provider with the manifest. Use a
+# bucket-scoped key — not a root credential.
+
+version: "2.0"
+services:
+  headscale:
+    image: sparkdreamnft/headscale:v0.28.0
+    expose:
+      - port: 8080
+        as: 80
+        accept:
+          - headscale.sparkdream.io
+        proto: tcp
+        to:
+          - global: true
+      - port: 3478
+        as: 3478
+        proto: udp
+        to:
+          - global: true
+    env:
+      - TZ=UTC
+      # --- Litestream backup target (fill in before deploying) ---
+      - LITESTREAM_S3_ENDPOINT=CHANGE_ME
+      - LITESTREAM_S3_BUCKET=CHANGE_ME
+      - LITESTREAM_S3_PATH=archive
+      - LITESTREAM_S3_REGION=CHANGE_ME
+      - LITESTREAM_S3_ACCESS_KEY_ID=CHANGE_ME
+      - LITESTREAM_S3_SECRET_ACCESS_KEY=CHANGE_ME
+      # --- Client-side encryption (age) ---
+      # AGE_RECIPIENT is a public key — fine to commit to git.
+      # AGE_IDENTITY is a private key — never commit; paste at deploy time.
+      # Generate with: age-keygen -o headscale-backup-age.key
+      # Backup AGE_IDENTITY offline (password manager + paper). Losing it
+      # means every encrypted blob in the bucket is unrecoverable.
+      - AGE_RECIPIENT=CHANGE_ME
+      - AGE_IDENTITY=CHANGE_ME
+      # --- Optional static-key overrides ---
+      # Headscale generates noise_private.key and derp_server_private.key on
+      # first boot. Clients pin them, so regenerating either rejects every
+      # existing peer. Primary recovery path is the S3 state-keys.tar.age that
+      # seed-replica.sh uploads alongside the litestream snapshot. Setting
+      # these env vars overrides whatever the S3 archive holds — useful when
+      # you want to deploy without seeding the bucket. Same trust posture as
+      # AGE_IDENTITY (the Akash provider sees them). Paste the file contents
+      # verbatim, including any trailing newline headscale wrote.
+      # - HEADSCALE_NOISE_PRIVATE_KEY=
+      # - HEADSCALE_DERP_PRIVATE_KEY=
+    params:
+      storage:
+        headscale-data:
+          mount: /var/lib/headscale
+          readOnly: false
+        headscale-config:
+          mount: /etc/headscale
+          readOnly: false
+profiles:
+  compute:
+    headscale:
+      resources:
+        cpu:
+          units: 0.5
+        memory:
+          size: 512Mi
+        storage:
+          - size: 512Mi
+          - name: headscale-data
+            size: 512Mi
+            attributes:
+              persistent: true
+              class: beta3
+          - name: headscale-config
+            size: 512Mi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        headscale:
+          denom: uact
+          amount: 50000
+deployment:
+  headscale:
+    dcloud:
+      profile: headscale
+      count: 1

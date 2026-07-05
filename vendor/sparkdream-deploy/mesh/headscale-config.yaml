@@ -1,0 +1,95 @@
+# Headscale configuration for Akash deployment
+#
+# IMPORTANT: After deploying, update server_url to match
+# your actual provider address and forwarded port:
+#   http://<provider_address>:<forwarded_8080_port>
+#
+# You can update this file via the Akash shell.
+
+# The URL clients will connect to.
+# UPDATE THIS after deployment with the actual provider address and port.
+server_url: http://CHANGE_ME:8080
+
+# Listen on all interfaces so Akash port forwarding works
+listen_addr: 0.0.0.0:8080
+
+# Metrics endpoint (internal only, not exposed in SDL)
+metrics_listen_addr: 0.0.0.0:9090
+
+# gRPC for CLI management (internal only)
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: true
+
+# Noise protocol keys (auto-generated on first run)
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# IP allocation for tailnet nodes
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# DERP relay configuration
+#
+# Embedded DERP is the SOLE relay path for this tailnet. The public Tailscale
+# DERP map is intentionally NOT included as a fallback — Akash provider NAT
+# blocks direct WireGuard, so every peer-to-peer connection must relay, and
+# we want a single predictable path we control. To restore the public DERP
+# map as a fallback, add the controlplane.tailscale.com URL back to `urls`
+# and set `auto_update_enabled: true`.
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "sparkdream"
+    region_name: "SparkDream DERP"
+    verify_clients: true
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+    # UPDATE these with the provider's actual IP after deployment
+    # ipv4: <provider_ip>
+
+  urls: []
+  paths: []
+  auto_update_enabled: false
+
+# Disable update checks
+disable_check_updates: true
+
+# Clean up disconnected ephemeral nodes after 30 min
+ephemeral_node_inactivity_timeout: 30m
+
+# Database - SQLite on persistent storage
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+# No TLS - Akash handles the transport, and Tailscale/Noise
+# protocol encrypts the control plane traffic end-to-end
+tls_cert_path: ""
+tls_key_path: ""
+
+# Logging
+log:
+  level: info
+  format: text
+
+# ACL policy - allow all nodes to communicate
+# Can be tightened later for fine-grained access control
+policy:
+  mode: file
+  path: ""
+
+# DNS - minimal config, nodes will use their own DNS
+dns:
+  magic_dns: false
+  base_domain: sparkdream.mesh
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8

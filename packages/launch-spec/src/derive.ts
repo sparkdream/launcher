@@ -1,0 +1,70 @@
+import type { LaunchSpec } from "./schema.js";
+
+/** sparkdream + suffix 1 → "sparkdream-1" (§4). */
+export function chainId(spec: LaunchSpec): string {
+  return `${spec.network.name}-${spec.network.chainIdSuffix}`;
+}
+
+export function validatorMoniker(spec: LaunchSpec, v: number): string {
+  return `${spec.network.name}-val-${v}`;
+}
+
+export function sentryMoniker(spec: LaunchSpec, s: number): string {
+  return `${spec.network.name}-sentry-${s}`;
+}
+
+/** Tunnel port on a sentry for validator v (§5 step 4): 16656 + v. */
+export function tunnelPort(v: number): number {
+  return 16656 + v;
+}
+
+export interface Topology {
+  /** sentryValidators[s] = validator indices sentry s fronts. */
+  sentryValidators: number[][];
+  /** validatorSentries[v] = sentry indices fronting validator v. */
+  validatorSentries: number[][];
+}
+
+/** Expand round-robin or explicit mapping into both directions. */
+export function resolveTopology(spec: LaunchSpec): Topology {
+  const V = spec.topology.validators.count;
+  const S = spec.topology.sentries.count;
+  const mapping = spec.topology.sentries.mapping;
+
+  const sentryValidators: number[][] =
+    mapping === "round-robin"
+      ? Array.from({ length: S }, (_, s) => [s % V])
+      : mapping.map((vals) => [...vals]);
+
+  const validatorSentries: number[][] = Array.from({ length: V }, () => []);
+  for (const [s, vals] of sentryValidators.entries()) {
+    for (const v of vals) validatorSentries[v]!.push(s);
+  }
+
+  // Round-robin with S < V leaves validators uncovered only when S < V;
+  // with S >= V every validator gets at least one sentry. Callers needing
+  // coverage guarantees run validateSpec() first (explicit mappings) or
+  // check here for round-robin.
+  return { sentryValidators, validatorSentries };
+}
+
+export type NodeRole = "validator" | "sentry";
+
+export interface NodeRef {
+  role: NodeRole;
+  index: number;
+  /** e.g. "val-0", "sentry-1" — stable key used in state db, tailnet hostnames, SDL names. */
+  key: string;
+  moniker: string;
+}
+
+export function nodes(spec: LaunchSpec): NodeRef[] {
+  const out: NodeRef[] = [];
+  for (let v = 0; v < spec.topology.validators.count; v++) {
+    out.push({ role: "validator", index: v, key: `val-${v}`, moniker: validatorMoniker(spec, v) });
+  }
+  for (let s = 0; s < spec.topology.sentries.count; s++) {
+    out.push({ role: "sentry", index: s, key: `sentry-${s}`, moniker: sentryMoniker(spec, s) });
+  }
+  return out;
+}
