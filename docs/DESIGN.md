@@ -44,11 +44,12 @@ Source material:
    status and per-component actions; connect a fresh wallet → land on the
    wizard.
 
-Non-goals (v1): joining existing chains as a new validator, multi-operator
-coordinated genesis (external gentx collection), TMKMS automation (we pause and
-hand off), cosmovisor / gov-upgrade automation (coordinated halt-height
-upgrades are guided, not automatic — §5 "Node upgrades"), archive-node /
-Arweave archival automation.
+Non-goals (v1): joining existing chains as a new validator, **multi-party**
+coordinated genesis (collecting gentxs from other people — the single
+operator signing their own gentxs with a hardware wallet IS supported, §3
+"Operator keys"), TMKMS automation (we pause and hand off), cosmovisor /
+gov-upgrade automation (coordinated halt-height upgrades are guided, not
+automatic — §5 "Node upgrades"), archive-node / Arweave archival automation.
 
 ---
 
@@ -104,7 +105,9 @@ responsibilities:
 Expected signature count for a full launch: **5** — cert, headscale deployment,
 headscale lease, batched node deployments, batched node leases — plus 1 at the
 end for the step-20b persist (skippable in devnet, required for
-testnet/mainnet), plus 1 if a fee-denom deposit tx is needed first. The first three
+testnet/mainnet), plus 1 if a fee-denom deposit tx is needed first, plus 1
+per validator for external-operator gentxs (§3 — these sign against the NEW
+chain, not the compute network, and happen during Phase A). The first three
 happen in the opening minutes; the node deployment/lease pair comes after
 headscale is up and configured (~5–10 min later, longer if DNS is manual).
 The UI surfaces each as a blocking banner, so the user can walk away between
@@ -174,11 +177,14 @@ image):
 |---|---|---|
 | `node_key.json` × (N+M) | node IDs — known **before** deploy, enabling pre-rendered `persistent_peers` | uploaded to nodes; kept in state db |
 | `priv_validator_key.json` × N | consensus signing | **softsign mode**: uploaded to validator. **tmkms mode**: never uploaded; handed to user |
-| account mnemonics (validators' operator accounts, any "generate for me" initial accounts) | genesis allocations, gentxs | shown once in UI + downloadable encrypted bundle; flagged for sweep/rotation after launch |
+| account mnemonics (generated validator operator accounts, any "generate for me" initial accounts) | genesis allocations, gentxs | shown once in UI + downloadable encrypted bundle; flagged for sweep/rotation after launch. **Not created at all** for external-operator validators and address-only initial accounts — a hardware-custody mainnet launch generates zero mnemonics |
 | SSH keypair (ed25519, per launch) | node orchestration | conductor state db |
 | age keypair | headscale backup encryption | public key into SDL; private key shown once for offline stash |
 
-**Key-security modes** (wizard choice, defaulted by network type):
+**Key-security modes** (wizard choices, defaulted by network type). Two
+independent axes:
+
+*Consensus keys* (`security.keyMode`) — who signs blocks:
 
 - `softsign` (default devnet/testnet): consensus keys live in the validator
   containers. True one-click.
@@ -188,6 +194,27 @@ image):
   user, never uploaded. The launcher can generate every input the signer
   needs — it just can't (and shouldn't) run it: the whole point is that the
   signing box is hardware the launcher never touches.
+
+*Operator keys* (`topology.validators.operators`) — who owns the stake:
+
+- `generated` (default devnet/testnet): the conductor creates operator
+  accounts in a local keyring and signs the gentxs itself (§5 step 3).
+  Simple, but the mnemonics exist on the launcher until swept.
+- `external` (recommended mainnet): the user supplies operator **addresses**
+  (Keplr accounts, hardware-backed or not); the conductor funds them at
+  genesis and **pauses per validator for a browser-signed gentx** (§5 step
+  3b). The operator key never exists outside the user's wallet. Works with
+  Ledger: a gentx is offline-signed with account number 0 / sequence 0 (the
+  SDK's height-0 verification convention), Keplr supplies
+  `SIGN_MODE_LEGACY_AMINO_JSON` for Ledger accounts (the Ledger Cosmos app
+  supports `MsgCreateValidator`), and the new chain is pre-registered in
+  Keplr via `experimentalSuggestChain` — Keplr accepts a suggested chain
+  whose endpoints aren't live yet, and signing never queries the chain.
+
+`tmkms` + `external` operators + address-only initial accounts is the full
+mainnet custody posture: no consensus key, operator key, or funded mnemonic
+ever exists on the launcher or a provider. What the launcher still holds —
+node keys, the SSH keypair, the mTLS cert — is operational, not monetary.
 
 ---
 
@@ -225,6 +252,10 @@ accounts:
 topology:
   validators:
     count: 2
+    operators: generated             # or a list of external addresses, one per
+                                     # validator — gentxs then signed in the
+                                     # browser (hardware-wallet capable, §3):
+    # operators: [sprkdrm1aaa..., sprkdrm1bbb...]
   sentries:
     count: 2
     mapping: round-robin             # or explicit [[0],[1]] sentry→validators
@@ -306,13 +337,42 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
 
 1. `validate-spec` — schema + cross-field checks (denoms consistent, mainnet
    requires backup creds, allocations ≥ self-delegations, validators and
-   sentries keep `persistent: true` storage…).
+   sentries keep `persistent: true` storage, external operator list length =
+   validator count with addresses matching the chain's bech32 prefix;
+   mainnet warns on `generated` operators…).
 2. `generate-keys` — SSH keypair, age keypair, node keys ×(N+M), consensus
    keys ×N, mnemonics for `generate: true` accounts.
 3. `build-genesis` — `sparkdreamd init` per node home; add genesis accounts;
-   apply `chainParams` onto genesis JSON; `gentx` per validator (all local —
-   we control every validator key, so no external gentx collection);
-   `collect-gentxs`; `validate-genesis`.
+   apply `chainParams` onto genesis JSON; then gentxs by operator mode (§3):
+   - `generated` operators: `gentx` per validator, signed locally with the
+     conductor's keyring (we hold every operator key — this is
+     single-operator genesis, not multi-party collection);
+   - `external` operators: step 3b pauses for browser signatures.
+   Finally `collect-gentxs`; `validate-genesis`; distribute.
+3b. *(external operators only)* `await-gentxs` — one pause per validator,
+   served by a gentx variant of the signing loop (§8): the conductor builds
+   the `MsgCreateValidator` sign doc (operator address, that validator's
+   consensus pubkey from its home, self-delegation, commission from
+   `validatorDefaults`, moniker; chain-id = the NEW chain, account number 0,
+   sequence 0, zero fee); the UI pre-registers the new chain in Keplr via
+   `experimentalSuggestChain` (endpoints may point at the not-yet-live
+   sentry domains) and signs — amino mode for Ledger accounts, direct
+   otherwise. The conductor verifies the returned signature against the
+   operator address and the sign doc before accepting the gentx into the
+   collection; a bad signature re-pauses rather than poisoning genesis
+   (signature failures at InitChain brick block 1 — see the chain repo's
+   gentx-hash guard war story).
+   Two account-number notions, deliberately kept apart:
+   - the **sign-doc account number is pinned to 0 and MUST NOT be
+     user-configurable**: the SDK's ante handler verifies all height-0
+     signatures against account number 0 regardless of the account's
+     assigned number (`x/auth/ante/sigverify.go`) — any other value bricks
+     the chain at block 1;
+   - **which wallet account signs is entirely the user's choice**: operators
+     are specified as addresses, so any Keplr/Ledger account at any BIP-44
+     derivation index can back any validator — the wallet resolves the
+     derivation, the conductor only checks that the signature matches the
+     address.
 4. `render-configs` — from `deploy/config/template/*.toml.{validator,sentry}`
    (vendored into the launcher). Node IDs are known now, but **tailnet IPs are
    not** (assigned by headscale in Phase E), so peer wiring renders in two
@@ -652,13 +712,18 @@ launching the chain launches the armada).
    denom, exponent, min gas price. Advanced accordion: bech32 prefix, chain-id
    suffix.
 2. **Accounts & Topology** — initial accounts table (address or "generate"),
-   self-delegation; validator/sentry count steppers with a live
+   self-delegation; **operator key mode** (generated vs. external addresses —
+   external shows one address field per validator and explains the extra
+   gentx signatures, §3; any Keplr/Ledger account at any derivation index
+   can be used per validator — paste that account's address); validator/sentry
+   count steppers with a live
    topology diagram (ships + mesh lines) and per-count cost delta; component
    toggles (explorer/frontend/hub) with domain fields.
 3. **Pre-flight review** — full spec summary, editable-in-place advanced
    sections (chain params, provider policy, images, resources, key mode,
    backup creds), cost + escrow total vs. wallet balance, mainnet warnings
-   (launcher-on-Akash, softsign, missing backup creds). Buttons:
+   (launcher-on-Akash, softsign, generated operators, missing backup creds).
+   Buttons:
    *Export spec* / **Launch fleet**.
 4. **Launch board** — one row per component with stage chips
    (`deploying → bidding → provider ✓ (name, price, why) → lease → configuring
@@ -690,9 +755,14 @@ GET  /api/launches/:id                spec + step states
 POST /api/launches/:id/start|resume|abort
 WS   /api/launches/:id/events         step transitions, logs, decisions
 
-# Keplr signing loop
+# Keplr signing loop (compute-network txs)
 GET  /api/launches/:id/pending-tx     next unsigned tx (proto JSON), if any
 POST /api/launches/:id/tx-result      {txHash} → conductor verifies on-chain
+
+# gentx signing loop (NEW-chain offline signatures, external operators §3;
+# no broadcast — conductor verifies the signature and embeds the gentx)
+GET  /api/launches/:id/pending-gentx  sign doc for the next unsigned gentx
+POST /api/launches/:id/gentx-result   {signedTxJson} → verify + collect
 
 # fleet ops — owner always derived from the auth session (never a query
 # param); SSH-mutating actions (restart, relaunch prep) require session
@@ -733,8 +803,12 @@ Repo layout (github.com/sparkdream/launcher):
 ```
 launcher/
   packages/launch-spec/      zod schema + defaults profiles + types
-  apps/web/                  React 19 + Vite (matches hub stack), Keplr via
-                             @cosmos-kit or direct window.keplr (decide M3)
+  packages/akash-tx/         isomorphic msg conversion + signing registry
+                             (shared by conductor CLI signer and browser)
+  apps/web/                  Next.js 15 + React 19, static export (matches
+                             sparkdream-ui / gallery stack; no Next server —
+                             the conductor serves apps/web/out). Keplr via
+                             direct window.keplr (decided).
   apps/conductor/            Node 22 + Fastify + better-sqlite3 + ssh2
   vendor/sparkdream-deploy/  synced copy of deploy/config templates + SDLs
                              (script to re-sync from the chain repo)
@@ -828,8 +902,11 @@ with health-gated sequencing and tmkms-aware pauses (§5 "Node upgrades",
 "tmkms-mode fleets"); fleet bundle export/import; escrow runway alerts.
 The coordinated halt-height upgrade flow may slip to M7 if M5 runs long.
 
-**M6 — Launcher-on-Akash hardening.** litestream state replication, secret
-encryption at rest, allowlist auth, mainnet warnings; publish image + SDL.
+**M6 — Launcher-on-Akash + mainnet hardening.** litestream state
+replication, secret encryption at rest, allowlist auth, mainnet warnings;
+**external-operator gentx flow** (§3/§5 step 3b: browser/hardware-wallet
+gentx signing — verify the amino-mode path against a real Ledger before
+calling it done); publish image + SDL.
 
 **M7 — Polish.** fleet-visual launch board, spec import/export, preference
 list management UI, guided tmkms signer setup (§5 step 19 panel; a plain

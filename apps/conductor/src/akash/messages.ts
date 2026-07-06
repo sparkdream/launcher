@@ -1,24 +1,14 @@
+import { TypeUrl, type Msg } from "@sparkdream/akash-tx";
+
 /**
  * Unsigned Akash tx message construction, ported in shape from console-air's
  * TransactionMessageData.ts (see NOTICE). Values are proto-JSON: the browser
- * (Keplr + registry) or the CLI signer encodes them; the conductor never signs.
- * Versions per §9: deployment v1beta4, lease (market) v1beta5, cert v1,
- * escrow deposit v1.
+ * (Keplr + registry) or the CLI signer encodes them via @sparkdream/akash-tx;
+ * the conductor never signs. Versions per §9: deployment v1beta4, lease
+ * (market) v1beta5, cert v1, escrow deposit v1.
  */
 
-export const TypeUrl = {
-  CreateCertificate: "/akash.cert.v1.MsgCreateCertificate",
-  CreateDeployment: "/akash.deployment.v1beta4.MsgCreateDeployment",
-  UpdateDeployment: "/akash.deployment.v1beta4.MsgUpdateDeployment",
-  CloseDeployment: "/akash.deployment.v1beta4.MsgCloseDeployment",
-  CreateLease: "/akash.market.v1beta5.MsgCreateLease",
-  AccountDeposit: "/akash.escrow.v1.MsgAccountDeposit",
-} as const;
-
-export interface Msg {
-  typeUrl: string;
-  value: Record<string, unknown>;
-}
+export { TypeUrl, type Msg };
 
 export interface Coin {
   denom: string;

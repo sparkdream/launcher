@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
 import { validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb } from "./db.js";
-import { runLaunch, type RunResult, type StepDef } from "./engine.js";
+import { runLaunch, type StepDef } from "./engine.js";
 import type { Services } from "./services.js";
 
 export interface ServerDeps {
@@ -22,14 +22,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify();
   const running = new Set<string>();
 
-  const drive = async (id: string, spec: LaunchSpec): Promise<RunResult | { status: "already-running" }> => {
-    if (running.has(id)) return { status: "already-running" };
-    running.add(id);
-    try {
-      return await runLaunch(deps.db, id, spec, deps.workRoot, deps.steps, deps.services);
-    } finally {
-      running.delete(id);
+  // Fire-and-forget: SSH phases run for minutes, HTTP must not block on
+  // them. The UI polls GET /api/launches/:id + pending-tx. (WS events: M4.)
+  // A drive requested while one is active re-runs when it finishes, so a
+  // tx-result landing mid-run is never stranded.
+  const rerun = new Set<string>();
+  const drive = (id: string, spec: LaunchSpec): "started" | "already-running" => {
+    if (running.has(id)) {
+      rerun.add(id);
+      return "already-running";
     }
+    running.add(id);
+    void runLaunch(deps.db, id, spec, deps.workRoot, deps.steps, deps.services)
+      .catch((e) => {
+        deps.db.setLaunchStatus(id, "paused");
+        app.log.error(e, `launch ${id} driver crashed`);
+      })
+      .finally(() => {
+        running.delete(id);
+        if (rerun.delete(id)) drive(id, spec);
+      });
+    return "started";
   };
 
   app.post("/api/launches", async (req, reply) => {
@@ -73,8 +86,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const launch = deps.db.getLaunch(id);
     if (!launch) return reply.status(404).send({ error: "not found" });
     if (launch.status === "completed") return { status: "completed" };
-    const result = await drive(id, JSON.parse(launch.spec_json));
-    return result;
+    return { status: drive(id, JSON.parse(launch.spec_json)) };
   }
 
   app.post("/api/launches/:id/abort", async (req, reply) => {
@@ -103,9 +115,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const pending = deps.db.nextPendingTx(id);
     if (!pending) return reply.status(409).send({ error: "no pending tx" });
     deps.db.setPendingTxSigned(id, pending.step, txHash);
-    // resume immediately: requireTx verifies inclusion on-chain
-    const result = await drive(id, JSON.parse(launch.spec_json));
-    return result;
+    // resume in the background: requireTx verifies inclusion on-chain
+    return { status: drive(id, JSON.parse(launch.spec_json)) };
   });
 
   return app;

@@ -61,31 +61,36 @@ describe("API server (§8)", () => {
     expect(created.statusCode).toBe(201);
     const { id } = created.json() as { id: string };
 
-    let result = (await app.inject({ method: "POST", url: `/api/launches/${id}/start` })).json() as any;
+    const started = (await app.inject({ method: "POST", url: `/api/launches/${id}/start` })).json() as any;
+    expect(started.status).toBe("started");
 
-    // Keplr signing loop: fetch pending tx → "sign" → post result → repeat
+    // The driver runs in the background — poll like the UI does: launch
+    // status + pending-tx; sign whatever comes due.
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     let signatures = 0;
-    while (result.status === "awaiting-signature") {
+    let status = "";
+    for (let i = 0; i < 2000 && status !== "completed"; i++) {
+      status = ((await app.inject({ method: "GET", url: `/api/launches/${id}` })).json() as any).status;
       const pending = await app.inject({ method: "GET", url: `/api/launches/${id}/pending-tx` });
-      expect(pending.statusCode).toBe(200);
-      const { step, msgs } = pending.json() as { step: string; msgs: unknown[] };
-      expect(msgs.length).toBeGreaterThan(0);
-      signatures++;
-      result = (
+      if (pending.statusCode === 200) {
+        const { step, msgs } = pending.json() as { step: string; msgs: unknown[] };
+        expect(msgs.length).toBeGreaterThan(0);
+        signatures++;
         await app.inject({
           method: "POST",
           url: `/api/launches/${id}/tx-result`,
           payload: { txHash: `HTTPTX-${step}-${signatures}` },
-        })
-      ).json() as any;
+        });
+      }
+      await sleep(20);
     }
 
-    expect(result.status).toBe("completed");
+    expect(status).toBe("completed");
     expect(signatures).toBe(6); // §2: 5 + persist-start on testnet
 
-    const status = (await app.inject({ method: "GET", url: `/api/launches/${id}` })).json() as any;
-    expect(status.status).toBe("completed");
-    expect(status.steps.every((s: any) => s.status === "done")).toBe(true);
+    const view = (await app.inject({ method: "GET", url: `/api/launches/${id}` })).json() as any;
+    expect(view.status).toBe("completed");
+    expect(view.steps.every((s: any) => s.status === "done")).toBe(true);
 
     const noPending = await app.inject({ method: "GET", url: `/api/launches/${id}/pending-tx` });
     expect(noPending.statusCode).toBe(204);

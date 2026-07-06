@@ -17,6 +17,17 @@ N validators, M sentries, block explorer, and chain frontend — onto
 - **Runs anywhere** — the same container works locally (recommended for
   mainnet) or deployed on Akash.
 
+## Running
+
+```bash
+pnpm install
+npm run start   # build everything, serve UI + API on http://localhost:8080
+npm run dev     # development: Next.js frontend on :3210 (hot reload) + conductor API on :8080
+```
+
+Open the UI, configure your compute network (chain id, RPC/REST, denom), and
+connect Keplr — all Akash transactions are signed in the browser.
+
 ## Status
 
 Pre-1.0, under active development, built for SparkDream first — expect

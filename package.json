@@ -11,6 +11,8 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
+    "dev": "pnpm --parallel -r dev",
+    "start": "pnpm -r build && node apps/conductor/dist/main.js",
     "sync-vendor": "bash scripts/sync-vendor.sh"
   }
 }
