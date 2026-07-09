@@ -1,0 +1,18 @@
+# Provenance Record
+
+On-chain provenance for archived Spark Dream files. Each entry documents an archive file's cryptographic hash recorded at the [sparkdream.eth](https://etherscan.io/name-lookup-search?id=sparkdream.eth) Ethereum address and its permanent storage location(s) on Arweave.
+
+**Note:** Ethereum transaction [0xc3d90a32c2aa8ad2ab7597e89f0a1ae52374ed88febc917f535229b928669a5d](https://etherscan.io/tx/0xc3d90a32c2aa8ad2ab7597e89f0a1ae52374ed88febc917f535229b928669a5d) contains the Arweave wallet address ([4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q](https://viewblock.io/arweave/address/4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q)) used to store the Spark Dream archived files. The wallet address can be deduced from the transaction's hex input data `0x34694645543055666d3058303830354e34753578376c3958614a48716e683934364f674f53365347783651`.
+
+---
+
+## launcher1.tgz
+
+| Field | Value |
+|---|---|
+| **Date** | 2026-07-09 17:04:01 UTC |
+| **Git Hash** | c204eb146b2049c169e37d5a75be001429d477b1 |
+| **Ethereum Tx** | [0x920437f7feea1f6e00ef36a2c20e6749ad5b58e56dc36ccfb98f775dc24e4f16](https://etherscan.io/tx/0x920437f7feea1f6e00ef36a2c20e6749ad5b58e56dc36ccfb98f775dc24e4f16) |
+| **SHA-256** | `0x7e96183000e62859ab267d0171b1796555f704dc0b4dc0805b82429ec7a158bd` |
+| **Arweave Wallet** | [4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q](https://viewblock.io/arweave/address/4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q) |
+| **Arweave Copy 1** | [ChF1_fL8RQQ-4xXxEVDkCys6MUGKyfVAcRtv5Da8tXw](https://arweave.net/ChF1_fL8RQQ-4xXxEVDkCys6MUGKyfVAcRtv5Da8tXw) |
