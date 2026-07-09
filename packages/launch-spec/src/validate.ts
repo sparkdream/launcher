@@ -102,6 +102,33 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     }
   }
 
+  // Operator custody (§3)
+  const operators = spec.topology.validators.operators;
+  if (Array.isArray(operators)) {
+    if (operators.length !== V) {
+      err(
+        "topology.validators.operators",
+        `${operators.length} operator addresses for ${V} validators`,
+      );
+    }
+    for (const [i, addr] of operators.entries()) {
+      if (!addr.startsWith(spec.network.bech32Prefix + "1")) {
+        err(
+          `topology.validators.operators[${i}]`,
+          `address does not match bech32 prefix "${spec.network.bech32Prefix}"`,
+        );
+      }
+    }
+    if (new Set(operators).size !== operators.length) {
+      err("topology.validators.operators", "duplicate operator addresses");
+    }
+  } else if (mainnet) {
+    warn(
+      "topology.validators.operators",
+      "generated operators on mainnet: mnemonics exist on the launcher until swept — consider external (hardware-wallet) operators",
+    );
+  }
+
   // Mainnet hardening
   if (mainnet) {
     if (!spec.topology.headscale.backup) {

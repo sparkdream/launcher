@@ -88,13 +88,22 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
   if (timeoutCommit) {
     config = setTomlLine(config, "timeout_commit", `timeout_commit = "${timeoutCommit}"`);
   }
+  // softsign signs with the uploaded priv_validator_key.json — the
+  // validator template's socket privval (tmkms keepalive at 26660) would
+  // make the node block forever waiting for a signer that never connects
+  if (role === "validator" && spec.security.keyMode === "softsign") {
+    config = setTomlLine(config, "priv_validator_laddr", 'priv_validator_laddr = ""');
+  }
   fs.writeFileSync(path.join(configDir, "config.toml"), config);
 
   // --- app.toml ---
   let app = substitute(fs.readFileSync(templatePath(`app.toml.${role}`), "utf8"), vars);
-  // "default" means keep the template's role default (sentry template prunes
-  // "everything" deliberately); only explicit choices override.
-  if (role === "sentry" && spec.infra.sentrySettings.pruning !== "default") {
+  // The spec's pruning value is authoritative. The vendored sentry template
+  // ships pruning="everything", which sparkdreamd refuses to combine with
+  // the snapshot settings templated above ("cannot enable state sync
+  // snapshots with 'everything' pruning") — so "default" must be WRITTEN,
+  // not treated as keep-template.
+  if (role === "sentry") {
     app = setTomlLine(app, "pruning", `pruning = "${spec.infra.sentrySettings.pruning}"`);
   }
   fs.writeFileSync(path.join(configDir, "app.toml"), app);

@@ -1,20 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
+import yaml from "js-yaml";
 import { nodes } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import {
   accountDepositMsg,
+  closeDeploymentMsg,
   createCertificateMsg,
   createDeploymentMsg,
   createLeaseMsg,
+  TypeUrl,
   type Msg,
 } from "../akash/messages.js";
 import { pollBids } from "../akash/client.js";
 import { selectProvider, type PolicyDecision } from "../akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../akash/sdl-groups.js";
 import { vendorDir } from "../vendor.js";
-import type { Certificate } from "../services.js";
+import type { Certificate, SshTarget } from "../services.js";
 import { placeholder } from "./phase-a.js";
+import { readSecretFile, writeSecretFile } from "../secrets.js";
+import { toSsh2CompatiblePrivateKey } from "../keys.js";
 
 /** Initial escrow deposit per pricing denom (M2 estimate-costs refines this). */
 const DEFAULT_DEPOSIT: Record<string, string> = { uakt: "5000000", uact: "5000000" };
@@ -37,7 +42,7 @@ export function loadCert(ctx: StepCtx): Certificate {
   const p = certPaths(ctx);
   return {
     certPem: fs.readFileSync(p.cert, "utf8"),
-    keyPem: fs.readFileSync(p.key, "utf8"),
+    keyPem: readSecretFile(p.key),
     pubkeyPem: fs.readFileSync(p.pub, "utf8"),
   };
 }
@@ -53,8 +58,16 @@ export const ensureCertificateStep: StepDef = {
     if (!fs.existsSync(p.cert)) {
       const cert = await ctx.services.certs.generate(addr);
       fs.writeFileSync(p.cert, cert.certPem);
-      fs.writeFileSync(p.key, cert.keyPem, { mode: 0o600 });
+      writeSecretFile(p.key, cert.keyPem);
       fs.writeFileSync(p.pub, cert.pubkeyPem);
+    } else {
+      // self-heal pubkeys written before the "EC PUBLIC KEY" relabel fix in
+      // OpensslCertProvider (x/cert rejects the standard SPKI label; the
+      // key bytes are identical)
+      const pub = fs.readFileSync(p.pub, "utf8");
+      if (/(BEGIN|END) PUBLIC KEY/.test(pub)) {
+        fs.writeFileSync(p.pub, pub.replace(/(BEGIN|END) PUBLIC KEY/g, "$1 EC PUBLIC KEY"));
+      }
     }
     const cert = loadCert(ctx);
     const txHash = await ctx.requireTx("ensure-certificate", [
@@ -71,70 +84,268 @@ export interface HeadscaleOutput {
   provider: string;
   hostUri: string;
   price: string;
-  sshHost: string;
-  sshPort: number;
+  gseq: number;
+  oseq: number;
+}
+
+/** Resolve a headscale user's numeric id — preauthkeys --user rejects names. */
+export async function headscaleUserId(
+  ctx: StepCtx,
+  hs: Pick<HeadscaleOutput, "hostUri" | "dseq" | "gseq" | "oseq">,
+  name: string,
+): Promise<string> {
+  const res = await headscaleShell(ctx, hs, "headscale users list --output json");
+  const users = JSON.parse(res.stdout.trim() || "[]");
+  const user = (users as Array<{ id: number | string; name: string }>).find(
+    (u) => u.name === name,
+  );
+  if (!user) throw new Error(`headscale user ${name} not found after create`);
+  return String(user.id);
+}
+
+/**
+ * Run a command inside the headscale container via the provider's
+ * lease-shell — the headscale image has no sshd (its entrypoint execs
+ * straight into litestream/headscale), so SSH is not an option there.
+ */
+function headscaleShell(
+  ctx: StepCtx,
+  hs: Pick<HeadscaleOutput, "hostUri" | "dseq" | "gseq" | "oseq">,
+  script: string,
+) {
+  return ctx.services.provider.shellExec(
+    loadCert(ctx),
+    hs.hostUri,
+    hs.dseq,
+    hs.gseq,
+    hs.oseq,
+    "headscale",
+    ["sh", "-c", script],
+  );
+}
+
+/**
+ * Template the vendored headscale SDL with the spec's real values — the
+ * vendored file hardcodes an example `accept:` hostname and CHANGE_ME
+ * litestream/age env placeholders (the manual flow edits these by hand).
+ * Shared by the deploy step and the fleet SDL-download endpoint.
+ */
+export function templateHeadscaleSdl(
+  spec: StepCtx["spec"],
+  deps: { ageRecipient?: string | undefined; ageIdentity?: string | undefined } = {},
+): ReturnType<typeof loadSdl> {
+  const sdl = loadSdl(path.join(vendorDir(), "mesh", "headscale.sdl.yaml"));
+  const domain = spec.topology.headscale.domain;
+  const backup = spec.topology.headscale.backup;
+  for (const svc of Object.values(sdl.services) as any[]) {
+    for (const e of svc.expose ?? []) {
+      if (e.accept) e.accept = [domain];
+    }
+    if (!svc.env) continue;
+    if (!backup) {
+      // no backup configured → drop the placeholder env entirely: the
+      // entrypoint only runs headscale standalone when LITESTREAM_S3_BUCKET
+      // is UNSET, and a literal "CHANGE_ME" bucket boots litestream against
+      // a bogus endpoint — the container crash-loops and never turns ready
+      svc.env = svc.env.filter((e: string) => !/^(LITESTREAM_|AGE_)/.test(e));
+    } else {
+      const secretEnv = backup.s3.secretRef.replace(/^env:/, "");
+      const values: Record<string, string | undefined> = {
+        LITESTREAM_S3_ENDPOINT: backup.s3.endpoint,
+        LITESTREAM_S3_BUCKET: backup.s3.bucket,
+        LITESTREAM_S3_REGION: backup.s3.region,
+        LITESTREAM_S3_ACCESS_KEY_ID: backup.s3.accessKeyId,
+        LITESTREAM_S3_SECRET_ACCESS_KEY: process.env[secretEnv],
+        AGE_RECIPIENT: deps.ageRecipient,
+        AGE_IDENTITY: deps.ageIdentity,
+      };
+      if (!values.LITESTREAM_S3_SECRET_ACCESS_KEY) {
+        throw new Error(`headscale backup: ${backup.s3.secretRef} is not set in the environment`);
+      }
+      svc.env = svc.env.map((e: string) => {
+        const key = e.split("=")[0]!;
+        return values[key] ? `${key}=${values[key]}` : e;
+      });
+    }
+  }
+  return sdl;
 }
 
 export const deployHeadscaleStep: StepDef = {
   name: "deploy-headscale",
   async run(ctx): Promise<HeadscaleOutput> {
     const addr = owner(ctx);
-    const sdlPath = path.join(vendorDir(), "mesh", "headscale.sdl.yaml");
-    const sdl = loadSdl(sdlPath);
+    const domain = ctx.spec.topology.headscale.domain;
+    const backup = ctx.spec.topology.headscale.backup;
+    const sdl = templateHeadscaleSdl(ctx.spec, {
+      ageRecipient: backup
+        ? ctx.output<{ ageRecipient: string }>("generate-keys")!.ageRecipient
+        : undefined,
+      ageIdentity: backup
+        ? readSecretFile(path.join(ctx.dirs.secrets, "age.txt"))
+            .split("\n")
+            .find((l) => l.startsWith("AGE-SECRET-KEY-"))
+        : undefined,
+    });
+    // persist the rendered SDL beside the node SDLs (fleet SDL download)
+    fs.mkdirSync(ctx.dirs.sdl, { recursive: true });
+    fs.writeFileSync(path.join(ctx.dirs.sdl, "headscale.yaml"), yaml.dump(sdl, { lineWidth: 120 }));
     const artifacts = sdlArtifacts(sdl);
 
-    // dseq derived from chain height (console-air pattern), pinned in the tx
-    const dseq = String(await ctx.services.api.latestBlockHeight());
     const deposit = {
       denom: artifacts.pricingDenom,
       amount: DEFAULT_DEPOSIT[artifacts.pricingDenom] ?? "5000000",
     };
-    await ctx.requireTx("deploy-headscale:deployment", [
-      createDeploymentMsg({ owner: addr, dseq, groups: artifacts.groups, hash: artifacts.hash, deposit }),
-    ]);
 
-    const bids = await pollBids(ctx.services.api, addr, dseq, {
-      sleep: ctx.services.sleep,
-      minBids: 1,
-    });
     const providers = await ctx.services.api.listProviders();
-    const decision = selectProvider(bids, {
-      policy: ctx.spec.providers.policy,
-      chosenProviders: new Set(),
-      requiredStorageClass: artifacts.requiredStorageClass,
-      providers,
-    });
-    if (!decision.chosen) {
-      throw new AwaitUser(
-        "deploy-headscale",
-        `no acceptable headscale bids: ${JSON.stringify(decision.rejected)}`,
+    let dseq!: string;
+    let bidId!: { owner: string; dseq: string; gseq: number; oseq: number; provider: string };
+    let price!: string;
+
+    // close a dead order (refunding escrow) and forget its pinned dseq +
+    // txs so the next pass redeploys fresh
+    const redeploy = async (staleDseq: string, why: string) => {
+      ctx.log(`headscale order ${staleDseq} ${why} — closing and redeploying`);
+      // a provider-closed lease usually takes the whole deployment down with
+      // it — MsgCloseDeployment on a closed deployment fails simulation, so
+      // only ask for a close signature when there's something left to close
+      if ((await ctx.services.api.deploymentInfo(addr, staleDseq))?.state === "active") {
+        await ctx.requireTx(`deploy-headscale:close:${staleDseq}`, [closeDeploymentMsg(addr, staleDseq)]);
+      } else {
+        ctx.db.deletePendingTx(ctx.launchId, `deploy-headscale:close:${staleDseq}`);
+      }
+      clearPin(ctx, "headscale-dseq");
+      ctx.db.deletePendingTx(ctx.launchId, "deploy-headscale:deployment");
+      ctx.db.deletePendingTx(ctx.launchId, "deploy-headscale:lease");
+    };
+
+    const leaseRow = ctx.db.getPendingTx(ctx.launchId, "deploy-headscale:lease");
+    let haveLease = Boolean(
+      leaseRow && (leaseRow.status === "signed" || leaseRow.status === "confirmed"),
+    );
+    if (haveLease) {
+      // A lease was already signed on a prior run — its bid IS the choice.
+      // Don't re-poll bids: leasing flips the winner to "active" and closes
+      // the rest, so a re-run would misread the order as dead (and the old
+      // stale-order path would offer to close a LIVE deployment).
+      dseq = await pinnedValue(ctx, "headscale-dseq", async () =>
+        String(await ctx.services.api.latestBlockHeight()),
       );
+      bidId = JSON.parse(leaseRow!.msgs_json)[0].value.bidId;
+      // providers close leases whose manifest never arrives — that order is
+      // dead (all bids spent), so start over
+      const leaseState = await ctx.services.api.leaseState(addr, dseq, bidId.provider);
+      if (leaseState === "closed") {
+        await redeploy(dseq, "lease closed by the provider (manifest never accepted)");
+        haveLease = false;
+      } else {
+        // drop any close erroneously enqueued by a pre-fix run against this dseq
+        ctx.db.deletePendingTx(ctx.launchId, `deploy-headscale:close:${dseq}`);
+        await ctx.requireTx("deploy-headscale:lease", [createLeaseMsg(bidId)]);
+        const bids = await ctx.services.api.listBids(addr, dseq);
+        price = bids.find((b) => b.bid.id.provider === bidId.provider)?.bid.price.amount ?? "0";
+      }
     }
-    const bidId = decision.chosen.bid.bid_id;
-    await ctx.requireTx("deploy-headscale:lease", [createLeaseMsg(bidId)]);
+    if (!haveLease) {
+      let bids;
+      // Akash bids expire minutes after the order opens; the signing loop's
+      // human latency can outlive them. A stale order (bids exist, none open
+      // or active) never recovers — close it to refund the escrow and
+      // redeploy fresh.
+      for (let round = 0; ; round++) {
+        // dseq derived from chain height (console-air pattern) — PINNED to the
+        // workdir on first computation: this step re-runs after the signature
+        // pause, and a recomputed dseq would diverge from the signed tx
+        dseq = await pinnedValue(ctx, "headscale-dseq", async () =>
+          String(await ctx.services.api.latestBlockHeight()),
+        );
+        await ctx.requireTx("deploy-headscale:deployment", [
+          createDeploymentMsg({ owner: addr, dseq, groups: artifacts.groups, hash: artifacts.hash, deposit }),
+        ]);
+
+        const existing = await ctx.services.api.listBids(addr, dseq);
+        const alive = existing.some((b) => b.bid.state === "open" || b.bid.state === "active");
+        if (existing.length === 0 || alive) {
+          bids = await pollBids(ctx.services.api, addr, dseq, {
+            sleep: ctx.services.sleep,
+            minBids: 1,
+            // console-air-style: gather a fuller bid set before the policy engine picks
+            settleRounds: 2,
+          });
+          break;
+        }
+        if (round >= 1) {
+          throw new AwaitUser(
+            "deploy-headscale",
+            `bids on redeployed order ${dseq} expired too — sign faster, or check provider supply, then resume`,
+          );
+        }
+        await redeploy(dseq, `went stale (all ${existing.length} bids closed)`);
+      }
+      const openBids = bids.filter((b) => b.bid.state === "open");
+      const decision = selectProvider(openBids, {
+        policy: ctx.spec.providers.policy,
+        chosenProviders: new Set(),
+        requiredStorageClass: artifacts.requiredStorageClass,
+        providers,
+      });
+      if (!decision.chosen) {
+        throw new AwaitUser(
+          "deploy-headscale",
+          `no acceptable headscale bids: ${JSON.stringify(decision.rejected)}`,
+        );
+      }
+      bidId = decision.chosen.bid.id;
+      price = decision.chosen.bid.price.amount;
+      await ctx.requireTx("deploy-headscale:lease", [createLeaseMsg(bidId)]);
+    }
+
+    // the manifest hash must match the deployment on-chain — if the renderer
+    // changed since the deployment tx (e.g. a manifest-shape fix), update the
+    // deployment in place (keeps the lease) before pushing the manifest
+    const wantHash = Buffer.from(artifacts.hash).toString("base64");
+    const onChain = await ctx.services.api.deploymentInfo(addr, dseq);
+    if (onChain?.hash && onChain.hash !== wantHash) {
+      ctx.log(`headscale manifest hash drifted from deployment ${dseq} — updating on-chain`);
+      await ctx.requireTx(`deploy-headscale:update:${dseq}:${wantHash.slice(0, 8)}`, [
+        {
+          typeUrl: TypeUrl.UpdateDeployment,
+          value: { id: { owner: addr, dseq }, hash: wantHash },
+        },
+      ]);
+    }
 
     const cert = loadCert(ctx);
     const info = providers.get(bidId.provider)!;
-    await ctx.services.provider.sendManifest(cert, info.hostUri, dseq, sortedJson(artifacts.manifest));
-    const status = await ctx.services.provider.leaseStatus(cert, info.hostUri, dseq, bidId.gseq, bidId.oseq);
-    const ssh = extractForwardedPort(status, 2222);
+    await ctx.services.provider.sendManifest(cert, info.hostUri, dseq, artifacts.manifestJson);
+    // confirm the workload is running — and grab the provider ingress
+    // hostname, which is what the user's DNS record must point at (NOT the
+    // provider's :8443 API endpoint)
+    const status: any = await waitLeaseStatus(
+      ctx, cert, info.hostUri, dseq, bidId.gseq, bidId.oseq,
+    );
+    const uris: string[] = Object.values(status?.services ?? {}).flatMap(
+      (s: any) => s?.uris ?? [],
+    );
+    const ingress = uris.find((u) => u !== domain) ?? new URL(info.hostUri).hostname;
 
     // DNS gate (§5 step 9): headscale must answer on its public domain
-    const url = `https://${ctx.spec.topology.headscale.domain}/health`;
+    const url = `https://${domain}/health`;
     if (!(await ctx.services.rpc.httpOk(url))) {
       throw new AwaitUser(
         "deploy-headscale",
-        `headscale not reachable at ${url} — create the DNS A record to ${info.hostUri} ` +
-          `(Cloudflare: SSL=Flexible, WebSockets on), then resume`,
+        `headscale not reachable at ${url} — create a DNS record for ${domain} → ` +
+          `CNAME ${ingress} (or an A record to that host's IP). ` +
+          `Cloudflare: proxy on, SSL=Flexible, WebSockets on. Then resume.`,
       );
     }
     return {
       dseq,
       provider: bidId.provider,
       hostUri: info.hostUri,
-      price: decision.chosen.bid.price.amount,
-      sshHost: ssh.host,
-      sshPort: ssh.port,
+      price,
+      gseq: bidId.gseq,
+      oseq: bidId.oseq,
     };
   },
 };
@@ -149,22 +360,43 @@ export const configureHeadscaleStep: StepDef = {
   async run(ctx): Promise<PreauthKeys> {
     const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
     if (!hs) throw new Error("deploy-headscale output missing");
-    const target = sshTarget(ctx, hs.sshHost, hs.sshPort);
     const domain = ctx.spec.topology.headscale.domain;
 
-    await ctx.services.ssh.exec(
-      target,
-      `sed -i 's|^server_url:.*|server_url: https://${domain}|' /etc/headscale/config.yaml && kill 1`,
+    await headscaleShell(
+      ctx,
+      hs,
+      `sed -i 's|^server_url:.*|server_url: https://${domain}|' /etc/headscale/config.yaml`,
     );
-    await ctx.services.ssh.exec(
-      target,
+    // kill 1 restarts the container — the shell connection dies with it, so
+    // tolerate the drop, then wait for the pod to actually accept commands
+    // again. (The lease-status `available` counter is NOT a readiness
+    // signal — it reads 1 even mid-crash-loop; the shell itself is.)
+    await headscaleShell(ctx, hs, "kill 1").catch(() => {});
+    let up = false;
+    for (let i = 0; i < 20 && !up; i++) {
+      await ctx.services.sleep(4000);
+      try {
+        await headscaleShell(ctx, hs, "true");
+        up = true;
+      } catch {
+        // "no active replica" / connection refused while the pod restarts
+      }
+    }
+    if (!up) throw new Error("headscale did not come back after server_url restart");
+    await headscaleShell(
+      ctx,
+      hs,
       `headscale users create ${ctx.spec.network.name} 2>/dev/null || true`,
     );
+    // preauthkeys --user takes the NUMERIC id, not the name (DEPLOYMENT.md:
+    // "note the numeric user ID from headscale users list")
+    const userId = await headscaleUserId(ctx, hs, ctx.spec.network.name);
 
     const mint = async (label: string) => {
-      const res = await ctx.services.ssh.exec(
-        target,
-        `headscale preauthkeys create --user ${ctx.spec.network.name} --reusable --expiration 8760h --output json`,
+      const res = await headscaleShell(
+        ctx,
+        hs,
+        `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
       );
       const parsed = JSON.parse(res.stdout.trim());
       const key = typeof parsed === "string" ? parsed : parsed.key;
@@ -185,17 +417,19 @@ export const seedHeadscaleBackupStep: StepDef = {
     const backup = ctx.spec.topology.headscale.backup;
     if (!backup || ctx.spec.network.type === "devnet") return { skipped: true };
     const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
-    const target = sshTarget(ctx, hs.sshHost, hs.sshPort);
     const stage = path.join(ctx.dirs.root, "headscale-backup");
     fs.mkdirSync(stage, { recursive: true });
-    // Port of seed-replica.sh: db + noise/DERP keys, validated before upload
-    const check = await ctx.services.ssh.exec(
-      target,
+    // Port of seed-replica.sh: db + noise/DERP keys, validated before upload.
+    // No sshd in the headscale image — files come out base64 over lease-shell.
+    const check = await headscaleShell(
+      ctx,
+      hs,
       `sqlite3 /var/lib/headscale/db.sqlite "SELECT count(*) FROM users"`,
     );
     if (Number(check.stdout.trim()) === 0) throw new Error("refusing to seed: headscale db has no users");
     for (const f of ["db.sqlite", "noise_private.key"]) {
-      await ctx.services.ssh.download?.(target, `/var/lib/headscale/${f}`, path.join(stage, f));
+      const b64 = await headscaleShell(ctx, hs, `base64 /var/lib/headscale/${f}`);
+      fs.writeFileSync(path.join(stage, f), Buffer.from(b64.stdout.replace(/\s+/g, ""), "base64"));
     }
     const keys = ctx.output<{ ageRecipient: string }>("generate-keys")!;
     const out = path.join(ctx.dirs.secrets, "state-keys.tar.age");
@@ -220,7 +454,13 @@ export const createDeploymentsStep: StepDef = {
     const preauth = ctx.output<PreauthKeys>("configure-headscale");
     if (!preauth) throw new Error("configure-headscale output missing");
 
-    const height = await ctx.services.api.latestBlockHeight();
+    // pinned for the same reason as the headscale dseq: the signed batch
+    // must match the plan across re-runs of this step
+    const height = Number(
+      await pinnedValue(ctx, "node-dseq-base", async () =>
+        String(await ctx.services.api.latestBlockHeight()),
+      ),
+    );
     const msgs: Msg[] = [];
     const perNode: DeploymentPlan["perNode"] = {};
     let offset = 0;
@@ -235,7 +475,7 @@ export const createDeploymentsStep: StepDef = {
       const artifacts = sdlArtifacts(loadSdl(sdlPath));
       const dseq = String(height + offset++); // distinct dseq per deployment, one batched tx
       const manifestPath = path.join(ctx.dirs.sdl, `${node.key}.manifest.json`);
-      fs.writeFileSync(manifestPath, sortedJson(artifacts.manifest));
+      fs.writeFileSync(manifestPath, artifacts.manifestJson);
       perNode[node.key] = { dseq, manifestPath, requiredStorageClass: artifacts.requiredStorageClass };
       msgs.push(
         createDeploymentMsg({
@@ -277,8 +517,10 @@ export const collectBidsStep: StepDef = {
       const bids = await pollBids(ctx.services.api, addr, entry.dseq, {
         sleep: ctx.services.sleep,
         minBids: 1,
+        // console-air-style: gather a fuller bid set before the policy engine picks
+        settleRounds: 2,
       });
-      const decision = selectProvider(bids, {
+      const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
         policy: ctx.spec.providers.policy,
         chosenProviders: chosen,
         requiredStorageClass: entry.requiredStorageClass,
@@ -291,13 +533,13 @@ export const collectBidsStep: StepDef = {
         );
       }
       const bid = decision.chosen.bid;
-      chosen.add(bid.bid_id.provider);
+      chosen.add(bid.id.provider);
       perNode[key] = {
-        provider: bid.bid_id.provider,
-        hostUri: providers.get(bid.bid_id.provider)!.hostUri,
+        provider: bid.id.provider,
+        hostUri: providers.get(bid.id.provider)!.hostUri,
         price: bid.price.amount,
-        gseq: bid.bid_id.gseq,
-        oseq: bid.bid_id.oseq,
+        gseq: bid.id.gseq,
+        oseq: bid.id.oseq,
         decision,
       };
     }
@@ -340,7 +582,9 @@ export const sendManifestsStep: StepDef = {
       const a = assignments.perNode[key]!;
       const manifest = fs.readFileSync(entry.manifestPath, "utf8");
       await ctx.services.provider.sendManifest(cert, a.hostUri, entry.dseq, manifest);
-      const status = await ctx.services.provider.leaseStatus(cert, a.hostUri, entry.dseq, a.gseq, a.oseq);
+      const status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
+        forwardedPort: 2222,
+      });
       perNode[key] = extractForwardedPort(status, 2222);
     }
     return { perNode };
@@ -349,13 +593,112 @@ export const sendManifestsStep: StepDef = {
 
 // --- shared helpers ---
 
-export function sshTarget(ctx: StepCtx, host: string, port: number) {
+/**
+ * Lease status right after a manifest PUT races the provider's kube
+ * scheduler ("no deployments for lease" 404) and image pulls — poll until
+ * the workload exists (and, when requested, a forwarded port appears).
+ */
+export async function waitLeaseStatus(
+  ctx: StepCtx,
+  cert: Certificate,
+  hostUri: string,
+  dseq: string,
+  gseq: number,
+  oseq: number,
+  opts: { forwardedPort?: number; attempts?: number } = {},
+): Promise<unknown> {
+  const attempts = opts.attempts ?? 36; // × 5s ≈ 3 min (image pulls are slow)
+  let lastError = "";
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await ctx.services.sleep(5000);
+    try {
+      const status = await ctx.services.provider.leaseStatus(cert, hostUri, dseq, gseq, oseq);
+      if (opts.forwardedPort === undefined) return status;
+      try {
+        extractForwardedPort(status, opts.forwardedPort);
+        return status;
+      } catch (e) {
+        lastError = String(e);
+      }
+    } catch (e) {
+      lastError = String(e);
+      if (!/404|no deployments|not found/i.test(lastError)) throw e;
+    }
+  }
+  throw new Error(`lease ${dseq} workload not up after ${attempts} checks: ${lastError}`);
+}
+
+/**
+ * Compute a value once per launch and persist it in the workdir; re-runs
+ * of a step (after signature pauses) get the original value back.
+ */
+export async function pinnedValue(
+  ctx: StepCtx,
+  name: string,
+  compute: () => Promise<string>,
+): Promise<string> {
+  const file = path.join(ctx.dirs.root, `${name}.pin`);
+  if (fs.existsSync(file)) return fs.readFileSync(file, "utf8");
+  const value = await compute();
+  fs.mkdirSync(ctx.dirs.root, { recursive: true });
+  fs.writeFileSync(file, value);
+  return value;
+}
+
+/** Forget a pinned value so the next pinnedValue() recomputes (redeploys). */
+export function clearPin(ctx: StepCtx, name: string): void {
+  fs.rmSync(path.join(ctx.dirs.root, `${name}.pin`), { force: true });
+}
+
+export function sshTarget(
+  ctx: StepCtx,
+  host: string,
+  port: number,
+  shellFallback?: SshTarget["shellFallback"],
+): SshTarget {
   return {
     host,
     port,
     user: "root",
-    privateKeyPem: fs.readFileSync(path.join(ctx.dirs.secrets, "ssh_ed25519.pem"), "utf8"),
+    privateKeyPem: toSsh2CompatiblePrivateKey(readSecretFile(path.join(ctx.dirs.secrets, "ssh_ed25519.pem"))),
+    ...(shellFallback ? { shellFallback } : {}),
   };
+}
+
+/** Lease-shell fallback descriptor for a node component (service sparkdreamd). */
+export function nodeShellFallback(
+  ctx: StepCtx,
+  hostUri: string,
+  dseq: string,
+  gseq = 1,
+  oseq = 1,
+): NonNullable<SshTarget["shellFallback"]> {
+  const cert = loadCert(ctx);
+  return {
+    creds: { certPem: cert.certPem, keyPem: cert.keyPem },
+    hostUri,
+    dseq,
+    gseq,
+    oseq,
+    service: "sparkdreamd",
+  };
+}
+
+/**
+ * External URL of a node's CometBFT RPC. The SDL exposes 26657 globally as a
+ * RANDOM_PORT, so the reachable endpoint is a provider-assigned forwarded
+ * port from lease status (plain http) — NOT <provider-host>:26657.
+ */
+export async function nodeRpcUrl(
+  ctx: StepCtx,
+  hostUri: string,
+  dseq: string,
+  gseq = 1,
+  oseq = 1,
+): Promise<string> {
+  const status = await ctx.services.provider.leaseStatus(loadCert(ctx), hostUri, dseq, gseq, oseq);
+  const ep = extractForwardedPort(status, 26657);
+  return `http://${ep.host}:${ep.port}`;
 }
 
 /** Pull a forwarded port mapping out of a provider lease-status payload. */

@@ -35,7 +35,7 @@ export function updateDeploymentMsgs(input: UpdateInput): {
     fs.writeFileSync(sdlPath, text);
 
     const artifacts = sdlArtifacts(loadSdl(sdlPath));
-    manifests[node.key] = sortedJson(artifacts.manifest);
+    manifests[node.key] = artifacts.manifestJson;
     msgs.push({
       typeUrl: TypeUrl.UpdateDeployment,
       value: {

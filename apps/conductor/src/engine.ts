@@ -46,6 +46,13 @@ export class AwaitUser extends Error {
   }
 }
 
+/** Thrown by build-genesis to pause for an external-operator gentx (§5 3b). */
+export class AwaitGentx extends Error {
+  constructor(readonly valIndex: number) {
+    super(`awaiting gentx signature for validator ${valIndex}`);
+  }
+}
+
 export interface StepCtx {
   launchId: string;
   spec: LaunchSpec;
@@ -60,6 +67,12 @@ export interface StepCtx {
    * AwaitSignature until the tx is signed & confirmed on-chain.
    */
   requireTx(stepName: string, msgs: Msg[]): Promise<string>;
+  /**
+   * Gentx loop (§5 3b): returns the wallet's raw sign response for this
+   * validator, or throws AwaitGentx. The CALLER verifies the signature and
+   * calls db.resetGentx + throws if it doesn't hold up.
+   */
+  requireGentx(valIndex: number, address: string, signDocJson: string): string;
 }
 
 export interface StepDef {
@@ -68,7 +81,7 @@ export interface StepDef {
 }
 
 export interface RunResult {
-  status: "completed" | "paused" | "awaiting-signature" | "awaiting-user";
+  status: "completed" | "paused" | "awaiting-signature" | "awaiting-gentx" | "awaiting-user";
   failedStep?: string;
   reason?: string;
 }
@@ -106,6 +119,12 @@ export async function runLaunch(
       }
       if (row.status === "confirmed") return row.tx_hash!;
       if (row.status === "pending" || row.status === "failed") {
+        // nothing signed yet — steps regenerate msgs deterministically
+        // (pinnedValue), so drift means the code producing them changed
+        // since the tx was enqueued; refresh so the user doesn't keep
+        // re-signing a stale (possibly invalid) payload
+        const msgsJson = JSON.stringify(msgs);
+        if (row.msgs_json !== msgsJson) db.updatePendingTxMsgs(launchId, stepName, msgsJson);
         throw new AwaitSignature(stepName);
       }
       // signed → verify on-chain
@@ -118,6 +137,15 @@ export async function runLaunch(
       // failed on-chain: require a fresh signature
       db.setPendingTxStatus(launchId, stepName, "pending");
       throw new Error(`tx ${row.tx_hash} failed on-chain for step ${stepName}; re-sign required`);
+    },
+    requireGentx: (valIndex, address, signDocJson) => {
+      const row = db.getPendingGentx(launchId, valIndex);
+      if (!row) {
+        db.enqueuePendingGentx(launchId, valIndex, address, signDocJson);
+        throw new AwaitGentx(valIndex);
+      }
+      if (row.status !== "signed" || !row.response_json) throw new AwaitGentx(valIndex);
+      return row.response_json;
     },
   };
 
@@ -142,7 +170,18 @@ export async function runLaunch(
         db.setLaunchStatus(launchId, "paused");
         return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
       }
-      const message = cause instanceof Error ? cause.message : String(cause);
+      if (cause instanceof AwaitGentx) {
+        db.stepWaiting(launchId, step.name, `awaiting gentx for validator ${cause.valIndex}`);
+        db.setLaunchStatus(launchId, "paused");
+        return { status: "awaiting-gentx", failedStep: step.name };
+      }
+      // some libraries throw Errors with EMPTY messages — fall back to the
+      // error name + first stack frame so the UI never shows a blank banner
+      const message =
+        cause instanceof Error
+          ? cause.message ||
+            `${cause.name || "Error"} (no message): ${(cause.stack ?? "").split("\n")[1]?.trim() ?? "no stack"}`
+          : String(cause);
       db.stepFailed(launchId, step.name, message);
       db.setLaunchStatus(launchId, "paused");
       log(`pause at ${step.name}: ${message}`);
@@ -159,9 +198,15 @@ export interface Signer {
   sign(msgs: Msg[]): Promise<string>;
 }
 
+export interface GentxSigner {
+  /** Amino-sign a gentx sign doc; returns the AminoSignResponse JSON. */
+  signGentx(signDocJson: string, address: string): Promise<string>;
+}
+
 /**
- * Headless driver (M2): auto-signs every pending tx with the given signer
- * and resumes until the launch completes, fails, or needs the user.
+ * Headless driver (M2): auto-signs every pending tx (and gentx, when a
+ * gentx signer is provided) and resumes until the launch completes, fails,
+ * or needs the user.
  */
 export async function runWithSigner(
   db: ConductorDb,
@@ -172,13 +217,24 @@ export async function runWithSigner(
   services: Services,
   signer: Signer,
   log?: (message: string) => void,
+  gentxSigner?: GentxSigner,
 ): Promise<RunResult> {
   for (;;) {
     const result = await runLaunch(db, launchId, spec, workRoot, steps, services, log);
-    if (result.status !== "awaiting-signature") return result;
-    const pending = db.nextPendingTx(launchId);
-    if (!pending) throw new Error("awaiting-signature with no pending tx");
-    const txHash = await signer.sign(JSON.parse(pending.msgs_json));
-    db.setPendingTxSigned(launchId, pending.step, txHash);
+    if (result.status === "awaiting-signature") {
+      const pending = db.nextPendingTx(launchId);
+      if (!pending) throw new Error("awaiting-signature with no pending tx");
+      const txHash = await signer.sign(JSON.parse(pending.msgs_json));
+      db.setPendingTxSigned(launchId, pending.step, txHash);
+      continue;
+    }
+    if (result.status === "awaiting-gentx" && gentxSigner) {
+      const pending = db.nextPendingGentx(launchId);
+      if (!pending) throw new Error("awaiting-gentx with no pending gentx");
+      const response = await gentxSigner.signGentx(pending.sign_doc_json, pending.address);
+      db.setGentxSigned(launchId, pending.val_index, response);
+      continue;
+    }
+    return result;
   }
 }

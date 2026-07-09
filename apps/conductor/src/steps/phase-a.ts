@@ -10,9 +10,17 @@ import {
   type NodeRef,
 } from "@sparkdream/launch-spec";
 import type { StepCtx, StepDef } from "../engine.js";
+import { writeSecretFile } from "../secrets.js";
 import { sparkdreamd, run } from "../exec.js";
 import { generateAgeKeypair, generateSshKeypair } from "../keys.js";
 import { applyChainParams, commissionFlags } from "../genesis-params.js";
+import {
+  assembleGentxJson,
+  buildGentxSignDoc,
+  verifyGentxSignature,
+  type GentxInputs,
+  type GentxSignResponse,
+} from "../gentx.js";
 import { renderNodeConfigs } from "../render-configs.js";
 import { renderNodeSdl } from "../render-sdl.js";
 
@@ -27,8 +35,11 @@ export const placeholder = {
 
 export interface GenerateKeysOutput {
   nodeIds: Record<string, string>;
-  /** name → address for operator + generated initial accounts. */
+  /** name → address for operator + generated initial accounts. External
+   *  operators appear here too (op-val-N → supplied address). */
   accounts: Record<string, string>;
+  /** val key → base64 ed25519 consensus pubkey (comet show-validator). */
+  consensusPubkeys: Record<string, string>;
   sshPublicKey: string;
   ageRecipient: string;
 }
@@ -49,9 +60,33 @@ export const validateSpecStep: StepDef = {
       );
     }
     for (const w of result.warnings) ctx.log(`warning: ${w.path}: ${w.message}`);
+    // fail fast on unpublished images — otherwise the pods ImagePullBackOff
+    // silently 15 steps later, after real deposits are on-chain
+    for (const image of Object.values(ctx.spec.images).filter((i): i is string => Boolean(i))) {
+      if (await dockerHubTagMissing(ctx, image)) {
+        throw new Error(
+          `image ${image} not found on Docker Hub — push it (chain repo: ` +
+            `make docker-build-*-ssh VERSION=<tag> && docker push) or override spec.images`,
+        );
+      }
+    }
     return result;
   },
 };
+
+/**
+ * True only when the image is a Docker Hub `ns/repo:tag` reference AND the
+ * registry positively reports the tag absent (404). Network errors and
+ * other registries return false — a fail-fast convenience, not a gate.
+ */
+async function dockerHubTagMissing(ctx: StepCtx, image: string): Promise<boolean> {
+  const m = /^([a-z0-9-]+)\/([a-z0-9-_.]+):([\w.-]+)$/.exec(image);
+  if (!m) return false;
+  const status = await ctx.services.rpc.httpStatus(
+    `https://hub.docker.com/v2/repositories/${m[1]}/${m[2]}/tags/${m[3]}`,
+  );
+  return status === 404;
+}
 
 export const generateKeysStep: StepDef = {
   name: "generate-keys",
@@ -64,23 +99,21 @@ export const generateKeysStep: StepDef = {
     let sshPublicKey = spec.security.sshPublicKey;
     if (!sshPublicKey) {
       const pair = generateSshKeypair(`launch-${ctx.launchId}`);
-      fs.writeFileSync(path.join(dirs.secrets, "ssh_ed25519.pem"), pair.privateKeyPem, {
-        mode: 0o600,
-      });
+      writeSecretFile(path.join(dirs.secrets, "ssh_ed25519.pem"), pair.privateKeyPem);
       fs.writeFileSync(path.join(dirs.secrets, "ssh_ed25519.pub"), pair.publicKeyOpenssh);
       sshPublicKey = pair.publicKeyOpenssh;
     }
 
     // age keypair for headscale backup (§3)
     const age = generateAgeKeypair();
-    fs.writeFileSync(
+    writeSecretFile(
       path.join(dirs.secrets, "age.txt"),
       `# recipient: ${age.recipient}\n${age.identity}\n`,
-      { mode: 0o600 },
     );
 
     // Node homes: init creates node_key, priv_validator_key, genesis skeleton
     const nodeIds: Record<string, string> = {};
+    const consensusPubkeys: Record<string, string> = {};
     for (const node of nodes(spec)) {
       const home = dirs.node(node.key);
       if (!fs.existsSync(path.join(home, "config", "node_key.json"))) {
@@ -97,6 +130,10 @@ export const generateKeysStep: StepDef = {
       }
       const { stdout } = await sparkdreamd(["comet", "show-node-id", "--home", home]);
       nodeIds[node.key] = stdout.trim();
+      if (node.role === "validator") {
+        const { stdout: pub } = await sparkdreamd(["comet", "show-validator", "--home", home]);
+        consensusPubkeys[node.key] = (JSON.parse(pub) as { key: string }).key;
+      }
     }
 
     // Operator + generated accounts live in the master keyring (test backend)
@@ -125,9 +162,15 @@ export const generateKeysStep: StepDef = {
     };
 
     const mnemonics: Record<string, string> = {};
+    const operators = spec.topology.validators.operators;
     for (let v = 0; v < spec.topology.validators.count; v++) {
-      const parsed = await addAccount(`op-val-${v}`);
-      mnemonics[`op-val-${v}`] = parsed.mnemonic;
+      if (Array.isArray(operators)) {
+        // external operators (§3): address supplied, key never exists here
+        accounts[`op-val-${v}`] = operators[v]!;
+      } else {
+        const parsed = await addAccount(`op-val-${v}`);
+        mnemonics[`op-val-${v}`] = parsed.mnemonic;
+      }
     }
     for (const acct of spec.accounts.initial) {
       if (acct.generate) {
@@ -136,11 +179,9 @@ export const generateKeysStep: StepDef = {
       }
     }
     // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
-    fs.writeFileSync(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2), {
-      mode: 0o600,
-    });
+    writeSecretFile(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2));
 
-    return { nodeIds, accounts, sshPublicKey, ageRecipient: age.recipient };
+    return { nodeIds, accounts, consensusPubkeys, sshPublicKey, ageRecipient: age.recipient };
   },
 };
 
@@ -160,9 +201,16 @@ export const buildGenesisStep: StepDef = {
     applyChainParams(genesis, spec);
     fs.writeFileSync(genesisPath, JSON.stringify(genesis, null, 2));
 
-    // 2. genesis accounts: initial allocations + operator self-delegation funds
-    const addGenesisAccount = (address: string, amount: string) =>
-      sparkdreamd([
+    // 2. genesis accounts: initial allocations + operator self-delegation
+    //    funds. Idempotent: this step re-runs after every gentx pause in
+    //    external-operator mode, so skip accounts already present.
+    const hasAccount = (address: string): boolean => {
+      const g = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
+      return (g.app_state?.bank?.balances ?? []).some((b: any) => b.address === address);
+    };
+    const addGenesisAccount = async (address: string, amount: string) => {
+      if (hasAccount(address)) return;
+      await sparkdreamd([
         "genesis",
         "add-genesis-account",
         address,
@@ -170,6 +218,7 @@ export const buildGenesisStep: StepDef = {
         "--home",
         master,
       ]);
+    };
 
     for (const acct of spec.accounts.initial) {
       const address = acct.address ?? keys.accounts[`acct-${acct.name}`];
@@ -183,16 +232,41 @@ export const buildGenesisStep: StepDef = {
       );
     }
 
-    // 3. one gentx per validator, each against its own home (its consensus key)
-    //    but the master keyring (operator keys live there)
+    // 3. one gentx per validator — locally signed (generated operators) or
+    //    browser-signed with verification (external operators, §5 step 3b)
     const gentxDir = path.join(master, "config", "gentx");
     fs.mkdirSync(gentxDir, { recursive: true });
-    const commission = commissionFlags(spec);
+    const operators = spec.topology.validators.operators;
     for (let v = 0; v < spec.topology.validators.count; v++) {
       const home = dirs.node(`val-${v}`);
       if (v !== 0) {
         fs.copyFileSync(genesisPath, path.join(home, "config", "genesis.json"));
       }
+      const outputDocument = path.join(gentxDir, `gentx-val-${v}.json`);
+
+      if (Array.isArray(operators)) {
+        const inputs: GentxInputs = {
+          spec,
+          valIndex: v,
+          operatorAddress: operators[v]!,
+          consensusPubkey: keys.consensusPubkeys[`val-${v}`]!,
+          nodeId: keys.nodeIds[`val-${v}`]!,
+          chainId: cid,
+        };
+        const signDoc = buildGentxSignDoc(inputs);
+        const responseJson = ctx.requireGentx(v, operators[v]!, JSON.stringify(signDoc));
+        const response = JSON.parse(responseJson) as GentxSignResponse;
+        const verdict = await verifyGentxSignature(signDoc, response, operators[v]!);
+        if (!verdict.ok) {
+          // never let a bad signature into genesis — it bricks block 1
+          ctx.db.resetGentx(ctx.launchId, v);
+          throw new Error(`gentx signature for validator ${v} rejected: ${verdict.reason}`);
+        }
+        fs.writeFileSync(outputDocument, assembleGentxJson(inputs, response));
+        continue;
+      }
+
+      const commission = commissionFlags(spec);
       await sparkdreamd([
         "genesis",
         "gentx",
@@ -215,7 +289,7 @@ export const buildGenesisStep: StepDef = {
         "--keyring-dir",
         master,
         "--output-document",
-        path.join(gentxDir, `gentx-val-${v}.json`),
+        outputDocument,
       ]);
     }
 

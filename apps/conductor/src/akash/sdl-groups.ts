@@ -1,15 +1,19 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import yaml from "js-yaml";
+import { generateManifest, manifestToSortedJSON } from "@akashnetwork/chain-sdk";
 
 /**
  * SDL → deployment group specs + provider manifest + version hash for our
- * vendored single-service SDLs. Mirrors chain-sdk's generateManifest /
- * manifestToSortedJSON / generateManifestVersion behavior in shape.
+ * vendored single-service SDLs.
  *
- * M2 NOTE (§11): before the first real devnet deployment, diff this output
- * against @akashnetwork/chain-sdk for one of our SDLs — the group/manifest
- * proto-JSON shape must match byte-for-byte where hashed.
+ * The MANIFEST and its VERSION HASH come straight from chain-sdk (the
+ * reference implementation console-air uses): providers recompute the
+ * version from the manifest they receive and 422 on any canonicalization
+ * drift (storage param shape, expose order, field names, HTML escaping…) —
+ * hand-mirroring it proved untenable. The GROUP SPECS for
+ * MsgCreateDeployment stay hand-built below (proto-JSON for our stored-msg
+ * pipeline, proven on-chain).
  */
 
 type Sdl = {
@@ -23,8 +27,13 @@ type Sdl = {
 
 export interface SdlArtifacts {
   groups: any[];
+  /** Canonical manifest (parsed from chain-sdk's manifestToSortedJSON). */
   manifest: any[];
-  /** sha256 over the sorted manifest JSON. */
+  /** The canonical manifest JSON string — hashed AND sent to providers
+   *  verbatim (console-air PUTs these exact bytes). */
+  manifestJson: string;
+  /** Manifest version: sha256 over the canonical manifest JSON — what the
+   *  provider recomputes and checks against the on-chain deployment. */
   hash: Uint8Array;
   /** First persistent storage class required, if any. */
   requiredStorageClass?: string | undefined;
@@ -37,7 +46,6 @@ export function loadSdl(path: string): Sdl {
 
 export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
   const groups: any[] = [];
-  const manifest: any[] = [];
   let requiredStorageClass: string | undefined;
   let pricingDenom = "uakt";
 
@@ -55,7 +63,6 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
     if (!placement) throw new Error(`SDL: placement profile ${placementName} missing`);
 
     const groupResources: any[] = [];
-    const manifestServices: any[] = [];
 
     for (const { serviceName, dep } of entries) {
       const svc = sdl.services[serviceName];
@@ -102,29 +109,20 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
         price: pricing ? { denom: pricing.denom, amount: String(pricing.amount) } : undefined,
       });
 
-      manifestServices.push({
-        name: serviceName,
-        image: svc.image,
-        env: svc.env ?? [],
-        count: dep.count,
-        resources: resource,
-        expose: (svc.expose ?? []).map((e: any) => ({
-          port: e.port,
-          externalPort: e.as ?? e.port,
-          proto: (e.proto ?? "TCP").toUpperCase(),
-          global: (e.to ?? []).some((t: any) => t.global),
-        })),
-        params: svc.params ?? null,
-      });
     }
 
     groups.push({ name: placementName, requirements: { attributes: [], signed_by: { all_of: [], any_of: [] } }, resources: groupResources });
-    manifest.push({ name: placementName, services: manifestServices });
   }
 
-  const sorted = sortedJson(manifest);
-  const hash = crypto.createHash("sha256").update(sorted).digest();
-  return { groups, manifest, hash, requiredStorageClass, pricingDenom };
+  // manifest + version from the reference implementation (see module doc)
+  const generated = generateManifest(sdl as any);
+  if (!generated.ok) {
+    throw new Error(`SDL rejected by chain-sdk: ${JSON.stringify(generated.value)}`);
+  }
+  const canonical = manifestToSortedJSON(generated.value.groups);
+  const hash = crypto.createHash("sha256").update(canonical).digest();
+  const manifest = JSON.parse(canonical);
+  return { groups, manifest, manifestJson: canonical, hash, requiredStorageClass, pricingDenom };
 }
 
 function sizeToBytes(size: string): string {

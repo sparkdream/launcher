@@ -22,11 +22,23 @@ N validators, M sentries, block explorer, and chain frontend — onto
 ```bash
 pnpm install
 npm run start   # build everything, serve UI + API on http://localhost:8080
-npm run dev     # development: Next.js frontend on :3210 (hot reload) + conductor API on :8080
+npm run dev     # development: Next.js frontend on :3210 + conductor API on :8180 (both hot-reload)
 ```
 
 Open the UI, configure your compute network (chain id, RPC/REST, denom), and
 connect Keplr — all Akash transactions are signed in the browser.
+
+### Running on Akash
+
+Build the image (`Dockerfile`) and deploy with `deploy.yaml`. In Akash mode set:
+
+- `LAUNCHER_SECRET` — encrypts secret files at rest (required)
+- `OPERATOR_ADDRESSES` — comma-separated allowlist; enables wallet-session auth
+- `LAUNCHER_ON_AKASH=true` — surfaces the mainnet-on-untrusted-provider warning
+- `LITESTREAM_REPLICA_URL` (+ S3 creds) — optional state replication
+
+Mainnet launches should use a **local** launcher with `tmkms` + external
+(hardware-wallet) operators — see [docs/DESIGN.md](docs/DESIGN.md) §2–3.
 
 ## Status
 

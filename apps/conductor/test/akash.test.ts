@@ -11,7 +11,7 @@ import { fakeProviders, FakeAkashApi } from "./fakes.js";
 function bid(provider: string, amount: string, state = "open"): Bid {
   return {
     bid: {
-      bid_id: { owner: "akash1owner", dseq: "100", gseq: 1, oseq: 1, provider },
+      id: { owner: "akash1owner", dseq: "100", gseq: 1, oseq: 1, provider },
       state,
       price: { denom: "uact", amount },
     },
@@ -29,7 +29,7 @@ describe("policy engine (§6)", () => {
       [bid("akash1provider1", "300"), bid("akash1provider2", "100"), bid("akash1provider3", "200")],
       { policy: basePolicy, chosenProviders: new Set(), providers },
     );
-    expect(decision.chosen?.bid.bid_id.provider).toBe("akash1provider1");
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
     expect(decision.rejected).toEqual([
       { provider: "akash1provider2", reason: "not audited" },
       { provider: "akash1provider3", reason: expect.stringContaining("uptime") },
@@ -45,7 +45,7 @@ describe("policy engine (§6)", () => {
         providers: fakeProviders(),
       },
     );
-    expect(decision.chosen?.bid.bid_id.provider).toBe("akash1provider2");
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
     expect(decision.rejected[0]!.reason).toContain("anti-affinity");
   });
 
@@ -58,7 +58,7 @@ describe("policy engine (§6)", () => {
         providers: fakeProviders(),
       },
     );
-    expect(decision.chosen?.bid.bid_id.provider).toBe("akash1provider4");
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider4");
   });
 
   it("rejects providers without the required storage class", () => {
@@ -74,12 +74,32 @@ describe("policy engine (§6)", () => {
     expect(decision.rejected[0]!.reason).toBe("no beta3 persistent storage");
   });
 
+  it("trusts the bid's resources_offer for storage class when metadata lacks it", () => {
+    const providers = fakeProviders();
+    providers.get("akash1provider1")!.storageClasses = []; // stale Console metadata
+    const offering: Bid = {
+      bid: {
+        ...bid("akash1provider1", "100").bid,
+        resources_offer: [
+          { resources: { storage: [{ attributes: [{ key: "class", value: "beta3" }, { key: "persistent", value: "true" }] }] } },
+        ],
+      },
+    };
+    const decision = selectProvider([offering], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      requiredStorageClass: "beta3",
+      providers,
+    });
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
+  });
+
   it("price ceiling is relative to the median", () => {
     const decision = selectProvider(
       [bid("akash1provider1", "100"), bid("akash1provider2", "110"), bid("akash1provider3", "9000")],
       { policy: basePolicy, chosenProviders: new Set(), providers: fakeProviders() },
     );
-    expect(decision.chosen?.bid.bid_id.provider).toBe("akash1provider1");
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
     expect(decision.rejected[0]!.reason).toContain("above 2x median");
   });
 });
@@ -102,7 +122,17 @@ describe("tx messages", () => {
 
     const deposit = accountDepositMsg("akash1owner", "42", { denom: "uact", amount: "1" });
     expect(deposit.typeUrl).toBe(TypeUrl.AccountDeposit);
-    expect(deposit.value.id).toEqual({ scope: "deployment", xid: "akash1owner/42" });
+    expect(deposit.value.signer).toBe("akash1owner");
+    expect(deposit.value.id).toEqual({ scope: 1, xid: "akash1owner/42" });
+    expect(deposit.value.deposit).toEqual({
+      amount: { denom: "uact", amount: "1" },
+      sources: [2, 1], // grant, balance — console-air order
+    });
+
+    expect(dep.value.deposit).toEqual({
+      amount: { denom: "uact", amount: "5000000" },
+      sources: [2, 1],
+    });
   });
 });
 
@@ -125,6 +155,23 @@ describe("SDL artifacts", () => {
 });
 
 describe("bid polling", () => {
+  it("keeps collecting until no new provider bids for settleRounds polls", async () => {
+    // bids trickle in: p1, then p2, then the flow dries up
+    const rounds = [["p1"], ["p1", "p2"], ["p1", "p2"], ["p1", "p2"]];
+    let call = 0;
+    const api = {
+      listBids: async () => (rounds[Math.min(call++, rounds.length - 1)] ?? []).map((p) => bid(p, "100")),
+    } as any;
+    const bids = await pollBids(api, "akash1owner", "42", {
+      minBids: 1,
+      settleRounds: 2,
+      sleep: async () => {},
+    });
+    // didn't stop at the first bid: waited out two stable rounds and kept both
+    expect(call).toBe(4);
+    expect(bids).toHaveLength(2);
+  });
+
   it("returns early once minBids is reached", async () => {
     const api = new FakeAkashApi();
     let polls = 0;

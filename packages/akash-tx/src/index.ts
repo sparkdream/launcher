@@ -7,7 +7,9 @@ import {
   MsgCreateDeployment,
   MsgUpdateDeployment,
 } from "@sparkdreamnft/sparkdreamjs/akash/deployment/v1beta4/deploymentmsg.js";
+import { MsgAccountDeposit } from "@sparkdreamnft/sparkdreamjs/akash/escrow/v1/msg.js";
 import { MsgCreateLease } from "@sparkdreamnft/sparkdreamjs/akash/market/v1beta5/leasemsg.js";
+import { MsgMintACT } from "@sparkdreamnft/sparkdreamjs/akash/bme/v1/msgs.js";
 
 /**
  * Shared Akash tx layer: the conductor STORES msgs as plain proto-JSON
@@ -22,7 +24,11 @@ export const TypeUrl = {
   UpdateDeployment: "/akash.deployment.v1beta4.MsgUpdateDeployment",
   CloseDeployment: "/akash.deployment.v1beta4.MsgCloseDeployment",
   CreateLease: "/akash.market.v1beta5.MsgCreateLease",
+  /** escrow top-up — same message console-air uses; the network removed
+   *  deployment.v1.MsgDepositDeployment. */
   AccountDeposit: "/akash.escrow.v1.MsgAccountDeposit",
+  /** BME module: burn AKT → mint ACT (async settlement). */
+  MintAct: "/akash.bme.v1.MsgMintACT",
 } as const;
 
 export interface Msg {
@@ -102,8 +108,8 @@ export function toEncodeObject(msg: Msg): EncodeObject {
           id: { owner: v.id.owner, dseq: BigInt(v.id.dseq) },
           groups: v.groups.map(groupSpec),
           hash: b64ToBytes(v.hash),
+          // Deposit { amount: Coin, sources: Source[] } — console-air shape
           deposit: v.deposit,
-          depositor: v.depositor,
         }),
       };
     case TypeUrl.UpdateDeployment:
@@ -121,6 +127,15 @@ export function toEncodeObject(msg: Msg): EncodeObject {
           id: { owner: v.id.owner, dseq: BigInt(v.id.dseq) },
         }),
       };
+    case TypeUrl.AccountDeposit:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgAccountDeposit.fromPartial({
+          signer: v.signer,
+          id: { scope: v.id.scope, xid: v.id.xid },
+          deposit: v.deposit,
+        }),
+      };
     case TypeUrl.CreateLease:
       return {
         typeUrl: msg.typeUrl,
@@ -134,11 +149,26 @@ export function toEncodeObject(msg: Msg): EncodeObject {
           },
         }),
       };
+    case TypeUrl.MintAct:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgMintACT.fromPartial({
+          owner: v.owner,
+          to: v.to,
+          coinsToBurn: v.coins_to_burn,
+        }),
+      };
     default:
-      // escrow top-up (M5) stays unresolved until the network's proto
-      // generation is pinned (MsgDepositDeployment vs MsgAccountDeposit)
       throw new Error(`no encoder for ${msg.typeUrl}`);
   }
+}
+
+/** Mint ACT by burning AKT — `to` must equal `owner` for ACT mints. */
+export function mintActMsg(owner: string, coinsToBurn: { denom: string; amount: string }): Msg {
+  return {
+    typeUrl: TypeUrl.MintAct,
+    value: { owner, to: owner, coins_to_burn: coinsToBurn },
+  };
 }
 
 export function launcherRegistry(): Registry {

@@ -62,4 +62,36 @@ describe("runLaunch checkpointing", () => {
     expect(db.stepOutput<{ sawA: number }>("l1", "c")?.sawA).toBe(1);
     db.close();
   });
+
+  it("refreshes unsigned pending-tx msgs when a step re-run produces different ones", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const spec = testnetSpec();
+    db.createLaunch("l2", JSON.stringify(spec));
+
+    // simulates a conductor fix between runs: same step, corrected msg
+    let payload = "stale-pubkey";
+    const steps: StepDef[] = [
+      {
+        name: "needs-sig",
+        run: async (ctx) => ({
+          txHash: await ctx.requireTx("needs-sig", [
+            { typeUrl: "/test.Msg", value: { payload } },
+          ]),
+        }),
+      },
+    ];
+
+    const services = fakeServices();
+    const first = await runLaunch(db, "l2", spec, work, steps, services);
+    expect(first.status).toBe("awaiting-signature");
+    expect(db.getPendingTx("l2", "needs-sig")?.msgs_json).toContain("stale-pubkey");
+
+    payload = "fixed-pubkey";
+    const second = await runLaunch(db, "l2", spec, work, steps, services);
+    expect(second.status).toBe("awaiting-signature");
+    // still unsigned, so the stored msgs follow the fixed code
+    expect(db.getPendingTx("l2", "needs-sig")?.msgs_json).toContain("fixed-pubkey");
+    db.close();
+  });
 });

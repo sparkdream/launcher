@@ -89,6 +89,44 @@ describe("validateSpec", () => {
     expect(res.errors.some((e) => e.message.includes("validator 1 has no sentry"))).toBe(true);
   });
 
+  it("validates external operator lists", () => {
+    const base = {
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: false },
+        frontend: { enabled: false },
+        hub: { enabled: false },
+      },
+      headscale: { domain: "headscale.sparkdream.io" },
+    };
+    const wrongCount = testnetSpec({
+      topology: { ...base, validators: { count: 2, operators: ["spark1abc"] } },
+    });
+    expect(
+      validateSpec(wrongCount).errors.some((e) => e.message.includes("1 operator addresses")),
+    ).toBe(true);
+
+    const wrongPrefix = testnetSpec({
+      topology: { ...base, validators: { count: 1, operators: ["cosmos1abc"] } },
+    });
+    expect(
+      validateSpec(wrongPrefix).errors.some((e) =>
+        e.path.startsWith("topology.validators.operators["),
+      ),
+    ).toBe(true);
+
+    const ok = testnetSpec({
+      topology: { ...base, validators: { count: 1, operators: ["spark1abc"] } },
+    });
+    expect(validateSpec(ok).errors).toEqual([]);
+  });
+
+  it("warns on generated operators for mainnet", () => {
+    const spec = testnetSpec({ network: { name: "sparkdream", type: "mainnet" } });
+    const res = validateSpec(spec);
+    expect(res.warnings.some((w) => w.path === "topology.validators.operators")).toBe(true);
+  });
+
   it("rejects addresses with the wrong bech32 prefix", () => {
     const spec = testnetSpec({
       accounts: {

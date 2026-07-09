@@ -4,17 +4,22 @@ import { nodes, resolveTopology, tunnelPort } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
-import { loadCert, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import { loadCert, nodeRpcUrl, nodeShellFallback, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "../node-ops.js";
 import type { SshTarget } from "../services.js";
 
-const NODE_HOME = "/root/.sparkdream";
 const UPLOAD_MARKER = `${NODE_HOME}/.node-data-uploaded`;
 
 function nodeTarget(ctx: StepCtx, key: string): SshTarget {
   const ssh = ctx.output<SshEndpoints>("send-manifests");
   const ep = ssh?.perNode[key];
   if (!ep) throw new Error(`no SSH endpoint for ${key}`);
-  return sshTarget(ctx, ep.host, ep.port);
+  // lease-shell fallback for providers whose forwarded ports drop SSH
+  const entry = ctx.output<DeploymentPlan>("create-deployments")?.perNode[key];
+  const a = ctx.output<Assignments>("collect-bids")?.perNode[key];
+  const fallback =
+    a && entry ? nodeShellFallback(ctx, a.hostUri, entry.dseq, a.gseq, a.oseq) : undefined;
+  return sshTarget(ctx, ep.host, ep.port, fallback);
 }
 
 // --- Phase E ---
@@ -74,18 +79,15 @@ export const wireTunnelsStep: StepDef = {
     const topo = resolveTopology(ctx.spec);
     for (let s = 0; s < ctx.spec.topology.sentries.count; s++) {
       const target = nodeTarget(ctx, `sentry-${s}`);
-      // replace boot-time placeholder tunnels with real validator IPs (§5 step 18)
-      await ctx.services.ssh.exec(target, "pkill -f 'socat TCP-LISTEN' || true");
+      // replace boot-time placeholder tunnels with real validator IPs (§5
+      // step 18). ^socat: an unanchored -f pattern also matches this
+      // command's own sh wrapper — pkill then kills the wrapper mid-command
+      await ctx.services.ssh.exec(target, "pkill -f '^socat TCP-LISTEN' || true");
       for (const v of topo.sentryValidators[s] ?? []) {
         const port = tunnelPort(v);
         const ip = mesh.ips[`val-${v}`];
         if (!ip) throw new Error(`no tailnet IP for val-${v}`);
-        await ctx.services.ssh.exec(
-          target,
-          `nohup socat TCP-LISTEN:${port},fork,reuseaddr ` +
-            `EXEC:"tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock nc ${ip} 26656" ` +
-            `>/dev/null 2>&1 & sleep 1 && nc -z 127.0.0.1 ${port}`,
-        );
+        await ctx.services.ssh.exec(target, socatTunnelCmd(port, ip));
       }
     }
     return { wired: true };
@@ -151,10 +153,7 @@ export const startChainStep: StepDef = {
       const target = nodeTarget(ctx, key);
       const running = await ctx.services.ssh.exec(target, "pgrep -x sparkdreamd >/dev/null && echo yes || echo no");
       if (running.stdout.trim() === "yes") return;
-      await ctx.services.ssh.exec(
-        target,
-        `nohup sparkdreamd start --home ${NODE_HOME} > ${NODE_HOME}/sparkdreamd.log 2>&1 &`,
-      );
+      await ctx.services.ssh.exec(target, START_NODE_CMD);
     };
     // validators near-simultaneously (>2/3 must be online for block 1), then sentries
     await Promise.all(
@@ -168,7 +167,10 @@ export const startChainStep: StepDef = {
 export const persistStartStep: StepDef = {
   name: "persist-start",
   async run(ctx) {
-    if (ctx.spec.network.type === "devnet") return { skipped: true };
+    // No devnet skip: without persisted env (WAIT_FOR_CONFIG=false + real
+    // tunnel IPs) a provider-initiated pod restart leaves the node dead in
+    // wait mode behind a placeholder tunnel — observed live on mainnet.
+    // Containers must self-heal; devnets pay real uact like everyone else.
     const plan = ctx.output<DeploymentPlan>("create-deployments")!;
     const assignments = ctx.output<Assignments>("collect-bids")!;
     const mesh = ctx.output<MeshTable>("await-mesh")!;
@@ -197,18 +199,43 @@ export const verifyChainStep: StepDef = {
   async run(ctx) {
     const assignments = ctx.output<Assignments>("collect-bids")!;
     // sentry RPC must be up with height increasing (§5 step 21)
+    const plan = ctx.output<DeploymentPlan>("create-deployments")!;
     const sentryKeys = Object.keys(assignments.perNode).filter((k) => k.startsWith("sentry-"));
     const checks: Record<string, { height: number }> = {};
     for (const key of sentryKeys) {
-      const hostUri = assignments.perNode[key]!.hostUri;
-      const rpcUrl = `${new URL(hostUri).protocol}//${new URL(hostUri).hostname}:26657`;
-      const first = await ctx.services.rpc.status(rpcUrl);
-      await ctx.services.sleep(6000);
-      const second = await ctx.services.rpc.status(rpcUrl);
-      if (second.latestBlockHeight <= first.latestBlockHeight) {
-        throw new Error(`${key}: block height not increasing (${first.latestBlockHeight})`);
+      const a = assignments.perNode[key]!;
+      const url = await nodeRpcUrl(ctx, a.hostUri, plan.perNode[key]!.dseq, a.gseq, a.oseq);
+      // Right after persist-start the providers restart the pods, so the
+      // RPC may be unreachable for a minute and then blocksyncing — poll
+      // patiently (~5 min) for "reachable, synced, height increasing"
+      // rather than failing the launch on one unlucky probe.
+      const attempts = 60;
+      let last: number | undefined;
+      let verified = false;
+      let lastProblem = "unreachable";
+      for (let i = 0; i < attempts && !verified; i++) {
+        if (i > 0) await ctx.services.sleep(5000);
+        let s;
+        try {
+          s = await ctx.services.rpc.status(url);
+        } catch (e) {
+          lastProblem = `unreachable (${String(e).slice(0, 80)})`;
+          continue; // node still restarting
+        }
+        if (s.catchingUp) {
+          lastProblem = `still catching up at height ${s.latestBlockHeight}`;
+        } else if (last !== undefined && s.latestBlockHeight > last) {
+          checks[key] = { height: s.latestBlockHeight };
+          verified = true;
+        } else {
+          lastProblem = `height not increasing (${s.latestBlockHeight})`;
+        }
+        last = s.latestBlockHeight;
       }
-      checks[key] = { height: second.latestBlockHeight };
+      if (!verified) {
+        throw new Error(`${key}: chain not verified after ~5 min — ${lastProblem}`);
+      }
+      ctx.log(`${key}: verified at height ${checks[key]!.height}`);
     }
     return { sentries: checks };
   },

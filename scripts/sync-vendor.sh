@@ -29,7 +29,7 @@ rsync -a --delete \
 
 {
   echo "# Synced from the SparkDream chain repo — do not edit by hand."
-  echo "# Source: $SRC"
+  echo "# Source: deploy/config in the chain repo"
   echo "# Commit: $(git -C "$CHAIN_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 } > "$DEST/SYNC_INFO"
 

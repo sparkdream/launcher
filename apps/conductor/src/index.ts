@@ -5,7 +5,9 @@ export {
   launchDirs,
   AwaitSignature,
   AwaitUser,
+  AwaitGentx,
   type Signer,
+  type GentxSigner,
   type StepCtx,
   type StepDef,
   type LaunchDirs,
@@ -25,7 +27,16 @@ export { sdlArtifacts, loadSdl, sortedJson } from "./akash/sdl-groups.js";
 export { productionServices, Ssh2Runner, OpensslCertProvider } from "./adapters.js";
 export type * from "./services.js";
 export { buildServer, type ServerDeps } from "./server.js";
+export { FleetService, type FleetView, type FleetSummary, type ComponentView } from "./fleet.js";
 export { CliSigner, toEncodeObject, launcherRegistry, type CliSignerOpts } from "./signer.js";
+export {
+  buildGentxSignDoc,
+  verifyGentxSignature,
+  assembleGentxJson,
+  valoperAddress,
+  type GentxInputs,
+  type GentxSignResponse,
+} from "./gentx.js";
 
 import { phaseASteps } from "./steps/phase-a.js";
 import { phaseBCDSteps } from "./steps/phase-bcd.js";

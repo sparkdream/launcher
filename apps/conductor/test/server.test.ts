@@ -79,7 +79,7 @@ describe("API server (§8)", () => {
         await app.inject({
           method: "POST",
           url: `/api/launches/${id}/tx-result`,
-          payload: { txHash: `HTTPTX-${step}-${signatures}` },
+          payload: { txHash: `${signatures}`.repeat(64).slice(0, 64) },
         });
       }
       await sleep(20);

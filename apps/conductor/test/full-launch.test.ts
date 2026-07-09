@@ -41,6 +41,38 @@ function spec(overrides: Record<string, unknown> = {}): LaunchSpec {
   });
 }
 
+describe("stale-order recovery", () => {
+  it("closes a headscale order whose bids expired and redeploys fresh", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    db.createLaunch("stale", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    (services.api as any).staleFirstOrder = true;
+    const signer = new FakeSigner();
+
+    const result = await runWithSigner(db, "stale", s, work, allSteps(), services, signer);
+    if (result.status !== "completed") {
+      const step = db.listSteps("stale").find((x) => x.status !== "done");
+      throw new Error(`ended ${result.status} at ${step?.name}: ${step?.error}`);
+    }
+
+    // one close tx was signed for the stale order, and headscale ended up
+    // on a different (fresh) dseq
+    const closes = signer.signed.flat().filter((m) => m.typeUrl.includes("MsgCloseDeployment"));
+    expect(closes).toHaveLength(1);
+    const headscale = db.stepOutput<any>("stale", "deploy-headscale")!;
+    expect(String((closes[0]!.value as any).id.dseq)).not.toBe(headscale.dseq);
+  }, 120_000);
+});
+
 describe("full launch, simulated (2×2 softsign testnet)", () => {
   it("runs Phase A → F to completion with 6 signatures", async () => {
     const work = tmp();

@@ -1,0 +1,141 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { Secp256k1HdWallet, type StdSignDoc } from "@cosmjs/amino";
+import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
+import { ConductorDb } from "../src/db.js";
+import { launchDirs, runWithSigner, type GentxSigner } from "../src/engine.js";
+import { allSteps } from "../src/index.js";
+import { fakeServices, FakeSigner } from "./fakes.js";
+
+/**
+ * External-operator gentx flow (§5 step 3b), end to end: the "wallet" here
+ * is cosmjs amino signing — byte-identical to what Keplr does for
+ * Ledger-backed accounts — and genesis is validated by the real sparkdreamd.
+ */
+
+// throwaway test vector — never funded
+const OPERATOR_MNEMONIC =
+  "surround miss nominee dream gap cross assault thank captain prosper drop duty group candy wealth weather scale put";
+const PREFIX = "sprkdrm";
+
+const tmpDirs: string[] = [];
+function tmp(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "conductor-gentx-"));
+  tmpDirs.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
+
+async function operatorWallet(mnemonic = OPERATOR_MNEMONIC) {
+  const wallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, { prefix: PREFIX });
+  const [account] = await wallet.getAccounts();
+  return { wallet, address: account!.address };
+}
+
+function externalSpec(operatorAddress: string): LaunchSpec {
+  return testnetSpec({
+    network: { name: "sparkdream", type: "testnet", bech32Prefix: PREFIX },
+    topology: {
+      validators: { count: 1, operators: [operatorAddress] },
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: false },
+        frontend: { enabled: false },
+        hub: { enabled: false },
+      },
+      headscale: { domain: "headscale.sparkdream.io" },
+    },
+  });
+}
+
+function walletGentxSigner(wallet: Secp256k1HdWallet, signAs: string): GentxSigner {
+  return {
+    async signGentx(signDocJson: string): Promise<string> {
+      const signDoc = JSON.parse(signDocJson) as StdSignDoc;
+      const response = await wallet.signAmino(signAs, signDoc);
+      return JSON.stringify(response);
+    },
+  };
+}
+
+describe("external-operator launch (1×1, browser-style gentx signing)", () => {
+  it("completes with a verified, wallet-signed gentx in genesis", async () => {
+    const { wallet, address } = await operatorWallet();
+    const spec = externalSpec(address);
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    db.createLaunch("ext", JSON.stringify(spec), "akash1owner");
+
+    const result = await runWithSigner(
+      db,
+      "ext",
+      spec,
+      work,
+      allSteps(),
+      fakeServices(),
+      new FakeSigner(),
+      undefined,
+      walletGentxSigner(wallet, address),
+    );
+    if (result.status !== "completed") {
+      const step = db.listSteps("ext").find((x) => x.status !== "done");
+      throw new Error(`ended ${result.status} at ${step?.name}: ${step?.error}`);
+    }
+
+    const dirs = launchDirs(work, "ext");
+    const genesis = JSON.parse(
+      fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"), "utf8"),
+    );
+    // the collected gentx is ours: external operator, amino sign mode
+    expect(genesis.app_state.genutil.gen_txs).toHaveLength(1);
+    const gentx = genesis.app_state.genutil.gen_txs[0];
+    expect(gentx.body.messages[0].delegator_address).toBe(address);
+    expect(gentx.auth_info.signer_infos[0].mode_info.single.mode).toBe(
+      "SIGN_MODE_LEGACY_AMINO_JSON",
+    );
+    // operator funded at genesis
+    expect(
+      genesis.app_state.bank.balances.some((b: any) => b.address === address),
+    ).toBe(true);
+
+    // no operator mnemonic ever generated (§3: hardware-custody posture)
+    const mnemonics = JSON.parse(
+      fs.readFileSync(path.join(dirs.secrets, "mnemonics.json"), "utf8"),
+    );
+    expect(Object.keys(mnemonics).filter((k) => k.startsWith("op-val-"))).toEqual([]);
+    db.close();
+  }, 120_000);
+
+  it("rejects a gentx signed by the wrong wallet and re-pauses", async () => {
+    const { address } = await operatorWallet();
+    const impostor = await operatorWallet(
+      "special sign fit simple patrol salute grocery chicken wheat radar tonight ceiling",
+    );
+    const spec = externalSpec(address); // declared operator ≠ actual signer
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    db.createLaunch("bad", JSON.stringify(spec), "akash1owner");
+
+    const result = await runWithSigner(
+      db,
+      "bad",
+      spec,
+      work,
+      allSteps(),
+      fakeServices(),
+      new FakeSigner(),
+      undefined,
+      walletGentxSigner(impostor.wallet, impostor.address),
+    );
+    expect(result.status).toBe("paused");
+    expect(result.failedStep).toBe("build-genesis");
+    expect(db.getStep("bad", "build-genesis")?.error).toContain("rejected");
+    // the bad response was discarded — a fresh signature is required
+    expect(db.getPendingGentx("bad", 0)?.status).toBe("pending");
+    db.close();
+  }, 120_000);
+});

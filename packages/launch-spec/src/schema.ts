@@ -81,7 +81,15 @@ export const launchSpecSchema = z.object({
   }),
 
   topology: z.object({
-    validators: z.object({ count: z.number().int().min(1).max(50) }),
+    validators: z.object({
+      count: z.number().int().min(1).max(50),
+      /**
+       * Operator key custody (§3): "generated" → conductor keyring signs the
+       * gentxs; a list of addresses → one browser-signed gentx per validator
+       * (hardware-wallet capable), keys never leave the user's wallet.
+       */
+      operators: z.union([z.literal("generated"), z.array(z.string())]).default("generated"),
+    }),
     sentries: z.object({
       count: z.number().int().min(0).max(100),
       /** round-robin, or per-sentry list of validator indices it fronts. */

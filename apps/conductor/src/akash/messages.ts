@@ -15,6 +15,19 @@ export interface Coin {
   amount: string;
 }
 
+/**
+ * akash.base.deposit.v1 enums, stored numerically so the generated
+ * fromPartial encodes them directly (proto-JSON name strings would not
+ * survive telescope's fromPartial).
+ */
+const SOURCE = { balance: 1, grant: 2 } as const;
+const SCOPE = { deployment: 1 } as const;
+
+/** Deposit { amount, sources } — same sources console-air sends. */
+function deposit(amount: Coin) {
+  return { amount, sources: [SOURCE.grant, SOURCE.balance] };
+}
+
 export interface DeploymentGroup {
   /** Raw group spec produced from the SDL (chain-sdk shape). */
   [key: string]: unknown;
@@ -45,8 +58,7 @@ export function createDeploymentMsg(input: {
       id: { owner: input.owner, dseq: input.dseq },
       groups: input.groups,
       hash: Buffer.from(input.hash).toString("base64"),
-      deposit: input.deposit,
-      depositor: input.owner,
+      deposit: deposit(input.deposit),
     },
   };
 }
@@ -73,16 +85,14 @@ export function createLeaseMsg(bidId: BidId): Msg {
   };
 }
 
+/** Escrow top-up — mirrors console-air's getDepositDeploymentMsg. */
 export function accountDepositMsg(owner: string, dseq: string, amount: Coin): Msg {
   return {
     typeUrl: TypeUrl.AccountDeposit,
     value: {
-      id: { scope: "deployment", xid: `${owner}/${dseq}` },
-      depositor: owner,
-      deposit: {
-        amount,
-        sources: ["grant", "balance"],
-      },
+      signer: owner,
+      id: { scope: SCOPE.deployment, xid: `${owner}/${dseq}` },
+      deposit: deposit(amount),
     },
   };
 }

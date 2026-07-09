@@ -88,7 +88,9 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     );
     expect(val0).toContain('moniker = "sparkdream-val-0"');
     expect(val0).toContain('timeout_commit = "3s"');
-    expect(val0).toContain('priv_validator_laddr = "tcp://127.0.0.1:26660"');
+    // softsign: file-based privval — the template's tmkms socket is cleared
+    // (a socket laddr makes the node block waiting for a signer)
+    expect(val0).toContain('priv_validator_laddr = ""');
     expect(val0).toContain("allow_duplicate_ip = true");
 
     const sentry1 = fs.readFileSync(path.join(dirs.node("sentry-1"), "config", "config.toml"), "utf8");

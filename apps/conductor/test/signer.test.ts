@@ -70,10 +70,13 @@ describe("signer conversion (stored JSON → proto)", () => {
     expect(decoded.hash).toEqual(new Uint8Array(artifacts.hash));
   });
 
-  it("rejects the unresolved escrow top-up type loudly", () => {
+  it("encodes the escrow top-up through the registry", () => {
+    const registry = launcherRegistry();
     const deposit = accountDepositMsg("akash1owner", "42", { denom: "uact", amount: "1" });
-    expect(() => toEncodeObject(deposit)).toThrow(/no encoder/);
     expect(deposit.typeUrl).toBe(TypeUrl.AccountDeposit);
+    const any = registry.encodeAsAny(toEncodeObject(deposit));
+    expect(any.typeUrl).toBe("/akash.escrow.v1.MsgAccountDeposit");
+    expect(any.value.length).toBeGreaterThan(0);
   });
 });
 

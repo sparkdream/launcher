@@ -1,7 +1,7 @@
-import { generateKeyPairSync } from "node:crypto";
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from "node:crypto";
 
 export interface SshKeypair {
-  /** PKCS8 PEM — accepted by ssh2 for client auth. */
+  /** openssh-key-v1 PEM — the only ed25519 container ssh2 can parse. */
   privateKeyPem: string;
   /** authorized_keys line, ready for the SDL's SSH_PUBLIC_KEY env. */
   publicKeyOpenssh: string;
@@ -12,13 +12,61 @@ export function generateSshKeypair(comment = "sparkdream-launcher"): SshKeypair 
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const spki = publicKey.export({ type: "spki", format: "der" });
   const raw = spki.subarray(spki.length - 32); // ed25519 SPKI = fixed prefix + 32-byte key
+  const pkcs8 = privateKey.export({ type: "pkcs8", format: "der" });
+  const seed = pkcs8.subarray(pkcs8.length - 32); // ed25519 PKCS8 = prefix + 32-byte seed
 
   const type = Buffer.from("ssh-ed25519");
   const wire = Buffer.concat([u32(type.length), type, u32(raw.length), raw]);
   return {
-    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    privateKeyPem: toOpenSshPrivate(seed, raw, comment),
     publicKeyOpenssh: `ssh-ed25519 ${wire.toString("base64")} ${comment}`,
   };
+}
+
+/**
+ * Accept both key containers: openssh-key-v1 passes through; PKCS8 PEM
+ * (what pre-fix launches wrote — node crypto's native export, which ssh2
+ * rejects for ed25519 with "Unsupported key format") is converted.
+ */
+export function toSsh2CompatiblePrivateKey(pem: string): string {
+  if (!pem.includes("BEGIN PRIVATE KEY")) return pem;
+  const key = createPrivateKey(pem);
+  const pkcs8 = key.export({ type: "pkcs8", format: "der" });
+  const seed = pkcs8.subarray(pkcs8.length - 32);
+  const spki = createPublicKey(key).export({ type: "spki", format: "der" });
+  const raw = spki.subarray(spki.length - 32);
+  return toOpenSshPrivate(seed, raw, "sparkdream-launcher");
+}
+
+/** Serialize an ed25519 key as openssh-key-v1 (unencrypted). */
+function toOpenSshPrivate(seed: Buffer | Uint8Array, pub: Buffer | Uint8Array, comment: string): string {
+  const str = (b: Buffer) => Buffer.concat([u32(b.length), b]);
+  const type = Buffer.from("ssh-ed25519");
+  const pubBlob = Buffer.concat([str(type), str(Buffer.from(pub))]);
+  const check = randomBytes(4);
+  let priv = Buffer.concat([
+    check,
+    check,
+    str(type),
+    str(Buffer.from(pub)),
+    str(Buffer.concat([Buffer.from(seed), Buffer.from(pub)])), // sk = seed || pub
+    str(Buffer.from(comment)),
+  ]);
+  // pad the private block to the cipher block size (8 for "none") with 1,2,3…
+  const padLen = (8 - (priv.length % 8)) % 8;
+  priv = Buffer.concat([priv, Buffer.from(Array.from({ length: padLen }, (_, i) => i + 1))]);
+
+  const body = Buffer.concat([
+    Buffer.from("openssh-key-v1\0"),
+    str(Buffer.from("none")), // cipher
+    str(Buffer.from("none")), // kdf
+    str(Buffer.alloc(0)), // kdf options
+    u32(1), // number of keys
+    str(pubBlob),
+    str(priv),
+  ]);
+  const b64 = body.toString("base64").replace(/(.{70})/g, "$1\n");
+  return `-----BEGIN OPENSSH PRIVATE KEY-----\n${b64}${b64.endsWith("\n") ? "" : "\n"}-----END OPENSSH PRIVATE KEY-----\n`;
 }
 
 function u32(n: number): Buffer {

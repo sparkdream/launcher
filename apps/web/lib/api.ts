@@ -1,5 +1,74 @@
 import type { Msg } from "@sparkdream/akash-tx";
 
+// kept in sessionStorage so a page reload doesn't force a re-sign; the
+// conductor expires sessions after 12h regardless (auth.ts SESSION_TTL_MS)
+const AUTH_TOKEN_KEY = "launcher.authToken";
+let authToken: string | null = null;
+export function setAuthToken(token: string | null): void {
+  authToken = token;
+  try {
+    if (token) sessionStorage.setItem(AUTH_TOKEN_KEY, token);
+    else sessionStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch {
+    // storage unavailable (private mode) — in-memory token still works
+  }
+}
+/** Restore a persisted session token (if any) into memory and return it. */
+export function loadAuthToken(): string | null {
+  try {
+    authToken = sessionStorage.getItem(AUTH_TOKEN_KEY) ?? authToken;
+  } catch {
+    // storage unavailable — keep whatever is in memory
+  }
+  return authToken;
+}
+
+/** fetch with the wallet-session bearer token attached (M6 §2). */
+function afetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (authToken) headers.set("authorization", `Bearer ${authToken}`);
+  return fetch(url, { ...init, headers });
+}
+
+export interface AuthMode {
+  required: boolean;
+}
+export async function getAuthMode(): Promise<AuthMode> {
+  return json(await fetch("/api/auth/mode"));
+}
+export async function authNonce(address: string): Promise<string> {
+  return (await json<{ nonce: string }>(
+    await fetch("/api/auth/nonce", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address }),
+    }),
+  )).nonce;
+}
+export async function authVerify(address: string, signature: unknown): Promise<string> {
+  return (await json<{ token: string }>(
+    await fetch("/api/auth/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address, signature }),
+    }),
+  )).token;
+}
+
+export interface TmkmsSetup {
+  chainId: string;
+  validators: Array<{
+    key: string;
+    tailnetIp: string;
+    tmkmsToml: string;
+    consensusKey: unknown;
+    commands: string[];
+  }>;
+}
+export async function getTmkmsSetup(id: string): Promise<TmkmsSetup> {
+  return json(await afetch(`/api/launches/${id}/tmkms`));
+}
+
 export interface StepView {
   name: string;
   status: "pending" | "running" | "waiting" | "done" | "error";
@@ -30,7 +99,7 @@ async function json<T>(res: Response): Promise<T> {
 
 export async function createLaunch(spec: unknown, owner: string): Promise<{ id: string; warnings: { path: string; message: string }[] }> {
   return json(
-    await fetch("/api/launches", {
+    await afetch("/api/launches", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ spec, owner }),
@@ -39,29 +108,208 @@ export async function createLaunch(spec: unknown, owner: string): Promise<{ id: 
 }
 
 export async function getLaunch(id: string): Promise<LaunchView> {
-  return json(await fetch(`/api/launches/${id}`));
+  return json(await afetch(`/api/launches/${id}`));
 }
 
 export async function startLaunch(id: string): Promise<void> {
-  await json(await fetch(`/api/launches/${id}/start`, { method: "POST" }));
+  await json(await afetch(`/api/launches/${id}/start`, { method: "POST" }));
 }
 
 export async function resumeLaunch(id: string): Promise<void> {
-  await json(await fetch(`/api/launches/${id}/resume`, { method: "POST" }));
+  await json(await afetch(`/api/launches/${id}/resume`, { method: "POST" }));
 }
 
 export async function getPendingTx(id: string): Promise<PendingTx | null> {
-  const res = await fetch(`/api/launches/${id}/pending-tx`);
+  const res = await afetch(`/api/launches/${id}/pending-tx`);
   if (res.status === 204) return null;
   return json(res);
 }
 
 export async function postTxResult(id: string, txHash: string): Promise<void> {
   await json(
-    await fetch(`/api/launches/${id}/tx-result`, {
+    await afetch(`/api/launches/${id}/tx-result`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ txHash }),
+    }),
+  );
+}
+
+export interface PendingGentx {
+  valIndex: number;
+  address: string;
+  signDoc: unknown;
+}
+
+export async function getPendingGentx(id: string): Promise<PendingGentx | null> {
+  const res = await afetch(`/api/launches/${id}/pending-gentx`);
+  if (res.status === 204) return null;
+  return json(res);
+}
+
+export interface ComponentView {
+  key: string;
+  dseq: string;
+  provider: string;
+  providerName: string;
+  priceDenom: string;
+  escrow?: string | null;
+  price: string;
+  state: string;
+  health?: { status: string; detail: string | null; checked_at: string };
+}
+
+export interface FleetSummary {
+  fleets: Array<{
+    launchId: string;
+    launchStatus: string;
+    chainId: string;
+    components: ComponentView[];
+    ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
+  }>;
+  unmanaged: Array<{ dseq: string; state: string }>;
+}
+
+export async function getFleet(owner: string): Promise<FleetSummary> {
+  return json(await afetch(`/api/fleet?owner=${encodeURIComponent(owner)}`));
+}
+
+export type FleetAction =
+  | "close"
+  | "restart"
+  | "relaunch"
+  | "upgrade"
+  | "halt-upgrade"
+  | "topup";
+
+export async function postFleetAction(
+  launchId: string,
+  dseq: string,
+  action: FleetAction,
+  extra: {
+    confirm?: boolean;
+    image?: string;
+    components?: string[];
+    amount?: string;
+    haltHeight?: number;
+  } = {},
+): Promise<{ status?: string; warnings?: string[] }> {
+  const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action, ...extra }),
+  });
+  if (res.status === 409) return res.json() as Promise<{ warnings: string[] }>;
+  return json(res);
+}
+
+export async function getComponentLogs(
+  launchId: string,
+  dseq: string,
+  tail = 100,
+): Promise<string> {
+  const res = await afetch(`/api/fleet/${launchId}/${dseq}/logs?tail=${tail}`);
+  if (!res.ok) throw new Error(`logs: HTTP ${res.status}`);
+  return res.text();
+}
+
+async function downloadBlob(res: Response, filename: string): Promise<void> {
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** The rendered SDL a component was deployed with (paste into Console). */
+export async function downloadComponentSdl(
+  launchId: string,
+  dseq: string,
+  key: string,
+): Promise<void> {
+  const res = await afetch(`/api/fleet/${launchId}/${dseq}/sdl`);
+  if (!res.ok) throw new Error(`sdl: HTTP ${res.status}`);
+  await downloadBlob(res, `${key}.sdl.yaml`);
+}
+
+/** The chain's genesis.json (identical for every node). */
+export async function downloadGenesis(launchId: string, chainId: string): Promise<void> {
+  const res = await afetch(`/api/launches/${launchId}/genesis`);
+  if (!res.ok) throw new Error(`genesis: HTTP ${res.status}`);
+  await downloadBlob(res, `${chainId}-genesis.json`);
+}
+
+/** Shut the whole fleet down — one batched close tx via the signing loop. */
+export async function postFleetShutdown(
+  launchId: string,
+): Promise<{ step: string; closing: string[] }> {
+  return json(await afetch(`/api/fleet/${launchId}/shutdown`, { method: "POST" }));
+}
+
+/** Live block height of a node's RPC (for a real-time indicator). */
+export async function getComponentHeight(
+  launchId: string,
+  dseq: string,
+): Promise<{ height: number; catchingUp: boolean }> {
+  return json(await afetch(`/api/fleet/${launchId}/${dseq}/height`));
+}
+
+/** Abandon a stuck op (e.g. relaunch on a broken provider). */
+export async function postAbortOp(
+  launchId: string,
+  opId: number,
+): Promise<{ status: string; step?: string }> {
+  return json(await afetch(`/api/fleet/${launchId}/ops/${opId}/abort`, { method: "POST" }));
+}
+
+export interface ProviderPrefs {
+  avoid: string[];
+  prefer: string[];
+  /** provider address → human-readable name, for display. */
+  names: Record<string, string>;
+}
+export async function getProviderPrefs(launchId: string): Promise<ProviderPrefs> {
+  return json(await afetch(`/api/fleet/${launchId}/provider-prefs`));
+}
+/** Add/remove a provider on this fleet's avoid or prefer list. */
+export async function setProviderPref(
+  launchId: string,
+  provider: string,
+  kind: "avoid" | "prefer" | "none",
+  name?: string,
+): Promise<ProviderPrefs> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/provider-prefs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider, kind, name }),
+    }),
+  );
+}
+
+/** Bundle export needs the bearer token, so it can't be a plain link. */
+export async function downloadFleetBundle(launchId: string): Promise<void> {
+  const res = await afetch(`/api/fleet/${launchId}/bundle`);
+  if (!res.ok) throw new Error(`bundle: HTTP ${res.status}`);
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `fleet-${launchId.slice(0, 8)}.tar.age`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function postGentxResult(
+  id: string,
+  valIndex: number,
+  response: unknown,
+): Promise<void> {
+  await json(
+    await afetch(`/api/launches/${id}/gentx-result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ valIndex, response }),
     }),
   );
 }

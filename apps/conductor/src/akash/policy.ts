@@ -3,7 +3,7 @@ import type { LaunchSpec } from "@sparkdream/launch-spec";
 /** LCD bid shape (snake_case per API conventions). */
 export interface Bid {
   bid: {
-    bid_id: {
+    id: {
       owner: string;
       dseq: string;
       gseq: number;
@@ -12,7 +12,23 @@ export interface Bid {
     };
     state: string;
     price: { denom: string; amount: string };
+    /** What the provider offers for this order — storage carries class attributes. */
+    resources_offer?: Array<{
+      resources?: {
+        storage?: Array<{ attributes?: Array<{ key: string; value: string }> }>;
+      };
+    }>;
   };
+}
+
+/** The bid itself is the authoritative storage signal: a provider that bid
+ *  on an order requiring a class echoes it in resources_offer. */
+function bidOffersStorageClass(b: Bid, cls: string): boolean {
+  return (b.bid.resources_offer ?? []).some((o) =>
+    (o.resources?.storage ?? []).some((s) =>
+      (s.attributes ?? []).some((a) => a.key === "class" && a.value === cls),
+    ),
+  );
 }
 
 /** Enriched provider metadata from the Console public API. */
@@ -61,7 +77,7 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
         : (prices[prices.length / 2 - 1]! + prices[prices.length / 2]!) / 2;
 
   const survivors = open.filter((b) => {
-    const provider = b.bid.bid_id.provider;
+    const provider = b.bid.id.provider;
     const info = ctx.providers.get(provider);
     const reject = (reason: string) => {
       rejected.push({ provider, reason });
@@ -84,6 +100,7 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
     }
     if (
       ctx.requiredStorageClass &&
+      !bidOffersStorageClass(b, ctx.requiredStorageClass) &&
       !info.storageClasses.includes(ctx.requiredStorageClass)
     ) {
       return reject(`no ${ctx.requiredStorageClass} persistent storage`);
@@ -95,14 +112,14 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
 
   // Preference list: order beats price (§6.2)
   for (const preferred of ctx.policy.preference) {
-    const hit = survivors.find((b) => b.bid.bid_id.provider === preferred);
+    const hit = survivors.find((b) => b.bid.id.provider === preferred);
     if (hit) return { chosen: hit, rejected };
   }
 
   // preferSpread: soft anti-affinity — prefer unused providers, fall back if none
   let pool = survivors;
   if (ctx.policy.antiAffinity === "preferSpread") {
-    const fresh = survivors.filter((b) => !ctx.chosenProviders.has(b.bid.bid_id.provider));
+    const fresh = survivors.filter((b) => !ctx.chosenProviders.has(b.bid.id.provider));
     if (fresh.length > 0) pool = fresh;
   }
 

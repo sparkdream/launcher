@@ -1,0 +1,61 @@
+---
+# SDL for running the launcher itself on Akash (§2 dual-mode, M6).
+# Placeholders only — see SECURITY.md. Recommended for devnet/testnet fleets;
+# mainnet launches belong on a local launcher (§2 security model).
+version: "2.0"
+services:
+  launcher:
+    image: sparkdreamnft/launcher:v0.1.0
+    expose:
+      - port: 8080
+        as: 80
+        proto: tcp
+        to:
+          - global: true
+        accept:
+          - launcher.example.com   # front with Cloudflare like other services
+    env:
+      # REQUIRED on Akash: encrypts secret files at rest (§2)
+      - "LAUNCHER_SECRET=CHANGE_ME"
+      # REQUIRED on Akash: wallet-session auth allowlist (§2)
+      - "OPERATOR_ADDRESSES=akash1YOUR_OPERATOR_ADDRESS"
+      # surfaces the mainnet-on-Akash warning in the wizard
+      - "LAUNCHER_ON_AKASH=true"
+      # chain + provider-metadata endpoints for the compute network
+      - "AKASH_LCD=https://rest.example.com"
+      - "CONSOLE_API=https://console-api.example.com"
+      # optional: replicate the SQLite state db (same pattern as headscale)
+      # - "LITESTREAM_REPLICA_URL=s3://BUCKET/launcher-state"
+      # - "LITESTREAM_ACCESS_KEY_ID=..."
+      # - "LITESTREAM_SECRET_ACCESS_KEY=..."
+    params:
+      storage:
+        data:
+          mount: /app/data
+          readOnly: false
+profiles:
+  compute:
+    launcher:
+      resources:
+        cpu:
+          units: 1
+        memory:
+          size: 1Gi
+        storage:
+          - size: 1Gi
+          - name: data
+            size: 5Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        launcher:
+          denom: uact
+          amount: 10000
+deployment:
+  launcher:
+    dcloud:
+      profile: launcher
+      count: 1

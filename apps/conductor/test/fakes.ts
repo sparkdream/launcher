@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import type { AkashApi, MtlsCredentials } from "../src/akash/client.js";
 import type { Bid, ProviderInfo } from "../src/akash/policy.js";
 import type { Msg } from "../src/akash/messages.js";
@@ -35,12 +36,30 @@ export class FakeAkashApi implements AkashApi {
     return (this.height += 10);
   }
 
+  /** When set, the first dseq listBids sees only ever has closed bids —
+   *  simulates an order whose bids expired while awaiting a signature. */
+  staleFirstOrder = false;
+  private firstDseq: string | undefined;
+
+  async deploymentInfo(
+    _owner: string,
+    dseq: string,
+  ): Promise<{ state: string; hash?: string } | undefined> {
+    if (!this.knownDseqs.has(dseq)) return undefined;
+    // the stale order still has an active deployment awaiting the close;
+    // no hash → the steps skip on-chain hash reconciliation in tests
+    return { state: "active" };
+  }
+
   async listBids(_owner: string, dseq: string): Promise<Bid[]> {
+    this.knownDseqs.add(dseq); // every launched dseq shows up on-chain
+    if (this.staleFirstOrder) this.firstDseq ??= dseq;
+    const state = this.staleFirstOrder && dseq === this.firstDseq ? "closed" : "open";
     // every provider bids on everything; price varies by provider index
     return [...this.providers.keys()].map((provider, i) => ({
       bid: {
-        bid_id: { owner: _owner, dseq, gseq: 1, oseq: 1, provider },
-        state: "open",
+        id: { owner: _owner, dseq, gseq: 1, oseq: 1, provider },
+        state,
         price: { denom: "uact", amount: String(100 + i * 10) },
       },
     }));
@@ -58,8 +77,33 @@ export class FakeAkashApi implements AkashApi {
     return true;
   }
 
-  async leaseState(): Promise<string> {
-    return "active";
+  /** dseq → lease state override (default "active"). */
+  leaseStates = new Map<string, string>();
+
+  async leaseState(_owner: string, dseq: string): Promise<string> {
+    return this.leaseStates.get(dseq) ?? "active";
+  }
+
+  /** extra on-chain deployments not created by this launcher (unmanaged). */
+  extraDeployments: Array<{ dseq: string; state: string }> = [];
+  private knownDseqs = new Set<string>();
+
+  registerDseq(dseq: string): void {
+    this.knownDseqs.add(dseq);
+  }
+
+  async listDeployments(_owner: string) {
+    const fromLaunches = [...this.knownDseqs].map((dseq) => ({
+      dseq,
+      state: this.leaseStates.get(dseq) === "closed" ? "closed" : "active",
+    }));
+    return [...fromLaunches, ...this.extraDeployments];
+  }
+
+  escrowBalances = new Map<string, { denom: string; amount: string }>();
+
+  async deploymentEscrow(_owner: string, dseq: string) {
+    return this.escrowBalances.get(dseq) ?? { denom: "uact", amount: "5000000" };
   }
 }
 
@@ -72,6 +116,10 @@ export class FakeProviderGateway {
     this.manifests.push({ hostUri, dseq });
   }
 
+  async leaseLogs(): Promise<string> {
+    return "fake log line 1\nfake log line 2\n";
+  }
+
   async leaseStatus(_creds: MtlsCredentials, hostUri: string, dseq: string): Promise<unknown> {
     const key = `${hostUri}/${dseq}`;
     if (!this.assigned.has(key)) {
@@ -82,10 +130,49 @@ export class FakeProviderGateway {
     }
     const ep = this.assigned.get(key)!;
     return {
+      services: {
+        headscale: { available: 1, total: 1, uris: [`fake.ingress.${ep.host}`] },
+        sparkdreamd: { available: 1, total: 1 },
+      },
       forwarded_ports: {
-        sparkdreamd: [{ host: ep.host, port: 2222, externalPort: ep.port }],
+        sparkdreamd: [
+          { host: ep.host, port: 2222, externalPort: ep.port },
+          // RPC rides a RANDOM_PORT too — nodeRpcUrl resolves it from here
+          { host: ep.host, port: 26657, externalPort: ep.port + 10000 },
+        ],
       },
     };
+  }
+
+  /** Lease-shell exec — the headscale image has no sshd (mirrors FakeSsh). */
+  shellLog: Array<{ dseq: string; script: string }> = [];
+  async shellExec(
+    _creds: MtlsCredentials,
+    _hostUri: string,
+    dseq: string,
+    _gseq: number,
+    _oseq: number,
+    _service: string,
+    cmd: string[],
+  ): Promise<{ stdout: string; stderr: string }> {
+    const script = cmd[cmd.length - 1] ?? "";
+    this.shellLog.push({ dseq, script });
+    if (script.includes("kill 1")) throw new Error("lease shell: connection closed before result");
+    if (script.includes("users list")) {
+      return { stdout: JSON.stringify([{ id: 1, name: "sparkdream" }]), stderr: "" };
+    }
+    if (script.includes("preauthkeys create")) {
+      // mirrors the real CLI: --user must be the numeric id, not a name
+      if (!/--user \d+/.test(script)) {
+        throw new Error('lease shell: exit 1: invalid argument for "-u, --user" flag: strconv.ParseUint');
+      }
+      return { stdout: JSON.stringify({ key: `hskey-${this.shellLog.length}` }), stderr: "" };
+    }
+    if (script.includes("SELECT count(*) FROM users")) return { stdout: "1", stderr: "" };
+    if (script.startsWith("base64 ")) {
+      return { stdout: Buffer.from("FAKE").toString("base64"), stderr: "" };
+    }
+    return { stdout: "", stderr: "" };
   }
 }
 
@@ -94,6 +181,8 @@ export class FakeSsh {
   uploaded = new Set<string>();
   started = new Set<string>();
   signerConnected = true;
+  /** host:port targets that refuse connections (torn-down containers). */
+  failHosts = new Set<string>();
   execLog: Array<{ target: string; command: string }> = [];
   private ipCounter = 10;
   private ips = new Map<string, string>();
@@ -104,6 +193,7 @@ export class FakeSsh {
 
   async exec(target: SshTarget, command: string): Promise<SshResult> {
     const id = this.id(target);
+    if (this.failHosts.has(id)) throw new Error(`connect ECONNREFUSED ${id}`);
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
 
@@ -148,6 +238,12 @@ export class FakeSsh {
 export class FakeRpc {
   private heights = new Map<string, number>();
   httpOkResult = true;
+  /** Docker Hub tag probe — 200 = image exists (validate-spec fail-fast). */
+  httpStatusResult = 200;
+
+  async httpStatus(_url: string): Promise<number> {
+    return this.httpStatusResult;
+  }
 
   async status(url: string) {
     const h = (this.heights.get(url) ?? 0) + 5;
@@ -163,7 +259,7 @@ export class FakeRpc {
 const FAKE_CERT: Certificate = {
   certPem: "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
   keyPem: "-----BEGIN EC PRIVATE KEY-----\nFAKE\n-----END EC PRIVATE KEY-----\n",
-  pubkeyPem: "-----BEGIN PUBLIC KEY-----\nFAKE\n-----END PUBLIC KEY-----\n",
+  pubkeyPem: "-----BEGIN EC PUBLIC KEY-----\nFAKE\n-----END EC PUBLIC KEY-----\n",
 };
 
 export interface FakeWorld extends Services {
@@ -180,8 +276,10 @@ export function fakeServices(): FakeWorld {
     ssh: new FakeSsh(),
     rpc: new FakeRpc(),
     certs: { generate: async () => FAKE_CERT },
-    encryptBackup: async (_src, _recipient, outFile) => {
-      fs.writeFileSync(outFile, "age-fake");
+    // "encryption" placeholder: a plain tarball, so bundle round-trips are
+    // testable (real adapter pipes tar through the age CLI)
+    encryptBackup: async (src, _recipient, outFile) => {
+      execFileSync("tar", ["czf", outFile, "-C", src, "."]);
     },
     sleep: async () => {},
   };

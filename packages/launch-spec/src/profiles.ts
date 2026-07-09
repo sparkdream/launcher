@@ -99,7 +99,9 @@ export const profiles: Record<NetworkType, Profile> = {
     },
     security: { keyMode: "softsign" },
     infra: {
-      akashNetwork: "sandbox",
+      // mainnet since the ACT migration — deployments pay uact everywhere;
+      // the Akash sandbox (uakt) is opt-in via an explicit spec override
+      akashNetwork: "mainnet",
       resources: nodeResources,
       sentrySettings: {
         pruning: "default",

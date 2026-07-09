@@ -6,6 +6,20 @@ export interface SshTarget {
   port: number;
   user: string;
   privateKeyPem: string;
+  /**
+   * Provider lease-shell escape hatch: some providers' forwarded ports
+   * reset non-HTTP TCP while their gateway works fine. When SSH cannot
+   * CONNECT (resets/refused/timeouts — not auth failures), the runner
+   * reroutes exec/upload/download through the lease shell.
+   */
+  shellFallback?: {
+    creds: MtlsCredentials;
+    hostUri: string;
+    dseq: string;
+    gseq: number;
+    oseq: number;
+    service: string;
+  };
 }
 
 export interface SshResult {
@@ -27,6 +41,8 @@ export interface RpcStatus {
 export interface RpcProber {
   status(url: string): Promise<RpcStatus>;
   httpOk(url: string): Promise<boolean>;
+  /** HTTP status code of a GET, 0 on network error. */
+  httpStatus(url: string): Promise<number>;
 }
 
 export interface Certificate extends MtlsCredentials {
@@ -52,6 +68,25 @@ export interface ProviderGateway {
     gseq: number,
     oseq: number,
   ): Promise<unknown>;
+  /** One-shot command in a lease container without sshd (headscale). */
+  shellExec(
+    creds: MtlsCredentials,
+    hostUri: string,
+    dseq: string,
+    gseq: number,
+    oseq: number,
+    service: string,
+    cmd: string[],
+  ): Promise<{ stdout: string; stderr: string }>;
+  /** Recent service logs (non-follow) for the fleet logs viewer (M5). */
+  leaseLogs(
+    creds: MtlsCredentials,
+    hostUri: string,
+    dseq: string,
+    gseq: number,
+    oseq: number,
+    tail: number,
+  ): Promise<string>;
 }
 
 /**

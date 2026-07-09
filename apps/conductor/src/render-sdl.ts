@@ -9,7 +9,7 @@ import {
 import { networkSdlPath } from "./vendor.js";
 
 /** Akash pricing denom per target network (§12.7: repo SDLs price in uact). */
-const PRICING_DENOM: Record<LaunchSpec["infra"]["akashNetwork"], string> = {
+export const PRICING_DENOM: Record<LaunchSpec["infra"]["akashNetwork"], string> = {
   mainnet: "uact",
   sandbox: "uakt",
 };

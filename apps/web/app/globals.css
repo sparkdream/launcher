@@ -33,6 +33,23 @@ code { color: var(--dim); font-size: 0.8rem; }
 .banner pre { white-space: pre-wrap; margin: 0; flex-basis: 100%; font-size: 0.8rem; }
 .warnings { color: var(--warn); font-size: 0.85rem; }
 .steps { list-style: none; padding: 0; margin: 8px 0 0; }
+.steps-toggle {
+  display: block; margin: 2px auto 0; background: none; border: none;
+  color: var(--dim); cursor: pointer; font-size: 1.1rem; line-height: 1;
+  padding: 4px 24px;
+}
+.steps-toggle:hover { color: var(--accent); }
+.pref-tag {
+  background: none; border: 1px solid var(--line); border-radius: 10px;
+  color: var(--dim); cursor: pointer; font-size: 0.68rem; margin-left: 6px;
+  padding: 1px 7px; vertical-align: middle;
+}
+.pref-tag:hover { border-color: var(--accent); color: var(--accent); }
+.pref-tag.avoid { color: var(--err); border-color: var(--err); }
+.pref-tag.prefer { color: var(--ok); border-color: var(--ok); }
+.pref-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 8px; }
+.live-height { display: block; color: var(--ok); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.escrow-bal { display: block; color: var(--dim); font-size: 0.72rem; }
 .steps li { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-bottom: 1px solid var(--line); font-family: ui-monospace, monospace; font-size: 0.85rem; }
 .steps .status { margin-left: auto; color: var(--dim); font-size: 0.75rem; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: none; }
@@ -42,3 +59,20 @@ li.waiting .dot { background: var(--warn); }
 li.error .dot { background: var(--err); }
 @keyframes pulse { from { opacity: 0.4; } to { opacity: 1; } }
 .busy { position: fixed; bottom: 16px; right: 16px; background: var(--accent); padding: 8px 16px; border-radius: 8px; }
+h3 { font-size: 0.9rem; color: var(--dim); }
+table.fleet { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+table.fleet th { text-align: left; color: var(--dim); font-weight: 400; padding: 4px; border-bottom: 1px solid var(--line); }
+table.fleet td { padding: 6px 4px; border-bottom: 1px solid var(--line); }
+table.fleet tr.closed { opacity: 0.45; }
+td.health.healthy { color: var(--ok); }
+td.health.unreachable, td.health.lease-not-active { color: var(--err); }
+td.health.low-escrow, td.health.catching-up { color: var(--warn); }
+table.fleet button { padding: 3px 8px; font-size: 0.75rem; }
+td.actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.op-active { color: var(--warn); font-size: 0.8rem; animation: pulse 1s infinite alternate; }
+.import-btn { background: var(--line); border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 0.85rem; color: var(--text); }
+.dim-note { color: var(--dim); font-size: 0.8rem; }
+.tmkms-val { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; }
+.tmkms-val details { margin: 6px 0; }
+.tmkms-val summary { cursor: pointer; color: var(--dim); font-size: 0.8rem; }
+.tmkms-val pre, pre.commands { background: var(--bg); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 0.75rem; }

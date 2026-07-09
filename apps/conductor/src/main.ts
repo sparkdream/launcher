@@ -23,7 +23,27 @@ const services = productionServices({
   consoleApi: process.env.CONSOLE_API ?? "https://console-api.akash.network",
 });
 
-const app = buildServer({ db, services, workRoot: dataDir, steps: allSteps() });
+/**
+ * Additional env (M6):
+ *   LAUNCHER_SECRET     encrypt secret files at rest (Akash mode)
+ *   OPERATOR_ADDRESSES  comma-separated allowlist → enables wallet-session auth
+ *   LAUNCHER_ON_AKASH   "true" → mainnet warning at launch creation
+ */
+const allowlist = (process.env.OPERATOR_ADDRESSES ?? "")
+  .split(",")
+  .map((a) => a.trim())
+  .filter(Boolean);
+
+const app = buildServer({
+  db,
+  services,
+  workRoot: dataDir,
+  steps: allSteps(),
+  ...(allowlist.length > 0 ? { auth: { allowlist } } : {}),
+  onAkash: process.env.LAUNCHER_ON_AKASH === "true",
+});
+if (allowlist.length > 0) console.log(`wallet auth enabled for ${allowlist.length} operator(s)`);
+if (!process.env.LAUNCHER_SECRET) console.log("LAUNCHER_SECRET not set — secrets stored in plaintext (fine locally)");
 
 // Serve the statically-exported web UI when present (single-container mode,
 // §2). In dev, run `npm run dev` instead — next dev proxies /api here.

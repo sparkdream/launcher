@@ -13,12 +13,14 @@ export interface ChainConfig {
   gasPrice: string;
 }
 
+// Akash mainnet — Keplr knows akashnet-2 natively, so connect skips the
+// suggest-chain prompt. Deployments price in uact (minted from AKT via BME).
 export const DEFAULT_CHAIN: ChainConfig = {
-  chainId: "sandbox-01",
-  chainName: "Akash Sandbox",
-  rpc: "https://rpc.sandbox-01.aksh.pw",
-  rest: "https://api.sandbox-01.aksh.pw",
-  denom: "uakt",
+  chainId: "akashnet-2",
+  chainName: "Akash",
+  rpc: "https://rpc.akashnet.net",
+  rest: "https://api.akashnet.net",
+  denom: "uact",
   bech32Prefix: "akash",
   gasPrice: "0.025",
 };
@@ -46,13 +48,49 @@ interface KeplrWindow {
     experimentalSuggestChain(info: unknown): Promise<void>;
     getOfflineSigner(chainId: string): OfflineSigner;
     getKey(chainId: string): Promise<{ bech32Address: string; name: string }>;
+    /** Amino signing — the Ledger-compatible path used for gentxs (§5 3b). */
+    signAmino(
+      chainId: string,
+      signer: string,
+      signDoc: unknown,
+      signOptions?: { preferNoSetFee?: boolean; preferNoSetMemo?: boolean },
+    ): Promise<unknown>;
+    /** ADR-36 arbitrary-data signature — wallet-session auth (M6 §2). */
+    signArbitrary(chainId: string, signer: string, data: string): Promise<AuthSignature>;
   };
+}
+
+export interface AuthSignature {
+  pub_key: { type: string; value: string };
+  signature: string;
+}
+
+/** Sign a server nonce for wallet-session auth (M6, §2). */
+export async function signAuthNonce(
+  config: ChainConfig,
+  address: string,
+  nonce: string,
+): Promise<AuthSignature> {
+  return keplr().signArbitrary(config.chainId, address, nonce);
 }
 
 export function keplr() {
   const k = (window as unknown as KeplrWindow).keplr;
   if (!k) throw new Error("Keplr extension not found — install it and reload");
   return k;
+}
+
+/**
+ * Wait for the extension to inject `window.keplr` — on a fresh page load the
+ * app can hydrate before the content script runs. False on timeout.
+ */
+export async function waitForKeplr(timeoutMs = 3000): Promise<boolean> {
+  const start = Date.now();
+  while (!(window as unknown as KeplrWindow).keplr) {
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return true;
 }
 
 /** Register a non-registry chain (our uact network) with Keplr. */
@@ -90,6 +128,54 @@ export interface ConnectedWallet {
   address: string;
   name: string;
   signer: OfflineSigner;
+}
+
+/**
+ * Register the NEW chain (the one being launched) in Keplr so it can sign
+ * gentxs pre-genesis. Endpoints aren't live yet — Keplr accepts that; the
+ * sign call itself is fully offline.
+ */
+export async function suggestNewChain(spec: any): Promise<string> {
+  const chainId = `${spec.network.name}-${spec.network.chainIdSuffix ?? 1}`;
+  const coinDenom = spec.token.displayDenom;
+  const currency = {
+    coinDenom,
+    coinMinimalDenom: spec.token.baseDenom,
+    coinDecimals: spec.token.exponent ?? 6,
+  };
+  const prefix = spec.network.bech32Prefix;
+  await keplr().experimentalSuggestChain({
+    chainId,
+    chainName: `${spec.network.name} (${spec.network.type})`,
+    // placeholders until the sentries are live
+    rpc: "http://127.0.0.1:26657",
+    rest: "http://127.0.0.1:1317",
+    bip44: { coinType: 118 },
+    bech32Config: {
+      bech32PrefixAccAddr: prefix,
+      bech32PrefixAccPub: `${prefix}pub`,
+      bech32PrefixValAddr: `${prefix}valoper`,
+      bech32PrefixValPub: `${prefix}valoperpub`,
+      bech32PrefixConsAddr: `${prefix}valcons`,
+      bech32PrefixConsPub: `${prefix}valconspub`,
+    },
+    currencies: [currency],
+    feeCurrencies: [{ ...currency, gasPriceStep: { low: 0, average: 0, high: 0 } }],
+    stakeCurrency: currency,
+  });
+  await keplr().enable(chainId);
+  return chainId;
+}
+
+/** Sign a gentx sign doc with the wallet account owning `address`. */
+export async function signGentx(spec: any, address: string, signDoc: unknown): Promise<unknown> {
+  const chainId = await suggestNewChain(spec);
+  // preferNoSetFee/Memo: the sign doc must round-trip unmodified — the
+  // conductor rejects msg drift, and fee is zero at genesis anyway
+  return keplr().signAmino(chainId, address, signDoc, {
+    preferNoSetFee: true,
+    preferNoSetMemo: true,
+  });
 }
 
 export async function connectKeplr(config: ChainConfig): Promise<ConnectedWallet> {
