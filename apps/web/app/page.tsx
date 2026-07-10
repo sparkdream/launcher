@@ -89,7 +89,7 @@ topology:
 const LAST_LAUNCH_KEY = "launcher.lastLaunchId";
 const SPEC_KEY = "launcher.specText";
 /** Step rows shown while the list is collapsed (the tail holds the action). */
-const COLLAPSED_STEPS = 6;
+const COLLAPSED_STEPS = 3;
 
 export default function Page() {
   const [chain, setChain] = useState<ChainConfig>(DEFAULT_CHAIN);
@@ -1003,7 +1003,16 @@ export default function Page() {
               }
               onClick={() => setStepsExpanded((v) => !v)}
             >
-              {stepsExpanded ? "⌃" : "⌄"}
+              <svg width="16" height="8" viewBox="0 0 32 16" aria-hidden="true">
+                <path
+                  d={stepsExpanded ? "M2 13 L16 5 L30 13" : "M2 3 L16 11 L30 3"}
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </button>
           )}
 
@@ -1171,15 +1180,15 @@ export default function Page() {
                 <tbody>
                   {f.components.map((c) => (
                     <tr key={c.key} className={c.state}>
-                      <td>{c.key}</td>
-                      <td>
+                      <td data-label="component">{c.key}</td>
+                      <td data-label="image">
                         {c.image ? (
                           <code title={c.image}>{c.image.split(":").pop()}</code>
                         ) : (
                           "—"
                         )}
                       </td>
-                      <td>
+                      <td data-label="provider">
                         <code title={c.provider}>{c.providerName || `${c.provider.slice(0, 16)}…`}</code>
                         {(() => {
                           const pref = providerPrefOf(f.launchId, c.provider);
@@ -1195,7 +1204,7 @@ export default function Page() {
                           );
                         })()}
                       </td>
-                      <td title={`${c.price} ${c.priceDenom}/block`}>
+                      <td data-label="price" title={`${c.price} ${c.priceDenom}/block`}>
                         {priceMonthly(c.price, c.priceDenom)}
                         {c.escrow != null && (
                           <span className="escrow-bal" title="deployment escrow balance (funds remaining)">
@@ -1203,8 +1212,8 @@ export default function Page() {
                           </span>
                         )}
                       </td>
-                      <td>{c.state}</td>
-                      <td className={`health ${c.health?.status ?? ""}`}>
+                      <td data-label="state">{c.state}</td>
+                      <td data-label="health" className={`health ${c.health?.status ?? ""}`}>
                         {c.health ? `${c.health.status}${c.health.detail ? ` (${c.health.detail})` : ""}` : "—"}
                         {liveHeights[c.dseq] && (
                           <span className="live-height" title="live block height (updates every 3s)">
@@ -1335,11 +1344,11 @@ export default function Page() {
                         // columns never re-flow when it appears
                         <Fragment key={a.name}>
                           <tr>
-                            <td>{a.name}</td>
-                            <td>
+                            <td data-label="name">{a.name}</td>
+                            <td data-label="address">
                               <code>{a.address}</code>
                             </td>
-                            <td>
+                            <td data-label="mnemonic">
                               {!a.hasMnemonic ? (
                                 <span className="dim-note">external key</span>
                               ) : revealed ? (
