@@ -162,6 +162,30 @@ export class ConductorDb {
       | undefined;
   }
 
+  /** Replace a launch's stored spec (post-launch reconfiguration, e.g. domains). */
+  setLaunchSpec(id: string, specJson: string): void {
+    this.db.prepare("UPDATE launches SET spec_json = ? WHERE id = ?").run(specJson, id);
+  }
+
+  /** Purge every record of a launch (guarded by FleetService.deleteLaunch). */
+  deleteLaunch(id: string): void {
+    const del = this.db.transaction((launchId: string) => {
+      for (const table of [
+        "launch_steps",
+        "pending_txs",
+        "pending_gentxs",
+        "fleet_ops",
+        "fleet_components",
+        "component_health",
+        "provider_prefs",
+      ]) {
+        this.db.prepare(`DELETE FROM ${table} WHERE launch_id = ?`).run(launchId);
+      }
+      this.db.prepare("DELETE FROM launches WHERE id = ?").run(launchId);
+    });
+    del(id);
+  }
+
   setLaunchStatus(id: string, status: LaunchStatus): void {
     this.db.prepare("UPDATE launches SET status = ? WHERE id = ?").run(status, id);
   }
@@ -229,6 +253,11 @@ export class ConductorDb {
       .run(launchId, `op${opId}:%`);
   }
 
+  /** Forget a done step so the next drive re-runs it (stale-bid recovery). */
+  resetStep(launchId: string, name: string): void {
+    this.db.prepare("DELETE FROM launch_steps WHERE launch_id = ? AND name = ?").run(launchId, name);
+  }
+
   stepOutput<T>(launchId: string, name: string): T | undefined {
     const row = this.getStep(launchId, name);
     if (!row?.output_json) return undefined;
@@ -276,6 +305,26 @@ export class ConductorDb {
     this.db
       .prepare("DELETE FROM pending_txs WHERE launch_id = ? AND step = ?")
       .run(launchId, step);
+  }
+
+  /**
+   * Drop every unsigned tx in a launch's queue. The queue surfaces
+   * oldest-first, so a wedged engine tx (e.g. create-leases whose bids
+   * expired) would shadow a fleet shutdown's closes forever.
+   */
+  clearUnsignedPendingTxs(launchId: string): void {
+    this.db
+      .prepare("DELETE FROM pending_txs WHERE launch_id = ? AND status IN ('pending', 'failed')")
+      .run(launchId);
+  }
+
+  /** Drop unsigned rows whose step matches a LIKE pattern (orphan cleanup). */
+  deleteUnsignedPendingTxsLike(launchId: string, pattern: string): void {
+    this.db
+      .prepare(
+        "DELETE FROM pending_txs WHERE launch_id = ? AND step LIKE ? AND status IN ('pending', 'failed')",
+      )
+      .run(launchId, pattern);
   }
 
   /** Replace the msgs of a not-yet-signed pending tx (step re-run drift). */

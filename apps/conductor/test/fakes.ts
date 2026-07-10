@@ -31,9 +31,15 @@ export class FakeAkashApi implements AkashApi {
   txCounter = 0;
   failTxHashes = new Set<string>();
   providers = fakeProviders();
+  /** 1 AKT = $0.50 → uact fee amounts convert to exactly 2× uakt. */
+  aktUsd: number | undefined = 0.5;
 
   async latestBlockHeight(): Promise<number> {
     return (this.height += 10);
+  }
+
+  async aktUsdPrice(): Promise<number | undefined> {
+    return this.aktUsd;
   }
 
   /** When set, the first dseq listBids sees only ever has closed bids —
@@ -46,15 +52,21 @@ export class FakeAkashApi implements AkashApi {
     dseq: string,
   ): Promise<{ state: string; hash?: string } | undefined> {
     if (!this.knownDseqs.has(dseq)) return undefined;
-    // the stale order still has an active deployment awaiting the close;
+    // a stale order still has an active deployment awaiting the close;
     // no hash → the steps skip on-chain hash reconciliation in tests
-    return { state: "active" };
+    return { state: this.leaseStates.get(dseq) === "closed" ? "closed" : "active" };
   }
+
+  /** dseqs whose bids have all expired (create-leases stale-bid recovery). */
+  expiredBidDseqs = new Set<string>();
 
   async listBids(_owner: string, dseq: string): Promise<Bid[]> {
     this.knownDseqs.add(dseq); // every launched dseq shows up on-chain
     if (this.staleFirstOrder) this.firstDseq ??= dseq;
-    const state = this.staleFirstOrder && dseq === this.firstDseq ? "closed" : "open";
+    const state =
+      (this.staleFirstOrder && dseq === this.firstDseq) || this.expiredBidDseqs.has(dseq)
+        ? "closed"
+        : "open";
     // every provider bids on everything; price varies by provider index
     return [...this.providers.keys()].map((provider, i) => ({
       bid: {

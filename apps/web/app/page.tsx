@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
 import { withDefaults } from "@sparkdream/launch-spec";
@@ -16,6 +16,7 @@ import {
   postTxResult,
   resumeLaunch,
   startLaunch,
+  type AccountView,
   type CostEstimate,
   type FeeInfo,
   type FleetSummary,
@@ -99,6 +100,8 @@ export default function Page() {
   const [pending, setPending] = useState<PendingTx | null>(null);
   const [pendingGentx, setPendingGentx] = useState<PendingGentx | null>(null);
   const [fleet, setFleet] = useState<FleetSummary | null>(null);
+  const [fleetAccounts, setFleetAccounts] = useState<Record<string, AccountView[]>>({});
+  const [revealedMnemonics, setRevealedMnemonics] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stepsExpanded, setStepsExpanded] = useState(false);
@@ -917,7 +920,8 @@ export default function Page() {
                       <tr>
                         <td>launch fee</td>
                         <td className="dim-note">
-                          one-time, {costEstimate.feeBps / 100}% of actual leased monthly rate
+                          one-time, {costEstimate.feeBps / 100}% of actual leased monthly rate —
+                          paid in AKT at the chain oracle price
                         </td>
                         <td>
                           ${costEstimate.feeLowUsd.toFixed(2)}–{costEstimate.feeHighUsd.toFixed(2)}
@@ -1038,7 +1042,14 @@ export default function Page() {
             </div>
           )}
 
-          {!pending && !pendingGentx && waitingStep && (
+          {launch.status === "aborted" && (
+            <div className="dim-note">
+              launch aborted — its deployments are closed (deposits refunded). Start a new
+              launch from the spec above.
+            </div>
+          )}
+
+          {!pending && !pendingGentx && waitingStep && launch.status !== "aborted" && (
             <div className="banner wait">
               <b>{waitingStep.name}</b> is waiting on you
               {reportedAgo(waitingStep) && (
@@ -1059,7 +1070,7 @@ export default function Page() {
             </div>
           )}
 
-          {failedStep && (
+          {failedStep && launch.status !== "aborted" && (
             <div className="banner fail">
               <b>{failedStep.name}</b> failed
               {reportedAgo(failedStep) && (
@@ -1097,6 +1108,36 @@ export default function Page() {
                     }
                   >
                     {collapsed ? "show" : "hide"}
+                  </button>
+                )}
+                {shutDown && (
+                  <button
+                    title="Permanently delete this launch — all records AND secrets (mnemonics, keys) are erased from the launcher. Export the fleet bundle first if you want an archive."
+                    onClick={async () => {
+                      const ok = window.confirm(
+                        `Delete launch ${f.launchId.slice(0, 8)} (${f.chainId}) permanently?\n\n` +
+                          "This erases its records AND secrets (account mnemonics, validator keys) " +
+                          "from the launcher. Export the fleet bundle first if you want an archive.",
+                      );
+                      if (!ok) return;
+                      try {
+                        const { deleteLaunch } = await import("../lib/api");
+                        await deleteLaunch(f.launchId);
+                        if (launchId === f.launchId) {
+                          localStorage.removeItem(LAST_LAUNCH_KEY);
+                          setLaunchId(null);
+                        }
+                        setFleet((cur) =>
+                          cur
+                            ? { ...cur, fleets: cur.fleets.filter((x) => x.launchId !== f.launchId) }
+                            : cur,
+                        );
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    delete…
                   </button>
                 )}
                 {!collapsed &&
@@ -1229,6 +1270,121 @@ export default function Page() {
                   ))}
                 </tbody>
               </table>
+              {(() => {
+                const prefs = providerPrefs[f.launchId];
+                if (!prefs || (!prefs.avoid.length && !prefs.prefer.length)) return null;
+                const removePref = async (provider: string) => {
+                  const { setProviderPref } = await import("../lib/api");
+                  const next = await setProviderPref(f.launchId, provider, "none").catch((e) => {
+                    setError(String(e));
+                    return null;
+                  });
+                  if (next) setProviderPrefs((m) => ({ ...m, [f.launchId]: next }));
+                };
+                const chip = (provider: string, kind: "avoid" | "prefer") => {
+                  const display = prefs.names[provider] ?? `${provider.slice(0, 14)}…`;
+                  return (
+                    <button
+                      key={provider}
+                      className={`pref-tag ${kind}`}
+                      title={`${provider} — click to remove`}
+                      onClick={() => removePref(provider)}
+                    >
+                      {kind === "avoid" ? "⛔" : "⭐"} {display} ✕
+                    </button>
+                  );
+                };
+                return (
+                  <p className="dim-note pref-summary" title="These lists apply to every launch on this wallet">
+                    Relaunch policy (wallet-wide) —{" "}
+                    {prefs.prefer.length > 0 && <>prefer: {prefs.prefer.map((p) => chip(p, "prefer"))} </>}
+                    {prefs.avoid.length > 0 && <>avoid: {prefs.avoid.map((p) => chip(p, "avoid"))}</>}
+                  </p>
+                );
+              })()}
+              <details
+                className="accounts"
+                onToggle={async (e) => {
+                  if (!(e.target as HTMLDetailsElement).open || fleetAccounts[f.launchId]) return;
+                  try {
+                    const { getFleetAccounts } = await import("../lib/api");
+                    const r = await getFleetAccounts(f.launchId);
+                    setFleetAccounts((m) => ({ ...m, [f.launchId]: r.accounts }));
+                  } catch (err) {
+                    setError(String(err));
+                  }
+                }}
+              >
+                <summary title="Named accounts generated at launch — operator keys and spec accounts">
+                  accounts
+                </summary>
+                <table className="fleet">
+                  <thead>
+                    <tr>
+                      <th>name</th>
+                      <th>address</th>
+                      <th>mnemonic</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(fleetAccounts[f.launchId] ?? []).map((a) => {
+                      const rkey = `${f.launchId}:${a.name}`;
+                      const revealed = revealedMnemonics[rkey];
+                      return (
+                        // the seed goes on its own full-width row so the
+                        // columns never re-flow when it appears
+                        <Fragment key={a.name}>
+                          <tr>
+                            <td>{a.name}</td>
+                            <td>
+                              <code>{a.address}</code>
+                            </td>
+                            <td>
+                              {!a.hasMnemonic ? (
+                                <span className="dim-note">external key</span>
+                              ) : revealed ? (
+                                <button
+                                  onClick={() =>
+                                    setRevealedMnemonics((m) => {
+                                      const next = { ...m };
+                                      delete next[rkey];
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  hide
+                                </button>
+                              ) : (
+                                <button
+                                  title="Show this account's seed phrase (import into Keplr to act as it)"
+                                  onClick={async () => {
+                                    try {
+                                      const { getAccountMnemonic } = await import("../lib/api");
+                                      const r = await getAccountMnemonic(f.launchId, a.name);
+                                      setRevealedMnemonics((m) => ({ ...m, [rkey]: r.mnemonic }));
+                                    } catch (err) {
+                                      setError(String(err));
+                                    }
+                                  }}
+                                >
+                                  reveal
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                          {revealed && (
+                            <tr className="mnemonic-row">
+                              <td colSpan={3}>
+                                <code className="mnemonic">{revealed}</code>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </details>
               <div className="row">
                 {!shutDown && (<>
                 <button
@@ -1269,6 +1425,45 @@ export default function Page() {
                   halt-height upgrade…
                 </button>
                 </>)}
+                {!shutDown && (
+                  <button
+                    title="Apply the domains from the launch-spec editor above to this fleet — one deployment-update signature, then repoint DNS"
+                    onClick={async () => {
+                      try {
+                        // the spec editor is the source of truth: diff its
+                        // domains against the fleet's stored spec and apply
+                        const edited = yaml.load(specText) as any;
+                        const ec = edited?.topology?.components ?? {};
+                        const ep = edited?.topology?.publicEndpoints ?? {};
+                        const cur = (await getLaunch(f.launchId)).spec as any;
+                        const cc = cur?.topology?.components ?? {};
+                        const cp = cur?.topology?.publicEndpoints ?? {};
+                        const changes: Record<string, string> = {};
+                        if (ec.explorer?.domain && ec.explorer.domain !== cc.explorer?.domain)
+                          changes.explorer = ec.explorer.domain;
+                        if (ec.explorer?.route && ec.explorer.route !== cc.explorer?.route)
+                          changes.explorerRoute = ec.explorer.route;
+                        if (ec.frontend?.domain && ec.frontend.domain !== cc.frontend?.domain)
+                          changes.frontend = ec.frontend.domain;
+                        if (ep?.api && ep.api !== cp?.api) changes.api = ep.api;
+                        if (ep?.rpc && ep.rpc !== cp?.rpc) changes.rpc = ep.rpc;
+                        if (Object.keys(changes).length === 0) {
+                          setError(
+                            "no domain changes: the spec editor's domains match this fleet — edit the spec above first",
+                          );
+                          return;
+                        }
+                        const { postDomainUpdate } = await import("../lib/api");
+                        await postDomainUpdate(f.launchId, changes);
+                        setLaunchId(f.launchId); // surfaces the signing banner
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    update domains…
+                  </button>
+                )}
                 <button
                   onClick={async () => {
                     const { downloadFleetBundle } = await import("../lib/api");
@@ -1328,38 +1523,6 @@ export default function Page() {
                     </span>
                   ))}
               </div>
-              {(() => {
-                const prefs = providerPrefs[f.launchId];
-                if (!prefs || (!prefs.avoid.length && !prefs.prefer.length)) return null;
-                const removePref = async (provider: string) => {
-                  const { setProviderPref } = await import("../lib/api");
-                  const next = await setProviderPref(f.launchId, provider, "none").catch((e) => {
-                    setError(String(e));
-                    return null;
-                  });
-                  if (next) setProviderPrefs((m) => ({ ...m, [f.launchId]: next }));
-                };
-                const chip = (provider: string, kind: "avoid" | "prefer") => {
-                  const display = prefs.names[provider] ?? `${provider.slice(0, 14)}…`;
-                  return (
-                    <button
-                      key={provider}
-                      className={`pref-tag ${kind}`}
-                      title={`${provider} — click to remove`}
-                      onClick={() => removePref(provider)}
-                    >
-                      {kind === "avoid" ? "⛔" : "⭐"} {display} ✕
-                    </button>
-                  );
-                };
-                return (
-                  <p className="dim-note pref-summary" title="These lists apply to every launch on this wallet">
-                    Relaunch policy (wallet-wide) —{" "}
-                    {prefs.prefer.length > 0 && <>prefer: {prefs.prefer.map((p) => chip(p, "prefer"))} </>}
-                    {prefs.avoid.length > 0 && <>avoid: {prefs.avoid.map((p) => chip(p, "avoid"))}</>}
-                  </p>
-                );
-              })()}
               </>)}
             </div>
             );
@@ -1432,7 +1595,7 @@ export default function Page() {
 
       {busy && <div className="busy">{busy}</div>}
       {error && (
-        <div className="banner fail">
+        <div className="banner fail global-error">
           <pre>{error}</pre>
           <button onClick={() => setError(null)}>dismiss</button>
         </div>

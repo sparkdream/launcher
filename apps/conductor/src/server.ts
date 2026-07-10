@@ -223,8 +223,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!launch) return reply.status(404).send({ error: "not found" });
     if (denyForeign(req, reply, launch)) return;
     if (launch.status === "completed") return { status: "completed" };
+    if (launch.status === "aborted") {
+      return reply
+        .status(409)
+        .send({ error: "launch aborted — its fleet was shut down; start a new launch" });
+    }
     return { status: drive(id, JSON.parse(launch.spec_json)) };
   }
+
+  // permanently delete a shut-down launch (records + work dir with secrets);
+  // "export fleet bundle" beforehand is the archival path
+  app.delete("/api/launches/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const launch = deps.db.getLaunch(id);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (running.has(id)) return reply.status(409).send({ error: "launch is currently driving — try again shortly" });
+    try {
+      await fleet.deleteLaunch(launch);
+      return { status: "deleted" };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
 
   app.post("/api/launches/:id/abort", async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -344,7 +365,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
       case "topup": {
         if (!body.amount) return reply.status(400).send({ error: "amount required" });
-        const { step } = fleet.requestTopUp(launch, component, body.amount);
+        const { step } = await fleet.requestTopUp(launch, component, body.amount);
         return { status: "awaiting-signature", step };
       }
       default:
@@ -438,6 +459,57 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     fleet.setProviderPref(launch.owner, provider, kind, name);
     return fleet.providerPrefs(launch.owner);
+  });
+
+  // change component domains / public endpoints after launch (retarget op):
+  // updates the stored spec, then MsgUpdateDeployment + manifests re-point
+  // the accept-domain ingress and the frontend's endpoint env
+  app.post("/api/fleet/:launchId/domains", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as {
+      explorer?: string;
+      frontend?: string;
+      api?: string;
+      rpc?: string;
+      explorerRoute?: string;
+    };
+    try {
+      const opId = fleet.requestDomainUpdate(launch, body);
+      // drive with the UPDATED spec — requestDomainUpdate just rewrote it
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "retarget-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // named accounts (generate-keys): addresses openly; the mnemonic reveal is
+  // a separate per-account call so seeds never ride the list response
+  app.get("/api/fleet/:launchId/accounts", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      return { accounts: fleet.accounts(launch) };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  app.get("/api/fleet/:launchId/accounts/:name/mnemonic", async (req, reply) => {
+    const { launchId, name } = req.params as { launchId: string; name: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      return { mnemonic: fleet.mnemonic(launch, name) };
+    } catch (e) {
+      return reply.status(404).send({ error: String(e instanceof Error ? e.message : e) });
+    }
   });
 
   // shut down the whole fleet: batched closes through the signing loop

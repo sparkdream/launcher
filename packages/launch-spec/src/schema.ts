@@ -100,7 +100,18 @@ export const launchSpecSchema = z.object({
         .default("round-robin"),
     }),
     components: z.object({
-      explorer: componentToggle,
+      explorer: componentToggle.extend({
+        /**
+         * ping-pub route path under the explorer domain (the chain name in
+         * the image's baked config). Defaults to network.name — override
+         * when the image was built for a differently-named chain, e.g. a
+         * devnet ("sparkdreamdev") running the stock "sparkdream" explorer.
+         */
+        route: z
+          .string()
+          .regex(/^[a-z0-9-]+$/i)
+          .optional(),
+      }),
       frontend: componentToggle,
       hub: componentToggle,
     }),

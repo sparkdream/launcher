@@ -22,6 +22,11 @@ export interface AkashApi {
   listDeployments(owner: string): Promise<DeploymentSummary[]>;
   /** Escrow balance for runway estimation (§5 monitor). */
   deploymentEscrow(owner: string, dseq: string): Promise<Coin | undefined>;
+  /**
+   * AKT/USD from the chain's own oracle (the price BME settles mints at).
+   * undefined when the feed is unavailable or reports unhealthy.
+   */
+  aktUsdPrice(): Promise<number | undefined>;
 }
 
 export interface DeploymentSummary {

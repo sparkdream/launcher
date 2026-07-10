@@ -13,7 +13,7 @@ import {
   TypeUrl,
   type Msg,
 } from "../akash/messages.js";
-import { feeConfig, launchFeeAmount } from "../fee.js";
+import { feeCoin, feeConfig, launchFeeAmount } from "../fee.js";
 import { PRICING_DENOM } from "../render-sdl.js";
 import { pollBids } from "../akash/client.js";
 import { selectProvider, type PolicyDecision } from "../akash/policy.js";
@@ -286,9 +286,16 @@ export const deployHeadscaleStep: StepDef = {
         await redeploy(dseq, `went stale (all ${existing.length} bids closed)`);
       }
       const openBids = bids.filter((b) => b.bid.state === "open");
+      // wallet-wide provider prefs apply to the initial pick, not just
+      // relaunches — avoid is a hard filter, prefer outranks the spec's list
+      const prefs = ctx.db.providerPrefs(addr);
       const decision = selectProvider(openBids, {
-        policy: ctx.spec.providers.policy,
+        policy: {
+          ...ctx.spec.providers.policy,
+          preference: [...new Set([...prefs.prefer, ...ctx.spec.providers.policy.preference])],
+        },
         chosenProviders: new Set(),
+        avoidProviders: new Set(prefs.avoid),
         requiredStorageClass: artifacts.requiredStorageClass,
         providers,
       });
@@ -460,6 +467,28 @@ export const createDeploymentsStep: StepDef = {
     const preauth = ctx.output<PreauthKeys>("configure-headscale");
     if (!preauth) throw new Error("configure-headscale output missing");
 
+    // a fleet shutdown may have closed headscale while this launch sat in
+    // recovery — the nodes about to be deployed can never join the mesh
+    // without it, so refuse before spending their deposits. Only positive
+    // evidence pauses (an LCD hiccup must not wedge a healthy launch).
+    const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
+    if (hs) {
+      const info = await ctx.services.api.deploymentInfo(addr, hs.dseq).catch(() => undefined);
+      if (info && info.state !== "active") {
+        throw new AwaitUser(
+          "create-deployments",
+          `headscale deployment ${hs.dseq} is closed on-chain (fleet shut down?) — ` +
+            "this launch cannot continue without its mesh coordinator. " +
+            "Shut down the fleet and start a new launch from the same spec.",
+        );
+      }
+    }
+
+    // a re-run after stale-bid recovery may inherit an orphaned close row
+    // (recovery raced a fleet shutdown that had already closed everything);
+    // this step re-running means that generation is dead either way
+    ctx.db.deleteUnsignedPendingTxsLike(ctx.launchId, "create-leases:close:%");
+
     // pinned for the same reason as the headscale dseq: the signed batch
     // must match the plan across re-runs of this step
     const height = Number(
@@ -528,6 +557,14 @@ export const collectBidsStep: StepDef = {
     // components can share providers freely — requiring N more distinct
     // providers for them would only shrink the viable bid set
     const stateless = new Set<string>(statelessComponents(ctx.spec).map((c) => c.key));
+    // wallet-wide provider prefs apply to the initial pick, not just
+    // relaunches — avoid is a hard filter, prefer outranks the spec's list
+    const prefs = ctx.db.providerPrefs(addr);
+    const policy = {
+      ...ctx.spec.providers.policy,
+      preference: [...new Set([...prefs.prefer, ...ctx.spec.providers.policy.preference])],
+    };
+    const avoidProviders = new Set(prefs.avoid);
     const perNode: Assignments["perNode"] = {};
     for (const [key, entry] of Object.entries(plan.perNode)) {
       const bids = await pollBids(ctx.services.api, addr, entry.dseq, {
@@ -537,8 +574,9 @@ export const collectBidsStep: StepDef = {
         settleRounds: 2,
       });
       const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
-        policy: ctx.spec.providers.policy,
+        policy,
         chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
+        avoidProviders,
         requiredStorageClass: entry.requiredStorageClass,
         providers,
       });
@@ -569,6 +607,63 @@ export const createLeasesStep: StepDef = {
     const addr = owner(ctx);
     const plan = ctx.output<DeploymentPlan>("create-deployments")!;
     const assignments = ctx.output<Assignments>("collect-bids")!;
+
+    // Bids expire minutes after their order opens, so a launch that sat at
+    // this signature holds assignments the chain will reject ("bid not
+    // open"). Re-check freshness before asking for a signature — but only
+    // while nothing is signed: leasing flips the winner to "active" and
+    // closes the rest, so a re-check after signing would misread a good
+    // batch as stale (same trap as the headscale stale-order path).
+    const row = ctx.db.getPendingTx(ctx.launchId, "create-leases");
+    if (!row || row.status === "pending" || row.status === "failed") {
+      const stale: string[] = [];
+      for (const [key, a] of Object.entries(assignments.perNode)) {
+        const bids = await ctx.services.api.listBids(addr, plan.perNode[key]!.dseq);
+        const bid = bids.find(
+          (b) =>
+            b.bid.id.provider === a.provider &&
+            b.bid.id.gseq === a.gseq &&
+            b.bid.id.oseq === a.oseq,
+        );
+        if (bid?.bid.state !== "open") stale.push(key);
+      }
+      if (stale.length > 0) {
+        // start the node batch over: close what's still open on-chain
+        // (escrow refunds on close), then forget the plan + bids so the
+        // next drive redeploys fresh. Deployments and bids are cheap;
+        // partial surgery on a half-stale batch is not.
+        ctx.log(`bids expired for ${stale.join(", ")} — closing node deployments to redeploy`);
+        // drop the unsigned lease tx FIRST: the queue serves oldest-first,
+        // so the older create-leases row would shadow the close signature
+        // (and signing it is exactly the "bid not open" failure)
+        ctx.db.deletePendingTx(ctx.launchId, "create-leases");
+        const closes: Msg[] = [];
+        for (const { dseq } of Object.values(plan.perNode)) {
+          if ((await ctx.services.api.deploymentInfo(addr, dseq))?.state === "active") {
+            closes.push(closeDeploymentMsg(addr, dseq));
+          }
+        }
+        const closeStep = `create-leases:close:${Object.values(plan.perNode)[0]!.dseq}`;
+        if (closes.length > 0) {
+          await ctx.requireTx(closeStep, closes);
+        } else {
+          // everything already closed on-chain (a fleet shutdown raced this
+          // recovery) — drop the close row a prior pass may have enqueued,
+          // or it wedges the oldest-first signing queue with a tx the chain
+          // rejects ("Deployment closed")
+          ctx.db.deletePendingTx(ctx.launchId, closeStep);
+        }
+        clearPin(ctx, "node-dseq-base");
+        ctx.db.deletePendingTx(ctx.launchId, "create-deployments");
+        ctx.db.resetStep(ctx.launchId, "create-deployments");
+        ctx.db.resetStep(ctx.launchId, "collect-bids");
+        throw new Error(
+          `bids for ${stale.join(", ")} expired while awaiting the lease signature — ` +
+            "stale deployments closed (deposits refunded); resume to redeploy and re-bid",
+        );
+      }
+    }
+
     const msgs = Object.entries(assignments.perNode).map(([key, a]) =>
       createLeaseMsg({
         owner: addr,
@@ -590,9 +685,17 @@ export const createLeasesStep: StepDef = {
         [hs.price, ...Object.values(assignments.perNode).map((a) => a.price)],
         fee.launchBps,
       );
-      const denom = PRICING_DENOM[ctx.spec.infra.akashNetwork];
-      msgs.push(sendMsg(addr, fee.address, { denom, amount }));
-      feePaid = { address: fee.address, amount, denom };
+      const coin = await feeCoin(
+        PRICING_DENOM[ctx.spec.infra.akashNetwork],
+        amount,
+        ctx.services.api,
+      );
+      if (coin) {
+        msgs.push(sendMsg(addr, fee.address, coin));
+        feePaid = { address: fee.address, ...coin };
+      } else {
+        ctx.log("AKT oracle price unavailable — launch fee skipped");
+      }
     }
     const txHash = await ctx.requireTx("create-leases", msgs);
     return { txHash, fee: feePaid };

@@ -114,9 +114,10 @@ function frontendSdl(input: RenderComponentSdlInput) {
     `BECH32_PREFIX=${spec.network.bech32Prefix}`,
   ];
   if (explorer.enabled && explorer.domain) {
-    // ping-pub routes are /<chain-name-in-baked-config>; the explorer image
-    // is built for this chain, so network.name matches
-    env.push(`EXPLORER_URL=https://${explorer.domain}/${spec.network.name}`);
+    // ping-pub routes are /<chain-name-in-baked-config>; network.name
+    // matches when the image was built for this chain — explorer.route
+    // overrides it (e.g. a devnet running the stock chain's explorer image)
+    env.push(`EXPLORER_URL=https://${explorer.domain}/${explorer.route ?? spec.network.name}`);
   }
   return {
     service: {

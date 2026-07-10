@@ -1,12 +1,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import yaml from "js-yaml";
 import { resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
-import { feeConfig } from "./fee.js";
+import { feeCoin, feeConfig } from "./fee.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
 import { selectProvider } from "./akash/policy.js";
@@ -207,13 +208,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         };
       }
 
-      // exclude: other active components' providers (anti-affinity) PLUS
-      // any provider we're explicitly moving off of — including the one this
-      // component just ran on. A relaunch is a "move", so re-picking the
-      // same (often broken) provider defeats the purpose. Stateless
-      // components are exempt from anti-affinity (§6) — only the avoid list
-      // (which carries the old provider) constrains them.
-      const exclude = new Set<string>(params.avoidProviders ?? []);
+      // avoid (hard, regardless of anti-affinity mode): any provider we're
+      // explicitly moving off of — including the one this component just ran
+      // on. A relaunch is a "move", so re-picking the same (often broken)
+      // provider defeats the purpose. exclude (per the policy's anti-affinity
+      // mode): other active components' providers. Stateless components are
+      // exempt from anti-affinity (§6) — only the avoid list constrains them.
+      const avoidProviders = new Set<string>(params.avoidProviders ?? []);
+      const exclude = new Set<string>();
       if (!stateless) {
         for (const c of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
           if (c.key !== key && c.state === "active") exclude.add(c.provider);
@@ -232,13 +234,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
         policy: { ...spec.providers.policy, preference },
         chosenProviders: exclude,
+        avoidProviders,
         requiredStorageClass: deploy.requiredStorageClass,
         providers,
       });
       if (!decision.chosen) {
         throw new AwaitUser(
           p("lease"),
-          `no acceptable bids for ${key} relaunch avoiding ${[...exclude].length} provider(s): ${JSON.stringify(decision.rejected)}`,
+          `no acceptable bids for ${key} relaunch avoiding ${avoidProviders.size + exclude.size} provider(s): ${JSON.stringify(decision.rejected)}`,
         );
       }
       const bidId = decision.chosen.bid.id;
@@ -506,12 +509,13 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         // upgrade service fee — flat, once per op, on the first update tx
         const fee = feeConfig();
         if (isFirst && fee.upgradeFlat > 0) {
-          msgs.push(
-            sendMsg(owner, fee.address, {
-              denom: PRICING_DENOM[spec.infra.akashNetwork],
-              amount: String(fee.upgradeFlat),
-            }),
+          const coin = await feeCoin(
+            PRICING_DENOM[spec.infra.akashNetwork],
+            String(fee.upgradeFlat),
+            ctx.services.api,
           );
+          if (coin) msgs.push(sendMsg(owner, fee.address, coin));
+          else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
         }
         await ctx.requireTx(p("update"), msgs);
         const cert = loadCert(ctx);
@@ -669,12 +673,13 @@ export function haltUpgradeSteps(
         // upgrade service fee — flat, once per op, on this batched update
         const fee = feeConfig();
         if (fee.upgradeFlat > 0) {
-          msgs.push(
-            sendMsg(owner, fee.address, {
-              denom: PRICING_DENOM[spec.infra.akashNetwork],
-              amount: String(fee.upgradeFlat),
-            }),
+          const coin = await feeCoin(
+            PRICING_DENOM[spec.infra.akashNetwork],
+            String(fee.upgradeFlat),
+            ctx.services.api,
           );
+          if (coin) msgs.push(sendMsg(owner, fee.address, coin));
+          else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
         }
         // one batched tx: all nodes move to the new binary together
         await ctx.requireTx(p("update-all"), msgs);
@@ -705,6 +710,146 @@ export function haltUpgradeSteps(
   ];
 }
 
+export interface RetargetParams {
+  /** Deployments whose SDLs must be re-rendered for the new domains. */
+  components: string[];
+}
+
+/**
+ * Rewrite the domain-bearing parts of an already-deployed SDL from the
+ * (updated) spec: accept-domain ingress lists, and the frontend's runtime
+ * endpoint env. Everything else — baked tailnet IPs, auth keys, images —
+ * is preserved, which is why this mutates the on-disk SDL instead of
+ * re-rendering from scratch.
+ */
+export function retargetSdl(sdlPath: string, key: string, spec: LaunchSpec): void {
+  const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+  const comps = spec.topology.components;
+  const pub = spec.topology.publicEndpoints;
+  if (key === "explorer" || key === "frontend") {
+    const svc = doc.services?.[key];
+    if (!svc) throw new Error(`${key}.yaml has no services.${key}`);
+    const domain = comps[key].domain;
+    if (!domain) throw new Error(`${key} has no domain in the spec`);
+    for (const e of svc.expose ?? []) if (e.accept) e.accept = [domain];
+    if (key === "frontend") {
+      const env: string[] = svc.env ?? [];
+      const set = (k: string, v: string | undefined) => {
+        const i = env.findIndex((x) => x.startsWith(k + "="));
+        if (v === undefined) {
+          if (i >= 0) env.splice(i, 1);
+        } else if (i >= 0) env[i] = `${k}=${v}`;
+        else env.push(`${k}=${v}`);
+      };
+      if (pub?.api) set("LCD_ENDPOINT", `https://${pub.api}`);
+      if (pub?.rpc) set("RPC_ENDPOINT", `https://${pub.rpc}`);
+      set(
+        "EXPLORER_URL",
+        comps.explorer.enabled && comps.explorer.domain
+          ? `https://${comps.explorer.domain}/${comps.explorer.route ?? spec.network.name}`
+          : undefined,
+      );
+      svc.env = env;
+    }
+  } else {
+    // sentry-0: LCD accept rides the 1317 expose, RPC accept the 26657 one
+    const svc = doc.services?.sparkdreamd;
+    if (!svc) throw new Error(`${key}.yaml has no services.sparkdreamd`);
+    for (const e of svc.expose ?? []) {
+      if (e.port === 1317 && pub?.api) e.accept = [pub.api];
+      if (e.port === 26657 && pub?.rpc) e.accept = [pub.rpc];
+    }
+  }
+  fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
+}
+
+/**
+ * Domain retarget: batch one MsgUpdateDeployment per affected deployment
+ * (same signature), re-send manifests, then gate on the new domains
+ * answering. No service fee — it's configuration, not an upgrade. The spec
+ * was already updated by requestDomainUpdate, so health checks and future
+ * relaunches use the new domains.
+ */
+export function retargetSteps(opId: number, params: RetargetParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  return [
+    {
+      name: p("update"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const msgs: Msg[] = [];
+        const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
+        for (const key of params.components) {
+          const row = componentRow(ctx, key);
+          retargetSdl(sdlPathFor(ctx, key), key, spec);
+          const artifacts = sdlArtifacts(loadSdl(sdlPathFor(ctx, key)));
+          fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+          manifests.push({ row, json: artifacts.manifestJson });
+          // convergent, like deploy-headscale's hash reconciliation: if the
+          // on-chain version already matches (an earlier retarget landed),
+          // an update tx would be rejected with ErrInvalidHash ("nothing to
+          // change") — just re-send the manifest for that one
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash === wantHash) {
+            ctx.log(`${key}: on-chain version already matches — skipping update tx`);
+            continue;
+          }
+          msgs.push({
+            typeUrl: TypeUrl.UpdateDeployment,
+            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+          });
+        }
+        if (msgs.length > 0) {
+          await ctx.requireTx(p("update"), msgs);
+        } else {
+          // everything already on-chain — drop a tx an earlier pass enqueued
+          ctx.db.deletePendingTx(ctx.launchId, p("update"));
+        }
+        const cert = loadCert(ctx);
+        for (const { row, json } of manifests) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+        }
+        return { updated: params.components };
+      },
+    },
+    {
+      name: p("verify"),
+      async run(ctx) {
+        const comps = spec.topology.components;
+        const pub = spec.topology.publicEndpoints;
+        const urls: string[] = [];
+        for (const key of params.components) {
+          if (key === "explorer" || key === "frontend") urls.push(`https://${comps[key].domain}/`);
+        }
+        if (params.components.some((k) => k.startsWith("sentry-"))) {
+          if (pub?.api) urls.push(`https://${pub.api}/cosmos/base/tendermint/v1beta1/node_info`);
+          if (pub?.rpc) urls.push(`https://${pub.rpc}/status`);
+        }
+        const dark: string[] = [];
+        for (const url of urls) {
+          let ok = false;
+          for (let i = 0; i < 24 && !ok; i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            ok = await ctx.services.rpc.httpOk(url);
+          }
+          if (!ok) dark.push(url);
+        }
+        if (dark.length > 0) {
+          throw new AwaitUser(
+            p("verify"),
+            `not reachable after the domain update: ${dark.join(", ")} — ` +
+              "create or repoint the DNS records (CNAME each domain to its provider ingress host, " +
+              "same target as before for unchanged providers), then resume.",
+          );
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { verified: urls };
+      },
+    },
+  ];
+}
+
 /** Steps for every active op of a launch, in creation order. */
 export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
   const launch = db.getLaunch(launchId);
@@ -718,6 +863,7 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
     if (op.kind === "relaunch") steps.push(...relaunchSteps(op.id, params, spec));
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
+    if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));
   }
   return steps;
 }

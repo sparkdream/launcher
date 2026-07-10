@@ -287,6 +287,50 @@ export async function postFleetShutdown(
   return json(await afetch(`/api/fleet/${launchId}/shutdown`, { method: "POST" }));
 }
 
+export interface AccountView {
+  name: string;
+  address: string;
+  hasMnemonic: boolean;
+}
+
+/** Named accounts generated at launch (addresses only — no seeds). */
+export async function getFleetAccounts(launchId: string): Promise<{ accounts: AccountView[] }> {
+  return json(await afetch(`/api/fleet/${launchId}/accounts`));
+}
+
+/** Reveal one account's mnemonic (launch-scoped, per-account). */
+export async function getAccountMnemonic(
+  launchId: string,
+  name: string,
+): Promise<{ mnemonic: string }> {
+  return json(await afetch(`/api/fleet/${launchId}/accounts/${encodeURIComponent(name)}/mnemonic`));
+}
+
+/** Permanently delete a shut-down launch (records + secrets on the conductor). */
+export async function deleteLaunch(id: string): Promise<{ status: string }> {
+  return json(await afetch(`/api/launches/${id}`, { method: "DELETE" }));
+}
+
+/** Change component domains / public endpoints after launch (retarget op). */
+export async function postDomainUpdate(
+  launchId: string,
+  changes: {
+    explorer?: string;
+    frontend?: string;
+    api?: string;
+    rpc?: string;
+    explorerRoute?: string;
+  },
+): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/domains`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(changes),
+    }),
+  );
+}
+
 /** Live block height of a node's RPC (for a real-time indicator). */
 export async function getComponentHeight(
   launchId: string,

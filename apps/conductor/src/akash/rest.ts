@@ -9,9 +9,23 @@ export interface RestEndpoints {
 }
 
 async function getJson(url: string): Promise<any> {
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) throw new Error(`GET ${url}: HTTP ${res.status}`);
-  return res.json();
+  // public LCDs 500 transiently — retry 5xx and network errors before
+  // failing the step that asked (same rationale as txStatus below)
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+    let res: Response;
+    try {
+      res = await fetch(url, { headers: { accept: "application/json" } });
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      continue;
+    }
+    if (res.ok) return res.json();
+    lastError = new Error(`GET ${url}: HTTP ${res.status}`);
+    if (res.status < 500) break; // 4xx is a real answer, not a hiccup
+  }
+  throw lastError!;
 }
 
 /** Real chain-facing adapter. Field names mirror the LCD (snake_case). */
@@ -105,6 +119,20 @@ export class RestAkashApi implements AkashApi {
       dseq: String(d.deployment?.id?.dseq ?? d.deployment?.deployment_id?.dseq),
       state: String(d.deployment?.state ?? "unknown"),
     }));
+  }
+
+  async aktUsdPrice(): Promise<number | undefined> {
+    // aggregated oracle price (twap/median across sources) — the same feed
+    // the BME module converts at when settling MsgMintACT
+    let data: any;
+    try {
+      data = await getJson(`${this.endpoints.lcd}/akash/oracle/v2/aggregated_price/akt`);
+    } catch {
+      return undefined;
+    }
+    if (data.price_health && data.price_health.is_healthy === false) return undefined;
+    const price = Number(data.aggregated_price?.median_price);
+    return price > 0 ? price : undefined;
   }
 
   async deploymentEscrow(owner: string, dseq: string) {

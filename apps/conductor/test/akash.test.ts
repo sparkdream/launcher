@@ -49,6 +49,22 @@ describe("policy engine (§6)", () => {
     expect(decision.rejected[0]!.reason).toContain("anti-affinity");
   });
 
+  it("avoid list is a hard filter, even for a preferred or cheapest provider", () => {
+    const decision = selectProvider(
+      [bid("akash1provider1", "100"), bid("akash1provider2", "200")],
+      {
+        policy: { ...basePolicy, preference: ["akash1provider1"] },
+        chosenProviders: new Set(),
+        avoidProviders: new Set(["akash1provider1"]),
+        providers: fakeProviders(),
+      },
+    );
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
+    expect(decision.rejected).toEqual([
+      { provider: "akash1provider1", reason: "on the avoid list" },
+    ]);
+  });
+
   it("preference list beats price", () => {
     const decision = selectProvider(
       [bid("akash1provider1", "100"), bid("akash1provider4", "900")],

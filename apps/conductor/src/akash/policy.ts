@@ -55,6 +55,11 @@ export interface PolicyContext {
   policy: LaunchSpec["providers"]["policy"];
   /** Providers already chosen this launch (anti-affinity, §6.1). */
   chosenProviders: ReadonlySet<string>;
+  /**
+   * Hard exclusions regardless of anti-affinity mode: the wallet-wide avoid
+   * list, plus the provider a relaunch is moving off of.
+   */
+  avoidProviders?: ReadonlySet<string>;
   /** Persistent storage class the deployment needs, if any. */
   requiredStorageClass?: string | undefined;
   providers: Map<string, ProviderInfo>;
@@ -85,6 +90,7 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
     };
 
     if (!info) return reject("unknown provider (not in Console API list)");
+    if (ctx.avoidProviders?.has(provider)) return reject("on the avoid list");
     if (ctx.policy.auditedOnly && !info.isAudited) return reject("not audited");
     if (info.uptime7d < ctx.policy.minUptime7d) {
       return reject(`uptime ${info.uptime7d} below floor ${ctx.policy.minUptime7d}`);

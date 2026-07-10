@@ -12,6 +12,11 @@
  * Relaunches move an existing deployment (often forced by a dead provider),
  * so they are NOT charged.
  *
+ * Fees are computed in the pricing denom but SENT in a transferable one:
+ * mainnet prices in uact, and ACT credits cannot be bank-sent (the chain
+ * disables uact transfers — credits are mint-and-spend only), so uact fee
+ * amounts convert to uakt at the chain oracle's AKT/USD price (see feeCoin).
+ *
  * The launcher is open source, so every knob is env-overridable — a fork can
  * change or disable any fee, and being upfront costs nothing.
  */
@@ -57,4 +62,27 @@ export const BLOCKS_PER_MONTH = (30.437 * 24 * 60 * 60) / 6.098;
 export function launchFeeAmount(perBlockPrices: string[], bps: number): string {
   const perBlock = perBlockPrices.reduce((sum, p) => sum + Number(p), 0);
   return bpsAmount(perBlock * BLOCKS_PER_MONTH, bps);
+}
+
+/** uact (USD-pegged micro-credits) → uakt at the oracle AKT/USD price (round up). */
+export function uactToUakt(uact: string | number, aktUsd: number): string {
+  return String(Math.ceil(Number(uact) / aktUsd));
+}
+
+/**
+ * The coin a service fee is actually sent as. Fees are computed in the
+ * pricing denom, but on mainnet that is uact — ACT credits are mint-and-spend
+ * only (bank sends disabled), so a uact fee converts to uakt at the chain
+ * oracle's AKT/USD price. undefined = price unavailable; fees are best-effort
+ * and must never block the op that carries them, so callers skip the send.
+ */
+export async function feeCoin(
+  pricingDenom: string,
+  amount: string,
+  api: { aktUsdPrice(): Promise<number | undefined> },
+): Promise<{ denom: string; amount: string } | undefined> {
+  if (pricingDenom !== "uact") return { denom: pricingDenom, amount };
+  const price = await api.aktUsdPrice().catch(() => undefined);
+  if (!price) return undefined;
+  return { denom: "uakt", amount: uactToUakt(amount, price) };
 }

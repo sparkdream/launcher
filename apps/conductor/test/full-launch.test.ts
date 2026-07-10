@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
-import { launchDirs, runWithSigner } from "../src/engine.js";
+import { launchDirs, runLaunch, runWithSigner } from "../src/engine.js";
 import { BLOCKS_PER_MONTH } from "../src/fee.js";
 import { allSteps } from "../src/index.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
@@ -72,6 +72,138 @@ describe("stale-order recovery", () => {
     const headscale = db.stepOutput<any>("stale", "deploy-headscale")!;
     expect(String((closes[0]!.value as any).id.dseq)).not.toBe(headscale.dseq);
   }, 120_000);
+
+  it("recovers create-leases when node bids expire while awaiting the signature", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    db.createLaunch("stalebids", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const api = services.api as any;
+    const signer = new FakeSigner();
+
+    // drive like runWithSigner, but the FIRST time the create-leases
+    // signature comes up, expire every node bid instead of signing —
+    // simulates a launch that sat paused past the bid TTL ("bid not open")
+    let expired = false;
+    let staleDseqs: string[] = [];
+    let resumesAfterExpiry = 0;
+    let result;
+    for (;;) {
+      result = await runLaunch(db, "stalebids", s, work, allSteps(), services);
+      if (result.status === "awaiting-signature") {
+        const pending = db.nextPendingTx("stalebids")!;
+        if (!expired && pending.step === "create-leases") {
+          expired = true;
+          const plan = db.stepOutput<any>("stalebids", "create-deployments")!;
+          staleDseqs = Object.values(plan.perNode).map((p: any) => String(p.dseq));
+          for (const dseq of staleDseqs) api.expiredBidDseqs.add(dseq);
+          continue; // re-drive: the step re-checks bid freshness first
+        }
+        const txHash = await signer.sign(JSON.parse(pending.msgs_json));
+        db.setPendingTxSigned("stalebids", pending.step, txHash);
+        continue;
+      }
+      if (result.status === "paused") {
+        const step = db.listSteps("stalebids").find((x) => x.status === "error");
+        if (step?.error?.includes("expired") && resumesAfterExpiry++ === 0) continue;
+        throw new Error(`ended paused at ${step?.name}: ${step?.error}`);
+      }
+      break;
+    }
+    expect(result.status).toBe("completed");
+
+    // the stale node deployments were closed in one batch (escrow refund)…
+    const closes = signer.signed
+      .flat()
+      .filter((m) => m.typeUrl.includes("MsgCloseDeployment"))
+      .map((m) => String((m.value as any).id.dseq));
+    expect(closes.sort()).toEqual([...staleDseqs].sort());
+
+    // …and the leases landed on fresh dseqs from the redeployed batch
+    const leased = signer.signed
+      .flat()
+      .filter((m) => m.typeUrl.includes("MsgCreateLease"))
+      .map((m) => String((m.value as any).bidId.dseq));
+    for (const dseq of staleDseqs) expect(leased).not.toContain(dseq);
+  }, 120_000);
+
+  it("drops the recovery close when a shutdown already closed the deployments", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    db.createLaunch("raced", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const api = services.api as any;
+    const signer = new FakeSigner();
+
+    // bids expire at the lease prompt; then, instead of signing the
+    // recovery's close tx, the deployments get closed out-of-band (the
+    // user's fleet shutdown racing the recovery) — the close row must be
+    // dropped, not offered as a tx the chain rejects ("Deployment closed")
+    let expired = false;
+    let closedOutOfBand = false;
+    let staleDseqs: string[] = [];
+    let resumesAfterExpiry = 0;
+    let result;
+    for (;;) {
+      result = await runLaunch(db, "raced", s, work, allSteps(), services);
+      if (result.status === "awaiting-signature") {
+        const pending = db.nextPendingTx("raced")!;
+        if (!expired && pending.step === "create-leases") {
+          expired = true;
+          const plan = db.stepOutput<any>("raced", "create-deployments")!;
+          staleDseqs = Object.values(plan.perNode).map((p: any) => String(p.dseq));
+          for (const dseq of staleDseqs) api.expiredBidDseqs.add(dseq);
+          continue;
+        }
+        if (!closedOutOfBand && pending.step.startsWith("create-leases:close:")) {
+          closedOutOfBand = true;
+          for (const dseq of staleDseqs) api.leaseStates.set(dseq, "closed");
+          continue; // don't sign — re-drive; recovery must retract the close
+        }
+        const txHash = await signer.sign(JSON.parse(pending.msgs_json));
+        db.setPendingTxSigned("raced", pending.step, txHash);
+        continue;
+      }
+      if (result.status === "paused") {
+        const step = db.listSteps("raced").find((x) => x.status === "error");
+        if (step?.error?.includes("expired") && resumesAfterExpiry++ === 0) continue;
+        throw new Error(`ended paused at ${step?.name}: ${step?.error}`);
+      }
+      break;
+    }
+    expect(result.status).toBe("completed");
+
+    // no close was ever signed for the already-closed deployments…
+    const closes = signer.signed
+      .flat()
+      .filter((m) => m.typeUrl.includes("MsgCloseDeployment"))
+      .map((m) => String((m.value as any).id.dseq));
+    expect(closes).toEqual([]);
+
+    // …the orphaned close row is gone, and the leases are on fresh dseqs
+    expect(db.nextPendingTx("raced")).toBeUndefined();
+    const leased = signer.signed
+      .flat()
+      .filter((m) => m.typeUrl.includes("MsgCreateLease"))
+      .map((m) => String((m.value as any).bidId.dseq));
+    for (const dseq of staleDseqs) expect(leased).not.toContain(dseq);
+  }, 120_000);
 });
 
 describe("full launch, simulated (2×2 softsign testnet)", () => {
@@ -97,14 +229,16 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     expect(signer.signed[5]!.every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
 
     // launch fee: 10% of the leased monthly rate, sent with the leases —
-    // fake bids: headscale 100 + nodes 110/120/130/140 = 600 uact/block
+    // fake bids: headscale 100 + nodes 110/120/130/140 = 600 uact/block.
+    // uact bank sends are disabled, so the fee goes out in uakt at the fake
+    // oracle price ($0.50 → 2× the uact amount).
     const feeMsg = signer.signed[4]!.at(-1)!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     expect((feeMsg.value as any).to_address).toBe(
       "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w",
     );
     expect((feeMsg.value as any).amount).toEqual([
-      { denom: "uact", amount: String(Math.ceil(600 * BLOCKS_PER_MONTH * 0.1)) },
+      { denom: "uakt", amount: String(Math.ceil(600 * BLOCKS_PER_MONTH * 0.1) * 2) },
     ]);
 
     // Manifests: headscale + 4 nodes + 4 re-PUTs from persist-start

@@ -6,13 +6,14 @@ import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
-import { bpsAmount, feeConfig } from "./fee.js";
+import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
 import { restartNode, rpcUrl } from "./node-ops.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
+import type { RetargetParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -93,6 +94,17 @@ export class FleetService {
     const ssh = this.db.stepOutput<SshEndpoints>(launchId, "send-manifests");
     const mesh = this.db.stepOutput<{ ips: Record<string, string> }>(launchId, "await-mesh");
     if (hs) {
+      // adopt a redeployed headscale the same way as the node batch below
+      const hsRow = this.db.listFleetComponents(launchId).find((c) => c.key === "headscale");
+      if (hsRow && hsRow.generation === 0 && hsRow.dseq !== hs.dseq) {
+        this.db.updateComponentPlacement(launchId, "headscale", {
+          dseq: hs.dseq,
+          provider: hs.provider,
+          host_uri: hs.hostUri,
+          price: hs.price,
+          generation: 0,
+        });
+      }
       this.db.upsertFleetComponent({
         launch_id: launchId,
         key: "headscale",
@@ -118,9 +130,28 @@ export class FleetService {
       const componentImages = new Map<string, string>(
         spec ? statelessComponents(spec).map((c) => [c.key, c.image]) : [],
       );
+      const existing = new Map(
+        this.db.listFleetComponents(launchId).map((c) => [c.key, c]),
+      );
       for (const [key, entry] of Object.entries(plan.perNode)) {
         const a = assignments.perNode[key];
         if (!a) continue;
+        // stale-bid recovery redeploys the whole node batch inside the
+        // launch: the step outputs then carry NEW dseqs while the rows hold
+        // the closed old generation (upsert is DO NOTHING). Adopt the new
+        // identity — but only for generation-0 rows, so a relaunch op's
+        // placement (row ahead of the outputs, generation ≥ 1) is never
+        // clobbered.
+        const row = existing.get(key);
+        if (row && row.generation === 0 && row.dseq !== entry.dseq) {
+          this.db.updateComponentPlacement(launchId, key, {
+            dseq: entry.dseq,
+            provider: a.provider,
+            host_uri: a.hostUri,
+            price: a.price,
+            generation: 0,
+          });
+        }
         this.db.upsertFleetComponent({
           launch_id: launchId,
           key,
@@ -435,6 +466,12 @@ export class FleetService {
    */
   async requestShutdown(launch: LaunchRow): Promise<{ step: string; closing: string[] }> {
     this.materialize(launch.id);
+    // shutting down abandons whatever the launch was waiting on — drop any
+    // unsigned engine tx (e.g. create-leases with expired bids) so it can't
+    // shadow the closes in the oldest-first signing queue. Do this even when
+    // nothing is left to close: a wedged queue is exactly why a user reaches
+    // for shutdown on an already-dead launch.
+    this.db.clearUnsignedPendingTxs(launch.id);
     const components = this.db
       .listFleetComponents(launch.id)
       .filter((c) => c.state !== "closed");
@@ -445,15 +482,75 @@ export class FleetService {
       if (!info || info.state === "active") closing.push(c);
       else this.db.setComponentState(launch.id, c.key, "closed");
     }
-    if (closing.length === 0) throw new Error("nothing to shut down — all deployments are closed");
+    if (closing.length === 0) {
+      // still useful on an already-closed fleet: end an in-flight launch
+      // that was shut down before this reconciliation existed
+      if (launch.status !== "completed") this.db.setLaunchStatus(launch.id, "aborted");
+      throw new Error("nothing to shut down — all deployments are closed");
+    }
     const step = "fleet:shutdown";
-    this.db.deletePendingTx(launch.id, step); // re-request replaces a stale one
+    this.db.deletePendingTx(launch.id, step); // re-request replaces a signed-but-stale one
     this.db.enqueuePendingTx(
       launch.id,
       step,
       JSON.stringify(closing.map((c) => closeDeploymentMsg(launch.owner, c.dseq))),
     );
     return { step, closing: closing.map((c) => c.key) };
+  }
+
+  /**
+   * Permanently delete a shut-down launch: every db record plus the work
+   * directory (rendered SDLs, step outputs, SECRETS — mnemonics, tmkms keys,
+   * the age identity). Refused while any deployment might still be open.
+   * The fleet bundle export is the archival path; deletion is for launches
+   * the user is done with.
+   */
+  async deleteLaunch(launch: LaunchRow): Promise<void> {
+    this.materialize(launch.id);
+    for (const c of this.db.listFleetComponents(launch.id)) {
+      if (c.state === "closed") continue;
+      const info = await this.services.api
+        .deploymentInfo(launch.owner, c.dseq)
+        .catch(() => undefined);
+      if (!info) {
+        throw new Error(`cannot verify ${c.key} (dseq ${c.dseq}) on-chain — not deleting`);
+      }
+      if (info.state === "active") {
+        throw new Error(`${c.key} is still active on-chain — shut down the fleet first`);
+      }
+      this.db.setComponentState(launch.id, c.key, "closed");
+    }
+    this.db.deleteLaunch(launch.id);
+    fs.rmSync(launchDirs(this.workRoot, launch.id).root, { recursive: true, force: true });
+  }
+
+  private mnemonics(launch: LaunchRow): Record<string, string> {
+    const file = path.join(launchDirs(this.workRoot, launch.id).secrets, "mnemonics.json");
+    if (!fs.existsSync(file)) return {};
+    return JSON.parse(readSecretFile(file));
+  }
+
+  /** Named accounts from generate-keys: addresses openly, mnemonics flagged
+   *  only — reveal goes through mnemonic() so seeds never ride list calls. */
+  accounts(launch: LaunchRow): Array<{ name: string; address: string; hasMnemonic: boolean }> {
+    const keys = this.db.stepOutput<{ accounts: Record<string, string> }>(
+      launch.id,
+      "generate-keys",
+    );
+    if (!keys) throw new Error("launch has no generated keys yet");
+    const mnemonics = this.mnemonics(launch);
+    return Object.entries(keys.accounts).map(([name, address]) => ({
+      name,
+      address,
+      hasMnemonic: name in mnemonics,
+    }));
+  }
+
+  mnemonic(launch: LaunchRow, name: string): string {
+    const m = this.mnemonics(launch)[name];
+    // external operators (§3) are addresses only — their keys never exist here
+    if (!m) throw new Error(`no mnemonic stored for ${name}`);
+    return m;
   }
 
   /** The rendered SDL a component was deployed with (paste into console). */
@@ -500,6 +597,12 @@ export class FleetService {
       if (action === "shutdown") {
         for (const c of this.db.listFleetComponents(launchId)) {
           if (c.state !== "closed") this.db.setComponentState(launchId, c.key, "closed");
+        }
+        // shutting down an in-flight launch ends it — otherwise it lingers
+        // "paused" on whatever step it died at, error banner and all
+        const launch = this.db.getLaunch(launchId);
+        if (launch && launch.status !== "completed") {
+          this.db.setLaunchStatus(launchId, "aborted");
         }
       }
     }
@@ -556,7 +659,11 @@ export class FleetService {
 
   /** Escrow top-up: unsigned deposit into the launch's signing loop, plus
    *  the top-up service fee batched into the same tx (§ fee.ts). */
-  requestTopUp(launch: LaunchRow, component: FleetComponentRow, amount: string): { step: string } {
+  async requestTopUp(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    amount: string,
+  ): Promise<{ step: string }> {
     const step = `fleet:topup:${component.dseq}`;
     // the deposit must match the escrow's denom — same per-network mapping
     // the SDLs were rendered with
@@ -564,7 +671,8 @@ export class FleetService {
     const msgs = [accountDepositMsg(launch.owner, component.dseq, { denom, amount })];
     const fee = feeConfig();
     if (fee.topupBps > 0) {
-      msgs.push(sendMsg(launch.owner, fee.address, { denom, amount: bpsAmount(amount, fee.topupBps) }));
+      const coin = await feeCoin(denom, bpsAmount(amount, fee.topupBps), this.services.api);
+      if (coin) msgs.push(sendMsg(launch.owner, fee.address, coin));
     }
     this.db.enqueuePendingTx(launch.id, step, JSON.stringify(msgs));
     return { step };
@@ -651,6 +759,87 @@ export class FleetService {
 
   requestUpgrade(launch: LaunchRow, components: string[], image: string): number {
     return this.db.createFleetOp(launch.id, "upgrade", { components, image });
+  }
+
+  /**
+   * Change component domains / public endpoints after launch: update the
+   * stored spec (health checks + relaunches follow it), then a retarget op
+   * re-renders the affected SDLs and pushes MsgUpdateDeployment + manifests.
+   */
+  requestDomainUpdate(
+    launch: LaunchRow,
+    changes: {
+      explorer?: string;
+      frontend?: string;
+      api?: string;
+      rpc?: string;
+      /** ping-pub route path under the explorer domain (EXPLORER_URL env). */
+      explorerRoute?: string;
+    },
+  ): number {
+    const spec = this.spec(launch);
+    if (this.db.listFleetOps(launch.id, "active").some((o) => o.kind === "retarget")) {
+      throw new Error("a domain update is already in progress — finish or abort it first");
+    }
+    const hostname = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+    const { explorerRoute, ...domains } = changes;
+    for (const [field, value] of Object.entries(domains)) {
+      if (value !== undefined && !hostname.test(value)) {
+        throw new Error(`${field}: "${value}" is not a valid domain name`);
+      }
+    }
+    const comps = spec.topology.components;
+    const affected = new Set<string>();
+    if (changes.explorer) {
+      if (!comps.explorer.enabled) throw new Error("explorer is not enabled in this launch");
+      comps.explorer.domain = changes.explorer;
+      affected.add("explorer");
+      if (comps.frontend.enabled) affected.add("frontend"); // EXPLORER_URL env
+    }
+    if (explorerRoute) {
+      if (!/^[a-z0-9-]+$/i.test(explorerRoute)) {
+        throw new Error(`explorerRoute: "${explorerRoute}" is not a valid path segment`);
+      }
+      if (!comps.explorer.enabled) throw new Error("explorer is not enabled in this launch");
+      comps.explorer.route = explorerRoute;
+      // only the frontend's EXPLORER_URL env carries the route — the
+      // explorer itself serves whatever its baked config names
+      if (comps.frontend.enabled) affected.add("frontend");
+    }
+    if (changes.frontend) {
+      if (!comps.frontend.enabled) throw new Error("frontend is not enabled in this launch");
+      comps.frontend.domain = changes.frontend;
+      affected.add("frontend");
+    }
+    if (changes.api || changes.rpc) {
+      const pub = spec.topology.publicEndpoints;
+      if (changes.api && !pub?.api) {
+        // the 1317 expose only exists when api was set at launch; adding one
+        // now would add a group endpoint, which MsgUpdateDeployment can't do
+        throw new Error(
+          "the public api endpoint was not part of this launch — sentry-0 has no LCD ingress to retarget; relaunch sentry-0 (or launch anew) to add one",
+        );
+      }
+      spec.topology.publicEndpoints = {
+        ...(pub ?? {}),
+        ...(changes.api ? { api: changes.api } : {}),
+        ...(changes.rpc ? { rpc: changes.rpc } : {}),
+      } as typeof pub;
+      affected.add("sentry-0");
+      if (comps.frontend.enabled) affected.add("frontend"); // LCD/RPC_ENDPOINT env
+    }
+    if (affected.size === 0) throw new Error("no domain changes given");
+    const components = this.db.listFleetComponents(launch.id);
+    for (const key of affected) {
+      const row = components.find((c) => c.key === key);
+      if (!row || row.state === "closed") {
+        throw new Error(`${key} is not active — cannot retarget its deployment`);
+      }
+    }
+    this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    return this.db.createFleetOp(launch.id, "retarget", {
+      components: [...affected].sort(),
+    } satisfies RetargetParams);
   }
 
   /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */

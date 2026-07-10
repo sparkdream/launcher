@@ -235,7 +235,8 @@ describe("rolling upgrade op", () => {
     expect(upgradeTxs.every((msgs) => msgs[0]!.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
     const feeMsg = upgradeTxs[0]![1]!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
-    expect((feeMsg.value as any).amount).toEqual([{ denom: "uact", amount: "2000000" }]);
+    // 2 ACT at the fake $0.50 oracle price → 4 AKT (uact sends are disabled)
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "4000000" }]);
     // manifests re-PUT per component
     expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
     // SDLs carry the new image; components record it
@@ -263,13 +264,14 @@ describe("component upgrade", () => {
     const upgradeTxs = w.signer.signed.slice(sigsBefore);
     expect(upgradeTxs).toHaveLength(1);
     expect(upgradeTxs[0]![0]!.typeUrl.includes("MsgUpdateDeployment")).toBe(true);
-    // upgrade service fee: flat 2 ACT batched into this op's (first) update tx
+    // upgrade service fee: flat 2 ACT batched into this op's (first) update
+    // tx, paid as 4 AKT at the fake $0.50 oracle price
     const feeMsg = upgradeTxs[0]!.at(-1)!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     expect((feeMsg.value as any).to_address).toBe(
       "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w",
     );
-    expect((feeMsg.value as any).amount).toEqual([{ denom: "uact", amount: "2000000" }]);
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "4000000" }]);
     const explorer = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
     expect(explorer.image).toBe(image);
     const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "explorer.yaml"), "utf8");
@@ -280,21 +282,139 @@ describe("component upgrade", () => {
   }, 120_000);
 });
 
+describe("domain retarget", () => {
+  it("re-points the explorer domain: spec, SDL accept, frontend env, one update tx", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sigsBefore = w.signer.signed.length;
+    const manifestsBefore = w.services.provider.manifests.length;
+
+    w.fleet.requestDomainUpdate(launch, { explorer: "explorer-devnet.sparkdream.io" });
+
+    // the stored spec follows immediately (health checks read it)
+    const stored = JSON.parse(w.db.getLaunch("fl")!.spec_json);
+    expect(stored.topology.components.explorer.domain).toBe("explorer-devnet.sparkdream.io");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // one batched tx: explorer + frontend (EXPLORER_URL env) updates, no fee
+    const retargetTxs = w.signer.signed.slice(sigsBefore);
+    expect(retargetTxs).toHaveLength(1);
+    expect(retargetTxs[0]!).toHaveLength(2);
+    expect(retargetTxs[0]!.every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+    expect(w.services.provider.manifests.length - manifestsBefore).toBe(2);
+
+    // SDLs carry the new domain
+    const explorerSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "explorer.yaml"), "utf8");
+    expect(explorerSdl).toContain("explorer-devnet.sparkdream.io");
+    expect(explorerSdl).not.toContain("explorer.sparkdream.io\n");
+    const frontendSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "frontend.yaml"), "utf8");
+    expect(frontendSdl).toContain("EXPLORER_URL=https://explorer-devnet.sparkdream.io/sparkdream");
+    // the frontend's own accept domain is untouched
+    expect(frontendSdl).toContain("app.sparkdream.io");
+
+    expect(w.db.listFleetOps("fl").at(-1)!.status).toBe("done");
+  }, 120_000);
+
+  it("re-points public api/rpc: sentry-0 accepts + frontend endpoint env", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestDomainUpdate(launch, {
+      api: "api-devnet.sparkdream.io",
+      rpc: "rpc-devnet.sparkdream.io",
+    });
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const sentrySdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "sentry-0.yaml"), "utf8");
+    expect(sentrySdl).toContain("api-devnet.sparkdream.io");
+    expect(sentrySdl).toContain("rpc-devnet.sparkdream.io");
+    const frontendSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "frontend.yaml"), "utf8");
+    expect(frontendSdl).toContain("LCD_ENDPOINT=https://api-devnet.sparkdream.io");
+    expect(frontendSdl).toContain("RPC_ENDPOINT=https://rpc-devnet.sparkdream.io");
+  }, 120_000);
+
+  it("re-points the explorer route: frontend-only env update", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sigsBefore = w.signer.signed.length;
+
+    // devnet chains run the stock chain's explorer image, whose ping-pub
+    // route is the baked chain name, not network.name
+    w.fleet.requestDomainUpdate(launch, { explorerRoute: "sparkdream-main" });
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // only the frontend deployment updates
+    const txs = w.signer.signed.slice(sigsBefore);
+    expect(txs).toHaveLength(1);
+    expect(txs[0]!).toHaveLength(1);
+    const frontendSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "frontend.yaml"), "utf8");
+    expect(frontendSdl).toContain("EXPLORER_URL=https://explorer.sparkdream.io/sparkdream-main");
+    const stored = JSON.parse(w.db.getLaunch("fl")!.spec_json);
+    expect(stored.topology.components.explorer.route).toBe("sparkdream-main");
+  }, 120_000);
+
+  it("rejects adding a public api endpoint the launch never had", async () => {
+    const w = await launched(); // spec2x2: no publicEndpoints
+    const launch = w.db.getLaunch("fl")!;
+    expect(() => w.fleet.requestDomainUpdate(launch, { api: "api.sparkdream.io" })).toThrow(
+      /was not part of this launch/,
+    );
+  }, 120_000);
+});
+
+describe("accounts view", () => {
+  it("lists generated accounts with addresses, reveals mnemonics per name", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const accounts = w.fleet.accounts(launch);
+    expect(accounts.length).toBeGreaterThan(0);
+    for (const a of accounts) expect(a.address).toMatch(/^sprkdrm1/);
+    // the list carries no seeds, only the flag
+    expect(accounts.some((a) => "mnemonic" in a)).toBe(false);
+    const generated = accounts.filter((a) => a.hasMnemonic);
+    expect(generated.length).toBeGreaterThan(0);
+    const m = w.fleet.mnemonic(launch, generated[0]!.name);
+    expect(m.trim().split(/\s+/).length).toBeGreaterThanOrEqual(12);
+    expect(() => w.fleet.mnemonic(launch, "no-such-account")).toThrow(/no mnemonic/);
+  }, 120_000);
+});
+
+describe("delete launch", () => {
+  it("refuses while deployments are open, then purges records and secrets", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    await expect(w.fleet.deleteLaunch(launch)).rejects.toThrow(/still active/);
+
+    // shut down on-chain, then delete
+    for (const c of w.db.listFleetComponents("fl")) {
+      w.services.api.leaseStates.set(c.dseq, "closed");
+    }
+    await w.fleet.deleteLaunch(launch);
+    expect(w.db.getLaunch("fl")).toBeUndefined();
+    expect(w.db.listFleetComponents("fl")).toHaveLength(0);
+    expect(fs.existsSync(path.join(w.work, "launches/fl"))).toBe(false);
+  }, 120_000);
+});
+
 describe("top-up", () => {
   it("enqueues an encodable deposit plus the 0.5% fee into the signing loop", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
     const component = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
-    const { step } = w.fleet.requestTopUp(launch, component, "2500000");
+    const { step } = await w.fleet.requestTopUp(launch, component, "2500000");
     const pending = w.db.getPendingTx("fl", step)!;
     const msgs = JSON.parse(pending.msgs_json);
     expect(msgs[0].typeUrl).toBe("/akash.escrow.v1.MsgAccountDeposit");
     // the browser/CLI signer can actually encode it
     const encodeObject = toEncodeObject(msgs[0]);
     expect(encodeObject.value.deposit.amount).toEqual({ denom: "uact", amount: "2500000" });
-    // top-up fee: 0.5% of 2,500,000 = 12,500, sent with the deposit
+    // top-up fee: 0.5% of 2,500,000 = 12,500 uact, sent with the deposit as
+    // 25,000 uakt at the fake $0.50 oracle price (uact sends are disabled)
     expect(msgs[1].typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     expect(msgs[1].value.to_address).toBe("akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w");
-    expect(msgs[1].value.amount).toEqual([{ denom: "uact", amount: "12500" }]);
+    expect(msgs[1].value.amount).toEqual([{ denom: "uakt", amount: "25000" }]);
   }, 120_000);
 });
