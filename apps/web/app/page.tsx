@@ -75,7 +75,8 @@ topology:
   validators: { count: 1 }
   sentries: { count: 1 }
   components:
-    explorer: { enabled: false, domain: explorer.example.com }
+    # route: the ping-pub path baked into the image, when it differs from network.name
+    explorer: { enabled: false, domain: explorer.example.com, route: sparkdream }
     frontend: { enabled: false, domain: app.example.com }
     hub: { enabled: false }
   # required when frontend is enabled — sentry-0 serves these domains:
