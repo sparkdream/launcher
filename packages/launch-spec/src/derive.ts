@@ -68,3 +68,42 @@ export function nodes(spec: LaunchSpec): NodeRef[] {
   }
   return out;
 }
+
+export type ComponentKey = "explorer" | "frontend";
+
+export interface ComponentRef {
+  key: ComponentKey;
+  domain: string;
+  image: string;
+  /** Joins the headscale mesh (needs a preauth key + tunnel wiring). */
+  mesh: boolean;
+}
+
+/**
+ * Enabled stateless components (§5 "Component relaunch & close"): the
+ * explorer joins the mesh and tunnels to sentry-0's LCD/RPC; the frontend
+ * is env-configured only and talks to the public endpoints. Both are
+ * deployed in the Phase D batch alongside the nodes.
+ */
+export function statelessComponents(spec: LaunchSpec): ComponentRef[] {
+  const out: ComponentRef[] = [];
+  for (const [key, mesh] of [["explorer", true], ["frontend", false]] as const) {
+    const toggle = spec.topology.components[key];
+    if (!toggle.enabled) continue;
+    const image = spec.images[key];
+    if (!toggle.domain || !image) {
+      throw new Error(`${key} enabled but domain or image missing — validate-spec should have caught this`);
+    }
+    out.push({ key, domain: toggle.domain, image, mesh });
+  }
+  return out;
+}
+
+/** True when some enabled workload consumes the sentries' LCD (1317). */
+export function lcdRequired(spec: LaunchSpec): boolean {
+  return (
+    spec.topology.components.explorer.enabled ||
+    spec.topology.components.frontend.enabled ||
+    Boolean(spec.topology.publicEndpoints?.api)
+  );
+}

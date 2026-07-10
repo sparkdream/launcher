@@ -17,7 +17,7 @@ export interface Profile {
     escrow: { targetRunwayDays: number };
   };
   chainParams: Record<string, Record<string, unknown>>;
-  images: { sparkdreamd: string; headscale: string };
+  images: { sparkdreamd: string; headscale: string; explorer: string; frontend: string };
   security: { keyMode: "softsign" | "tmkms" };
   infra: {
     akashNetwork: "mainnet" | "sandbox";
@@ -42,6 +42,8 @@ interface RoleResources {
 
 const SPARKDREAMD_VERSION = "v1.0.24";
 const HEADSCALE_IMAGE = "sparkdreamnft/headscale:v0.28.0";
+const EXPLORER_IMAGE = "sparkdreamnft/sparkdream-explorer:v1.0.5";
+const FRONTEND_IMAGE = "sparkdreamnft/sparkdream-ui:v1.0.48";
 
 const nodeResources = {
   validator: {
@@ -96,6 +98,8 @@ export const profiles: Record<NetworkType, Profile> = {
     images: {
       sparkdreamd: `sparkdreamnft/sparkdreamd-devnet-ssh:${SPARKDREAMD_VERSION}`,
       headscale: HEADSCALE_IMAGE,
+      explorer: EXPLORER_IMAGE,
+      frontend: FRONTEND_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -131,6 +135,8 @@ export const profiles: Record<NetworkType, Profile> = {
     images: {
       sparkdreamd: `sparkdreamnft/sparkdreamd-testnet-ssh:${SPARKDREAMD_VERSION}`,
       headscale: HEADSCALE_IMAGE,
+      explorer: EXPLORER_IMAGE,
+      frontend: FRONTEND_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -164,6 +170,8 @@ export const profiles: Record<NetworkType, Profile> = {
     images: {
       sparkdreamd: `sparkdreamnft/sparkdreamd-mainnet-ssh:${SPARKDREAMD_VERSION}`,
       headscale: HEADSCALE_IMAGE,
+      explorer: EXPLORER_IMAGE,
+      frontend: FRONTEND_IMAGE,
     },
     security: { keyMode: "tmkms" },
     infra: {

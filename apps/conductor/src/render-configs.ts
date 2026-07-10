@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   chainId,
+  lcdRequired,
   tunnelPort,
   type LaunchSpec,
   type NodeRef,
@@ -33,6 +34,15 @@ function setTomlLine(content: string, key: string, rendered: string): string {
   const re = new RegExp(`^${key} = .*$`, "m");
   if (!re.test(content)) throw new Error(`expected "${key} = ..." line in template`);
   return content.replace(re, rendered);
+}
+
+/** Replace an exact string, asserting it appears exactly once. */
+function replaceOnce(content: string, from: string, to: string): string {
+  const first = content.indexOf(from);
+  if (first < 0 || content.includes(from, first + from.length)) {
+    throw new Error(`expected exactly one "${from}" in template`);
+  }
+  return content.replace(from, to);
 }
 
 /**
@@ -105,6 +115,17 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
   // not treated as keep-template.
   if (role === "sentry") {
     app = setTomlLine(app, "pruning", `pruning = "${spec.infra.sentrySettings.pruning}"`);
+    // The template ships the LCD off and bound to localhost. The explorer
+    // (tailnet tunnel to 1317) and the public api domain (ingress → pod
+    // 1317) both need it on and reachable from outside the container.
+    if (lcdRequired(spec)) {
+      app = replaceOnce(app, "enable = false", "enable = true");
+      app = replaceOnce(
+        app,
+        'address = "tcp://localhost:1317"',
+        'address = "tcp://0.0.0.0:1317"',
+      );
+    }
   }
   fs.writeFileSync(path.join(configDir, "app.toml"), app);
 

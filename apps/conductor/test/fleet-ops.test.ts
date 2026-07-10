@@ -37,6 +37,23 @@ function spec2x2(): LaunchSpec {
   });
 }
 
+function specWithComponents(): LaunchSpec {
+  return testnetSpec({
+    network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    topology: {
+      validators: { count: 1 },
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: true, domain: "explorer.sparkdream.io" },
+        frontend: { enabled: true, domain: "app.sparkdream.io" },
+        hub: { enabled: false },
+      },
+      publicEndpoints: { api: "api.sparkdream.io", rpc: "rpc.sparkdream.io" },
+      headscale: { domain: "headscale.sparkdream.io" },
+    },
+  });
+}
+
 interface World {
   work: string;
   db: ConductorDb;
@@ -46,10 +63,9 @@ interface World {
   signer: FakeSigner;
 }
 
-async function launched(): Promise<World> {
+async function launched(s: LaunchSpec = spec2x2()): Promise<World> {
   const work = tmp();
   const db = new ConductorDb(path.join(work, "state.db"));
-  const s = spec2x2();
   const services = fakeServices();
   const signer = new FakeSigner();
   db.createLaunch("fl", JSON.stringify(s), "akash1owner");
@@ -124,6 +140,74 @@ describe("relaunch op", () => {
   }, 120_000);
 });
 
+describe("stateless component relaunch", () => {
+  it("relaunches the explorer without rewiring or start guards", async () => {
+    const w = await launched(specWithComponents());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    const startsBefore = w.services.ssh.started.size;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+    expect(after.provider).not.toBe(before.provider);
+    // no chain-node work: nothing uploaded or started, no double-sign wait
+    expect(w.services.ssh.started.size).toBe(startsBefore);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("relaunches the frontend (no sshd, no preauth key)", async () => {
+    const w = await launched(specWithComponents());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!;
+    expect(before.ssh_host).toBeNull(); // never had an SSH endpoint
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    const mintsBefore = w.services.provider.shellLog.filter((e) =>
+      e.script.includes("preauthkeys create"),
+    ).length;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+    expect(after.ssh_host).toBeNull();
+    // no mesh membership → no preauth key was minted for the relaunch
+    const mintsAfter = w.services.provider.shellLog.filter((e) =>
+      e.script.includes("preauthkeys create"),
+    ).length;
+    expect(mintsAfter).toBe(mintsBefore);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("pauses with a DNS pointer when the relaunched component stays dark", async () => {
+    const w = await launched(specWithComponents());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    w.services.rpc.darkUrls.add("explorer.sparkdream.io");
+
+    const paused = await driveOps(w);
+    expect(paused.status).toBe("awaiting-user");
+    expect(paused.reason).toContain("CNAME");
+    expect(paused.reason).toContain("explorer.sparkdream.io");
+
+    w.services.rpc.darkUrls.clear();
+    const done = await driveOps(w);
+    expect(done.status).toBe("completed");
+  }, 120_000);
+});
+
 describe("rolling upgrade op", () => {
   it("upgrades sentries before validators, one MsgUpdateDeployment each", async () => {
     const w = await launched();
@@ -143,11 +227,15 @@ describe("rolling upgrade op", () => {
     const result = await driveOps(w);
     expect(result.status).toBe("completed");
 
-    // 4 components → 4 single-msg update txs, in sentry-then-validator order
+    // 4 components → 4 update txs, in sentry-then-validator order. The op's
+    // flat fee rides the FIRST tx only, so it has 2 msgs, the rest 1.
     const upgradeTxs = w.signer.signed.slice(sigsBefore);
     expect(upgradeTxs).toHaveLength(4);
-    expect(upgradeTxs.every((msgs) => msgs.length === 1)).toBe(true);
+    expect(upgradeTxs.map((msgs) => msgs.length)).toEqual([2, 1, 1, 1]);
     expect(upgradeTxs.every((msgs) => msgs[0]!.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+    const feeMsg = upgradeTxs[0]![1]!;
+    expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uact", amount: "2000000" }]);
     // manifests re-PUT per component
     expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
     // SDLs carry the new image; components record it
@@ -160,8 +248,40 @@ describe("rolling upgrade op", () => {
   }, 120_000);
 });
 
+describe("component upgrade", () => {
+  it("swaps the explorer image with an HTTP health gate, no SSH probing", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdream-explorer:v1.0.6";
+    w.fleet.requestUpgrade(launch, ["explorer"], image);
+    const sigsBefore = w.signer.signed.length;
+    const sshBefore = w.services.ssh.execLog.length;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const upgradeTxs = w.signer.signed.slice(sigsBefore);
+    expect(upgradeTxs).toHaveLength(1);
+    expect(upgradeTxs[0]![0]!.typeUrl.includes("MsgUpdateDeployment")).toBe(true);
+    // upgrade service fee: flat 2 ACT batched into this op's (first) update tx
+    const feeMsg = upgradeTxs[0]!.at(-1)!;
+    expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    expect((feeMsg.value as any).to_address).toBe(
+      "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w",
+    );
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uact", amount: "2000000" }]);
+    const explorer = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    expect(explorer.image).toBe(image);
+    const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "explorer.yaml"), "utf8");
+    expect(sdl).toContain(`image: ${image}`);
+    // verified over HTTP, not pgrep-over-SSH
+    expect(w.services.ssh.execLog.length).toBe(sshBefore);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+});
+
 describe("top-up", () => {
-  it("enqueues an encodable deposit into the signing loop", async () => {
+  it("enqueues an encodable deposit plus the 0.5% fee into the signing loop", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
     const component = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
@@ -172,5 +292,9 @@ describe("top-up", () => {
     // the browser/CLI signer can actually encode it
     const encodeObject = toEncodeObject(msgs[0]);
     expect(encodeObject.value.deposit.amount).toEqual({ denom: "uact", amount: "2500000" });
+    // top-up fee: 0.5% of 2,500,000 = 12,500, sent with the deposit
+    expect(msgs[1].typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    expect(msgs[1].value.to_address).toBe("akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w");
+    expect(msgs[1].value.amount).toEqual([{ denom: "uact", amount: "12500" }]);
   }, 120_000);
 });

@@ -98,6 +98,9 @@ importers:
       '@sparkdream/akash-tx':
         specifier: workspace:*
         version: link:../../packages/akash-tx
+      '@sparkdream/launch-spec':
+        specifier: workspace:*
+        version: link:../../packages/launch-spec
       js-yaml:
         specifier: ^4.1.0
         version: 4.3.0

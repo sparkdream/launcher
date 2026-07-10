@@ -105,6 +105,7 @@ export class FakeAkashApi implements AkashApi {
   async deploymentEscrow(_owner: string, dseq: string) {
     return this.escrowBalances.get(dseq) ?? { denom: "uact", amount: "5000000" };
   }
+
 }
 
 export class FakeProviderGateway {
@@ -251,7 +252,11 @@ export class FakeRpc {
     return { latestBlockHeight: h, catchingUp: false };
   }
 
-  async httpOk(): Promise<boolean> {
+  /** Hosts that answer false regardless of httpOkResult (dark domains). */
+  darkUrls = new Set<string>();
+
+  async httpOk(url?: string): Promise<boolean> {
+    if (url && [...this.darkUrls].some((d) => url.includes(d))) return false;
     return this.httpOkResult;
   }
 }

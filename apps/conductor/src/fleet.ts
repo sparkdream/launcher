@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { resolveTopology, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { resolveTopology, statelessComponents, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
+import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
+import { bpsAmount, feeConfig } from "./fee.js";
 import { restartNode, rpcUrl } from "./node-ops.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
@@ -43,6 +45,8 @@ export interface ComponentView {
   /** Escrow balance (deployment funds): micro-denom amount, or null. */
   escrow?: string | null;
   state: string;
+  /** Deployed image reference (upgrades update it). */
+  image: string | null;
   health?: { status: string; detail: string | null; checked_at: string } | undefined;
 }
 
@@ -100,9 +104,20 @@ export class FleetService {
         // no sshd in the headscale image — it's managed via lease-shell
         ssh_host: null,
         ssh_port: null,
+        image: spec?.images.headscale ?? null,
+      });
+      // rows from launches materialized before the image column carried
+      // headscale need the backfill (upserts DO NOTHING on conflict)
+      this.db.backfillComponentEndpoints(launchId, "headscale", {
+        image: spec?.images.headscale ?? null,
       });
     }
     if (plan && assignments) {
+      // stateless components deploy in the same batch as the nodes but run
+      // their own images
+      const componentImages = new Map<string, string>(
+        spec ? statelessComponents(spec).map((c) => [c.key, c.image]) : [],
+      );
       for (const [key, entry] of Object.entries(plan.perNode)) {
         const a = assignments.perNode[key];
         if (!a) continue;
@@ -117,13 +132,14 @@ export class FleetService {
           ssh_host: ssh?.perNode[key]?.host ?? null,
           ssh_port: ssh?.perNode[key]?.port ?? null,
           tailnet_ip: mesh?.ips[key] ?? null,
-          image: spec?.images.sparkdreamd ?? null,
+          image: componentImages.get(key) ?? spec?.images.sparkdreamd ?? null,
         });
         // endpoints land in later steps than the row itself
         this.db.backfillComponentEndpoints(launchId, key, {
           ssh_host: ssh?.perNode[key]?.host ?? null,
           ssh_port: ssh?.perNode[key]?.port ?? null,
           tailnet_ip: mesh?.ips[key] ?? null,
+          image: componentImages.get(key) ?? spec?.images.sparkdreamd ?? null,
         });
       }
     }
@@ -150,6 +166,8 @@ export class FleetService {
     launch: LaunchRow,
     component: FleetComponentRow,
   ): Promise<{ height: number; catchingUp: boolean } | null> {
+    // only chain nodes have an RPC; headscale/explorer/frontend do not
+    if (!/^(val|sentry)-/.test(component.key)) return null;
     let cached = this.rpcUrlCache.get(component.dseq);
     if (!cached || Date.now() - cached.at > 120_000) {
       let url: string | null = null;
@@ -246,6 +264,7 @@ export class FleetService {
             priceDenom: PRICING_DENOM[spec.infra.akashNetwork],
             escrow,
             state: c.state,
+            image: c.image,
             health: h
               ? { status: h.status, detail: h.detail, checked_at: h.checked_at }
               : undefined,
@@ -284,7 +303,8 @@ export class FleetService {
           }
         }
       }
-      unmanaged = onChain.filter((d) => !known.has(d.dseq));
+      // closed unknown deployments are history, not something to manage
+      unmanaged = onChain.filter((d) => !known.has(d.dseq) && d.state !== "closed");
     } catch {
       // chain unreachable — serve the local view; the monitor will catch up
     }
@@ -302,7 +322,11 @@ export class FleetService {
     if (!launch || launch.status !== "completed") return;
     this.materialize(launchId);
     const owner = launch.owner;
-    const perDay = blocksPerDay(this.spec(launch));
+    const spec = this.spec(launch);
+    const perDay = blocksPerDay(spec);
+    const componentDomains = new Map<string, string>(
+      statelessComponents(spec).map((c) => [c.key, c.domain]),
+    );
 
     // components are independent — probe them concurrently so one slow
     // provider doesn't stretch the whole pass
@@ -339,6 +363,15 @@ export class FleetService {
             // this check only flags a stalled/catching-up sentry
             if (status.catchingUp) {
               this.db.setComponentHealth(launchId, c.key, "catching-up", details.join("; "));
+              return;
+            }
+          } else if (componentDomains.has(c.key)) {
+            // stateless components: HTTP 200 on the public domain (§5 step 21)
+            const url = `https://${componentDomains.get(c.key)}/`;
+            if (!(await this.services.rpc.httpOk(url))) {
+              this.db.setComponentHealth(
+                launchId, c.key, "unreachable", `${url} not answering`,
+              );
               return;
             }
           }
@@ -473,13 +506,16 @@ export class FleetService {
   }
 
   /** Restart the component (no signature — §2 scoping rule). Nodes restart
-   *  over SSH; headscale (no sshd) restarts via provider lease-shell. */
+   *  over SSH; headscale (no sshd) and the stateless components restart via
+   *  provider lease-shell — killing PID 1 makes the provider recreate the
+   *  container, which re-reads its env (tunnels included) at boot. */
   async restart(launch: LaunchRow, component: FleetComponentRow): Promise<void> {
-    if (component.key === "headscale") {
+    if (["headscale", "explorer", "frontend"].includes(component.key)) {
       await this.services.provider
-        .shellExec(this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, "headscale", [
-          "sh", "-c", "kill 1",
-        ])
+        .shellExec(
+          this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, component.key,
+          ["sh", "-c", "kill 1"],
+        )
         .catch(() => {
           // killing PID 1 drops the shell connection — expected
         });
@@ -518,17 +554,19 @@ export class FleetService {
     };
   }
 
-  /** Escrow top-up: unsigned deposit into the launch's signing loop. */
+  /** Escrow top-up: unsigned deposit into the launch's signing loop, plus
+   *  the top-up service fee batched into the same tx (§ fee.ts). */
   requestTopUp(launch: LaunchRow, component: FleetComponentRow, amount: string): { step: string } {
     const step = `fleet:topup:${component.dseq}`;
     // the deposit must match the escrow's denom — same per-network mapping
     // the SDLs were rendered with
     const denom = PRICING_DENOM[this.spec(launch).infra.akashNetwork];
-    this.db.enqueuePendingTx(
-      launch.id,
-      step,
-      JSON.stringify([accountDepositMsg(launch.owner, component.dseq, { denom, amount })]),
-    );
+    const msgs = [accountDepositMsg(launch.owner, component.dseq, { denom, amount })];
+    const fee = feeConfig();
+    if (fee.topupBps > 0) {
+      msgs.push(sendMsg(launch.owner, fee.address, { denom, amount: bpsAmount(amount, fee.topupBps) }));
+    }
+    this.db.enqueuePendingTx(launch.id, step, JSON.stringify(msgs));
     return { step };
   }
 
@@ -536,6 +574,18 @@ export class FleetService {
   requestRelaunch(launch: LaunchRow, component: FleetComponentRow): number {
     if (component.key === "headscale") {
       throw new Error("headscale relaunch is not supported (it re-keys the whole mesh)");
+    }
+    // everything except the frontend joins the mesh, and a relaunch mints its
+    // preauth key via headscale — impossible once the fleet is shut down
+    if (component.key !== "frontend") {
+      const hs = this.db
+        .listFleetComponents(launch.id)
+        .find((c) => c.key === "headscale");
+      if (hs?.state === "closed") {
+        throw new Error(
+          `${component.key} cannot relaunch: headscale is closed (fleet shut down) — a relaunch needs the mesh to mint a preauth key`,
+        );
+      }
     }
     const prefs = this.db.providerPrefs(launch.owner);
     // always move OFF the current provider (that's the point of a relaunch),

@@ -345,17 +345,32 @@ export class ConductorDb {
   backfillComponentEndpoints(
     launchId: string,
     key: string,
-    fields: { ssh_host?: string | null; ssh_port?: number | null; tailnet_ip?: string | null },
+    fields: {
+      ssh_host?: string | null;
+      ssh_port?: number | null;
+      tailnet_ip?: string | null;
+      /** Filled only when unset — an upgraded row keeps its new tag. */
+      image?: string | null;
+    },
   ): void {
     this.db
       .prepare(
         `UPDATE fleet_components SET
            ssh_host = COALESCE(ssh_host, @ssh_host),
            ssh_port = COALESCE(ssh_port, @ssh_port),
-           tailnet_ip = COALESCE(tailnet_ip, @tailnet_ip)
+           tailnet_ip = COALESCE(tailnet_ip, @tailnet_ip),
+           image = COALESCE(image, @image)
          WHERE launch_id = @launch_id AND key = @key`,
       )
-      .run({ ssh_host: null, ssh_port: null, tailnet_ip: null, ...fields, launch_id: launchId, key });
+      .run({
+        ssh_host: null,
+        ssh_port: null,
+        tailnet_ip: null,
+        image: null,
+        ...fields,
+        launch_id: launchId,
+        key,
+      });
   }
 
   // --- provider preferences (§6 day-2): wallet-global, per owner ---

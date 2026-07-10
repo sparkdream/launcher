@@ -29,6 +29,8 @@ export const TypeUrl = {
   AccountDeposit: "/akash.escrow.v1.MsgAccountDeposit",
   /** BME module: burn AKT → mint ACT (async settlement). */
   MintAct: "/akash.bme.v1.MsgMintACT",
+  /** Bank transfer — the launch service fee rides the create-leases tx. */
+  Send: "/cosmos.bank.v1beta1.MsgSend",
 } as const;
 
 export interface Msg {
@@ -158,9 +160,32 @@ export function toEncodeObject(msg: Msg): EncodeObject {
           coinsToBurn: v.coins_to_burn,
         }),
       };
+    case TypeUrl.Send:
+      // bank MsgSend is in defaultRegistryTypes; cosmjs encodes the plain
+      // camelCase shape directly (same as SigningStargateClient.sendTokens)
+      return {
+        typeUrl: msg.typeUrl,
+        value: {
+          fromAddress: v.from_address,
+          toAddress: v.to_address,
+          amount: v.amount,
+        },
+      };
     default:
       throw new Error(`no encoder for ${msg.typeUrl}`);
   }
+}
+
+/** Plain bank transfer, stored proto-JSON like every other launcher msg. */
+export function sendMsg(
+  from: string,
+  to: string,
+  coin: { denom: string; amount: string },
+): Msg {
+  return {
+    typeUrl: TypeUrl.Send,
+    value: { from_address: from, to_address: to, amount: [coin] },
+  };
 }
 
 /** Mint ACT by burning AKT — `to` must equal `owner` for ACT mints. */

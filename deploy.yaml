@@ -28,6 +28,11 @@ services:
       # - "LITESTREAM_REPLICA_URL=s3://BUCKET/launcher-state"
       # - "LITESTREAM_ACCESS_KEY_ID=..."
       # - "LITESTREAM_SECRET_ACCESS_KEY=..."
+      # optional: service fee overrides (see README "Launch fee"; 0 disables)
+      # - "LAUNCH_FEE_ADDRESS=akash1YOUR_FEE_ADDRESS"
+      # - "LAUNCH_FEE_BPS=1000"
+      # - "LAUNCH_FEE_UPGRADE=2000000"
+      # - "LAUNCH_FEE_TOPUP_BPS=50"
     params:
       storage:
         data:

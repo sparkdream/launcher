@@ -1,15 +1,19 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveTopology, tunnelPort, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
+import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
+import { feeConfig } from "./fee.js";
+import { PRICING_DENOM } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
 import { selectProvider } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, waitLeaseStatus } from "./steps/phase-bcd.js";
 import { placeholder } from "./steps/phase-a.js";
+import { ingressHost } from "./steps/phase-ef.js";
 import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "./node-ops.js";
 import type { SshTarget } from "./services.js";
 
@@ -67,12 +71,15 @@ async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<numbe
   return (await ctx.services.rpc.status(url)).latestBlockHeight;
 }
 
-/** Relaunch: close → fresh deploy on a new provider → rewire → guarded start. */
+/** Relaunch: close → fresh deploy on a new provider → rewire → guarded start.
+ *  Stateless components (§5): no volume, keys, peers, or double-sign risk —
+ *  the rewiring and guarded-start steps are replaced by an HTTP health gate. */
 export function relaunchSteps(opId: number, params: RelaunchParams, spec: LaunchSpec): StepDef[] {
   const { key } = params;
   const p = (s: string) => `op${opId}:${s}`;
   const isValidator = key.startsWith("val-");
   const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
+  const stateless = statelessComponents(spec).find((c) => c.key === key);
 
   const steps: StepDef[] = [];
 
@@ -114,37 +121,41 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     name: p("deploy"),
     async run(ctx) {
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-      const hsRow = componentRow(ctx, "headscale");
-      // fresh preauth key via headscale lease-shell (§5: expired keys
-      // re-minted; the headscale image has no sshd). Single-group SDL ⇒
-      // gseq/oseq are always 1. preauthkeys --user needs the numeric id.
-      const hsRef = { hostUri: hsRow.host_uri, dseq: hsRow.dseq, gseq: 1, oseq: 1 };
-      // PINNED: this step re-runs after the signature pause — a re-minted
-      // key would rewrite the SDL/manifest and drift from the SIGNED
-      // deployment's hash (the provider then 422s the manifest)
-      const authkey = await pinnedValue(ctx, `op${opId}-authkey`, async () => {
-        const userId = await headscaleUserId(ctx, hsRef, spec.network.name);
-        const mint = await ctx.services.provider.shellExec(
-          loadCert(ctx),
-          hsRef.hostUri,
-          hsRef.dseq,
-          hsRef.gseq,
-          hsRef.oseq,
-          "headscale",
-          ["sh", "-c", `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`],
-        );
-        const parsedKey = JSON.parse(mint.stdout.trim());
-        const k: string = typeof parsedKey === "string" ? parsedKey : parsedKey.key;
-        if (!k) throw new Error("no preauth key in mint output");
-        return k;
-      });
+      // the frontend never joins the mesh — no preauth key to mint
+      if (!stateless || stateless.mesh) {
+        const hsRow = componentRow(ctx, "headscale");
+        // fresh preauth key via headscale lease-shell (§5: expired keys
+        // re-minted; the headscale image has no sshd). Single-group SDL ⇒
+        // gseq/oseq are always 1. preauthkeys --user needs the numeric id.
+        const hsRef = { hostUri: hsRow.host_uri, dseq: hsRow.dseq, gseq: 1, oseq: 1 };
+        // PINNED: this step re-runs after the signature pause — a re-minted
+        // key would rewrite the SDL/manifest and drift from the SIGNED
+        // deployment's hash (the provider then 422s the manifest)
+        const authkey = await pinnedValue(ctx, `op${opId}-authkey`, async () => {
+          const userId = await headscaleUserId(ctx, hsRef, spec.network.name);
+          const mint = await ctx.services.provider.shellExec(
+            loadCert(ctx),
+            hsRef.hostUri,
+            hsRef.dseq,
+            hsRef.gseq,
+            hsRef.oseq,
+            "headscale",
+            ["sh", "-c", `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`],
+          );
+          const parsedKey = JSON.parse(mint.stdout.trim());
+          const k: string = typeof parsedKey === "string" ? parsedKey : parsedKey.key;
+          if (!k) throw new Error("no preauth key in mint output");
+          return k;
+        });
 
+        const sdlPath = sdlPathFor(ctx, key);
+        let sdl = fs.readFileSync(sdlPath, "utf8");
+        sdl = sdl.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${authkey}`);
+        // fresh volume must wait for node-data again (no-op for components)
+        sdl = sdl.replace(/WAIT_FOR_CONFIG=false/g, "WAIT_FOR_CONFIG=true");
+        fs.writeFileSync(sdlPath, sdl);
+      }
       const sdlPath = sdlPathFor(ctx, key);
-      let sdl = fs.readFileSync(sdlPath, "utf8");
-      sdl = sdl.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${authkey}`);
-      // fresh volume must wait for node-data again
-      sdl = sdl.replace(/WAIT_FOR_CONFIG=false/g, "WAIT_FOR_CONFIG=true");
-      fs.writeFileSync(sdlPath, sdl);
 
       const artifacts = sdlArtifacts(loadSdl(sdlPath));
       const dseq = await pinnedValue(ctx, `op${opId}-dseq`, async () =>
@@ -199,10 +210,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // exclude: other active components' providers (anti-affinity) PLUS
       // any provider we're explicitly moving off of — including the one this
       // component just ran on. A relaunch is a "move", so re-picking the
-      // same (often broken) provider defeats the purpose.
+      // same (often broken) provider defeats the purpose. Stateless
+      // components are exempt from anti-affinity (§6) — only the avoid list
+      // (which carries the old provider) constrains them.
       const exclude = new Set<string>(params.avoidProviders ?? []);
-      for (const c of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
-        if (c.key !== key && c.state === "active") exclude.add(c.provider);
+      if (!stateless) {
+        for (const c of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
+          if (c.key !== key && c.state === "active") exclude.add(c.provider);
+        }
       }
       const bids = await pollBids(ctx.services.api, owner, deploy.dseq, {
         sleep: ctx.services.sleep,
@@ -266,6 +281,8 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         ]);
       }
       await ctx.services.provider.sendManifest(cert, lease.hostUri, deploy.dseq, manifest);
+      // the frontend image runs no sshd — just wait for the workload
+      const wantSsh = !stateless || stateless.mesh;
       const status = await waitLeaseStatus(
         ctx,
         cert,
@@ -273,9 +290,8 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         deploy.dseq,
         lease.gseq,
         lease.oseq,
-        { forwardedPort: 2222 },
+        wantSsh ? { forwardedPort: 2222 } : {},
       );
-      const ssh = extractForwardedPort(status, 2222);
       ctx.db.updateComponentPlacement(ctx.launchId, key, {
         dseq: deploy.dseq,
         provider: lease.provider,
@@ -283,6 +299,8 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         price: lease.price,
         generation: params.generation,
       });
+      if (!wantSsh) return {};
+      const ssh = extractForwardedPort(status, 2222);
       ctx.db.updateComponentRuntime(ctx.launchId, key, {
         ssh_host: ssh.host,
         ssh_port: ssh.port,
@@ -290,6 +308,40 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       return ssh;
     },
   });
+
+  if (stateless) {
+    // §5: stateless components skip the node rewiring and guarded start —
+    // the container is live once it answers on its domain. The explorer's
+    // SDL env already carries the real sentry tailnet IP (baked by
+    // persist-start), so its tunnels come up correct at boot.
+    steps.push({
+      name: p("verify"),
+      async run(ctx) {
+        const url = `https://${stateless!.domain}/`;
+        for (let i = 0; i < 36; i++) {
+          if (await ctx.services.rpc.httpOk(url)) {
+            ctx.db.setComponentState(ctx.launchId, key, "active");
+            ctx.db.setFleetOpStatus(opId, "done");
+            return { healthy: true, url };
+          }
+          await ctx.services.sleep(5000);
+        }
+        // the relaunch moved providers, so the domain's DNS record now
+        // points at the OLD provider's ingress — pause with the new target
+        const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+        const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+        const ingress = await ingressHost(
+          ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, stateless!.domain,
+        );
+        throw new AwaitUser(
+          p("verify"),
+          `${key} not answering at ${url} — update the DNS record for ${stateless!.domain} → ` +
+            `CNAME ${ingress} (the relaunch moved providers), then resume`,
+        );
+      },
+    });
+    return steps;
+  }
 
   steps.push({
     name: p("configure"),
@@ -410,14 +462,19 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
 /** Rolling upgrade (§5 "Node upgrades"): serial per component, health-gated. */
 export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSpec): StepDef[] {
   const steps: StepDef[] = [];
+  const stateless = new Map<string, ComponentRef>(
+    statelessComponents(spec).map((c) => [c.key, c]),
+  );
   const ordered = [...params.components].sort((a, b) => {
-    // sentries first, validators last (§5 rolling sequencer)
-    const rank = (k: string) => (k.startsWith("val-") ? 1 : 0);
+    // stateless components upgrade freely, then sentries, validators last
+    // (§5 rolling sequencer)
+    const rank = (k: string) => (stateless.has(k) ? 0 : k.startsWith("val-") ? 2 : 1);
     return rank(a) - rank(b) || a.localeCompare(b);
   });
 
   for (const key of ordered) {
     const p = (s: string) => `op${opId}:${key}:${s}`;
+    const isFirst = key === ordered[0];
 
     steps.push({
       name: p("update"),
@@ -437,7 +494,7 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           path.join(ctx.dirs.sdl, `${key}.manifest.json`),
           artifacts.manifestJson,
         );
-        await ctx.requireTx(p("update"), [
+        const msgs: Msg[] = [
           {
             typeUrl: TypeUrl.UpdateDeployment,
             value: {
@@ -445,7 +502,18 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
               hash: Buffer.from(artifacts.hash).toString("base64"),
             },
           },
-        ]);
+        ];
+        // upgrade service fee — flat, once per op, on the first update tx
+        const fee = feeConfig();
+        if (isFirst && fee.upgradeFlat > 0) {
+          msgs.push(
+            sendMsg(owner, fee.address, {
+              denom: PRICING_DENOM[spec.infra.akashNetwork],
+              amount: String(fee.upgradeFlat),
+            }),
+          );
+        }
+        await ctx.requireTx(p("update"), msgs);
         const cert = loadCert(ctx);
         await ctx.services.provider.sendManifest(
           cert,
@@ -461,6 +529,17 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
     steps.push({
       name: p("verify"),
       async run(ctx) {
+        // stateless (§5): ephemeral filesystem, so the update is just the
+        // image swap plus an HTTP health gate on the public domain
+        const comp = stateless.get(key);
+        if (comp) {
+          const url = `https://${comp.domain}/`;
+          for (let i = 0; i < 60; i++) {
+            if (await ctx.services.rpc.httpOk(url)) return { healthy: true, url };
+            await ctx.services.sleep(5000);
+          }
+          throw new Error(`${key} did not answer at ${url} after upgrade`);
+        }
         const row = componentRow(ctx, key);
         // persistent volume → same tailnet IP, supervised restart (§5): the
         // gate is "node back and progressing" before the next component
@@ -513,12 +592,14 @@ export interface HaltUpgradeParams {
 export function haltUpgradeSteps(
   opId: number,
   params: HaltUpgradeParams,
-  _spec: LaunchSpec,
+  spec: LaunchSpec,
 ): StepDef[] {
   const p = (s: string) => `op${opId}:${s}`;
+  // chain nodes only — headscale and the stateless components run neither
+  // sparkdreamd nor halt-height
   const nodeRows = (ctx: StepCtx) =>
     (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
-      (c) => c.state === "active" && c.key !== "headscale",
+      (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
     );
 
   return [
@@ -584,6 +665,16 @@ export function haltUpgradeSteps(
               hash: Buffer.from(artifacts.hash).toString("base64"),
             },
           });
+        }
+        // upgrade service fee — flat, once per op, on this batched update
+        const fee = feeConfig();
+        if (fee.upgradeFlat > 0) {
+          msgs.push(
+            sendMsg(owner, fee.address, {
+              denom: PRICING_DENOM[spec.infra.akashNetwork],
+              amount: String(fee.upgradeFlat),
+            }),
+          );
         }
         // one batched tx: all nodes move to the new binary together
         await ctx.requireTx(p("update-all"), msgs);

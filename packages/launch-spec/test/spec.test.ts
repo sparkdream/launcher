@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   chainId,
+  lcdRequired,
   resolveTopology,
+  statelessComponents,
   tunnelPort,
   validateSpec,
   withDefaults,
@@ -171,5 +173,65 @@ describe("derive", () => {
   it("tunnel ports are 16656+v", () => {
     expect(tunnelPort(0)).toBe(16656);
     expect(tunnelPort(3)).toBe(16659);
+  });
+});
+
+describe("stateless components", () => {
+  const componentsOn = (over: Record<string, unknown> = {}) => ({
+    validators: { count: 1 },
+    sentries: { count: 1 },
+    components: {
+      explorer: { enabled: true, domain: "explorer.sparkdream.io" },
+      frontend: { enabled: true, domain: "app.sparkdream.io" },
+      hub: { enabled: false },
+    },
+    publicEndpoints: { api: "api.sparkdream.io", rpc: "rpc.sparkdream.io" },
+    headscale: { domain: "headscale.sparkdream.io" },
+    ...over,
+  });
+
+  it("profile supplies explorer/frontend images; a full component spec validates", () => {
+    const spec = testnetSpec({ topology: componentsOn() });
+    expect(spec.images.explorer).toContain("sparkdream-explorer");
+    expect(spec.images.frontend).toContain("sparkdream-ui");
+    expect(validateSpec(spec).errors).toEqual([]);
+    expect(statelessComponents(spec)).toEqual([
+      { key: "explorer", domain: "explorer.sparkdream.io", image: spec.images.explorer, mesh: true },
+      { key: "frontend", domain: "app.sparkdream.io", image: spec.images.frontend, mesh: false },
+    ]);
+    expect(lcdRequired(spec)).toBe(true);
+  });
+
+  it("rejects an enabled component without a domain", () => {
+    const spec = testnetSpec({
+      topology: componentsOn({
+        components: {
+          explorer: { enabled: true },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+      }),
+    });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "topology.components.explorer.domain")).toBe(true);
+  });
+
+  it("frontend requires publicEndpoints api + rpc", () => {
+    const spec = testnetSpec({ topology: componentsOn({ publicEndpoints: undefined }) });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "topology.publicEndpoints")).toBe(true);
+  });
+
+  it("components and public endpoints need at least one sentry", () => {
+    const spec = testnetSpec({ topology: componentsOn({ sentries: { count: 0 } }) });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "topology.components.explorer.enabled")).toBe(true);
+    expect(res.errors.some((e) => e.path === "topology.publicEndpoints")).toBe(true);
+  });
+
+  it("disabled components derive to nothing and need no LCD", () => {
+    const spec = testnetSpec();
+    expect(statelessComponents(spec)).toEqual([]);
+    expect(lcdRequired(spec)).toBe(false);
   });
 });

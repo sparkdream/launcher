@@ -20,7 +20,11 @@ export {
   tunnelPort,
   resolveTopology,
   nodes,
+  statelessComponents,
+  lcdRequired,
   type Topology,
   type NodeRef,
   type NodeRole,
+  type ComponentKey,
+  type ComponentRef,
 } from "./derive.js";

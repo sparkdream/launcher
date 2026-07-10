@@ -97,6 +97,44 @@ async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface CostEstimate {
+  /** Per single deployment of the role, USD/month. */
+  perRole: Array<{ role: string; count: number; unitLowUsd: number; unitHighUsd: number }>;
+  /** low = competitive bids (observed); high = stock provider bid script. */
+  totalLowUsd: number;
+  totalHighUsd: number;
+  /** One-time launch service fee (feeBps of the leased monthly rate). */
+  feeBps: number;
+  feeLowUsd: number;
+  feeHighUsd: number;
+}
+
+export interface FeeInfo {
+  address: string;
+  /** launch fee: basis points of the leased monthly rate. */
+  launchBps: number;
+  /** upgrade fee: flat micro-denom per upgrade op. */
+  upgradeFlat: number;
+  /** top-up fee: basis points of the deposit amount. */
+  topupBps: number;
+}
+
+/** The service fee schedule (so day-2 dialogs show exact amounts). */
+export async function getFee(): Promise<FeeInfo> {
+  return json(await afetch("/api/fee"));
+}
+
+/** Market-based running-cost estimate for a spec (pre-launch, no wallet). */
+export async function postEstimate(spec: unknown): Promise<CostEstimate> {
+  return json(
+    await afetch("/api/estimate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spec }),
+    }),
+  );
+}
+
 export async function createLaunch(spec: unknown, owner: string): Promise<{ id: string; warnings: { path: string; message: string }[] }> {
   return json(
     await afetch("/api/launches", {
@@ -156,6 +194,8 @@ export interface ComponentView {
   escrow?: string | null;
   price: string;
   state: string;
+  /** Deployed image reference (upgrades update it). */
+  image?: string | null;
   health?: { status: string; detail: string | null; checked_at: string };
 }
 

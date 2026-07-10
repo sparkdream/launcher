@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { nodes } from "@sparkdream/launch-spec";
+import { nodes, statelessComponents } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
+import { sendMsg } from "@sparkdream/akash-tx";
 import {
   accountDepositMsg,
   closeDeploymentMsg,
@@ -12,6 +13,8 @@ import {
   TypeUrl,
   type Msg,
 } from "../akash/messages.js";
+import { feeConfig, launchFeeAmount } from "../fee.js";
+import { PRICING_DENOM } from "../render-sdl.js";
 import { pollBids } from "../akash/client.js";
 import { selectProvider, type PolicyDecision } from "../akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../akash/sdl-groups.js";
@@ -406,6 +409,9 @@ export const configureHeadscaleStep: StepDef = {
 
     const perNode: Record<string, string> = {};
     for (const node of nodes(ctx.spec)) perNode[node.key] = await mint(node.key);
+    for (const c of statelessComponents(ctx.spec)) {
+      if (c.mesh) perNode[c.key] = await mint(c.key);
+    }
     const home = await mint("home");
     return { perNode, home };
   },
@@ -464,19 +470,25 @@ export const createDeploymentsStep: StepDef = {
     const msgs: Msg[] = [];
     const perNode: DeploymentPlan["perNode"] = {};
     let offset = 0;
-    for (const node of nodes(ctx.spec)) {
-      // inject the real preauth key over the Phase A placeholder
-      const sdlPath = path.join(ctx.dirs.sdl, `${node.key}.yaml`);
-      const rendered = fs
-        .readFileSync(sdlPath, "utf8")
-        .replace(placeholder.tsAuthkey(node.key), preauth.perNode[node.key]!);
+    // nodes + stateless components share the one batched tx (§5 step 12)
+    const deployKeys = [
+      ...nodes(ctx.spec).map((n) => n.key),
+      ...statelessComponents(ctx.spec).map((c) => c.key),
+    ];
+    for (const key of deployKeys) {
+      // inject the real preauth key over the Phase A placeholder (the
+      // frontend never joins the mesh, so it has no key to inject)
+      const sdlPath = path.join(ctx.dirs.sdl, `${key}.yaml`);
+      let rendered = fs.readFileSync(sdlPath, "utf8");
+      const authkey = preauth.perNode[key];
+      if (authkey) rendered = rendered.replace(placeholder.tsAuthkey(key), authkey);
       fs.writeFileSync(sdlPath, rendered);
 
       const artifacts = sdlArtifacts(loadSdl(sdlPath));
       const dseq = String(height + offset++); // distinct dseq per deployment, one batched tx
-      const manifestPath = path.join(ctx.dirs.sdl, `${node.key}.manifest.json`);
+      const manifestPath = path.join(ctx.dirs.sdl, `${key}.manifest.json`);
       fs.writeFileSync(manifestPath, artifacts.manifestJson);
-      perNode[node.key] = { dseq, manifestPath, requiredStorageClass: artifacts.requiredStorageClass };
+      perNode[key] = { dseq, manifestPath, requiredStorageClass: artifacts.requiredStorageClass };
       msgs.push(
         createDeploymentMsg({
           owner: addr,
@@ -512,6 +524,10 @@ export const collectBidsStep: StepDef = {
     const providers = await ctx.services.api.listProviders();
 
     const chosen = new Set<string>([hs.provider]);
+    // anti-affinity covers headscale/validators/sentries (§6); the stateless
+    // components can share providers freely — requiring N more distinct
+    // providers for them would only shrink the viable bid set
+    const stateless = new Set<string>(statelessComponents(ctx.spec).map((c) => c.key));
     const perNode: Assignments["perNode"] = {};
     for (const [key, entry] of Object.entries(plan.perNode)) {
       const bids = await pollBids(ctx.services.api, addr, entry.dseq, {
@@ -522,7 +538,7 @@ export const collectBidsStep: StepDef = {
       });
       const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
         policy: ctx.spec.providers.policy,
-        chosenProviders: chosen,
+        chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
         requiredStorageClass: entry.requiredStorageClass,
         providers,
       });
@@ -533,7 +549,7 @@ export const collectBidsStep: StepDef = {
         );
       }
       const bid = decision.chosen.bid;
-      chosen.add(bid.id.provider);
+      if (!stateless.has(key)) chosen.add(bid.id.provider);
       perNode[key] = {
         provider: bid.id.provider,
         hostUri: providers.get(bid.id.provider)!.hostUri,
@@ -562,8 +578,24 @@ export const createLeasesStep: StepDef = {
         provider: a.provider,
       }),
     );
+    // Launch service fee: one-time send of a cut of the leased monthly
+    // rate (headscale included), batched into this tx so it rides the same
+    // signature and is visible in the prompt. Initial launch only —
+    // relaunch ops re-lease without it.
+    const fee = feeConfig();
+    let feePaid: { address: string; amount: string; denom: string } | undefined;
+    if (fee.launchBps > 0) {
+      const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
+      const amount = launchFeeAmount(
+        [hs.price, ...Object.values(assignments.perNode).map((a) => a.price)],
+        fee.launchBps,
+      );
+      const denom = PRICING_DENOM[ctx.spec.infra.akashNetwork];
+      msgs.push(sendMsg(addr, fee.address, { denom, amount }));
+      feePaid = { address: fee.address, amount, denom };
+    }
     const txHash = await ctx.requireTx("create-leases", msgs);
-    return { txHash };
+    return { txHash, fee: feePaid };
   },
 };
 
@@ -577,15 +609,22 @@ export const sendManifestsStep: StepDef = {
     const plan = ctx.output<DeploymentPlan>("create-deployments")!;
     const assignments = ctx.output<Assignments>("collect-bids")!;
     const cert = loadCert(ctx);
+    // the frontend image runs no sshd — wait for the workload, but skip the
+    // forwarded-port extraction (nothing ever SSHes into it)
+    const noSsh = new Set<string>(
+      statelessComponents(ctx.spec)
+        .filter((c) => !c.mesh)
+        .map((c) => c.key),
+    );
     const perNode: SshEndpoints["perNode"] = {};
     for (const [key, entry] of Object.entries(plan.perNode)) {
       const a = assignments.perNode[key]!;
       const manifest = fs.readFileSync(entry.manifestPath, "utf8");
       await ctx.services.provider.sendManifest(cert, a.hostUri, entry.dseq, manifest);
       const status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
-        forwardedPort: 2222,
+        ...(noSsh.has(key) ? {} : { forwardedPort: 2222 }),
       });
-      perNode[key] = extractForwardedPort(status, 2222);
+      if (!noSsh.has(key)) perNode[key] = extractForwardedPort(status, 2222);
     }
     return { perNode };
   },

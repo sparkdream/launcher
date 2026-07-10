@@ -74,10 +74,23 @@ describe("fleet read-model + reconciliation", () => {
     const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
     services.api.leaseStates.set(sentry.dseq, "closed"); // closed via another tool
     services.api.extraDeployments.push({ dseq: "999999", state: "active" }); // other instance's
+    services.api.extraDeployments.push({ dseq: "888888", state: "closed" }); // history — hidden
 
     const view = await fleet.fleetForOwner("akash1owner");
     expect(view.fleets[0]!.components.find((c) => c.key === "sentry-0")!.state).toBe("closed");
     expect(view.unmanaged).toEqual([{ dseq: "999999", state: "active" }]);
+  }, 120_000);
+
+  it("refuses to relaunch mesh components once the fleet is shut down", async () => {
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    await fleet.fleetForOwner("akash1owner"); // materialize
+    const launch = db.getLaunch("fl")!;
+    for (const c of db.listFleetComponents("fl")) {
+      db.setComponentState("fl", c.key, "closed");
+    }
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(() => fleet.requestRelaunch(launch, sentry)).toThrow(/headscale is closed/);
   }, 120_000);
 });
 

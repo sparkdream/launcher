@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { launchDirs, runWithSigner } from "../src/engine.js";
+import { BLOCKS_PER_MONTH } from "../src/fee.js";
 import { allSteps } from "../src/index.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 
@@ -92,8 +93,19 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     // node deployments (batched), node leases (batched), persist-start.
     expect(signer.signed).toHaveLength(6);
     expect(signer.signed[3]!).toHaveLength(4); // 4 node deployments in ONE tx
-    expect(signer.signed[4]!).toHaveLength(4); // 4 leases in ONE tx
+    expect(signer.signed[4]!).toHaveLength(5); // 4 leases + launch fee in ONE tx
     expect(signer.signed[5]!.every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+
+    // launch fee: 10% of the leased monthly rate, sent with the leases —
+    // fake bids: headscale 100 + nodes 110/120/130/140 = 600 uact/block
+    const feeMsg = signer.signed[4]!.at(-1)!;
+    expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    expect((feeMsg.value as any).to_address).toBe(
+      "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w",
+    );
+    expect((feeMsg.value as any).amount).toEqual([
+      { denom: "uact", amount: String(Math.ceil(600 * BLOCKS_PER_MONTH * 0.1)) },
+    ]);
 
     // Manifests: headscale + 4 nodes + 4 re-PUTs from persist-start
     expect(services.provider.manifests).toHaveLength(9);
@@ -121,6 +133,100 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
 
     // all pending txs confirmed, none dangling
     expect(db.nextPendingTx("full")).toBeUndefined();
+    db.close();
+  }, 120_000);
+
+  it("deploys explorer + frontend in the node batch, still 6 signatures", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({
+      topology: {
+        validators: { count: 2 },
+        sentries: { count: 2 },
+        components: {
+          explorer: { enabled: true, domain: "explorer.sparkdream.io" },
+          frontend: { enabled: true, domain: "app.sparkdream.io" },
+          hub: { enabled: false },
+        },
+        publicEndpoints: { api: "api.sparkdream.io", rpc: "rpc.sparkdream.io" },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    db.createLaunch("comp", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+
+    const result = await runWithSigner(db, "comp", s, work, allSteps(), services, signer);
+    if (result.status !== "completed") {
+      const step = db.listSteps("comp").find((x) => x.status !== "done");
+      throw new Error(`ended ${result.status} at ${step?.name}: ${step?.error}`);
+    }
+
+    // same 6 signatures as a node-only launch (§5 step 12): the components
+    // ride the batched deployment/lease txs
+    expect(signer.signed).toHaveLength(6);
+    expect(signer.signed[3]!).toHaveLength(6); // 4 nodes + explorer + frontend in ONE tx
+    expect(signer.signed[4]!).toHaveLength(7); // 6 leases + launch fee in ONE tx
+    // persist-start updates nodes + explorer (tunnel IPs) but NOT the
+    // frontend (env-final since Phase A; an update would only restart it)
+    expect(signer.signed[5]!).toHaveLength(5);
+
+    // manifests: headscale + 6 components + 5 persist-start re-PUTs
+    expect(services.provider.manifests).toHaveLength(12);
+
+    const dirs = launchDirs(work, "comp");
+    const explorerSdl = fs.readFileSync(path.join(dirs.sdl, "explorer.yaml"), "utf8");
+    expect(explorerSdl).not.toContain("{{TAILNET_IP");
+    expect(explorerSdl).not.toContain("{{TS_AUTHKEY");
+    const frontendSdl = fs.readFileSync(path.join(dirs.sdl, "frontend.yaml"), "utf8");
+    expect(frontendSdl).toContain("LCD_ENDPOINT=https://api.sparkdream.io");
+
+    // verify-chain proved the domains answer (fake rpc says HTTP 200)
+    const verify = db.stepOutput<any>("comp", "verify-chain")!;
+    expect(Object.keys(verify.http)).toEqual([
+      "explorer",
+      "frontend",
+      "public-api",
+      "public-rpc",
+    ]);
+
+    // components never get chain data or an SSH start — only the 4 nodes do
+    expect(services.ssh.started.size).toBe(4);
+    expect(db.nextPendingTx("comp")).toBeUndefined();
+    db.close();
+  }, 120_000);
+
+  it("verify-chain pauses with DNS guidance when a component domain is dark", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: true, domain: "explorer.sparkdream.io" },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    db.createLaunch("compdns", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    // only the explorer's domain is dark — headscale's DNS gate still passes
+    services.rpc.darkUrls.add("explorer.sparkdream.io");
+
+    const first = await runWithSigner(db, "compdns", s, work, allSteps(), services, signer);
+    expect(first.status).toBe("awaiting-user");
+    expect(first.failedStep).toBe("verify-chain");
+    expect(first.reason).toContain("explorer.sparkdream.io");
+    expect(first.reason).toContain("CNAME");
+
+    // user creates the DNS record, resumes
+    services.rpc.darkUrls.clear();
+    const second = await runWithSigner(db, "compdns", s, work, allSteps(), services, signer);
+    expect(second.status).toBe("completed");
     db.close();
   }, 120_000);
 

@@ -129,6 +129,37 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     );
   }
 
+  // Stateless components (§5 step 12): both serve chain data from a sentry
+  const comps = spec.topology.components;
+  for (const key of ["explorer", "frontend"] as const) {
+    if (!comps[key].enabled) continue;
+    if (!comps[key].domain) {
+      err(`topology.components.${key}.domain`, "domain is required when enabled");
+    }
+    if (!spec.images[key]) {
+      err(`images.${key}`, "image is required when enabled");
+    }
+    if (S === 0) {
+      err(
+        `topology.components.${key}.enabled`,
+        "requires at least one sentry — components read chain data from sentry-0",
+      );
+    }
+  }
+  if (comps.hub.enabled) {
+    warn("topology.components.hub", "hub deployment is not implemented yet — toggle is ignored");
+  }
+  const pub = spec.topology.publicEndpoints;
+  if (comps.frontend.enabled && !(pub?.api && pub?.rpc)) {
+    err(
+      "topology.publicEndpoints",
+      "frontend needs public api + rpc domains (LCD/RPC served by sentry-0 via accept-domain ingress)",
+    );
+  }
+  if ((pub?.api || pub?.rpc) && S === 0) {
+    err("topology.publicEndpoints", "public endpoints are served by sentry-0 — add a sentry");
+  }
+
   // Mainnet hardening
   if (mainnet) {
     if (!spec.topology.headscale.backup) {

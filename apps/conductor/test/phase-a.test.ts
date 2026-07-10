@@ -148,6 +148,75 @@ describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
   }, 120_000);
 });
 
+describe("Phase A golden run — explorer + frontend enabled", () => {
+  it("renders component SDLs and flips the sentry LCD on", async () => {
+    const s = spec(1, 2, {
+      network: {
+        name: "sparkdream",
+        type: "testnet",
+        bech32Prefix: "sprkdrm",
+        displayName: "Spark Dream",
+      },
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 2 },
+        components: {
+          explorer: { enabled: true, domain: "explorer.sparkdream.io" },
+          frontend: { enabled: true, domain: "app.sparkdream.io" },
+          hub: { enabled: false },
+        },
+        publicEndpoints: { api: "api.sparkdream.io", rpc: "rpc.sparkdream.io" },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const { db, result, dirs } = await runPhaseA(s, "gcomp");
+    if (result.status !== "completed") {
+      throw new Error(`paused at ${result.failedStep}: ${db.getStep("gcomp", result.failedStep!)?.error}`);
+    }
+
+    // explorer: mesh member tunneling to sentry-0's LCD/RPC, nginx on 80
+    const explorer = fs.readFileSync(path.join(dirs.sdl, "explorer.yaml"), "utf8");
+    expect(explorer).toContain(`image: ${s.images.explorer}`);
+    expect(explorer).toContain("TS_AUTHKEY={{TS_AUTHKEY:explorer}}");
+    expect(explorer).toContain("TS_TUNNEL_1=11317:{{TAILNET_IP:sentry-0}}:1317");
+    expect(explorer).toContain("TS_TUNNEL_2=26657:{{TAILNET_IP:sentry-0}}:26657");
+    expect(explorer).toContain("explorer.sparkdream.io");
+    expect(explorer).toContain("NODE_API_ENDPOINT=/api");
+    expect(explorer).toContain("persistent: true");
+    expect(explorer).toContain("denom: uact");
+
+    // frontend: pure runtime env, no mesh, port 3000 behind the domain
+    const frontend = fs.readFileSync(path.join(dirs.sdl, "frontend.yaml"), "utf8");
+    expect(frontend).toContain(`image: ${s.images.frontend}`);
+    expect(frontend).toContain("CHAIN_ID=sparkdream-1");
+    expect(frontend).toContain("CHAIN_NAME=Spark Dream");
+    expect(frontend).toContain("LCD_ENDPOINT=https://api.sparkdream.io");
+    expect(frontend).toContain("RPC_ENDPOINT=https://rpc.sparkdream.io");
+    expect(frontend).toContain("CHAIN_DENOM=uspark.sparkdreamtest");
+    expect(frontend).toContain("BECH32_PREFIX=sprkdrm");
+    expect(frontend).toContain("EXPLORER_URL=https://explorer.sparkdream.io/sparkdream");
+    expect(frontend).not.toContain("TS_AUTHKEY");
+    expect(frontend).toContain("app.sparkdream.io");
+
+    // sentry-0 carries the public accept-domain exposes; sentry-1 does not
+    const sentry0 = fs.readFileSync(path.join(dirs.sdl, "sentry-0.yaml"), "utf8");
+    expect(sentry0).toContain("api.sparkdream.io");
+    expect(sentry0).toContain("rpc.sparkdream.io");
+    const sentry1 = fs.readFileSync(path.join(dirs.sdl, "sentry-1.yaml"), "utf8");
+    expect(sentry1).not.toContain("api.sparkdream.io");
+    expect(sentry1).not.toContain("rpc.sparkdream.io");
+
+    // the sentry LCD is on and reachable from outside the container; the
+    // validator app.toml is untouched
+    const sentryApp = fs.readFileSync(path.join(dirs.node("sentry-0"), "config", "app.toml"), "utf8");
+    expect(sentryApp).toContain('address = "tcp://0.0.0.0:1317"');
+    expect(sentryApp).not.toContain("enable = false");
+    const valApp = fs.readFileSync(path.join(dirs.node("val-0"), "config", "app.toml"), "utf8");
+    expect(valApp).not.toContain('address = "tcp://0.0.0.0:1317"');
+    db.close();
+  }, 120_000);
+});
+
 describe("Phase A re-run", () => {
   it("is a no-op on a completed launch (checkpoint skip)", async () => {
     const s = spec(1, 0, {});

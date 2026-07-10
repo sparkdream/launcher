@@ -67,6 +67,29 @@ export function renderNodeSdl(input: RenderSdlInput): void {
     svc.env = env;
   }
 
+  // Public chain endpoints (§4 topology.publicEndpoints): sentry-0 serves
+  // LCD/RPC on accept-domain ingress — the exact shape running on the
+  // manual testnet (prod SDLs, verified live). The rpc accept rides the
+  // EXISTING 26657 expose so `global: true` keeps allocating the random
+  // forwarded port the health probes and verify-chain depend on.
+  if (node.role === "sentry" && node.index === 0) {
+    const pub = spec.topology.publicEndpoints;
+    if (pub?.api) {
+      svc.expose.push({
+        port: 1317,
+        as: 1317,
+        accept: [pub.api],
+        proto: "tcp",
+        to: [{ global: true }],
+      });
+    }
+    if (pub?.rpc) {
+      const rpc = (svc.expose as any[]).find((e) => e.port === 26657);
+      if (!rpc) throw new Error("vendored sentry SDL has no 26657 expose");
+      rpc.accept = [pub.rpc];
+    }
+  }
+
   const resources = doc.profiles?.compute?.sparkdreamd?.resources;
   if (!resources) throw new Error("vendored SDL has no compute profile resources");
   const roleRes = spec.infra.resources[node.role];

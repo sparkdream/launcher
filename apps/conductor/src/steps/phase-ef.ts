@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { nodes, resolveTopology, tunnelPort } from "@sparkdream/launch-spec";
+import { nodes, resolveTopology, statelessComponents, tunnelPort } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
@@ -237,9 +237,80 @@ export const verifyChainStep: StepDef = {
       }
       ctx.log(`${key}: verified at height ${checks[key]!.height}`);
     }
-    return { sentries: checks };
+
+    // §5 step 21 continued: explorer/frontend HTTP 200 on their domains,
+    // public api/rpc serving chain data. The domains are user-created DNS
+    // records pointing at provider ingress hosts, so an unreachable one
+    // pauses with the exact record needed (headscale DNS-gate pattern).
+    const http: Record<string, string> = {};
+    const targets: Array<{ name: string; domain: string; url: string; behind: string }> = [];
+    for (const c of statelessComponents(ctx.spec)) {
+      targets.push({ name: c.key, domain: c.domain, url: `https://${c.domain}/`, behind: c.key });
+    }
+    const pub = ctx.spec.topology.publicEndpoints;
+    if (pub?.api) {
+      targets.push({
+        name: "public-api",
+        domain: pub.api,
+        url: `https://${pub.api}/cosmos/base/tendermint/v1beta1/node_info`,
+        behind: "sentry-0",
+      });
+    }
+    if (pub?.rpc) {
+      targets.push({
+        name: "public-rpc",
+        domain: pub.rpc,
+        url: `https://${pub.rpc}/status`,
+        behind: "sentry-0",
+      });
+    }
+    const failures: string[] = [];
+    for (const t of targets) {
+      // ~1 min per target — persist-start restarts the pods just before this
+      let ok = false;
+      for (let i = 0; i < 12 && !ok; i++) {
+        if (i > 0) await ctx.services.sleep(5000);
+        ok = await ctx.services.rpc.httpOk(t.url);
+      }
+      if (ok) {
+        http[t.name] = t.url;
+        ctx.log(`${t.name}: reachable at ${t.url}`);
+        continue;
+      }
+      const a = assignments.perNode[t.behind]!;
+      const ingress = await ingressHost(
+        ctx, a.hostUri, plan.perNode[t.behind]!.dseq, a.gseq, a.oseq, t.domain,
+      );
+      failures.push(
+        `${t.name}: not reachable at ${t.url} — create a DNS record for ${t.domain} → ` +
+          `CNAME ${ingress} (or an A record to that host's IP). ` +
+          `Cloudflare: proxy on, SSL=Flexible.`,
+      );
+    }
+    if (failures.length > 0) {
+      throw new AwaitUser("verify-chain", `${failures.join("\n")}\nThen resume.`);
+    }
+    return { sentries: checks, http };
   },
 };
+
+/** The hostname the user's DNS record must point at (NOT the :8443 API). */
+export async function ingressHost(
+  ctx: StepCtx,
+  hostUri: string,
+  dseq: string,
+  gseq: number,
+  oseq: number,
+  domain: string,
+): Promise<string> {
+  const status: any = await ctx.services.provider.leaseStatus(
+    loadCert(ctx), hostUri, dseq, gseq, oseq,
+  );
+  const uris: string[] = Object.values(status?.services ?? {}).flatMap(
+    (s: any) => s?.uris ?? [],
+  );
+  return uris.find((u) => u !== domain) ?? new URL(hostUri).hostname;
+}
 
 export const finalizeStep: StepDef = {
   name: "finalize",

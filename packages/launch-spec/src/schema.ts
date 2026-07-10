@@ -63,6 +63,8 @@ export const launchSpecSchema = z.object({
     type: networkType,
     chainIdSuffix: z.number().int().min(1).default(1),
     bech32Prefix: z.string().regex(/^[a-z]{2,16}$/),
+    /** Human-readable name shown by the frontend (CHAIN_NAME). Defaults to name. */
+    displayName: z.string().min(1).max(64).optional(),
   }),
 
   token: z.object({
@@ -102,6 +104,18 @@ export const launchSpecSchema = z.object({
       frontend: componentToggle,
       hub: componentToggle,
     }),
+    /**
+     * Public chain endpoints, served by sentry-0 via accept-domain ingress
+     * (the pattern proven on the manual testnet): api → LCD 1317 (flips the
+     * sentry's app.toml [api] block on), rpc → CometBFT 26657. Required for
+     * the frontend, which reads LCD_ENDPOINT/RPC_ENDPOINT at runtime.
+     */
+    publicEndpoints: z
+      .object({
+        api: domain.optional(),
+        rpc: domain.optional(),
+      })
+      .optional(),
     headscale: z.object({
       domain,
       backup: z.object({ s3: s3Backup }).optional(),

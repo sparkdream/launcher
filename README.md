@@ -28,6 +28,27 @@ npm run dev     # development: Next.js frontend on :3210 + conductor API on :818
 Open the UI, configure your compute network (chain id, RPC/REST, denom), and
 connect Keplr — all Akash transactions are signed in the browser.
 
+## Launch fee
+
+Launching a fleet adds a **one-time service fee of 10% of the fleet's leased
+monthly rate**, computed from the actual winning bid prices and shown in the
+wizard's cost table before anything is signed. Two smaller day-2 fees follow:
+a flat **2 ACT per upgrade** (rolling or coordinated, once per operation) and
+**0.5% of each escrow top-up**. Every fee rides a transaction you already
+sign — no extra signature — and appears as a plain bank send in the Keplr
+prompt, so nothing is hidden.
+
+Self-hosters can change or disable any of them:
+
+| env var | default | fee |
+| --- | --- | --- |
+| `LAUNCH_FEE_ADDRESS` | project address | recipient of all fees |
+| `LAUNCH_FEE_BPS` | `1000` (10%) | launch, on the leased monthly rate |
+| `LAUNCH_FEE_UPGRADE` | `2000000` (2 ACT) | flat, per upgrade op |
+| `LAUNCH_FEE_TOPUP_BPS` | `50` (0.5%) | on each escrow top-up |
+
+Set any to `0` to disable that fee.
+
 ### Running on Akash
 
 Build the image (`Dockerfile`) and deploy with `deploy.yaml`. In Akash mode set:

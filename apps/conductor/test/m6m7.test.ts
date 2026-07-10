@@ -198,11 +198,14 @@ describe("coordinated halt-height upgrade (M7)", () => {
     const result = await runWithSigner(db, "hu", s2, work, steps, services, signer);
     expect(result.status).toBe("completed");
 
-    // one batched MsgUpdateDeployment tx for all 4 nodes
+    // one batched tx: 4 node MsgUpdateDeployment + the flat upgrade fee
     const upgradeTxs = signer.signed.slice(sigsBefore);
     expect(upgradeTxs).toHaveLength(1);
-    expect(upgradeTxs[0]!).toHaveLength(4);
-    expect(upgradeTxs[0]!.every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+    expect(upgradeTxs[0]!).toHaveLength(5);
+    expect(upgradeTxs[0]!.slice(0, 4).every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+    const feeMsg = upgradeTxs[0]!.at(-1)!;
+    expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uact", amount: "2000000" }]);
     // halt-height was set then cleared on every node
     const setHalt = services.ssh.execLog.filter((e) => e.command.includes("halt-height = 5"));
     const clearHalt = services.ssh.execLog.filter((e) => e.command.includes("halt-height = 0"));

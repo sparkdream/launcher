@@ -4,6 +4,7 @@ import {
   chainId,
   nodes,
   resolveTopology,
+  statelessComponents,
   tunnelPort,
   validateSpec,
   type LaunchSpec,
@@ -23,6 +24,7 @@ import {
 } from "../gentx.js";
 import { renderNodeConfigs } from "../render-configs.js";
 import { renderNodeSdl } from "../render-sdl.js";
+import { renderComponentSdl } from "../render-component-sdl.js";
 
 /**
  * Placeholder for values only known in Phase E (tailnet IPs) or Phase C
@@ -371,6 +373,17 @@ export const renderSdlsStep: StepDef = {
         spec: ctx.spec,
         node,
         topology: topo,
+        sshPublicKey: keys.sshPublicKey,
+        outPath,
+        placeholder,
+      });
+      written.push(outPath);
+    }
+    for (const component of statelessComponents(ctx.spec)) {
+      const outPath = path.join(ctx.dirs.sdl, `${component.key}.yaml`);
+      renderComponentSdl({
+        spec: ctx.spec,
+        component,
         sshPublicKey: keys.sshPublicKey,
         outPath,
         placeholder,

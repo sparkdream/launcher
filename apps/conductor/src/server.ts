@@ -10,6 +10,8 @@ import { AuthService } from "./auth.js";
 import { buildTmkmsSetup } from "./tmkms.js";
 import { FleetService } from "./fleet.js";
 import { buildOpSteps } from "./fleet-ops.js";
+import { estimateLaunchCost } from "./estimate.js";
+import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
 
 export interface ServerDeps {
@@ -152,6 +154,22 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
     return "started";
   };
+
+  // service fee schedule — lets the UI show exact day-2 fee amounts and
+  // honor env overrides (the fee is always visible in the Keplr prompt too)
+  app.get("/api/fee", async () => feeConfig());
+
+  // pre-launch running-cost estimate for a spec — read-only market data,
+  // callable before any wallet is connected
+  app.post("/api/estimate", async (req, reply) => {
+    let spec: LaunchSpec;
+    try {
+      spec = withDefaults((req.body as { spec: unknown }).spec);
+    } catch (e) {
+      return reply.status(400).send({ error: "schema", detail: String(e) });
+    }
+    return estimateLaunchCost(spec);
+  });
 
   app.post("/api/launches", async (req, reply) => {
     const body = req.body as { spec: unknown; owner?: string };
@@ -303,12 +321,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
       case "upgrade": {
         if (!body.image) return reply.status(400).send({ error: "image required" });
-        // rolling scope: given components or the whole node fleet (§5)
+        // rolling scope: given components or the whole node fleet (§5).
+        // Defaulting to nodes only — the image is a sparkdreamd tag;
+        // explorer/frontend upgrades name their component explicitly.
         const components =
           body.components ??
           deps.db
             .listFleetComponents(launchId)
-            .filter((c) => c.state === "active" && c.key !== "headscale")
+            .filter((c) => c.state === "active" && /^(val|sentry)-/.test(c.key))
             .map((c) => c.key);
         const opId = fleet.requestUpgrade(launch, components, body.image);
         drive(launchId, spec);

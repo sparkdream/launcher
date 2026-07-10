@@ -76,3 +76,15 @@ td.actions { display: flex; gap: 4px; flex-wrap: wrap; }
 .tmkms-val details { margin: 6px 0; }
 .tmkms-val summary { cursor: pointer; color: var(--dim); font-size: 0.8rem; }
 .tmkms-val pre, pre.commands { background: var(--bg); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 0.75rem; }
+
+/* collapsed Akash network settings (Wallet panel) */
+details.network-config { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.network-config summary { cursor: pointer; color: var(--dim); font-size: 0.85rem; }
+details.network-config .grid { margin-top: 10px; }
+
+/* deployment plan preview (Launch spec panel): images + cost per role */
+table.deploy-plan { margin-top: 12px; border-collapse: collapse; font-size: 0.8rem; }
+table.deploy-plan th { text-align: left; color: var(--dim); font-weight: normal; padding: 2px 22px 4px 0; }
+table.deploy-plan td { padding: 2px 22px 2px 0; color: var(--dim); vertical-align: top; }
+table.deploy-plan td code { word-break: break-all; }
+table.deploy-plan tfoot td { border-top: 1px solid var(--line); padding-top: 6px; color: var(--text); }

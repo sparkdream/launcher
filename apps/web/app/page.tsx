@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
+import { withDefaults } from "@sparkdream/launch-spec";
 import yaml from "js-yaml";
 import {
   createLaunch,
@@ -15,6 +16,8 @@ import {
   postTxResult,
   resumeLaunch,
   startLaunch,
+  type CostEstimate,
+  type FeeInfo,
   type FleetSummary,
   type LaunchView,
   type PendingGentx,
@@ -43,7 +46,7 @@ import {
 
 const EXAMPLE_SPEC = `version: 1
 network:
-  name: sparkdream-dev-1
+  name: sparkdreamdev
   type: devnet
   bech32Prefix: sprkdrm
 token:
@@ -71,9 +74,13 @@ topology:
   validators: { count: 1 }
   sentries: { count: 1 }
   components:
-    explorer: { enabled: false }
-    frontend: { enabled: false }
+    explorer: { enabled: false, domain: explorer.example.com }
+    frontend: { enabled: false, domain: app.example.com }
     hub: { enabled: false }
+  # required when frontend is enabled — sentry-0 serves these domains:
+  # publicEndpoints:
+  #   api: api.example.com
+  #   rpc: rpc.example.com
   headscale:
     domain: headscale.example.com
 `;
@@ -121,6 +128,20 @@ export default function Page() {
     saveChainConfig(next);
   };
 
+  // the Akash network parameters rarely change — they live folded behind a
+  // summary line and only unfold on demand or when connecting fails
+  const [networkOpen, setNetworkOpen] = useState(false);
+  const chainIsCustom = (Object.keys(DEFAULT_CHAIN) as (keyof ChainConfig)[]).some(
+    (k) => chain[k] !== DEFAULT_CHAIN[k],
+  );
+  const rpcHost = useMemo(() => {
+    try {
+      return new URL(chain.rpc).hostname;
+    } catch {
+      return chain.rpc;
+    }
+  }, [chain.rpc]);
+
   const WALLET_CONNECTED_KEY = "launcher.walletConnected";
 
   const connect = useCallback(
@@ -147,7 +168,11 @@ export default function Page() {
         // silent = auto-reconnect: site approval was likely revoked, so
         // stop trying on future loads rather than surfacing an error
         if (silent) localStorage.removeItem(WALLET_CONNECTED_KEY);
-        else setError(String(e));
+        else {
+          setError(String(e));
+          // a failed connect is the one moment the network fields matter
+          setNetworkOpen(true);
+        }
       }
     },
     [chain],
@@ -230,14 +255,27 @@ export default function Page() {
     };
   }, [wallet]);
 
+  // never orphan a launch that needs attention: if no launch board is open
+  // (fresh browser, or "New launch" clicked) and some launch is not
+  // completed — running, paused on a signature, failed — reattach to the
+  // most recent one so its banners stay reachable
+  useEffect(() => {
+    if (launchId || !fleet) return;
+    const active = [...fleet.fleets].reverse().find((f) => f.launchStatus !== "completed");
+    if (active) {
+      localStorage.setItem(LAST_LAUNCH_KEY, active.launchId);
+      setLaunchId(active.launchId);
+    }
+  }, [fleet, launchId]);
+
   // real-time block height for active nodes (validators + sentries; not
-  // headscale). Lighter + faster than the 45s health sweep; re-derives its
-  // target list from the current fleet.
+  // headscale/explorer/frontend — they have no RPC). Lighter + faster than
+  // the 45s health sweep; re-derives its target list from the current fleet.
   const heightTargets = useMemo(
     () =>
       (fleet?.fleets ?? []).flatMap((f) =>
         f.components
-          .filter((c) => c.key !== "headscale" && c.state === "active")
+          .filter((c) => /^(val|sentry)-/.test(c.key) && c.state === "active")
           .map((c) => ({ launchId: f.launchId, dseq: c.dseq })),
       ),
     [fleet],
@@ -382,7 +420,11 @@ export default function Page() {
       const nodeCount =
         (spec?.topology?.validators?.count ?? 0) + (spec?.topology?.sentries?.count ?? 0);
       if (nodeCount <= 0) return null;
-      return (nodeCount + 1) * DEPOSIT_PER_DEPLOYMENT;
+      const comps = spec?.topology?.components ?? {};
+      const componentCount = ["explorer", "frontend"].filter(
+        (k) => comps[k]?.enabled,
+      ).length;
+      return (nodeCount + 1 + componentCount) * DEPOSIT_PER_DEPLOYMENT;
     } catch {
       return null; // spec doesn't parse — validation will complain elsewhere
     }
@@ -392,7 +434,76 @@ export default function Page() {
       ? Math.max(0, requiredDeposit - Number(balanceOf(chain.denom) ?? "0"))
       : 0;
 
+  // the deployment plan this spec resolves to (profile defaults applied) —
+  // one row per role with count + image, joined with the cost estimate in
+  // the render. When the spec fails the schema, carry the FIRST issue: a
+  // silently missing preview gives no clue what to fix.
+  const specPreview = useMemo((): {
+    plan: Array<{ role: string; count: number; image: string }> | null;
+    error: string | null;
+  } => {
+    try {
+      const spec = withDefaults(yaml.load(specText));
+      // role names match the estimator's perRole keys
+      const rows: Array<{ role: string; count: number; image: string }> = [
+        { role: "validators", count: spec.topology.validators.count, image: spec.images.sparkdreamd },
+      ];
+      if (spec.topology.sentries.count > 0) {
+        rows.push({ role: "sentries", count: spec.topology.sentries.count, image: spec.images.sparkdreamd });
+      }
+      rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
+      if (spec.topology.components.explorer.enabled && spec.images.explorer) {
+        rows.push({ role: "explorer", count: 1, image: spec.images.explorer });
+      }
+      if (spec.topology.components.frontend.enabled && spec.images.frontend) {
+        rows.push({ role: "frontend", count: 1, image: spec.images.frontend });
+      }
+      return { plan: rows, error: null };
+    } catch (e: any) {
+      // zod puts issues in .issues; yaml throws a plain message
+      const issue = Array.isArray(e?.issues) && e.issues[0]
+        ? `${e.issues[0].path.join(".")}: ${e.issues[0].message}`
+        : String(e?.message ?? e).split("\n")[0]!;
+      return { plan: null, error: issue };
+    }
+  }, [specText]);
+  const resolvedImages = specPreview.plan;
+
+  // market-based running-cost estimate for the current spec (conductor →
+  // console pricing API), debounced so we only price a settled spec
+  const [costEstimate, setCostEstimate] = useState<CostEstimate | null>(null);
+  useEffect(() => {
+    if (!resolvedImages) {
+      setCostEstimate(null);
+      return;
+    }
+    let stale = false;
+    const t = setTimeout(async () => {
+      try {
+        const { postEstimate } = await import("../lib/api");
+        const est = await postEstimate(yaml.load(specText));
+        if (!stale) setCostEstimate(est);
+      } catch {
+        if (!stale) setCostEstimate(null); // estimate is best-effort
+      }
+    }, 700);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [specText, resolvedImages]);
+
+  // service fee schedule (day-2 dialogs show exact amounts; the fee is
+  // always in the Keplr prompt regardless)
+  const [fee, setFee] = useState<FeeInfo | null>(null);
+  useEffect(() => {
+    import("../lib/api").then(({ getFee }) => getFee().then(setFee).catch(() => {}));
+  }, []);
+
   const [logsView, setLogsView] = useState<{ key: string; text: string } | null>(null);
+  // shut-down fleets (every component closed) collapse to one line; the
+  // record stays for bundle export / genesis download behind this toggle
+  const [showClosedFleet, setShowClosedFleet] = useState<Record<string, boolean>>({});
   // live sentry block heights, keyed by dseq, polled every 3s
   const [liveHeights, setLiveHeights] = useState<
     Record<string, { height: number; catchingUp: boolean }>
@@ -445,8 +556,12 @@ export default function Page() {
         if (!ok) return;
         await postFleetAction(launchId, dseq, action, { ...extra, confirm: true });
       }
-      // signature-bearing actions flow through the launch's signing loop
-      if (action !== "restart") setLaunchId(launchId);
+      // signature-bearing actions flow through the launch's signing loop —
+      // open that launch's panel so the prompt is visible (and survives reload)
+      if (action !== "restart") {
+        localStorage.setItem(LAST_LAUNCH_KEY, launchId);
+        setLaunchId(launchId);
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -464,6 +579,11 @@ export default function Page() {
 
   // poll launch status + pending tx while a launch is active
   useEffect(() => {
+    // drop the previous launch's state immediately on switch — a stale
+    // pending tx must never be signable against the new launch id
+    setLaunch(null);
+    setPending(null);
+    setPendingGentx(null);
     if (!launchId) return;
     let stop = false;
     const tick = async () => {
@@ -587,33 +707,23 @@ export default function Page() {
       <h1>SPARK·DREAM chain launcher</h1>
 
       <section className="panel">
-        <h2>Compute network</h2>
-        <div className="grid">
-          {(
-            [
-              ["chainId", "chain id"],
-              ["chainName", "name"],
-              ["rpc", "rpc"],
-              ["rest", "rest (lcd)"],
-              ["denom", "denom"],
-              ["bech32Prefix", "prefix"],
-              ["gasPrice", "gas price"],
-            ] as const
-          ).map(([key, label]) => (
-            <label key={key}>
-              {label}
-              <input value={chain[key]} onChange={(e) => updateChain({ [key]: e.target.value })} />
-            </label>
-          ))}
-        </div>
+        <h2>Wallet</h2>
         <div className="row">
-          <button onClick={() => suggestChain(chain).catch((e) => setError(String(e)))}>
-            Suggest chain to Keplr
-          </button>
           <button onClick={() => connect()} className="primary">
             {wallet ? `Connected: ${wallet.name}` : "Connect Keplr"}
           </button>
           {wallet && <code>{wallet.address}</code>}
+          {wallet && balances && (
+            <span>
+              Balances: <b>{microToDisplay(balanceOf("uakt"))} AKT</b> ·{" "}
+              <b>{microToDisplay(balanceOf("uact"))} ACT</b>
+            </span>
+          )}
+          {wallet && ledger && ledger.pending > 0 && (
+            <span className="op-active">
+              {ledger.pending} mint{ledger.pending > 1 ? "s" : ""} settling…
+            </span>
+          )}
         </div>
         {wallet && ledger?.last_status === "canceled" && (
           <div className="banner fail">
@@ -639,6 +749,7 @@ export default function Page() {
               <button
                 onClick={mint}
                 disabled={busy !== null || !mintAmount || belowMinMint || !bme.mints_allowed}
+                title="Minting burns AKT and settles asynchronously via the BME ledger — the ACT arrives after the next settlement epoch."
               >
                 Mint ACT from AKT
               </button>
@@ -654,33 +765,62 @@ export default function Page() {
                 The BME circuit breaker has halted ACT mints on this network — try again later.
               </div>
             )}
+            <p className="dim-note">
+              Deployments are paid in ACT; minted ACT arrives after the next settlement epoch,
+              so mint before launching.
+              {bme.min_mint_uact && ` Minimum mint: ${microToDisplay(bme.min_mint_uact)} ACT.`}
+              {requiredDeposit !== null &&
+                ` The current spec needs ~${microToDisplay(String(requiredDeposit))} ${denomLabel} in refundable deployment deposits.`}
+              {aktPrice === null &&
+                " (Price feed unreachable — no output estimate; below-minimum mints will be canceled by the chain.)"}
+            </p>
           </>
         )}
-        {wallet && balances && (
+        <details
+          className="network-config"
+          open={networkOpen}
+          onToggle={(e) => setNetworkOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary>
+            Akash network: <code>{chain.chainId}</code> · <code>{chain.denom}</code> ·{" "}
+            <code>{rpcHost}</code>
+            {chainIsCustom && (
+              <b className="warnings" title="One or more values differ from the built-in Akash mainnet defaults">
+                {" "}
+                custom
+              </b>
+            )}
+          </summary>
+          <div className="grid">
+            {(
+              [
+                ["chainId", "chain id"],
+                ["chainName", "name"],
+                ["rpc", "rpc"],
+                ["rest", "rest (lcd)"],
+                ["denom", "denom"],
+                ["bech32Prefix", "prefix"],
+                ["gasPrice", "gas price"],
+              ] as const
+            ).map(([key, label]) => (
+              <label key={key}>
+                {label}
+                <input value={chain[key]} onChange={(e) => updateChain({ [key]: e.target.value })} />
+              </label>
+            ))}
+          </div>
           <div className="row">
-            <span>
-              Balances: <b>{microToDisplay(balanceOf("uakt"))} AKT</b> ·{" "}
-              <b>{microToDisplay(balanceOf("uact"))} ACT</b>
-            </span>
-            {ledger && ledger.pending > 0 && (
-              <span className="op-active">
-                {ledger.pending} mint{ledger.pending > 1 ? "s" : ""} settling…
-              </span>
+            <button
+              title="Register this network in Keplr (one-time; akashnet-2 is already known to Keplr)"
+              onClick={() => suggestChain(chain).catch((e) => setError(String(e)))}
+            >
+              Suggest chain to Keplr
+            </button>
+            {chainIsCustom && (
+              <button onClick={() => updateChain(DEFAULT_CHAIN)}>Reset to Akash mainnet</button>
             )}
           </div>
-        )}
-        {wallet && bme && (
-          <p className="dim-note">
-            Deployments are paid in ACT. Minting burns AKT and settles asynchronously via the
-            BME ledger — the ACT arrives after the next settlement epoch, so mint before
-            launching.
-            {bme.min_mint_uact && ` Minimum mint: ${microToDisplay(bme.min_mint_uact)} ACT.`}
-            {requiredDeposit !== null &&
-              ` The current spec needs ~${microToDisplay(String(requiredDeposit))} ${denomLabel} in deployment deposits that are refundable minus usage when the deployments are closed.`}
-            {aktPrice === null &&
-              " (Price feed unreachable — no output estimate; below-minimum mints will be canceled by the chain.)"}
-          </p>
-        )}
+        </details>
       </section>
 
       <section className="panel">
@@ -714,19 +854,100 @@ export default function Page() {
               hidden
             />
           </label>
-          {launchId && (
-            <button
-              onClick={() => {
-                localStorage.removeItem(LAST_LAUNCH_KEY);
-                setLaunchId(null);
-                setLaunch(null);
-                setPending(null);
-              }}
-            >
-              New launch
-            </button>
-          )}
         </div>
+        {specPreview.error && (
+          <p className="dim-note">
+            <span className="warnings">⚠ {specPreview.error}</span> — image and cost previews
+            appear once the spec parses.
+          </p>
+        )}
+        {resolvedImages && (
+          <>
+            <table className="deploy-plan">
+              <thead>
+                <tr>
+                  <th>deployment</th>
+                  <th>image</th>
+                  <th>est. cost / month</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resolvedImages.map((r) => {
+                  const cost = costEstimate?.perRole.find((c) => c.role === r.role);
+                  return (
+                    <tr key={r.role}>
+                      <td>
+                        {r.role}
+                        {r.count > 1 && ` ×${r.count}`}
+                      </td>
+                      <td>
+                        <code>{r.image}</code>
+                      </td>
+                      <td>
+                        {cost
+                          ? `${cost.count > 1 ? `${cost.count} × ` : ""}$${cost.unitLowUsd.toFixed(2)}–${cost.unitHighUsd.toFixed(2)}`
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              {costEstimate && (
+                <tfoot>
+                  <tr className="total">
+                    <td>{costEstimate.feeBps > 0 ? "deployments" : "total"}</td>
+                    <td className="dim-note">
+                      + ~{requiredDeposit !== null ? microToDisplay(String(requiredDeposit)) : "?"}{" "}
+                      {denomLabel} in refundable deposits
+                    </td>
+                    <td>
+                      {costEstimate.feeBps > 0 ? (
+                        <>
+                          ${costEstimate.totalLowUsd.toFixed(2)}–{costEstimate.totalHighUsd.toFixed(2)}
+                        </>
+                      ) : (
+                        <b>
+                          ${costEstimate.totalLowUsd.toFixed(2)}–{costEstimate.totalHighUsd.toFixed(2)}
+                        </b>
+                      )}
+                    </td>
+                  </tr>
+                  {costEstimate.feeBps > 0 && (
+                    <>
+                      <tr>
+                        <td>launch fee</td>
+                        <td className="dim-note">
+                          one-time, {costEstimate.feeBps / 100}% of actual leased monthly rate
+                        </td>
+                        <td>
+                          ${costEstimate.feeLowUsd.toFixed(2)}–{costEstimate.feeHighUsd.toFixed(2)}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>total</td>
+                        <td className="dim-note">
+                          first month; later months pay only the deployments line
+                        </td>
+                        <td>
+                          <b>
+                            $
+                            {(costEstimate.totalLowUsd + costEstimate.feeLowUsd).toFixed(2)}–
+                            {(costEstimate.totalHighUsd + costEstimate.feeHighUsd).toFixed(2)}
+                          </b>
+                        </td>
+                      </tr>
+                    </>
+                  )}
+                </tfoot>
+              )}
+            </table>
+            <p className="dim-note">
+              Cost range: stock provider bid-script rates (high) down to the competitive bids
+              the policy engine actually picks (low). Override images via <code>images:</code>{" "}
+              in the spec.
+            </p>
+          </>
+        )}
         {wallet && depositShortfall > 0 && (
           <div className="banner wait">
             This launch needs ~{microToDisplay(String(requiredDeposit))} {denomLabel} in
@@ -859,16 +1080,46 @@ export default function Page() {
       {fleet && fleet.fleets.length > 0 && (
         <section className="panel">
           <h2>Fleet</h2>
-          {fleet.fleets.map((f) => (
+          {fleet.fleets.map((f) => {
+            const shutDown =
+              f.components.length > 0 && f.components.every((c) => c.state === "closed");
+            const collapsed = shutDown && !showClosedFleet[f.launchId];
+            return (
             <div key={f.launchId}>
               <h3>
                 <code>{f.chainId}</code> — launch <code>{f.launchId.slice(0, 8)}</code> (
-                {f.launchStatus})
+                {shutDown ? "shut down" : f.launchStatus})
+                {shutDown && (
+                  <button
+                    title="A shut-down fleet is kept as a record — its bundle and genesis stay downloadable"
+                    onClick={() =>
+                      setShowClosedFleet((m) => ({ ...m, [f.launchId]: !m[f.launchId] }))
+                    }
+                  >
+                    {collapsed ? "show" : "hide"}
+                  </button>
+                )}
+                {!collapsed &&
+                  (f.launchId === launchId ? (
+                    <span className="dim-note"> — in the launch panel above</span>
+                  ) : (
+                    <button
+                      title="Open this launch's panel (steps, signature prompts, resume)"
+                      onClick={() => {
+                        localStorage.setItem(LAST_LAUNCH_KEY, f.launchId);
+                        setLaunchId(f.launchId);
+                      }}
+                    >
+                      view launch
+                    </button>
+                  ))}
               </h3>
+              {!collapsed && (<>
               <table className="fleet">
                 <thead>
                   <tr>
                     <th>component</th>
+                    <th>image</th>
                     <th>provider</th>
                     <th>price</th>
                     <th>state</th>
@@ -880,6 +1131,13 @@ export default function Page() {
                   {f.components.map((c) => (
                     <tr key={c.key} className={c.state}>
                       <td>{c.key}</td>
+                      <td>
+                        {c.image ? (
+                          <code title={c.image}>{c.image.split(":").pop()}</code>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
                       <td>
                         <code title={c.provider}>{c.providerName || `${c.provider.slice(0, 16)}…`}</code>
                         {(() => {
@@ -936,7 +1194,14 @@ export default function Page() {
                             </button>
                             <button
                               onClick={() => {
-                                const amount = window.prompt("Top-up amount (uact):", "5000000");
+                                const feeNote =
+                                  fee && fee.topupBps > 0
+                                    ? ` A ${fee.topupBps / 100}% service fee is added (signed together).`
+                                    : "";
+                                const amount = window.prompt(
+                                  `Top-up amount (uact):${feeNote}`,
+                                  "5000000",
+                                );
                                 if (amount) fleetAction(f.launchId, c.dseq, "topup", { amount });
                               }}
                             >
@@ -954,7 +1219,7 @@ export default function Page() {
                         )}
                         {/* a closed/relaunching node can still be relaunched
                             (redeploy fresh) — the only action that applies */}
-                        {c.state !== "active" && c.key !== "headscale" && (
+                        {c.state !== "active" && c.key !== "headscale" && !shutDown && (
                           <button onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}>
                             relaunch
                           </button>
@@ -965,9 +1230,14 @@ export default function Page() {
                 </tbody>
               </table>
               <div className="row">
+                {!shutDown && (<>
                 <button
                   onClick={() => {
-                    const image = window.prompt("Rolling upgrade — new sparkdreamd image:");
+                    const feeNote =
+                      fee && fee.upgradeFlat > 0
+                        ? ` A one-time ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added (signed together).`
+                        : "";
+                    const image = window.prompt(`Rolling upgrade — new sparkdreamd image:${feeNote}`);
                     const first = f.components.find((c) => c.state === "active" && c.key !== "headscale");
                     if (image && first) fleetAction(f.launchId, first.dseq, "upgrade", { image });
                   }}
@@ -976,7 +1246,13 @@ export default function Page() {
                 </button>
                 <button
                   onClick={async () => {
-                    const image = window.prompt("Coordinated (consensus-breaking) upgrade — new image:");
+                    const feeNote =
+                      fee && fee.upgradeFlat > 0
+                        ? ` A one-time ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added (signed together).`
+                        : "";
+                    const image = window.prompt(
+                      `Coordinated (consensus-breaking) upgrade — new image:${feeNote}`,
+                    );
                     if (!image) return;
                     const h = window.prompt("Halt height:");
                     const first = f.components.find((c) => c.state === "active" && c.key !== "headscale");
@@ -992,6 +1268,7 @@ export default function Page() {
                 >
                   halt-height upgrade…
                 </button>
+                </>)}
                 <button
                   onClick={async () => {
                     const { downloadFleetBundle } = await import("../lib/api");
@@ -1008,24 +1285,26 @@ export default function Page() {
                 >
                   download genesis
                 </button>
-                <button
-                  onClick={async () => {
-                    const active = f.components.filter((c) => c.state === "active").map((c) => c.key);
-                    const ok = window.confirm(
-                      `Shut down the whole fleet? This closes ${active.length} deployment${active.length === 1 ? "" : "s"} (${active.join(", ")}) — the chain STOPS and escrow is refunded. One signature.`,
-                    );
-                    if (!ok) return;
-                    const { postFleetShutdown } = await import("../lib/api");
-                    try {
-                      await postFleetShutdown(f.launchId);
-                      setLaunchId(f.launchId); // surfaces the signing banner
-                    } catch (e) {
-                      setError(String(e));
-                    }
-                  }}
-                >
-                  shut down fleet…
-                </button>
+                {!shutDown && (
+                  <button
+                    onClick={async () => {
+                      const active = f.components.filter((c) => c.state === "active").map((c) => c.key);
+                      const ok = window.confirm(
+                        `Shut down the whole fleet? This closes ${active.length} deployment${active.length === 1 ? "" : "s"} (${active.join(", ")}) — the chain STOPS and escrow is refunded. One signature.`,
+                      );
+                      if (!ok) return;
+                      const { postFleetShutdown } = await import("../lib/api");
+                      try {
+                        await postFleetShutdown(f.launchId);
+                        setLaunchId(f.launchId); // surfaces the signing banner
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    shut down fleet…
+                  </button>
+                )}
                 {f.ops
                   .filter((o) => o.status === "active")
                   .map((o) => (
@@ -1081,8 +1360,10 @@ export default function Page() {
                   </p>
                 );
               })()}
+              </>)}
             </div>
-          ))}
+            );
+          })}
           {logsView && (
             <div className="banner wait">
               <b>{logsView.key} logs</b>

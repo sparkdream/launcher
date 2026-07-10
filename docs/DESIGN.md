@@ -263,6 +263,9 @@ topology:
     explorer: { enabled: true, domain: explorer.sparkdream.io }
     frontend: { enabled: true, domain: app.sparkdream.io }
     hub:      { enabled: false }     # landing page usually already live
+  publicEndpoints:                   # sentry-0 serves these via accept-domain
+    api: api.sparkdream.io           # ingress (LCD 1317; flips the sentry's
+    rpc: rpc.sparkdream.io           # app.toml [api] on) — required by frontend
   headscale:
     domain: headscale.sparkdream.io
     backup:                          # required for mainnet, optional otherwise
@@ -441,6 +444,24 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
     anti-affinity across the whole set (including headscale's provider).
     Zero-passing-bids → pause with rejected-bid explanations + manual pick.
 14. `create-leases` — **one batched `MsgCreateLease` tx**. Browser signs once.
+    The tx also carries the **launch service fee**: a one-time bank send of
+    10% of the fleet's leased monthly rate (headscale included), computed
+    from the actual winning bid prices. Riding the lease tx means no extra
+    signature and full visibility in the Keplr prompt. Env-configurable
+    (`LAUNCH_FEE_ADDRESS`, `LAUNCH_FEE_BPS`; 0 disables — the launcher is
+    open source, so the knob is honest rather than pretend-hidden); shown in
+    the wizard's estimate table. Initial launch only — relaunches re-lease
+    without it.
+
+    Two day-2 service fees follow the same "ride an already-signed tx" model
+    (`fee.ts`, all to the same address, all overridable): a **flat fee per
+    upgrade op** (`LAUNCH_FEE_UPGRADE`, default 2 ACT) on the op's first
+    `MsgUpdateDeployment` tx — once per op, not per component, and covering
+    both rolling and halt-height upgrades; and a **top-up fee**
+    (`LAUNCH_FEE_TOPUP_BPS`, default 0.5%) on each `fleet:topup` deposit.
+    Relaunches are not charged — they are usually forced by a failed
+    provider. The `GET /api/fee` route exposes the schedule so day-2 dialogs
+    show exact amounts.
 15. `send-manifests` — conductor PUTs each manifest directly to the
     provider's hostUri over mTLS (3 retries on "no lease", 5s pre-send
     delay); wait for services up; record SSH forwarded ports from lease
@@ -939,13 +960,18 @@ console-air sources)
    onto genesis JSON (no Python dependency). The gentx-hash guard in
    `regenerate-network-genesis.py` only protects committed genesis artifacts;
    irrelevant for freshly generated gentxs.
-5. **Explorer/frontend chain wiring** — RESOLVED, needs chain-repo work. The
-   Ping-Pub explorer reads a **baked JSON chain config**
-   (`explorer/ping-pub/chains/<net>/sparkdream.json`, hardcoded localhost
-   endpoints); no env wiring exists in explorer or frontend images. The
-   launcher cannot inject endpoints until the images template their chain
-   config from env at startup. **Chain-repo ask**: entrypoint-templated chain
-   config for both images; blocks step 21's explorer/frontend health checks.
+5. **Explorer/frontend chain wiring** — RESOLVED, image work landed. The
+   explorer image (`sparkdream-explorer`) seds
+   `NODE_API_ENDPOINT`/`NODE_RPC_ENDPOINT` env over the baked chain config at
+   startup and joins the tailnet (socat tunnels to sentry-0's 1317/26657,
+   nginx proxying same-origin `/api` + `/rpc` — no CORS, no public LCD
+   needed). The frontend image (`sparkdream-ui`) reads its whole chain config
+   (CHAIN_ID, LCD_ENDPOINT, RPC_ENDPOINT, denoms, prefix) from runtime env
+   via `/api/config` + a server-side LCD proxy; it needs the public
+   `topology.publicEndpoints` api/rpc domains, which sentry-0 serves through
+   accept-domain ingress (the shape proven on the manual testnet). Both
+   deploy in the step-12 batch; the explorer's tunnel IPs are baked by
+   step 20b's SDL update; step 21 health-checks all four domains.
 6. **Faucet component** — RESOLVED by cutting it: no faucet image exists in
    the chain repo (the only faucet code is the explorer UI page calling the
    external `faucet.ping.pub`), and a faucet is out of scope for the
@@ -958,6 +984,7 @@ console-air sources)
 ### Remaining chain-repo dependencies
 
 Tracked asks, ordered by which milestone they block:
-- Explorer/frontend env-templated chain config (blocks full step 21 in M3/M4).
+- ~~Explorer/frontend env-templated chain config~~ — DONE (see §12.5); the
+  launcher deploys both components.
 - Entrypoint touch-file start gate + file-based tunnel specs (nice-to-have
   before M3; removes step 20b's extra signature and step 18's fragility).
