@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import { toEncodeObject } from "@sparkdream/akash-tx";
-import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
+import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
@@ -235,8 +236,8 @@ describe("rolling upgrade op", () => {
     expect(upgradeTxs.every((msgs) => msgs[0]!.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
     const feeMsg = upgradeTxs[0]![1]!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
-    // 2 ACT at the fake $0.50 oracle price → 4 AKT (uact sends are disabled)
-    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "4000000" }]);
+    // 0.5 ACT at the fake $0.50 oracle price → 1 AKT (uact sends are disabled)
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "1000000" }]);
     // manifests re-PUT per component
     expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
     // SDLs carry the new image; components record it
@@ -246,6 +247,7 @@ describe("rolling upgrade op", () => {
       expect(sdl).toContain(`image: ${image}`);
     }
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.sparkdreamd).toBe(image);
   }, 120_000);
 });
 
@@ -264,21 +266,28 @@ describe("component upgrade", () => {
     const upgradeTxs = w.signer.signed.slice(sigsBefore);
     expect(upgradeTxs).toHaveLength(1);
     expect(upgradeTxs[0]![0]!.typeUrl.includes("MsgUpdateDeployment")).toBe(true);
-    // upgrade service fee: flat 2 ACT batched into this op's (first) update
-    // tx, paid as 4 AKT at the fake $0.50 oracle price
+    // upgrade service fee: flat 0.5 ACT batched into this op's (first) update
+    // tx, paid as 1 AKT at the fake $0.50 oracle price
     const feeMsg = upgradeTxs[0]!.at(-1)!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     expect((feeMsg.value as any).to_address).toBe(
       "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w",
     );
-    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "4000000" }]);
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "1000000" }]);
     const explorer = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
     expect(explorer.image).toBe(image);
     const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "explorer.yaml"), "utf8");
     expect(sdl).toContain(`image: ${image}`);
+    // upgrading the explorer also (re)injects its chain-identity env, so the
+    // env-aware image gets its config without needing a chain reset
+    expect(sdl).toContain("CHAIN_DENOM=uspark.sparkdreamtest");
+    expect(sdl).toContain("DISPLAY_DENOM=SPARK");
     // verified over HTTP, not pgrep-over-SSH
     expect(w.services.ssh.execLog.length).toBe(sshBefore);
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+    // the stored spec follows the swap — a later chain reset would otherwise
+    // reject the (unchanged) editor spec as a frozen-image change
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.explorer).toBe(image);
   }, 120_000);
 });
 
@@ -416,5 +425,171 @@ describe("top-up", () => {
     expect(msgs[1].typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     expect(msgs[1].value.to_address).toBe("akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w");
     expect(msgs[1].value.amount).toEqual([{ denom: "uakt", amount: "25000" }]);
+  }, 120_000);
+});
+
+describe("chain reset op", () => {
+  it("rebuilds genesis under a bumped chain-id with edited accounts, wipes and restarts", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const treasuryBefore = w.db.stepOutput<{ accounts: Record<string, string> }>(
+      "fl",
+      "generate-keys",
+    )!.accounts["acct-treasury"]!;
+
+    // spec edits: a new member account joins, gov tuned down
+    const edited = JSON.parse(launch.spec_json);
+    edited.accounts.initial.push({
+      name: "newcomer",
+      generate: true,
+      amount: "1000000000",
+      member: true,
+    });
+    edited.chainParams = { ...edited.chainParams, gov: { votingPeriod: "600s" } };
+    w.fleet.requestChainReset(launch, edited);
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    const sigsBefore = w.signer.signed.length;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+
+    // stop/start ride the wait-mode env flip: two batched deployment-update
+    // txs (nodes exec sparkdreamd as PID 1 after persist-start, so pkill
+    // alone would just self-heal), and no service fee — it's not an upgrade
+    const txs = w.signer.signed.slice(sigsBefore);
+    expect(txs).toHaveLength(2);
+    expect(txs.map((msgs) => msgs.length)).toEqual([4, 4]);
+    expect(
+      txs.every((msgs) => msgs.every((m) => m.typeUrl.includes("MsgUpdateDeployment"))),
+    ).toBe(true);
+    // the fleet ends back in self-healing mode
+    const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/val-0.yaml"), "utf8");
+    expect(sdl).toContain("WAIT_FOR_CONFIG=false");
+    expect(sdl).not.toContain("WAIT_FOR_CONFIG=true");
+
+    // every node home carries the rebuilt genesis: new chain-id, new
+    // account seeded as a member, spec override applied
+    const keys = w.db.stepOutput<{ accounts: Record<string, string> }>("fl", "generate-keys")!;
+    const newcomer = keys.accounts["acct-newcomer"]!;
+    for (const key of ["val-0", "val-1", "sentry-0", "sentry-1"]) {
+      const g = JSON.parse(
+        fs.readFileSync(path.join(w.work, `launches/fl/nodes/${key}/config/genesis.json`), "utf8"),
+      );
+      expect(g.chain_id).toBe("sparkdream-2");
+      expect(g.app_state.gov.params.voting_period).toBe("600s");
+      expect(g.app_state.rep.member_map.map((m: any) => m.address)).toEqual([newcomer]);
+      expect(g.app_state.bank.balances.some((b: any) => b.address === newcomer)).toBe(true);
+      expect(g.app_state.genutil.gen_txs).toHaveLength(2);
+    }
+    // the keyring was rebuilt: same names, fresh keys
+    expect(keys.accounts["acct-treasury"]).toBeDefined();
+    expect(keys.accounts["acct-treasury"]).not.toBe(treasuryBefore);
+    const view = w.fleet.accounts(w.db.getLaunch("fl")!);
+    expect(view.find((a) => a.name === "acct-newcomer")?.hasMnemonic).toBe(true);
+
+    // node side: every node wiped, genesis chain-id fixed in client.toml
+    const wipes = w.services.ssh.execLog.filter((e) => e.command.includes("unsafe-reset-all"));
+    expect(wipes).toHaveLength(4);
+    const seds = w.services.ssh.execLog.filter((e) =>
+      e.command.includes('chain-id = "sparkdream-2"'),
+    );
+    expect(seds).toHaveLength(4);
+
+    // relaunch bundles were re-packed with the new genesis
+    const bundled = execFileSync("tar", [
+      "xzf",
+      path.join(w.work, "launches/fl/bundles/sentry-0.tgz"),
+      "-O",
+      "config/genesis.json",
+    ]).toString();
+    expect(JSON.parse(bundled).chain_id).toBe("sparkdream-2");
+  }, 120_000);
+
+  it("swaps the node image mid-reset when the reset rides an upgrade", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.25";
+    const edited = JSON.parse(launch.spec_json);
+    edited.images = { ...edited.images, sparkdreamd: image };
+    w.fleet.requestChainReset(launch, edited);
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    const sigsBefore = w.signer.signed.length;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // three signatures: halt flip (4 updates), image swap (4 updates + the
+    // flat upgrade fee), resume flip (4 updates)
+    const txs = w.signer.signed.slice(sigsBefore);
+    expect(txs).toHaveLength(3);
+    expect(txs.map((msgs) => msgs.length)).toEqual([4, 5, 4]);
+    expect(txs[1]!.slice(0, 4).every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
+    expect(txs[1]![4]!.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    for (const c of w.db.listFleetComponents("fl").filter((x) => x.key !== "headscale")) {
+      expect(c.image).toBe(image);
+    }
+    // container restarts kill the sentry-side tunnels — re-issued after wipe
+    const wipeIdx = w.services.ssh.execLog.findIndex((e) =>
+      e.command.includes("unsafe-reset-all"),
+    );
+    const socats = w.services.ssh.execLog
+      .slice(wipeIdx)
+      .filter((e) => e.command.includes("socat TCP-LISTEN"));
+    expect(socats.length).toBeGreaterThanOrEqual(2);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("re-renders the frontend's chain-identity env on the resume tx", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const edited = JSON.parse(launch.spec_json);
+    edited.token.displayDenom = "SPARZ"; // the Keplr suggest-chain coinDenom
+    w.fleet.requestChainReset(launch, edited);
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    const sigsBefore = w.signer.signed.length;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // resume tx carries the frontend + explorer updates alongside the two
+    // node flips
+    const txs = w.signer.signed.slice(sigsBefore);
+    expect(txs.map((msgs) => msgs.length)).toEqual([2, 4]);
+    const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/frontend.yaml"), "utf8");
+    expect(sdl).toContain("DISPLAY_DENOM=SPARZ");
+    expect(sdl).toContain("CHAIN_ID=sparkdream-2");
+    // the explorer's env is patched in place: new chain identity, but the
+    // persist-start-resolved tunnel targets survive (no placeholders back)
+    const explorerSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/explorer.yaml"), "utf8");
+    expect(explorerSdl).toContain("DISPLAY_DENOM=SPARZ");
+    expect(explorerSdl).toContain("CHAIN_NAME=sparkdream");
+    expect(explorerSdl).toContain("DREAM_DENOM=udream.sparkdreamtest");
+    expect(explorerSdl).not.toContain("{{TAILNET_IP");
+    expect(explorerSdl).not.toContain("{{TS_AUTHKEY");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("rejects edits the deployed fleet embodies", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const edited = JSON.parse(launch.spec_json);
+    edited.topology.sentries.count = 3;
+    expect(() => w.fleet.requestChainReset(launch, edited)).toThrow(/sentries.count/);
+  }, 120_000);
+
+  it("rejects denoms the chain's identity module would refuse, before touching anything", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const edited = JSON.parse(launch.spec_json);
+    edited.token.baseDenom = "usparkz.sparkdreamtest"; // six letters after the u
+    const execsBefore = w.services.ssh.execLog.length;
+    expect(() => w.fleet.requestChainReset(launch, edited)).toThrow(/bond denom rule/);
+    // nothing stored, no op created, no node touched
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).token.baseDenom).toBe(
+      "uspark.sparkdreamtest",
+    );
+    expect(w.db.listFleetOps("fl")).toHaveLength(0);
+    expect(w.services.ssh.execLog.length).toBe(execsBefore);
   }, 120_000);
 });

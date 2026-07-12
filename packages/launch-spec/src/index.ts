@@ -15,6 +15,7 @@ export {
 export { testnetSpec, testnetSpecInput } from "./fixtures.js";
 export {
   chainId,
+  deriveDreamDenom,
   validatorMoniker,
   sentryMoniker,
   tunnelPort,

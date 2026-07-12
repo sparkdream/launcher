@@ -331,6 +331,21 @@ export async function postDomainUpdate(
   );
 }
 
+/** Wipe the chain and restart from a rebuilt genesis on the same
+ *  deployments (reset-chain op): the posted spec replaces the stored one. */
+export async function postChainReset(
+  launchId: string,
+  spec: unknown,
+): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/reset-chain`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spec }),
+    }),
+  );
+}
+
 /** Live block height of a node's RPC (for a real-time indicator). */
 export async function getComponentHeight(
   launchId: string,

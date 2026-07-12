@@ -31,7 +31,11 @@ export class Ssh2Runner implements SshRunner {
     ) => new ProviderClient(creds),
   ) {}
 
-  async exec(target: SshTarget, command: string): Promise<SshResult> {
+  async exec(
+    target: SshTarget,
+    command: string,
+    opts: { quick?: boolean } = {},
+  ): Promise<SshResult> {
     try {
       return await this.withConnection(target, (conn) =>
         new Promise<SshResult>((resolve, reject) => {
@@ -51,7 +55,7 @@ export class Ssh2Runner implements SshRunner {
       );
     } catch (e) {
       if (!target.shellFallback || !isConnectFailure(e)) throw e;
-      return this.fallbackExec(target, command);
+      return this.fallbackExec(target, command, opts);
     }
   }
 
@@ -96,20 +100,42 @@ export class Ssh2Runner implements SshRunner {
     }
   }
 
-  private async fallbackExec(target: SshTarget, command: string): Promise<SshResult> {
+  /** Gateway/pod-level failures worth retrying, seen live as "Unexpected
+   *  server response: 500" (handshake) and "provider reported a failure"
+   *  (frame 103, pod mid-restart). A command that ran and exited non-zero
+   *  surfaces as "lease shell: exit N" and is never retried. */
+  private static readonly TRANSIENT_SHELL_ERROR =
+    /Unexpected server response: 5\d\d|ECONNRESET|socket hang up|provider reported a failure/;
+
+  private async fallbackExec(
+    target: SshTarget,
+    command: string,
+    opts: { quick?: boolean } = {},
+  ): Promise<SshResult> {
     const f = target.shellFallback!;
     const client = this.shellClient(f.creds);
-    try {
-      const r = await client.shellExec(f.hostUri, f.dseq, f.gseq, f.oseq, f.service, [
-        "sh",
-        "-c",
-        command,
-      ]);
-      return { stdout: r.stdout, code: 0 };
-    } catch (e) {
-      // keep the ssh-exit error shape callers already match on
-      throw new Error(`ssh exit 1 (via lease-shell): ${command}\n${String(e).slice(-500)}`);
+    const attempts = opts.quick ? 1 : 4;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
+      try {
+        const r = await client.shellExec(
+          f.hostUri,
+          f.dseq,
+          f.gseq,
+          f.oseq,
+          f.service,
+          ["sh", "-c", command],
+          opts.quick ? { timeoutMs: 15_000 } : {},
+        );
+        return { stdout: r.stdout, code: 0 };
+      } catch (e) {
+        lastError = e;
+        if (!Ssh2Runner.TRANSIENT_SHELL_ERROR.test(String(e))) break;
+      }
     }
+    // keep the ssh-exit error shape callers already match on
+    throw new Error(`ssh exit 1 (via lease-shell): ${command}\n${String(lastError).slice(-500)}`);
   }
 
   private withConnection<T>(target: SshTarget, fn: (conn: Client) => Promise<T>): Promise<T> {

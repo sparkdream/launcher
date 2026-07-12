@@ -52,7 +52,27 @@ async function runPhaseA(s: LaunchSpec, id: string) {
 
 describe("Phase A golden run — 2 validators × 2 sentries", () => {
   it("completes with a valid genesis and correctly wired configs", async () => {
-    const s = spec(2, 2);
+    const s = spec(2, 2, {
+      accounts: {
+        initial: [
+          { name: "treasury", generate: true, amount: "500000000000000" },
+          { name: "founder", generate: true, amount: "1000000000000", member: true },
+          {
+            name: "helper",
+            generate: true,
+            amount: "1000000000000",
+            member: { trustLevel: "provisional" },
+          },
+          {
+            name: "whale",
+            generate: true,
+            amount: "1000000000000",
+            member: { trustLevel: "trusted", dreamBalance: "9000000000" },
+          },
+        ],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
     const { db, result, dirs } = await runPhaseA(s, "g22");
     if (result.status !== "completed") {
       throw new Error(`paused at ${result.failedStep}: ${db.getStep("g22", result.failedStep!)?.error}`);
@@ -74,6 +94,24 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     );
     expect(genesis.app_state.genutil.gen_txs).toHaveLength(2);
 
+    // reference-genesis overlay: module params and bootstrap state come from
+    // the vendored testnet genesis, with denoms rewritten to the spec's
+    expect(genesis.app_state.gov.params.voting_period).toBe("43200s");
+    expect(genesis.app_state.gov.params.min_deposit[0].denom).toBe("uspark.sparkdreamtest");
+    expect(genesis.app_state.distribution.params.community_tax).toBe("0.15");
+    expect(genesis.app_state.rep.params.epoch_blocks).toBe("1440");
+    expect(genesis.app_state.identity.identity.chain_human_name).toBe("SparkdreamTest");
+    expect(genesis.app_state.identity.identity.bond_denom).toBe("uspark.sparkdreamtest");
+    expect(genesis.app_state.identity.identity.dream_denom).toBe("udream.sparkdreamtest");
+    expect(genesis.app_state.bank.denom_metadata.map((m: any) => m.base)).toEqual([
+      "uspark.sparkdreamtest",
+      "udream.sparkdreamtest",
+    ]);
+    expect(genesis.app_state.season.season.name).toBe("Genesis Season");
+    // launcher-owned state survives the overlay: balances back the spec's
+    // accounts, and the community pool stays empty (no module balance funds it)
+    expect(genesis.app_state.distribution.fee_pool.community_pool).toEqual([]);
+
     // every node got the same final genesis
     const master = fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"));
     for (const key of ["val-1", "sentry-0", "sentry-1"]) {
@@ -81,7 +119,46 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     }
 
     // peer wiring (§5 step 4): round-robin 2×2 → sentry s fronts val s
-    const keys = db.stepOutput<{ nodeIds: Record<string, string> }>("g22", "generate-keys")!;
+    const keys = db.stepOutput<{
+      nodeIds: Record<string, string>;
+      accounts: Record<string, string>;
+    }>("g22", "generate-keys")!;
+
+    // spec-driven membership: only member-flagged accounts are seeded (the
+    // reference's own members don't carry over), each shaped like the
+    // testnet reference's seed for its trust level
+    const memberByAddress = (name: string) =>
+      genesis.app_state.rep.member_map.find(
+        (m: any) => m.address === keys.accounts[`acct-${name}`],
+      );
+    expect(genesis.app_state.rep.member_map).toHaveLength(3);
+    const founder = memberByAddress("founder");
+    expect(founder.trust_level).toBe("TRUST_LEVEL_CORE");
+    expect(founder.dream_balance).toBe("5000000000");
+    expect(founder.invitation_credits).toBe(10);
+    expect(founder.lifetime_xp).toBeUndefined();
+    const helper = memberByAddress("helper");
+    expect(helper.trust_level).toBe("TRUST_LEVEL_PROVISIONAL");
+    expect(helper.dream_balance).toBe("2000000000");
+    expect(helper.invitation_credits).toBe(3);
+    const whale = memberByAddress("whale");
+    expect(whale.trust_level).toBe("TRUST_LEVEL_TRUSTED");
+    expect(whale.dream_balance).toBe("9000000000");
+    expect(whale.lifetime_earned).toBe("9000000000");
+    expect(whale.invitation_credits).toBe(7);
+    expect(genesis.app_state.season.member_profile_map).toHaveLength(3);
+    expect(genesis.app_state.season.member_profile_map[0].address).toBe(
+      keys.accounts["acct-founder"],
+    );
+    expect(genesis.app_state.season.member_profile_map[0].username).toBe("");
+
+    // default token naming reproduces the reference exactly
+    const dreamMeta = genesis.app_state.bank.denom_metadata.find(
+      (m: any) => m.base === "udream.sparkdreamtest",
+    );
+    expect(dreamMeta.display).toBe("dream");
+    expect(genesis.app_state.identity.identity.dream_display_symbol).toBe("DREAM");
+    expect(genesis.app_state.identity.identity.dream_display_name).toBe("Sparkdream Test Dream");
     const val0 = fs.readFileSync(path.join(dirs.node("val-0"), "config", "config.toml"), "utf8");
     expect(val0).toContain(
       `persistent_peers = "${keys.nodeIds["sentry-0"]}@{{TAILNET_IP:sentry-0}}:26656"`,
@@ -129,13 +206,28 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
 
 describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
   it("completes and never packages the consensus key", async () => {
-    const s = spec(1, 1, { security: { keyMode: "tmkms" } });
+    const s = spec(1, 1, {
+      security: { keyMode: "tmkms" },
+      token: { baseDenom: "uspark.sparkdreamtest", displayDenom: "SPARK", dreamDisplayDenom: "GLOW" },
+    });
     const { db, result, dirs } = await runPhaseA(s, "g11");
     if (result.status !== "completed") {
       throw new Error(`paused at ${result.failedStep}: ${db.getStep("g11", result.failedStep!)?.error}`);
     }
 
     expect(db.stepOutput<{ gentxCount: number }>("g11", "build-genesis")!.gentxCount).toBe(1);
+
+    // dream token renamed via spec: metadata display + identity symbol/name
+    const genesis = JSON.parse(
+      fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"), "utf8"),
+    );
+    const dreamMeta = genesis.app_state.bank.denom_metadata.find(
+      (m: any) => m.base === "udream.sparkdreamtest",
+    );
+    expect(dreamMeta.display).toBe("glow");
+    expect(dreamMeta.denom_units[1]).toMatchObject({ denom: "glow", exponent: 6 });
+    expect(genesis.app_state.identity.identity.dream_display_symbol).toBe("GLOW");
+    expect(genesis.app_state.identity.identity.dream_display_name).toBe("Glow");
 
     const listing = execFileSync("tar", ["tzf", path.join(dirs.bundles, "val-0.tgz")]).toString();
     expect(listing).not.toContain("priv_validator_key.json");

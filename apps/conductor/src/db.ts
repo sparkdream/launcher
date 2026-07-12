@@ -365,6 +365,13 @@ export class ConductorDb {
       .all(owner) as LaunchRow[];
   }
 
+  /** Launches whose driver was mid-run when the process died (boot resume). */
+  listRunningLaunches(): LaunchRow[] {
+    return this.db
+      .prepare("SELECT * FROM launches WHERE status = 'running' ORDER BY created_at")
+      .all() as LaunchRow[];
+  }
+
   upsertFleetComponent(c: {
     launch_id: string;
     key: string;
@@ -606,6 +613,12 @@ export class ConductorDb {
         "UPDATE pending_gentxs SET status = 'pending', response_json = NULL WHERE launch_id = ? AND val_index = ?",
       )
       .run(launchId, valIndex);
+  }
+
+  /** Drop all gentx rows so requireGentx enqueues fresh sign docs — needed
+   *  when the docs themselves went stale (reset-chain bumps the chain-id). */
+  deleteGentxs(launchId: string): void {
+    this.db.prepare("DELETE FROM pending_gentxs WHERE launch_id = ?").run(launchId);
   }
 }
 

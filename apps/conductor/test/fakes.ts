@@ -231,6 +231,10 @@ export class FakeSsh {
     if (command.includes("pgrep -x sparkdreamd")) {
       return ok(this.started.has(id) ? "yes" : "no");
     }
+    if (command.includes("pkill -x sparkdreamd")) {
+      this.started.delete(id);
+      return ok();
+    }
     if (command.includes("sparkdreamd start")) {
       this.started.add(id);
       return ok();

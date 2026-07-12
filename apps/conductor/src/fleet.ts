@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { resolveTopology, statelessComponents, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -13,7 +13,7 @@ import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
-import type { RetargetParams } from "./fleet-ops.js";
+import type { ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -758,7 +758,23 @@ export class FleetService {
   }
 
   requestUpgrade(launch: LaunchRow, components: string[], image: string): number {
+    this.recordSpecImage(launch, components, image);
     return this.db.createFleetOp(launch.id, "upgrade", { components, image });
+  }
+
+  /**
+   * Keep the stored spec's images truthful when an upgrade op swaps them —
+   * relaunches redeploy from the spec, and requestChainReset freezes
+   * component images against it (a stale value would reject a reset whose
+   * editor merely resolves the current profile default).
+   */
+  private recordSpecImage(launch: LaunchRow, components: string[], image: string): void {
+    const spec = this.spec(launch);
+    for (const key of components) {
+      if (/^(val|sentry)-/.test(key)) spec.images.sparkdreamd = image;
+      else if (key === "explorer" || key === "frontend" || key === "hub") spec.images[key] = image;
+    }
+    this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
   }
 
   /**
@@ -844,7 +860,78 @@ export class FleetService {
 
   /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */
   requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number): number {
+    this.recordSpecImage(launch, ["val-0"], image); // halt-upgrade swaps every node
     return this.db.createFleetOp(launch.id, "halt-upgrade", { image, haltHeight });
+  }
+
+  /**
+   * Wipe the chain and restart from a rebuilt genesis on the same
+   * deployments (state-breaking upgrades). The proposed spec replaces the
+   * stored one; genesis-shaping fields (accounts + members, chainParams,
+   * token) are free to change and the keyring is rebuilt around them, but
+   * anything the deployed fleet embodies — topology, domains, resources —
+   * must stay as launched. The chain-id suffix always moves forward so
+   * signer state can never bleed across resets.
+   */
+  requestChainReset(launch: LaunchRow, proposedInput: unknown): number {
+    const current = this.spec(launch);
+    const proposed = withDefaults(proposedInput);
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another fleet op is in progress — finish or abort it first");
+    }
+    // the launch's validate-spec step is checkpointed and won't re-run for
+    // an op — re-validate here so chain-identity violations (denom shapes)
+    // are rejected before the spec is stored or any node is touched
+    const check = validateSpec(proposed);
+    if (!check.ok) {
+      throw new Error(
+        "spec invalid: " + check.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
+      );
+    }
+    const frozen: Array<[string, unknown, unknown]> = [
+      ["network.name", current.network.name, proposed.network.name],
+      ["network.type", current.network.type, proposed.network.type],
+      ["network.bech32Prefix", current.network.bech32Prefix, proposed.network.bech32Prefix],
+      ["security.keyMode", current.security.keyMode, proposed.security.keyMode],
+      [
+        "topology.validators.count",
+        current.topology.validators.count,
+        proposed.topology.validators.count,
+      ],
+      ["topology.sentries.count", current.topology.sentries.count, proposed.topology.sentries.count],
+      ["topology.components", current.topology.components, proposed.topology.components],
+      [
+        "topology.publicEndpoints",
+        current.topology.publicEndpoints,
+        proposed.topology.publicEndpoints,
+      ],
+      ["topology.headscale", current.topology.headscale, proposed.topology.headscale],
+      ["infra", current.infra, proposed.infra],
+      ["images.headscale", current.images.headscale, proposed.images.headscale],
+      ["images.explorer", current.images.explorer, proposed.images.explorer],
+      ["images.frontend", current.images.frontend, proposed.images.frontend],
+      ["images.hub", current.images.hub, proposed.images.hub],
+    ];
+    for (const [field, a, b] of frozen) {
+      if (JSON.stringify(a) !== JSON.stringify(b)) {
+        throw new Error(
+          `${field} cannot change in a chain reset — the deployed fleet embodies it ` +
+            "(use the domain-update or upgrade ops, or shut down and launch anew)",
+        );
+      }
+    }
+    // always a NEW chain-id: an edited suffix is honored if it moves forward
+    if (proposed.network.chainIdSuffix <= current.network.chainIdSuffix) {
+      proposed.network.chainIdSuffix = current.network.chainIdSuffix + 1;
+    }
+    const image =
+      proposed.images.sparkdreamd !== current.images.sparkdreamd
+        ? proposed.images.sparkdreamd
+        : undefined;
+    this.db.setLaunchSpec(launch.id, JSON.stringify(proposed));
+    return this.db.createFleetOp(launch.id, "reset-chain", {
+      ...(image ? { image } : {}),
+    } satisfies ResetChainParams);
   }
 
   /** Recent provider logs for a component (M5 logs viewer, REST poll). */

@@ -51,25 +51,35 @@ network:
   type: devnet
   bech32Prefix: sprkdrm
 token:
+  # chain rules: baseDenom u<2-5 letters>.<suffix>; dream prefix is fixed "udream."
   baseDenom: uspark.sparkdreamdev
   displayDenom: SPARK
+  # dreamDenom: udream.sparkdreamdev  # udream. + baseDenom's suffix unless set
+  # dreamDisplayDenom: DREAM
 accounts:
   initial:
     - name: treasury
       generate: true
       amount: "500000000000000"
+    # member: seed as an active genesis member (people, not treasury/operators);
+    # true → core founder defaults, or pick trustLevel (new|provisional|
+    # established|trusted|core) and dreamBalance per account
     - name: alice
       generate: true
       amount: "1000000000000"
+      member: true
     - name: bob
       generate: true
       amount: "1000000000000"
+      member: { trustLevel: established }
     - name: carol
       generate: true
       amount: "1000000000000"
+      member: { trustLevel: provisional }
     - name: dave
       generate: true
       amount: "1000000000000"
+      member: { trustLevel: provisional, dreamBalance: "5000000000" }
   validatorSelfDelegation: "1000000000000"
 topology:
   validators: { count: 1 }
@@ -550,7 +560,7 @@ export default function Page() {
     launchId: string,
     dseq: string,
     action: "close" | "restart" | "relaunch" | "upgrade" | "topup",
-    extra: { image?: string; amount?: string; haltHeight?: number } = {},
+    extra: { image?: string; components?: string[]; amount?: string; haltHeight?: number } = {},
   ) => {
     setError(null);
     try {
@@ -1258,6 +1268,28 @@ export default function Page() {
                             >
                               top-up
                             </button>
+                            {(c.key === "explorer" || c.key === "frontend") && (
+                              <button
+                                title={`Swap just this component's image (current: ${c.image}). One deployment update; the service fee is added.`}
+                                onClick={() => {
+                                  const feeNote =
+                                    fee && fee.upgradeFlat > 0
+                                      ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
+                                      : "";
+                                  const image = window.prompt(
+                                    `Upgrade ${c.key}:${feeNote}`,
+                                    c.image ?? undefined,
+                                  );
+                                  if (image && image !== c.image)
+                                    fleetAction(f.launchId, c.dseq, "upgrade", {
+                                      image,
+                                      components: [c.key],
+                                    });
+                                }}
+                              >
+                                upgrade…
+                              </button>
+                            )}
                             {c.key !== "headscale" && (
                               <button onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}>
                                 relaunch
@@ -1401,11 +1433,19 @@ export default function Page() {
                   onClick={() => {
                     const feeNote =
                       fee && fee.upgradeFlat > 0
-                        ? ` A one-time ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added (signed together).`
+                        ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
                         : "";
-                    const image = window.prompt(`Rolling upgrade — new sparkdreamd image:${feeNote}`);
-                    const first = f.components.find((c) => c.state === "active" && c.key !== "headscale");
-                    if (image && first) fleetAction(f.launchId, first.dseq, "upgrade", { image });
+                    // node fleet only — prefill with a current node image so
+                    // the expected ns/repo:tag format is obvious
+                    const node = f.components.find(
+                      (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                    );
+                    const image = window.prompt(
+                      `New sparkdreamd image for validators + sentries:${feeNote}`,
+                      node?.image ?? undefined,
+                    );
+                    if (image && node && image !== node.image)
+                      fleetAction(f.launchId, node.dseq, "upgrade", { image });
                   }}
                 >
                   rolling upgrade…
@@ -1414,10 +1454,10 @@ export default function Page() {
                   onClick={async () => {
                     const feeNote =
                       fee && fee.upgradeFlat > 0
-                        ? ` A one-time ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added (signed together).`
+                        ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
                         : "";
                     const image = window.prompt(
-                      `Coordinated (consensus-breaking) upgrade — new image:${feeNote}`,
+                      `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
                     );
                     if (!image) return;
                     const h = window.prompt("Halt height:");
@@ -1490,6 +1530,31 @@ export default function Page() {
                 >
                   download genesis
                 </button>
+                {!shutDown && (
+                  <button
+                    title="Wipe all chain state and restart from a genesis rebuilt from the spec editor above — accounts and members are re-seeded (fresh mnemonics!), the chain-id suffix bumps, deployments stay"
+                    onClick={async () => {
+                      try {
+                        const edited = yaml.load(specText) as any;
+                        const ok = window.confirm(
+                          `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis built from the spec editor (chain-id moves past ${f.chainId}). ` +
+                            "The account keyring is rebuilt: generated accounts get FRESH mnemonics — export the fleet bundle first if you need the old ones." +
+                            (edited?.images?.sparkdreamd
+                              ? ` Node image: ${edited.images.sparkdreamd}.`
+                              : ""),
+                        );
+                        if (!ok) return;
+                        const { postChainReset } = await import("../lib/api");
+                        await postChainReset(f.launchId, edited);
+                        setLaunchId(f.launchId); // surfaces the signing banner
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    reset chain…
+                  </button>
+                )}
                 {!shutDown && (
                   <button
                     onClick={async () => {

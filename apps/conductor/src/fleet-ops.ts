@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -13,7 +13,15 @@ import { pollBids } from "./akash/client.js";
 import { selectProvider } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, waitLeaseStatus } from "./steps/phase-bcd.js";
-import { placeholder } from "./steps/phase-a.js";
+import {
+  buildGenesisFiles,
+  createNamedAccounts,
+  packageNodeDataStep,
+  placeholder,
+  type GenerateKeysOutput,
+} from "./steps/phase-a.js";
+import { sparkdreamd } from "./exec.js";
+import { explorerChainEnv, renderComponentSdl } from "./render-component-sdl.js";
 import { ingressHost } from "./steps/phase-ef.js";
 import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "./node-ops.js";
 import type { SshTarget } from "./services.js";
@@ -492,6 +500,12 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         }
         sdl = sdl.replace(/image: .*/g, `image: ${params.image}`);
         fs.writeFileSync(sdlPath, sdl);
+        // the explorer reads its chain identity from env (v1.0.6+ renders
+        // /chain-config.json from it) — inject the current values on upgrade
+        // so installing the env-aware image also delivers the env, without
+        // needing a chain reset. In place, so persist-start's resolved
+        // tunnel targets survive.
+        if (key === "explorer") setExplorerChainEnv(sdlPath, spec);
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(
           path.join(ctx.dirs.sdl, `${key}.manifest.json`),
@@ -850,6 +864,442 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
   ];
 }
 
+export interface ResetChainParams {
+  /** New sparkdreamd image — set when the reset rides a chain upgrade. */
+  image?: string;
+}
+
+/**
+ * Patch the explorer's chain-identity env into its deployed SDL in place —
+ * everything else (baked tunnel IPs, auth keys, image) is preserved, same
+ * rationale as retargetSdl.
+ */
+function setExplorerChainEnv(sdlPath: string, spec: LaunchSpec): void {
+  const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+  const svc = doc.services?.explorer;
+  if (!svc) throw new Error("explorer.yaml has no services.explorer");
+  const env: string[] = svc.env ?? [];
+  for (const [k, v] of Object.entries(explorerChainEnv(spec))) {
+    const i = env.findIndex((x) => x.startsWith(k + "="));
+    if (i >= 0) env[i] = `${k}=${v}`;
+    else env.push(`${k}=${v}`);
+  }
+  svc.env = env;
+  fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
+}
+
+/**
+ * Rewrite WAIT_FOR_CONFIG in the on-disk node SDLs and build the batched
+ * MsgUpdateDeployment + manifests. This is how a reset stops and resumes
+ * the chain: after persist-start the entrypoint execs sparkdreamd as PID 1,
+ * so pkill just restarts the container into a self-healed running node —
+ * the only way to hold a node stopped is its own wait mode ("container
+ * alive, SSH in, upload config/data"), and the only way out is flipping
+ * back. Convergent like retarget: deployments already at the wanted hash
+ * are skipped, so re-runs and relaunched nodes (SDL already in wait mode)
+ * don't produce rejected txs.
+ */
+async function flipWaitMode(
+  ctx: StepCtx,
+  rows: FleetComponentRow[],
+  value: "true" | "false",
+): Promise<{ msgs: Msg[]; manifests: Array<{ row: FleetComponentRow; json: string }> }> {
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const msgs: Msg[] = [];
+  const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
+  for (const row of rows) {
+    const sdlPath = sdlPathFor(ctx, row.key);
+    const sdl = fs
+      .readFileSync(sdlPath, "utf8")
+      .replace(/WAIT_FOR_CONFIG=(true|false)/g, `WAIT_FOR_CONFIG=${value}`);
+    fs.writeFileSync(sdlPath, sdl);
+    const artifacts = sdlArtifacts(loadSdl(sdlPath));
+    fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), artifacts.manifestJson);
+    manifests.push({ row, json: artifacts.manifestJson });
+    const wantHash = Buffer.from(artifacts.hash).toString("base64");
+    const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+    if (onChain?.hash === wantHash) continue;
+    msgs.push({
+      typeUrl: TypeUrl.UpdateDeployment,
+      value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+    });
+  }
+  return { msgs, manifests };
+}
+
+/**
+ * Chain reset (§5 "Chain reset"): wipe all chain state and restart from a
+ * freshly built genesis under a bumped chain-id, on the SAME deployments —
+ * no new leases, providers, mesh, or DNS. For state-breaking chain upgrades:
+ * the (already-updated) spec's genesis-shaping fields — accounts, members,
+ * chainParams, token — all take effect, and the operator/account keyring is
+ * rebuilt from scratch (fresh mnemonics; edited account lists just work).
+ * The bumped chain-id is also what makes restarting safe: signer state
+ * (softsign priv_validator_state, tmkms) can never confuse the new chain
+ * with the old one.
+ */
+export function resetChainSteps(opId: number, params: ResetChainParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const cid = chainId(spec);
+  const bondDenom = spec.token.bondDenom ?? spec.token.baseDenom;
+  const nodeRows = (ctx: StepCtx) =>
+    (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
+      (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+    );
+
+  const steps: StepDef[] = [
+    {
+      name: p("halt"),
+      async run(ctx) {
+        // hold every node stopped via its wait mode (see flipWaitMode);
+        // no service fee — it's the reset's stop mechanism, not an upgrade
+        const { msgs, manifests } = await flipWaitMode(ctx, nodeRows(ctx), "true");
+        if (msgs.length > 0) await ctx.requireTx(p("halt"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("halt"));
+        const cert = loadCert(ctx);
+        for (const { row, json } of manifests) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+        }
+        // converge to "stopped": once the wait-mode env is on-chain, ANY
+        // container restart lands in wait mode — so killing a straggler
+        // (even PID-1 sparkdreamd) is terminal, not a self-heal loop
+        for (const row of nodeRows(ctx)) {
+          let stopped = false;
+          for (let i = 0; i < 36 && !stopped; i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            if (i > 0 && i % 6 === 0) ctx.log(`${row.key}: waiting for wait mode (attempt ${i})`);
+            try {
+              const running = await ctx.services.ssh.exec(
+                rowTarget(ctx, row),
+                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+                { quick: true },
+              );
+              if (running.stdout.trim() === "no") {
+                stopped = true;
+                break;
+              }
+              await ctx.services.ssh.exec(rowTarget(ctx, row), "pkill -x sparkdreamd || true", {
+                quick: true,
+              });
+            } catch {
+              // container restarting into wait mode
+            }
+          }
+          if (!stopped) throw new Error(`${row.key}: sparkdreamd still running after the wait-mode flip`);
+        }
+        return { halted: nodeRows(ctx).map((r) => r.key) };
+      },
+    },
+    {
+      name: p("reset-keys"),
+      async run(ctx) {
+        const master = ctx.dirs.node("val-0");
+        // the whole account keyring is rebuilt — edited account lists (new,
+        // renamed, member changes) regenerate cleanly; old mnemonics die here
+        fs.rmSync(path.join(master, "keyring-test"), { recursive: true, force: true });
+        fs.rmSync(path.join(master, "config", "gentx"), { recursive: true, force: true });
+        // fresh genesis skeleton with the NEW chain-id, from a throwaway home
+        // (init in the node homes would clobber their rendered configs)
+        const scratch = path.join(ctx.dirs.root, `op${opId}-init`);
+        fs.rmSync(scratch, { recursive: true, force: true });
+        await sparkdreamd([
+          "init", "reset", "--chain-id", cid, "--default-denom", bondDenom, "--home", scratch,
+        ]);
+        fs.copyFileSync(
+          path.join(scratch, "config", "genesis.json"),
+          path.join(master, "config", "genesis.json"),
+        );
+        fs.rmSync(scratch, { recursive: true, force: true });
+
+        const accounts = await createNamedAccounts(ctx);
+        // fold the new addresses into the launch's generate-keys output —
+        // the accounts view and later ops read it (node keys are untouched)
+        const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+        if (!keys) throw new Error("generate-keys output missing");
+        ctx.db.stepDone(ctx.launchId, "generate-keys", { ...keys, accounts });
+        // external operators re-sign gentxs against the new chain-id — the
+        // old sign docs are stale, so drop the rows entirely
+        ctx.db.deleteGentxs(ctx.launchId);
+        return { chainId: cid, accounts: Object.keys(accounts).length };
+      },
+    },
+    {
+      name: p("rebuild-genesis"),
+      async run(ctx) {
+        const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+        if (!keys) throw new Error("generate-keys output missing");
+        const result = await buildGenesisFiles(ctx, keys);
+        // bundles feed future relaunches — re-pack so they carry the new genesis
+        await packageNodeDataStep.run(ctx);
+        return result;
+      },
+    },
+  ];
+
+  if (params.image) {
+    steps.push({
+      name: p("swap-image"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const msgs: Msg[] = [];
+        const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
+        for (const row of nodeRows(ctx)) {
+          const sdlPath = sdlPathFor(ctx, row.key);
+          let sdl = fs.readFileSync(sdlPath, "utf8");
+          sdl = sdl.replace(/image: .*/g, `image: ${params.image}`);
+          fs.writeFileSync(sdlPath, sdl);
+          const artifacts = sdlArtifacts(loadSdl(sdlPath));
+          fs.writeFileSync(
+            path.join(ctx.dirs.sdl, `${row.key}.manifest.json`),
+            artifacts.manifestJson,
+          );
+          manifests.push({ row, json: artifacts.manifestJson });
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash === wantHash) {
+            ctx.log(`${row.key}: on-chain version already matches — skipping update tx`);
+            continue;
+          }
+          msgs.push({
+            typeUrl: TypeUrl.UpdateDeployment,
+            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+          });
+        }
+        // it's an upgrade — same flat fee as the rolling/halt upgrade ops
+        const fee = feeConfig();
+        if (msgs.length > 0 && fee.upgradeFlat > 0) {
+          const coin = await feeCoin(
+            PRICING_DENOM[spec.infra.akashNetwork],
+            String(fee.upgradeFlat),
+            ctx.services.api,
+          );
+          if (coin) msgs.push(sendMsg(owner, fee.address, coin));
+          else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
+        }
+        if (msgs.length > 0) await ctx.requireTx(p("swap-image"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("swap-image"));
+        const cert = loadCert(ctx);
+        for (const { row, json } of manifests) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+          ctx.db.updateComponentRuntime(ctx.launchId, row.key, { image: params.image! });
+        }
+        // providers restart the containers — into wait mode, since op:halt
+        // flipped the env first; wait for SSH back before the wipe
+        for (const row of nodeRows(ctx)) {
+          let up = false;
+          for (let i = 0; i < 60 && !up; i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            try {
+              await ctx.services.ssh.exec(rowTarget(ctx, row), "true");
+              up = true;
+            } catch {
+              // container still restarting
+            }
+          }
+          if (!up) throw new Error(`${row.key} unreachable after the image swap`);
+        }
+        return { image: params.image };
+      },
+    });
+  }
+
+  steps.push(
+    {
+      name: p("wipe"),
+      async run(ctx) {
+        const master = ctx.dirs.node("val-0");
+        const genesisPath = path.join(master, "config", "genesis.json");
+        // nothing is running (wait mode, enforced by op:halt) — the data
+        // wipe and genesis swap happen on a quiet home dir
+        for (const row of nodeRows(ctx)) {
+          const target = rowTarget(ctx, row);
+          await ctx.services.ssh.exec(
+            target,
+            `sparkdreamd comet unsafe-reset-all --home ${NODE_HOME}`,
+          );
+          await ctx.services.ssh.upload(target, genesisPath, `${NODE_HOME}/config/genesis.json`);
+          await ctx.services.ssh.exec(
+            target,
+            `sed -i 's|^chain-id =.*|chain-id = "${cid}"|' ${NODE_HOME}/config/client.toml`,
+          );
+        }
+        return { wiped: nodeRows(ctx).map((r) => r.key), chainId: cid };
+      },
+    },
+  );
+
+  if (spec.security.keyMode === "tmkms") {
+    steps.push({
+      name: p("signer"),
+      async run(ctx) {
+        // new chain-id → the signer needs [chain] id updated BEFORE the
+        // nodes resume (tmkms state is per-chain-id, so it starts fresh)
+        for (const row of nodeRows(ctx).filter((r) => r.key.startsWith("val-"))) {
+          const probe = await ctx.services.ssh.exec(
+            rowTarget(ctx, row),
+            "nc -z 127.0.0.1 26660 && echo ok || echo no",
+          );
+          if (probe.stdout.trim() !== "ok") {
+            throw new AwaitUser(
+              p("signer"),
+              `update your tmkms config for ${row.key}: set chain_id = "${cid}" in tmkms.toml ` +
+                "(both [[chain]] and [[validator]]), restart the signer, then resume",
+            );
+          }
+        }
+        return { signersReady: true };
+      },
+    });
+  }
+
+  steps.push(
+    {
+      name: p("start"),
+      async run(ctx) {
+        // resume: flip wait mode off — the entrypoint execs sparkdreamd on
+        // the new genesis when the containers restart
+        const { msgs, manifests } = await flipWaitMode(ctx, nodeRows(ctx), "false");
+        // the frontend and explorer embed chain identity in their env
+        // (CHAIN_ID/CHAIN_NAME, denoms, display symbols — the Keplr
+        // suggest-chain payload and the explorer's runtime chain config) —
+        // refresh both on the resume tx, or they keep advertising the
+        // pre-reset chain. The frontend re-renders wholesale (no
+        // placeholders); the explorer's env is patched in place, because a
+        // re-render would reintroduce the {{TS_AUTHKEY}}/tunnel
+        // placeholders that persist-start already resolved.
+        const componentRows = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
+          (c) => (c.key === "frontend" || c.key === "explorer") && c.state === "active",
+        );
+        for (const row of componentRows) {
+          const sdlPath = sdlPathFor(ctx, row.key);
+          if (row.key === "frontend") {
+            const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+            if (!keys) throw new Error("generate-keys output missing");
+            const component = statelessComponents(spec).find((c) => c.key === "frontend")!;
+            renderComponentSdl({
+              spec,
+              component,
+              sshPublicKey: keys.sshPublicKey,
+              outPath: sdlPath,
+              placeholder,
+            });
+          } else {
+            setExplorerChainEnv(sdlPath, spec);
+          }
+          const artifacts = sdlArtifacts(loadSdl(sdlPath));
+          fs.writeFileSync(
+            path.join(ctx.dirs.sdl, `${row.key}.manifest.json`),
+            artifacts.manifestJson,
+          );
+          manifests.push({ row, json: artifacts.manifestJson });
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash !== wantHash) {
+            msgs.push({
+              typeUrl: TypeUrl.UpdateDeployment,
+              value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+            });
+          }
+        }
+        if (msgs.length > 0) await ctx.requireTx(p("start"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("start"));
+        const cert = loadCert(ctx);
+        for (const { row, json } of manifests) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+        }
+        // sentries first — validators dial them on start
+        const rows = nodeRows(ctx).sort(
+          (a, b) =>
+            (a.key.startsWith("val-") ? 1 : 0) - (b.key.startsWith("val-") ? 1 : 0) ||
+            a.key.localeCompare(b.key),
+        );
+        for (const row of rows) {
+          let running = false;
+          for (let i = 0; i < 36 && !running; i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            if (i > 0 && i % 6 === 0) ctx.log(`${row.key}: waiting for the node (attempt ${i})`);
+            try {
+              const r = await ctx.services.ssh.exec(
+                rowTarget(ctx, row),
+                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+                { quick: true },
+              );
+              if (r.stdout.trim() === "yes") running = true;
+              // a node whose deployment hash didn't change (relaunched nodes
+              // already carried wait mode) gets no container restart and
+              // must be started the SSH way. The long grace period keeps the
+              // nudge clear of a restarting container's entrypoint (tailscale
+              // join etc.) — racing it would double-start sparkdreamd.
+              else if (i >= 12) await ctx.services.ssh.exec(rowTarget(ctx, row), START_NODE_CMD);
+            } catch {
+              // container restarting
+            }
+          }
+          if (!running) throw new Error(`${row.key} did not come back after the resume flip`);
+        }
+        return { resumed: rows.map((r) => r.key) };
+      },
+    },
+    {
+      name: p("retunnel"),
+      async run(ctx) {
+        // sentry-side p2p tunnels: the restarts killed SSH-issued socat
+        // listeners; env-baked ones self-heal but relaunched nodes' don't —
+        // re-issuing is idempotent, so do it for every sentry
+        const topo = resolveTopology(spec);
+        for (const row of nodeRows(ctx).filter((r) => r.key.startsWith("sentry-"))) {
+          const sIndex = Number(row.key.split("-")[1]);
+          for (const v of topo.sentryValidators[sIndex] ?? []) {
+            const valIp = componentRow(ctx, `val-${v}`).tailnet_ip;
+            if (!valIp) throw new Error(`val-${v} has no recorded tailnet IP`);
+            await ctx.services.ssh.exec(rowTarget(ctx, row), socatTunnelCmd(tunnelPort(v), valIp));
+          }
+        }
+        return { retunneled: true };
+      },
+    },
+    {
+      name: p("verify"),
+      async run(ctx) {
+        let height: number | undefined;
+        for (let i = 0; i < 120 && height === undefined; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          if (i > 0 && i % 12 === 0) ctx.log(`waiting for block production (attempt ${i})`);
+          try {
+            const h = await sentryRpcHeight(ctx);
+            if (h !== undefined && h >= 1) height = h;
+          } catch {
+            // sentry RPC still rebooting — the loop is the retry
+          }
+        }
+        if (height === undefined) {
+          throw new Error("chain did not start producing blocks after the reset");
+        }
+        // the frontend and explorer restarted with the new chain env — gate
+        // on both answering again
+        const active = new Set(
+          (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[])
+            .filter((c) => c.state === "active")
+            .map((c) => c.key),
+        );
+        for (const comp of statelessComponents(spec).filter((c) => active.has(c.key))) {
+          let ok = false;
+          for (let i = 0; i < 24 && !ok; i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            ok = await ctx.services.rpc.httpOk(`https://${comp.domain}/`);
+          }
+          if (!ok) throw new Error(`${comp.key} did not answer at https://${comp.domain}/ after the reset`);
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { chainId: cid, height };
+      },
+    },
+  );
+
+  return steps;
+}
+
 /** Steps for every active op of a launch, in creation order. */
 export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
   const launch = db.getLaunch(launchId);
@@ -864,6 +1314,7 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));
+    if (op.kind === "reset-chain") steps.push(...resetChainSteps(op.id, params, spec));
   }
   return steps;
 }

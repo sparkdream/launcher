@@ -91,4 +91,46 @@ describe("lease-shell SSH fallback", () => {
     await expect(runner.exec(target, "true")).rejects.toThrow(/key|format|parse|connect/i);
     expect(stub.calls.length).toBe(0);
   });
+
+  it("retries transient lease-shell gateway 5xx handshakes", async () => {
+    const stub = stubShell();
+    let failures = 2;
+    const flaky = {
+      async shellExec(...args: Parameters<typeof stub.client.shellExec>) {
+        if (failures-- > 0) throw new Error("Unexpected server response: 500");
+        return stub.client.shellExec(...args);
+      },
+    };
+    const runner = new Ssh2Runner(() => flaky);
+    const r = await runner.exec(deadTarget(), "echo hi");
+    expect(r.stdout).toBe("ran:echo hi");
+  }, 30_000);
+
+  it("quick polls make a single attempt even on transient errors", async () => {
+    let attempts = 0;
+    const flaky = {
+      async shellExec(): Promise<{ stdout: string; stderr: string }> {
+        attempts++;
+        throw new Error("Unexpected server response: 500");
+      },
+    };
+    const runner = new Ssh2Runner(() => flaky);
+    await expect(runner.exec(deadTarget(), "pgrep -x sparkdreamd", { quick: true })).rejects.toThrow(
+      /via lease-shell/,
+    );
+    expect(attempts).toBe(1);
+  });
+
+  it("does not retry command failures, only handshake errors", async () => {
+    let attempts = 0;
+    const failing = {
+      async shellExec(): Promise<{ stdout: string; stderr: string }> {
+        attempts++;
+        throw new Error("command terminated with exit code 1");
+      },
+    };
+    const runner = new Ssh2Runner(() => failing);
+    await expect(runner.exec(deadTarget(), "false")).rejects.toThrow(/via lease-shell/);
+    expect(attempts).toBe(1);
+  });
 });

@@ -205,8 +205,8 @@ describe("coordinated halt-height upgrade (M7)", () => {
     expect(upgradeTxs[0]!.slice(0, 4).every((m) => m.typeUrl.includes("MsgUpdateDeployment"))).toBe(true);
     const feeMsg = upgradeTxs[0]!.at(-1)!;
     expect(feeMsg.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
-    // 2 ACT at the fake $0.50 oracle price → 4 AKT (uact sends are disabled)
-    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "4000000" }]);
+    // 0.5 ACT at the fake $0.50 oracle price → 1 AKT (uact sends are disabled)
+    expect((feeMsg.value as any).amount).toEqual([{ denom: "uakt", amount: "1000000" }]);
     // halt-height was set then cleared on every node
     const setHalt = services.ssh.execLog.filter((e) => e.command.includes("halt-height = 5"));
     const clearHalt = services.ssh.execLog.filter((e) => e.command.includes("halt-height = 0"));

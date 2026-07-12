@@ -238,6 +238,12 @@ token:
   displayDenom: SPARK
   exponent: 6
   minGasPrice: "25000"               # in baseDenom, per gas
+  # dreamDenom: udream.sparkdreamtest  # coordination token; the chain fixes the
+  #                                    # prefix ("udream.<suffix>") — defaults to
+  #                                    # udream. + the bond denom's suffix
+  # dreamDisplayDenom: DREAM           # dream display name, like displayDenom
+  # chain identity rules (validate-spec enforces): baseDenom matches
+  # u<2-5 letters>.<3-16 char suffix>; display symbols are 3-8 chars [A-Z0-9]
 
 accounts:
   initial:
@@ -247,6 +253,15 @@ accounts:
     - name: team
       generate: true
       amount: "100000000000000"
+      member: true                   # seed as an active genesis member (x/rep +
+                                     # blank x/season profile); true → the reference
+                                     # network's core founding member shape, or pick:
+                                     #   member: { trustLevel: provisional,   # new|provisional|
+                                     #             dreamBalance: "2000000000" }  # established|trusted|core
+                                     # (defaults per level come from the reference
+                                     # network's seeds). Omit for non-person accounts
+                                     # (treasury, operators). Reference-genesis member
+                                     # seeds never carry over — membership is spec-driven.
   validatorSelfDelegation: "1000000000000"
 
 topology:
@@ -281,17 +296,19 @@ providers:
   escrow:
     targetRunwayDays: 30             # sizes the initial deposit per deployment
 
-chainParams:                         # everything optional; profile provides defaults
-  consensus: { timeoutCommit: 3s }
+chainParams:                         # everything optional — overrides on top of the
+                                     # vendored reference genesis for the network type
+                                     # (chain repo deploy/config/network/<type>/genesis.json)
+  consensus: { timeoutCommit: 3s }   # config.toml timing; profile provides the default
   staking:   { unbondingTime: 1814400s, maxValidators: 100 }
   gov:       { votingPeriod: 172800s, minDeposit: "10000000000" }
-  mint:      { inflationMin: 0.07, inflationMax: 0.20, goalBonded: 0.67 }
-  distribution: { communityTax: 0.02 }
-  slashing:  { signedBlocksWindow: 10000, minSignedPerWindow: 0.5,
+  mint:      { inflationMin: 0.02, inflationMax: 0.05, goalBonded: 0.67 }
+  distribution: { communityTax: 0.15 }
+  slashing:  { signedBlocksWindow: 100, minSignedPerWindow: 0.5,
                downtimeJailDuration: 600s,
-               slashFractionDowntime: 0.0001, slashFractionDoubleSign: 0.05 }
+               slashFractionDowntime: 0.01, slashFractionDoubleSign: 0.05 }
   validatorDefaults: { commissionRate: 0.05, commissionMaxRate: 0.20,
-                       commissionMaxChangeRate: 0.01 }
+                       commissionMaxChangeRate: 0.01 }  # gentx flags; profile default
 
 images:                              # pinned versions; profile supplies latest-known
   sparkdreamd: sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.24
@@ -345,8 +362,13 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
    mainnet warns on `generated` operators…).
 2. `generate-keys` — SSH keypair, age keypair, node keys ×(N+M), consensus
    keys ×N, mnemonics for `generate: true` accounts.
-3. `build-genesis` — `sparkdreamd init` per node home; add genesis accounts;
-   apply `chainParams` onto genesis JSON; then gentxs by operator mode (§3):
+3. `build-genesis` — `sparkdreamd init` per node home; overlay the vendored
+   reference genesis for the network type (module params, identity, denom
+   metadata and other bootstrap state, denoms rewritten to the spec's; gentxs,
+   accounts/balances, membership and the distribution fee pool stay
+   launcher-built); seed `member: true` accounts into x/rep + x/season; add
+   genesis accounts; apply `chainParams` overrides onto genesis JSON; then
+   gentxs by operator mode (§3):
    - `generated` operators: `gentx` per validator, signed locally with the
      conductor's keyring (we hold every operator key — this is
      single-operator genesis, not multi-party collection);
@@ -455,7 +477,7 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
 
     Two day-2 service fees follow the same "ride an already-signed tx" model
     (`fee.ts`, all to the same address, all overridable): a **flat fee per
-    upgrade op** (`LAUNCH_FEE_UPGRADE`, default 2 ACT) on the op's first
+    upgrade op** (`LAUNCH_FEE_UPGRADE`, default 0.5 ACT) on the op's first
     `MsgUpdateDeployment` tx — once per op, not per component, and covering
     both rolling and halt-height upgrades; and a **top-up fee**
     (`LAUNCH_FEE_TOPUP_BPS`, default 0.5%) on each `fleet:topup` deposit.
@@ -637,6 +659,53 @@ and restarts validators near-simultaneously (same >2/3 rule as launch step
 monitor records each node's running version (RPC `/abci_info`), and the
 dashboard warns on mixed versions lingering past an upgrade or on an
 attempted downgrade.
+
+### Chain reset (day-2)
+
+For state-breaking upgrades (and devnet iteration generally): wipe all
+chain state and restart from a rebuilt genesis on the SAME deployments —
+no new leases, providers, mesh, or DNS. The posted spec replaces the
+stored one; genesis-shaping fields — accounts + members, chainParams,
+token — are free to change, while everything the deployed fleet embodies
+(topology, domains, resources, key mode) is frozen and rejected with a
+pointer to the right op.
+
+Stopping the chain is NOT a pkill: after persist-start the entrypoint
+execs sparkdreamd as PID 1, so killing it just restarts the container into
+a self-healed running node (observed live: a reset's wipe raced the
+restarted process and failed). The reset instead flips the deployments
+back into the entrypoint's own wait mode (`WAIT_FOR_CONFIG=true` — the
+"container alive, upload config/data" state the image was designed with)
+and out again — two batched MsgUpdateDeployment txs, fee-free, convergent
+per node like retarget so re-runs and already-flipped nodes skip cleanly.
+
+Flow: halt (wait-mode flip + kill stragglers — once the env is on-chain,
+any restart lands stopped) → wipe the account keyring and regenerate it
+against the edited account list (fresh mnemonics; the fleet-bundle export
+is the escape hatch for old ones) → fresh genesis skeleton under a bumped
+chain-id (an edited `chainIdSuffix` is honored if it moves forward) → the
+launch genesis pipeline re-runs (reference overlay, members, chain params,
+accounts, gentxs — external operators re-sign in the browser since the
+docs sign over the chain-id) → relaunch bundles re-packed → optional image
+swap while everything is stopped (one more batched update + the flat
+upgrade fee) → per node `comet unsafe-reset-all`, new genesis uploaded,
+client.toml chain-id fixed → resume flip, sentries verified first, sentry
+socat tunnels re-issued (container restarts kill SSH-issued listeners),
+block-production gate. The frontend and explorer embed chain identity in
+their env (CHAIN_ID/CHAIN_NAME, denoms, display symbols — the Keplr
+suggest-chain payload and the explorer's runtime chain config), so both
+ride the resume tx, gated on their domains answering again: the frontend
+SDL re-renders wholesale (it has no placeholders), the explorer's env is
+patched in place so the persist-start-resolved tunnel targets survive.
+Explorer images before v1.0.6 ignore the chain env and serve their baked
+ping-pub config — the runtime chain config (entrypoint renders
+/chain-config.json from env, app prefers it over the baked chains) lives
+in the explorer repo from v1.0.6. The bumped chain-id is what makes the restart
+signer-safe: softsign `priv_validator_state` is reset with the data dir,
+and tmkms keys its state per chain-id (the flow pauses before the resume
+until the user updates `chain_id` in tmkms.toml and the privval probe
+passes). Node keys, consensus keys, tailnet IPs, and SSH endpoints all
+survive.
 
 ### tmkms-mode fleets (day-2)
 
@@ -956,8 +1025,9 @@ console-air sources)
    via the local socat tunnel (`127.0.0.1:16656+v`). Consequence: validator
    `persistent_peers` cannot be pre-rendered in Phase A (tailnet IPs unknown)
    → step 18b patches it in Phase E. Sentry side pre-renders fully.
-4. **Genesis param application** — RESOLVED. Apply `chainParams` directly
-   onto genesis JSON (no Python dependency). The gentx-hash guard in
+4. **Genesis param application** — RESOLVED. Overlay the vendored per-network
+   reference genesis, then apply `chainParams` overrides directly onto
+   genesis JSON (no Python dependency). The gentx-hash guard in
    `regenerate-network-genesis.py` only protects committed genesis artifacts;
    irrelevant for freshly generated gentxs.
 5. **Explorer/frontend chain wiring** — RESOLVED, image work landed. The

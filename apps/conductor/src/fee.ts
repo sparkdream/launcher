@@ -26,7 +26,7 @@ export interface FeeConfig {
   address: string;
   /** Launch fee: basis points of the leased monthly rate (1000 = 10%). 0 disables. */
   launchBps: number;
-  /** Upgrade fee: flat micro-denom per upgrade op (2_000_000 = 2 ACT). 0 disables. */
+  /** Upgrade fee: flat micro-denom per upgrade op (500_000 = 0.5 ACT). 0 disables. */
   upgradeFlat: number;
   /** Top-up fee: basis points of the deposit amount (50 = 0.5%). 0 disables. */
   topupBps: number;
@@ -34,7 +34,7 @@ export interface FeeConfig {
 
 const DEFAULT_FEE_ADDRESS = "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w";
 const DEFAULT_LAUNCH_BPS = 1000;
-const DEFAULT_UPGRADE_FLAT = 2_000_000;
+const DEFAULT_UPGRADE_FLAT = 500_000;
 const DEFAULT_TOPUP_BPS = 50;
 
 export function feeConfig(): FeeConfig {

@@ -28,7 +28,13 @@ export interface SshResult {
 }
 
 export interface SshRunner {
-  exec(target: SshTarget, command: string): Promise<SshResult>;
+  /**
+   * opts.quick marks a probe inside a caller-owned retry loop: one attempt,
+   * short lease-shell timeout, no transient-error retries — without it a
+   * flaky provider turns a bounded poll gate into hours (up to 4 × 60s
+   * websocket timeouts per probe).
+   */
+  exec(target: SshTarget, command: string, opts?: { quick?: boolean }): Promise<SshResult>;
   upload(target: SshTarget, localPath: string, remotePath: string): Promise<void>;
   download(target: SshTarget, remotePath: string, localPath: string): Promise<void>;
 }

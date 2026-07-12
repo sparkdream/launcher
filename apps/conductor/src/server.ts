@@ -155,6 +155,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return "started";
   };
 
+  // Boot resume: a conductor restart orphans any launch whose driver was
+  // mid-step — status stays "running", the UI shows a forever-running step,
+  // and Retry never appears (that's for errors, not orphans). Re-drive:
+  // checkpointed steps skip, the interrupted step re-runs. Long-running
+  // fleet ops (reset, upgrades) make this the norm, not an edge case.
+  for (const l of deps.db.listRunningLaunches()) {
+    app.log.info(`launch ${l.id}: driver was mid-run at shutdown — resuming`);
+    drive(l.id, JSON.parse(l.spec_json));
+  }
+
   // service fee schedule — lets the UI show exact day-2 fee amounts and
   // honor env overrides (the fee is always visible in the Keplr prompt too)
   app.get("/api/fee", async () => feeConfig());
@@ -481,6 +491,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       // drive with the UPDATED spec — requestDomainUpdate just rewrote it
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
       return { status: "retarget-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // wipe the chain and restart from a rebuilt genesis on the same
+  // deployments (reset-chain op, for state-breaking upgrades): the posted
+  // spec replaces the stored one — accounts/members/chainParams/token
+  // changes take effect, the keyring is rebuilt, the chain-id suffix bumps
+  app.post("/api/fleet/:launchId/reset-chain", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { spec?: unknown };
+    try {
+      const opId = fleet.requestChainReset(launch, body.spec ?? JSON.parse(launch.spec_json));
+      // drive with the UPDATED spec — requestChainReset just rewrote it
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "reset-started", opId };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

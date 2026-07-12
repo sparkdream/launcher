@@ -1,4 +1,5 @@
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
+import { deriveDreamDenom } from "./derive.js";
 import { profiles } from "./profiles.js";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -55,9 +56,35 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   const V = spec.topology.validators.count;
   const S = spec.topology.sentries.count;
 
-  // Denoms & addresses
+  // Denoms & addresses — the shapes below are enforced by the chain's
+  // identity module at genesis (x/identity ChainIdentity.Validate); catching
+  // them here fails the launch/reset before any state changes hands.
   if (spec.token.bondDenom && spec.token.bondDenom !== spec.token.baseDenom) {
     warn("token.bondDenom", "bond denom differs from fee denom — double-check gentx amounts");
+  }
+  const bondDenom = spec.token.bondDenom ?? spec.token.baseDenom;
+  if (!/^u[a-z]{2,5}\.[a-z][a-z0-9-]{2,15}$/.test(bondDenom)) {
+    err(
+      spec.token.bondDenom ? "token.bondDenom" : "token.baseDenom",
+      `"${bondDenom}" violates the chain's bond denom rule ` +
+        "u<2-5 letters>.<3-16 char suffix>, e.g. uspark.sparkdreamdev (x/identity)",
+    );
+  }
+  const dreamDenom = deriveDreamDenom(spec.token);
+  if (!dreamDenom || !/^udream\.[a-z][a-z0-9-]{2,15}$/.test(dreamDenom)) {
+    err(
+      "token.dreamDenom",
+      `"${dreamDenom ?? "<underivable>"}" violates the chain's dream denom rule — the prefix ` +
+        'is fixed: it must be "udream.<3-16 char suffix>" (x/identity)',
+    );
+  }
+  for (const [field, symbol] of [
+    ["token.displayDenom", spec.token.displayDenom],
+    ["token.dreamDisplayDenom", spec.token.dreamDisplayDenom],
+  ] as const) {
+    if (!/^[A-Z][A-Z0-9]{2,7}$/.test(symbol)) {
+      err(field, `"${symbol}" violates the chain's display symbol rule: 3-8 chars, [A-Z][A-Z0-9]+ (x/identity)`);
+    }
   }
   for (const [i, acct] of spec.accounts.initial.entries()) {
     if (acct.address && !acct.address.startsWith(spec.network.bech32Prefix + "1")) {

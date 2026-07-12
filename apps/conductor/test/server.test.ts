@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { testnetSpecInput } from "@sparkdream/launch-spec";
+import { testnetSpecInput, withDefaults } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { buildServer } from "../src/server.js";
 import { allSteps } from "../src/index.js";
@@ -94,6 +94,30 @@ describe("API server (§8)", () => {
 
     const noPending = await app.inject({ method: "GET", url: `/api/launches/${id}/pending-tx` });
     expect(noPending.statusCode).toBe(204);
+    db.close();
+  }, 120_000);
+
+  it("resumes an orphaned running launch on boot", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    // a launch whose driver died mid-run: status "running", nobody driving —
+    // without boot resume it would sit "running" forever with no Retry
+    db.createLaunch("orphan", JSON.stringify(withDefaults(specInput())), "akash1owner");
+    db.setLaunchStatus("orphan", "running");
+    const app = buildServer({ db, services: fakeServices(), workRoot: work, steps: allSteps() });
+
+    // boot resume drives it in the background until the first signing pause
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    let status = "";
+    for (let i = 0; i < 2000 && status !== "paused"; i++) {
+      status = ((await app.inject({ method: "GET", url: "/api/launches/orphan" })).json() as any)
+        .status;
+      await sleep(20);
+    }
+    expect(status).toBe("paused");
+    // parked at the normal signing loop, resumable like any launch
+    const pending = await app.inject({ method: "GET", url: "/api/launches/orphan/pending-tx" });
+    expect(pending.statusCode).toBe(200);
     db.close();
   }, 120_000);
 });

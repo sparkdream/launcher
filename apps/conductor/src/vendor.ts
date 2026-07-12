@@ -25,3 +25,8 @@ export function templatePath(name: string): string {
 export function networkSdlPath(networkType: string, role: "validator" | "sentry"): string {
   return path.join(vendorDir(), "network", networkType, `${role}.sdl.yaml`);
 }
+
+/** Reference genesis for the network type (chain repo deploy/config/network). */
+export function referenceGenesisPath(networkType: string): string {
+  return path.join(vendorDir(), "network", networkType, "genesis.json");
+}

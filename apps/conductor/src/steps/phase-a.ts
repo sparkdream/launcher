@@ -14,7 +14,12 @@ import type { StepCtx, StepDef } from "../engine.js";
 import { writeSecretFile } from "../secrets.js";
 import { sparkdreamd, run } from "../exec.js";
 import { generateAgeKeypair, generateSshKeypair } from "../keys.js";
-import { applyChainParams, commissionFlags } from "../genesis-params.js";
+import {
+  applyChainParams,
+  applyGenesisMembers,
+  applyReferenceGenesis,
+  commissionFlags,
+} from "../genesis-params.js";
 import {
   assembleGentxJson,
   buildGentxSignDoc,
@@ -23,6 +28,7 @@ import {
   type GentxSignResponse,
 } from "../gentx.js";
 import { renderNodeConfigs } from "../render-configs.js";
+import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
 
@@ -138,179 +144,210 @@ export const generateKeysStep: StepDef = {
       }
     }
 
-    // Operator + generated accounts live in the master keyring (test backend)
-    const accounts: Record<string, string> = {};
-    const addAccount = async (name: string) => {
-      const { stdout } = await sparkdreamd([
-        "keys",
-        "add",
-        name,
-        "--keyring-backend",
-        "test",
-        "--home",
-        masterHome(ctx),
-        "--output",
-        "json",
-      ]);
-      const parsed = JSON.parse(stdout) as { address: string; mnemonic: string };
-      if (!parsed.address.startsWith(spec.network.bech32Prefix + "1")) {
-        throw new Error(
-          `binary produced address ${parsed.address} but spec.network.bech32Prefix is ` +
-            `"${spec.network.bech32Prefix}" — fix the spec (the chain binary's prefix is baked in)`,
-        );
-      }
-      accounts[name] = parsed.address;
-      return parsed;
-    };
-
-    const mnemonics: Record<string, string> = {};
-    const operators = spec.topology.validators.operators;
-    for (let v = 0; v < spec.topology.validators.count; v++) {
-      if (Array.isArray(operators)) {
-        // external operators (§3): address supplied, key never exists here
-        accounts[`op-val-${v}`] = operators[v]!;
-      } else {
-        const parsed = await addAccount(`op-val-${v}`);
-        mnemonics[`op-val-${v}`] = parsed.mnemonic;
-      }
-    }
-    for (const acct of spec.accounts.initial) {
-      if (acct.generate) {
-        const parsed = await addAccount(`acct-${acct.name}`);
-        mnemonics[`acct-${acct.name}`] = parsed.mnemonic;
-      }
-    }
-    // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
-    writeSecretFile(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2));
+    const accounts = await createNamedAccounts(ctx);
 
     return { nodeIds, accounts, consensusPubkeys, sshPublicKey, ageRecipient: age.recipient };
   },
 };
 
+/**
+ * Operator + generated accounts in the master keyring (test backend), with
+ * their mnemonics persisted to secrets/. Shared by generate-keys and the
+ * reset-chain fleet op, which wipes the keyring first and reruns this
+ * against the (possibly edited) account list.
+ */
+export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, string>> {
+  const { spec, dirs } = ctx;
+  const accounts: Record<string, string> = {};
+  const addAccount = async (name: string) => {
+    const { stdout } = await sparkdreamd([
+      "keys",
+      "add",
+      name,
+      "--keyring-backend",
+      "test",
+      "--home",
+      masterHome(ctx),
+      "--output",
+      "json",
+    ]);
+    const parsed = JSON.parse(stdout) as { address: string; mnemonic: string };
+    if (!parsed.address.startsWith(spec.network.bech32Prefix + "1")) {
+      throw new Error(
+        `binary produced address ${parsed.address} but spec.network.bech32Prefix is ` +
+          `"${spec.network.bech32Prefix}" — fix the spec (the chain binary's prefix is baked in)`,
+      );
+    }
+    accounts[name] = parsed.address;
+    return parsed;
+  };
+
+  const mnemonics: Record<string, string> = {};
+  const operators = spec.topology.validators.operators;
+  for (let v = 0; v < spec.topology.validators.count; v++) {
+    if (Array.isArray(operators)) {
+      // external operators (§3): address supplied, key never exists here
+      accounts[`op-val-${v}`] = operators[v]!;
+    } else {
+      const parsed = await addAccount(`op-val-${v}`);
+      mnemonics[`op-val-${v}`] = parsed.mnemonic;
+    }
+  }
+  for (const acct of spec.accounts.initial) {
+    if (acct.generate) {
+      const parsed = await addAccount(`acct-${acct.name}`);
+      mnemonics[`acct-${acct.name}`] = parsed.mnemonic;
+    }
+  }
+  // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
+  writeSecretFile(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2));
+  return accounts;
+}
+
 export const buildGenesisStep: StepDef = {
   name: "build-genesis",
   async run(ctx) {
-    const { spec, dirs } = ctx;
-    const cid = chainId(spec);
     const keys = ctx.output<GenerateKeysOutput>("generate-keys");
     if (!keys) throw new Error("generate-keys output missing");
-    const master = masterHome(ctx);
-    const genesisPath = path.join(master, "config", "genesis.json");
-    const bondDenom = spec.token.bondDenom ?? spec.token.baseDenom;
-
-    // 1. chain params + denoms directly onto genesis JSON
-    const genesis = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
-    applyChainParams(genesis, spec);
-    fs.writeFileSync(genesisPath, JSON.stringify(genesis, null, 2));
-
-    // 2. genesis accounts: initial allocations + operator self-delegation
-    //    funds. Idempotent: this step re-runs after every gentx pause in
-    //    external-operator mode, so skip accounts already present.
-    const hasAccount = (address: string): boolean => {
-      const g = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
-      return (g.app_state?.bank?.balances ?? []).some((b: any) => b.address === address);
-    };
-    const addGenesisAccount = async (address: string, amount: string) => {
-      if (hasAccount(address)) return;
-      await sparkdreamd([
-        "genesis",
-        "add-genesis-account",
-        address,
-        `${amount}${spec.token.baseDenom}`,
-        "--home",
-        master,
-      ]);
-    };
-
-    for (const acct of spec.accounts.initial) {
-      const address = acct.address ?? keys.accounts[`acct-${acct.name}`];
-      if (!address) throw new Error(`no address for account ${acct.name}`);
-      await addGenesisAccount(address, acct.amount);
-    }
-    for (let v = 0; v < spec.topology.validators.count; v++) {
-      await addGenesisAccount(
-        keys.accounts[`op-val-${v}`]!,
-        spec.accounts.validatorSelfDelegation,
-      );
-    }
-
-    // 3. one gentx per validator — locally signed (generated operators) or
-    //    browser-signed with verification (external operators, §5 step 3b)
-    const gentxDir = path.join(master, "config", "gentx");
-    fs.mkdirSync(gentxDir, { recursive: true });
-    const operators = spec.topology.validators.operators;
-    for (let v = 0; v < spec.topology.validators.count; v++) {
-      const home = dirs.node(`val-${v}`);
-      if (v !== 0) {
-        fs.copyFileSync(genesisPath, path.join(home, "config", "genesis.json"));
-      }
-      const outputDocument = path.join(gentxDir, `gentx-val-${v}.json`);
-
-      if (Array.isArray(operators)) {
-        const inputs: GentxInputs = {
-          spec,
-          valIndex: v,
-          operatorAddress: operators[v]!,
-          consensusPubkey: keys.consensusPubkeys[`val-${v}`]!,
-          nodeId: keys.nodeIds[`val-${v}`]!,
-          chainId: cid,
-        };
-        const signDoc = buildGentxSignDoc(inputs);
-        const responseJson = ctx.requireGentx(v, operators[v]!, JSON.stringify(signDoc));
-        const response = JSON.parse(responseJson) as GentxSignResponse;
-        const verdict = await verifyGentxSignature(signDoc, response, operators[v]!);
-        if (!verdict.ok) {
-          // never let a bad signature into genesis — it bricks block 1
-          ctx.db.resetGentx(ctx.launchId, v);
-          throw new Error(`gentx signature for validator ${v} rejected: ${verdict.reason}`);
-        }
-        fs.writeFileSync(outputDocument, assembleGentxJson(inputs, response));
-        continue;
-      }
-
-      const commission = commissionFlags(spec);
-      await sparkdreamd([
-        "genesis",
-        "gentx",
-        `op-val-${v}`,
-        `${spec.accounts.validatorSelfDelegation}${bondDenom}`,
-        "--chain-id",
-        cid,
-        "--moniker",
-        `${spec.network.name}-val-${v}`,
-        "--commission-rate",
-        commission.rate,
-        "--commission-max-rate",
-        commission.maxRate,
-        "--commission-max-change-rate",
-        commission.maxChangeRate,
-        "--home",
-        home,
-        "--keyring-backend",
-        "test",
-        "--keyring-dir",
-        master,
-        "--output-document",
-        outputDocument,
-      ]);
-    }
-
-    // 4. collect + validate, then distribute the final genesis everywhere
-    await sparkdreamd(["genesis", "collect-gentxs", "--home", master]);
-    await sparkdreamd(["genesis", "validate", genesisPath]);
-    for (const node of nodes(spec)) {
-      if (node.key === masterKey) continue;
-      fs.copyFileSync(genesisPath, path.join(dirs.node(node.key), "config", "genesis.json"));
-    }
-
-    const final = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
-    return {
-      chainId: cid,
-      genesisSha256: await sha256File(genesisPath),
-      gentxCount: (final.app_state?.genutil?.gen_txs ?? []).length,
-    };
+    return buildGenesisFiles(ctx, keys);
   },
 };
+
+/**
+ * The genesis pipeline (§5 step 3): reference overlay + members + chain
+ * params onto the master's init skeleton, genesis accounts, one gentx per
+ * validator (locally signed or browser-signed with verification), collect,
+ * validate, distribute to every node home. Shared by build-genesis and the
+ * reset-chain fleet op, which re-runs it against a fresh skeleton with a
+ * bumped chain-id.
+ */
+export async function buildGenesisFiles(
+  ctx: StepCtx,
+  keys: GenerateKeysOutput,
+): Promise<{ chainId: string; genesisSha256: string; gentxCount: number }> {
+  const { spec, dirs } = ctx;
+  const cid = chainId(spec);
+  const master = masterHome(ctx);
+  const genesisPath = path.join(master, "config", "genesis.json");
+  const bondDenom = spec.token.bondDenom ?? spec.token.baseDenom;
+
+  // 1. reference-network genesis overlay, then spec overrides on top
+  const genesis = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
+  const reference = JSON.parse(
+    fs.readFileSync(referenceGenesisPath(spec.network.type), "utf8"),
+  );
+  applyReferenceGenesis(genesis, reference, spec);
+  applyGenesisMembers(genesis, reference, spec, keys.accounts);
+  applyChainParams(genesis, spec);
+  fs.writeFileSync(genesisPath, JSON.stringify(genesis, null, 2));
+
+  // 2. genesis accounts: initial allocations + operator self-delegation
+  //    funds. Idempotent: this step re-runs after every gentx pause in
+  //    external-operator mode, so skip accounts already present.
+  const hasAccount = (address: string): boolean => {
+    const g = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
+    return (g.app_state?.bank?.balances ?? []).some((b: any) => b.address === address);
+  };
+  const addGenesisAccount = async (address: string, amount: string) => {
+    if (hasAccount(address)) return;
+    await sparkdreamd([
+      "genesis",
+      "add-genesis-account",
+      address,
+      `${amount}${spec.token.baseDenom}`,
+      "--home",
+      master,
+    ]);
+  };
+
+  for (const acct of spec.accounts.initial) {
+    const address = acct.address ?? keys.accounts[`acct-${acct.name}`];
+    if (!address) throw new Error(`no address for account ${acct.name}`);
+    await addGenesisAccount(address, acct.amount);
+  }
+  for (let v = 0; v < spec.topology.validators.count; v++) {
+    await addGenesisAccount(
+      keys.accounts[`op-val-${v}`]!,
+      spec.accounts.validatorSelfDelegation,
+    );
+  }
+
+  // 3. one gentx per validator — locally signed (generated operators) or
+  //    browser-signed with verification (external operators, §5 step 3b)
+  const gentxDir = path.join(master, "config", "gentx");
+  fs.mkdirSync(gentxDir, { recursive: true });
+  const operators = spec.topology.validators.operators;
+  for (let v = 0; v < spec.topology.validators.count; v++) {
+    const home = dirs.node(`val-${v}`);
+    if (v !== 0) {
+      fs.copyFileSync(genesisPath, path.join(home, "config", "genesis.json"));
+    }
+    const outputDocument = path.join(gentxDir, `gentx-val-${v}.json`);
+
+    if (Array.isArray(operators)) {
+      const inputs: GentxInputs = {
+        spec,
+        valIndex: v,
+        operatorAddress: operators[v]!,
+        consensusPubkey: keys.consensusPubkeys[`val-${v}`]!,
+        nodeId: keys.nodeIds[`val-${v}`]!,
+        chainId: cid,
+      };
+      const signDoc = buildGentxSignDoc(inputs);
+      const responseJson = ctx.requireGentx(v, operators[v]!, JSON.stringify(signDoc));
+      const response = JSON.parse(responseJson) as GentxSignResponse;
+      const verdict = await verifyGentxSignature(signDoc, response, operators[v]!);
+      if (!verdict.ok) {
+        // never let a bad signature into genesis — it bricks block 1
+        ctx.db.resetGentx(ctx.launchId, v);
+        throw new Error(`gentx signature for validator ${v} rejected: ${verdict.reason}`);
+      }
+      fs.writeFileSync(outputDocument, assembleGentxJson(inputs, response));
+      continue;
+    }
+
+    const commission = commissionFlags(spec);
+    await sparkdreamd([
+      "genesis",
+      "gentx",
+      `op-val-${v}`,
+      `${spec.accounts.validatorSelfDelegation}${bondDenom}`,
+      "--chain-id",
+      cid,
+      "--moniker",
+      `${spec.network.name}-val-${v}`,
+      "--commission-rate",
+      commission.rate,
+      "--commission-max-rate",
+      commission.maxRate,
+      "--commission-max-change-rate",
+      commission.maxChangeRate,
+      "--home",
+      home,
+      "--keyring-backend",
+      "test",
+      "--keyring-dir",
+      master,
+      "--output-document",
+      outputDocument,
+    ]);
+  }
+
+  // 4. collect + validate, then distribute the final genesis everywhere
+  await sparkdreamd(["genesis", "collect-gentxs", "--home", master]);
+  await sparkdreamd(["genesis", "validate", genesisPath]);
+  for (const node of nodes(spec)) {
+    if (node.key === masterKey) continue;
+    fs.copyFileSync(genesisPath, path.join(dirs.node(node.key), "config", "genesis.json"));
+  }
+
+  const final = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
+  return {
+    chainId: cid,
+    genesisSha256: await sha256File(genesisPath),
+    gentxCount: (final.app_state?.genutil?.gen_txs ?? []).length,
+  };
+}
 
 async function sha256File(p: string): Promise<string> {
   const { createHash } = await import("node:crypto");

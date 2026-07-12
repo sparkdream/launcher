@@ -14,12 +14,32 @@ const domain = z
 export const networkType = z.enum(["devnet", "testnet", "mainnet"]);
 export type NetworkType = z.infer<typeof networkType>;
 
+const trustLevel = z.enum(["new", "provisional", "established", "trusted", "core"]);
+
+const memberOptions = z.object({
+  /** Defaults to core. */
+  trustLevel: trustLevel.optional(),
+  /**
+   * Starting dream balance in the dream base denom. Defaults to the
+   * reference network's seed for a member of the same trust level.
+   */
+  dreamBalance: amount.optional(),
+});
+
 const initialAccount = z
   .object({
     name: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/),
     address: z.string().optional(),
     generate: z.boolean().optional(),
     amount,
+    /**
+     * Seed this account as an active genesis member (x/rep member_map plus a
+     * blank x/season profile). `true` seeds a core founding member shaped
+     * like the reference network's; the object form picks the trust level
+     * and dream balance. Leave unset for non-person accounts (treasury,
+     * operators).
+     */
+    member: z.union([z.boolean(), memberOptions]).optional(),
   })
   .refine((a) => Boolean(a.address) !== Boolean(a.generate), {
     message: "exactly one of address or generate must be set",
@@ -75,6 +95,17 @@ export const launchSpecSchema = z.object({
     minGasPrice: z.string().regex(/^[0-9]+(\.[0-9]+)?$/),
     /** Defaults to baseDenom. */
     bondDenom: denom.optional(),
+    /**
+     * The chain's internal coordination token. The chain's identity module
+     * hardcodes the prefix — this must be "udream.<suffix>" — so it defaults
+     * to "udream." + the bond denom's suffix (validateSpec enforces both).
+     */
+    dreamDenom: denom.optional(),
+    /** Display name for the dream token, like displayDenom for the bond token. */
+    dreamDisplayDenom: z
+      .string()
+      .regex(/^[A-Z][A-Z0-9]{1,11}$/)
+      .default("DREAM"),
   }),
 
   accounts: z.object({

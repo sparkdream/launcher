@@ -1,7 +1,34 @@
 import fs from "node:fs";
 import yaml from "js-yaml";
-import { chainId, type ComponentKey, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  chainId,
+  deriveDreamDenom,
+  type ComponentKey,
+  type ComponentRef,
+  type LaunchSpec,
+} from "@sparkdream/launch-spec";
 import { PRICING_DENOM } from "./render-sdl.js";
+
+/**
+ * Chain-identity env for the explorer (ping-pub) image. Images from
+ * v1.0.6 render their runtime chain config from these (same contract as
+ * the frontend); older images ignore them and serve their baked config.
+ * CHAIN_NAME doubles as the ping-pub route path, so it must agree with the
+ * frontend's EXPLORER_URL — both derive it as route ?? network.name.
+ */
+export function explorerChainEnv(spec: LaunchSpec): Record<string, string> {
+  const explorer = spec.topology.components.explorer;
+  const dreamDenom = deriveDreamDenom(spec.token);
+  return {
+    CHAIN_NAME: explorer.route ?? spec.network.name,
+    CHAIN_DENOM: spec.token.baseDenom,
+    DISPLAY_DENOM: spec.token.displayDenom,
+    ...(dreamDenom ? { DREAM_DENOM: dreamDenom } : {}),
+    DREAM_DISPLAY_DENOM: spec.token.dreamDisplayDenom,
+    COIN_DECIMALS: String(spec.token.exponent),
+    BECH32_PREFIX: spec.network.bech32Prefix,
+  };
+}
 
 /** SDL compute resources per component — also feeds the cost estimator. */
 export function componentResources(key: ComponentKey) {
@@ -88,6 +115,7 @@ function explorerSdl(input: RenderComponentSdlInput) {
         // hit the nginx proxies above
         "NODE_API_ENDPOINT=/api",
         "NODE_RPC_ENDPOINT=/rpc",
+        ...Object.entries(explorerChainEnv(spec)).map(([k, v]) => `${k}=${v}`),
       ],
       params: { storage: { data: { mount: "/data", readOnly: false } } },
     },

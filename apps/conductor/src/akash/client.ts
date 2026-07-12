@@ -157,7 +157,16 @@ export class ProviderClient {
             }
           });
         } else if (code === 103) {
-          done(() => reject(new Error("lease shell: provider reported a failure")));
+          // infrastructure-level failure frame — typical when the pod is
+          // mid-restart; surface whatever output made it through
+          const detail = (stderr || stdout).slice(0, 500);
+          done(() =>
+            reject(
+              new Error(
+                `lease shell: provider reported a failure${detail ? `: ${detail}` : " (pod restarting?)"}`,
+              ),
+            ),
+          );
         }
       });
       ws.on("error", (e: Error) => done(() => reject(e)));

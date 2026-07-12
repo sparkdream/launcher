@@ -1,0 +1,2144 @@
+{
+  "app_hash": null,
+  "app_name": "sparkdreamd",
+  "app_state": {
+    "06-solomachine": null,
+    "07-tendermint": null,
+    "auth": {
+      "accounts": [
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "0",
+          "address": "sprkdrm19wsctgkpk93wkquu7t8g07gnvwzwdupshys9mu",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "1",
+          "address": "sprkdrm1emtnqs9qw9vrg5lsa58dyt8llq5fyenylmqy3p",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "2",
+          "address": "sprkdrm1yhjdr8kxsrer3kcqpdrc2zd0kggvsj4c3vazkd",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "3",
+          "address": "sprkdrm1psq079p8erng2pf37nvvvmpqpetkknpmwxx4r8",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "4",
+          "address": "sprkdrm1wk6eh9zrw7n6xqmyw2yqja58ekpwy3h5u4gkge",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "5",
+          "address": "sprkdrm1crwfn2z2230jhtlaxwphyz0xrmuwc5ntc47vak",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "6",
+          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "7",
+          "address": "sprkdrm1dqpr060l2pxy08j7q4gaahnmchs7qlhmf2w4y9",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "8",
+          "address": "sprkdrm1jqyzam9sewlmf704c84ysmkvhaqy8l0tpwysfs",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.ModuleAccount",
+          "base_account": {
+            "account_number": "9",
+            "address": "sprkdrm1jv65s3grqf6v6jl3dp4t6c9t9rk99cd868re8z",
+            "pub_key": null,
+            "sequence": "0"
+          },
+          "name": "distribution",
+          "permissions": []
+        }
+      ],
+      "params": {
+        "max_memo_characters": "256",
+        "sig_verify_cost_ed25519": "590",
+        "sig_verify_cost_secp256k1": "1000",
+        "tx_sig_limit": "7",
+        "tx_size_cost_per_byte": "10"
+      }
+    },
+    "bank": {
+      "balances": [
+        {
+          "address": "sprkdrm19wsctgkpk93wkquu7t8g07gnvwzwdupshys9mu",
+          "coins": [
+            {
+              "amount": "1250000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1emtnqs9qw9vrg5lsa58dyt8llq5fyenylmqy3p",
+          "coins": [
+            {
+              "amount": "750000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1yhjdr8kxsrer3kcqpdrc2zd0kggvsj4c3vazkd",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1psq079p8erng2pf37nvvvmpqpetkknpmwxx4r8",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1wk6eh9zrw7n6xqmyw2yqja58ekpwy3h5u4gkge",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1crwfn2z2230jhtlaxwphyz0xrmuwc5ntc47vak",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1dqpr060l2pxy08j7q4gaahnmchs7qlhmf2w4y9",
+          "coins": [
+            {
+              "amount": "375000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1jqyzam9sewlmf704c84ysmkvhaqy8l0tpwysfs",
+          "coins": [
+            {
+              "amount": "375000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1jv65s3grqf6v6jl3dp4t6c9t9rk99cd868re8z",
+          "coins": [
+            {
+              "amount": "95000000000000",
+              "denom": "uspark.sparkdream"
+            }
+          ]
+        }
+      ],
+      "denom_metadata": [
+        {
+          "base": "uspark.sparkdream",
+          "denom_units": [
+            {
+              "denom": "uspark.sparkdream",
+              "exponent": 0
+            },
+            {
+              "denom": "spark",
+              "exponent": 6
+            }
+          ],
+          "description": "Native token of Spark Dream A T E L I E R.",
+          "display": "spark",
+          "name": "spark",
+          "symbol": "spark"
+        },
+        {
+          "base": "udream.sparkdream",
+          "denom_units": [
+            {
+              "denom": "udream.sparkdream",
+              "exponent": 0
+            },
+            {
+              "denom": "dream",
+              "exponent": 6
+            }
+          ],
+          "description": "Internal coordination token - earned through contribution, not traded.",
+          "display": "dream",
+          "name": "dream",
+          "symbol": "dream"
+        }
+      ],
+      "params": {
+        "default_send_enabled": true,
+        "send_enabled": []
+      },
+      "send_enabled": [],
+      "supply": [
+        {
+          "amount": "100000000000000",
+          "denom": "uspark.sparkdream"
+        }
+      ]
+    },
+    "blog": {
+      "params": {
+        "conviction_renewal_period": "604800",
+        "conviction_renewal_threshold": "100.000000000000000000",
+        "cost_per_byte_amount": "100",
+        "cost_per_byte_exempt": false,
+        "ephemeral_content_ttl": "604800",
+        "make_permanent_min_trust_level": 1,
+        "max_body_length": "10000",
+        "max_cost_per_byte_amount": "1000",
+        "max_make_permanent_per_day": 10,
+        "max_pins_per_day": 20,
+        "max_posts_per_day": 10,
+        "max_promotions_per_block": 50,
+        "max_reaction_fee_amount": "500",
+        "max_reactions_per_day": 100,
+        "max_replies_per_day": 50,
+        "max_reply_depth": 5,
+        "max_reply_length": "2000",
+        "max_tag_length": 32,
+        "max_tags_per_post": 5,
+        "max_title_length": "200",
+        "min_ephemeral_content_ttl": "86400",
+        "pin_min_trust_level": 2,
+        "reaction_fee_amount": "50",
+        "reaction_fee_exempt": false
+      },
+      "post_count": "1",
+      "posts": [],
+      "reaction_counts": [],
+      "reactions": [],
+      "replies": [],
+      "reply_count": "1"
+    },
+    "collect": {
+      "collaborators": [],
+      "collection_count": "1",
+      "collections": [],
+      "curation_review_count": "1",
+      "curation_reviews": [],
+      "curation_summaries": [],
+      "curator_activities": [],
+      "endorsements": [],
+      "flags": [],
+      "hide_record_count": "1",
+      "hide_records": [],
+      "item_count": "1",
+      "items": [],
+      "params": {
+        "appeal_cooldown_blocks": "600",
+        "appeal_deadline_blocks": "201600",
+        "appeal_fee": "5000000",
+        "author_rep_penalty": "15.000000000000000000",
+        "base_collection_deposit": "1000000",
+        "challenge_deposit": "250000000",
+        "challenge_reward_fraction": "0.800000000000000000",
+        "challenge_window_blocks": "100800",
+        "collab_inviter_rep_penalty": "5.000000000000000000",
+        "conviction_renewal_period": "432000",
+        "conviction_renewal_threshold": "0.000000000000000000",
+        "curator_demotion_cooldown": "604800",
+        "curator_demotion_threshold": "250000000",
+        "curator_overturn_demotion_streak": "3",
+        "curator_slash_fraction": "0.100000000000000000",
+        "curator_unbond_cooldown": "604800",
+        "downvote_cost": "25000000",
+        "endorsement_creation_fee": "10000000",
+        "endorsement_deletion_burn_fraction": "0.100000000000000000",
+        "endorsement_dream_stake": "100000000",
+        "endorsement_expiry_blocks": "432000",
+        "endorsement_fee_endorser_share": "0.800000000000000000",
+        "endorsement_stake_duration": "432000",
+        "endorser_rep_penalty": "10.000000000000000000",
+        "flag_expiration_blocks": "100800",
+        "flag_review_threshold": 5,
+        "hide_expiry_blocks": "100800",
+        "make_permanent_min_trust_level": 1,
+        "max_attribute_key_length": 64,
+        "max_attribute_value_length": 256,
+        "max_attributes_per_item": 20,
+        "max_batch_size": 50,
+        "max_challenge_reason_length": 1024,
+        "max_collaborators_per_collection": 20,
+        "max_collections_base": 5,
+        "max_collections_per_trust_level": 15,
+        "max_description_length": 1024,
+        "max_downvotes_per_day": 20,
+        "max_encrypted_data_size": 4096,
+        "max_flag_reason_length": 512,
+        "max_flaggers_per_target": 50,
+        "max_flags_per_day": 20,
+        "max_hides_per_sentinel_per_day": 50,
+        "max_items_per_collection": 500,
+        "max_make_permanent_per_day": 5,
+        "max_name_length": 128,
+        "max_non_member_collaborators_per_collection": 2,
+        "max_non_member_ttl_blocks": "432000",
+        "max_pins_per_day": 10,
+        "max_promotions_per_block": 50,
+        "max_prune_per_block": 100,
+        "max_reference_field_length": 256,
+        "max_review_comment_length": 512,
+        "max_reviews_per_collection": 20,
+        "max_tag_length": 32,
+        "max_tags_per_collection": 10,
+        "max_tags_per_review": 5,
+        "max_title_length": 128,
+        "max_ttl_blocks": "0",
+        "max_upvotes_per_day": 100,
+        "min_curator_age_blocks": "0",
+        "min_curator_bond": "500000000",
+        "min_curator_trust_level": "TRUST_LEVEL_PROVISIONAL",
+        "min_sponsor_trust_level": "TRUST_LEVEL_ESTABLISHED",
+        "non_member_collab_burn_fraction": "0.500000000000000000",
+        "non_member_collab_dream_stake": "100000000",
+        "per_item_deposit": "100000",
+        "per_item_spam_tax": "500000",
+        "pin_min_trust_level": 2,
+        "sentinel_commit_amount": "100000000",
+        "sentinel_unhide_window_blocks": "14400",
+        "sponsor_fee": "1000000",
+        "sponsorship_request_ttl_blocks": "100800"
+      },
+      "sponsorship_requests": []
+    },
+    "commons": {
+      "category_map": [
+        {
+          "admin_only_write": false,
+          "category_id": 1,
+          "description": "General discussion",
+          "members_only_write": false,
+          "title": "General"
+        },
+        {
+          "admin_only_write": false,
+          "category_id": 2,
+          "description": "Governance proposals and discussion",
+          "members_only_write": true,
+          "title": "Governance"
+        },
+        {
+          "admin_only_write": true,
+          "category_id": 3,
+          "description": "Official chain announcements — upgrades, season transitions, council notices, security advisories",
+          "members_only_write": false,
+          "title": "Announcements"
+        },
+        {
+          "admin_only_write": false,
+          "category_id": 4,
+          "description": "Onboarding questions and general support — open to non-members",
+          "members_only_write": false,
+          "title": "Help & Support"
+        },
+        {
+          "admin_only_write": false,
+          "category_id": 5,
+          "description": "Bug reports and feedback on the chain, modules, and UX",
+          "members_only_write": false,
+          "title": "Bugs & Feedback"
+        },
+        {
+          "admin_only_write": false,
+          "category_id": 6,
+          "description": "Coordination on x/rep initiatives, x/reveal contributions, and member projects",
+          "members_only_write": true,
+          "title": "Initiatives & Projects"
+        }
+      ],
+      "council_members": [],
+      "decision_policies": [],
+      "group_map": [],
+      "next_category_id": 7,
+      "next_council_id": "0",
+      "next_proposal_id": "0",
+      "next_recurring_spend_id": "0",
+      "params": {
+        "proposal_fee": "5000000uspark.sparkdream"
+      },
+      "policy_permissions_map": [],
+      "policy_versions": [],
+      "proposal_votes": [],
+      "proposals": [],
+      "recurring_spends": []
+    },
+    "consensus": null,
+    "crisis": {
+      "constant_fee": {
+        "denom": "uspark.sparkdream"
+      }
+    },
+    "distribution": {
+      "delegator_starting_infos": [],
+      "delegator_withdraw_infos": [],
+      "fee_pool": {
+        "community_pool": [
+          {
+            "amount": "95000000000000",
+            "denom": "uspark.sparkdream"
+          }
+        ]
+      },
+      "outstanding_rewards": [],
+      "params": {
+        "base_proposer_reward": "0.000000000000000000",
+        "bonus_proposer_reward": "0.000000000000000000",
+        "community_tax": "0.15",
+        "withdraw_addr_enabled": true
+      },
+      "previous_proposer": "",
+      "validator_accumulated_commissions": [],
+      "validator_current_rewards": [],
+      "validator_historical_rewards": [],
+      "validator_slash_events": []
+    },
+    "ecosystem": {
+      "params": {}
+    },
+    "evidence": {
+      "evidence": []
+    },
+    "federation": {
+      "bridge_bindings": [],
+      "federated_content": [],
+      "identity_links": [],
+      "next_content_id": "0",
+      "next_outbound_attestation_id": "0",
+      "outbound_attestations": [],
+      "params": {
+        "arbiter_escalation_window": "172800s",
+        "arbiter_quorum": 3,
+        "arbiter_resolution_window": "86400s",
+        "attestation_ttl": "2592000s",
+        "bridge_inactivity_threshold": "100",
+        "challenge_cooldown": "604800s",
+        "challenge_fee_amount": "250000000",
+        "challenge_jury_deadline": "1209600s",
+        "challenge_ttl": "604800s",
+        "challenge_window": "604800s",
+        "content_ttl": "7776000s",
+        "escalation_fee_amount": "100000000",
+        "global_max_trust_credit": 1,
+        "ibc_channel_version": "federation-1",
+        "ibc_packet_timeout": "600s",
+        "ibc_port": "federation",
+        "known_content_types": [
+          "blog_post",
+          "blog_reply",
+          "forum_thread",
+          "forum_reply",
+          "collection"
+        ],
+        "max_bridges_per_peer": "1000",
+        "max_content_body_size": "4096",
+        "max_content_uri_size": "2048",
+        "max_identity_links_per_user": 10,
+        "max_inbound_per_block": "50",
+        "max_outbound_per_block": "50",
+        "max_protocol_metadata_size": "8192",
+        "max_prune_per_block": "100",
+        "max_verifier_dream_mint_per_epoch": "100000000",
+        "min_epoch_verifications": 3,
+        "min_verifier_accuracy": "0.800000000000000000",
+        "min_verifier_bond": "500000000",
+        "min_verifier_trust_level": 2,
+        "operator_reward_share": "0.600000000000000000",
+        "rate_limit_window": "86400s",
+        "trust_discount_rate": "0.500000000000000000",
+        "unverified_link_ttl": "2592000s",
+        "upheld_to_reset_overturns": 3,
+        "verification_window": "86400s",
+        "verifier_demotion_cooldown": "604800s",
+        "verifier_dream_reward": "5000000",
+        "verifier_overturn_base_cooldown": "86400s",
+        "verifier_recovery_threshold": "250000000",
+        "verifier_slash_amount": "50000000",
+        "verifier_unbond_cooldown": "1209600s"
+      },
+      "peer_policies": [],
+      "peers": [],
+      "port_id": "federation",
+      "reputation_attestations": [],
+      "verification_records": [],
+      "verifier_activities": []
+    },
+    "forum": {
+      "archive_metadata_map": [],
+      "bounty_count": "0",
+      "bounty_list": [],
+      "hide_record_map": [],
+      "params": {
+        "accept_proposal_timeout": "172800",
+        "appeal_fee_amount": "5000000",
+        "appeals_paused": false,
+        "archive_cooldown": "2592000",
+        "archive_threshold": "2592000",
+        "author_rep_slash": "5.000000000000000000",
+        "bounties_enabled": true,
+        "bounty_cancellation_fee_percent": "10",
+        "conviction_renewal_period": "604800",
+        "conviction_renewal_threshold": "100.000000000000000000",
+        "cost_per_byte_amount": "100",
+        "cost_per_byte_exempt": false,
+        "curation_dream_reward": "5000000",
+        "daily_post_limit": "50",
+        "downvote_deposit_amount": "50000",
+        "edit_fee_amount": "10000",
+        "edit_grace_period": "300",
+        "edit_max_window": "86400",
+        "editing_enabled": true,
+        "ephemeral_ttl": "86400",
+        "flag_spam_tax_amount": "100000",
+        "forum_paused": false,
+        "hide_appeal_cooldown": "3600",
+        "lock_appeal_cooldown": "3600",
+        "lock_appeal_fee_amount": "5000000",
+        "lock_backing_amount": "20000000000",
+        "lock_bond_multiplier": "4",
+        "lock_min_rep_tier": "4",
+        "make_permanent_min_trust_level": 1,
+        "max_accept_proposals_per_sentinel_per_thread": 2,
+        "max_content_size": "10240",
+        "max_follows_per_day": "50",
+        "max_forum_rep_per_tag_per_epoch": "5.000000000000000000",
+        "max_hides_per_epoch": "50",
+        "max_make_permanent_per_day": "10",
+        "max_promotions_per_block": 50,
+        "max_reply_depth": 10,
+        "max_sentinel_locks_per_epoch": "5",
+        "max_sentinel_moves_per_epoch": "10",
+        "min_post_conviction_stake": "10000000",
+        "min_sentinel_age_blocks": "0",
+        "min_sentinel_bond": "500000000",
+        "min_sentinel_rep_tier": "0",
+        "min_sentinel_trust_level": "TRUST_LEVEL_ESTABLISHED",
+        "moderation_paused": false,
+        "move_appeal_cooldown": "3600",
+        "move_appeal_fee_amount": "5000000",
+        "post_conviction_lock_seconds": "1209600",
+        "post_conviction_staker_slash_bps": "2500",
+        "post_conviction_stream_rate_per_block": "0.050000000000000000",
+        "reaction_spam_tax_amount": "100000",
+        "reactions_enabled": true,
+        "sentinel_demotion_cooldown": "604800",
+        "sentinel_demotion_threshold": "250",
+        "sentinel_slash_amount": "100000000",
+        "sentinel_unbond_cooldown": "1209600",
+        "sentinel_unhide_window": "86400",
+        "spam_tax_amount": "1000000",
+        "unarchive_cooldown": "86400"
+      },
+      "post_count": "1",
+      "post_flag_map": [],
+      "post_map": [],
+      "proposal_count_map": [],
+      "sentinel_activity_map": [],
+      "thread_follow_count_map": [],
+      "thread_follow_map": [],
+      "thread_lock_record_map": [],
+      "thread_metadata_map": [],
+      "thread_move_record_map": [],
+      "user_rate_limit_map": [],
+      "user_reaction_limit_map": []
+    },
+    "futarchy": {
+      "market_map": [],
+      "params": {
+        "default_min_tick": "1000",
+        "max_duration": "5256000",
+        "max_lmsr_exponent": "20",
+        "max_redemption_delay": "5256000",
+        "min_liquidity": "100000",
+        "trading_fee_bps": "30"
+      }
+    },
+    "genutil": {
+      "gen_txs": []
+    },
+    "gnovm": {
+      "params": {
+        "chain_domain": "gno.land",
+        "default_deposit": "100000uspark.sparkdream",
+        "storage_fee_collector": "aLpYisb4Fny8ElIzuT4SKbVeJqU=",
+        "storage_price": "1uspark.sparkdream",
+        "sysnames_pkgpath": ""
+      },
+      "realm_params": null,
+      "state": []
+    },
+    "gov": {
+      "constitution": "",
+      "deposit_params": null,
+      "deposits": [],
+      "params": {
+        "burn_proposal_deposit_prevote": false,
+        "burn_vote_quorum": false,
+        "burn_vote_veto": true,
+        "expedited_min_deposit": [
+          {
+            "amount": "100000000",
+            "denom": "uspark.sparkdream"
+          }
+        ],
+        "expedited_threshold": "0.667000000000000000",
+        "expedited_voting_period": "86400s",
+        "max_deposit_period": "172800s",
+        "min_deposit": [
+          {
+            "amount": "50000000",
+            "denom": "uspark.sparkdream"
+          }
+        ],
+        "min_deposit_ratio": "0.010000000000000000",
+        "min_initial_deposit_ratio": "0.000000000000000000",
+        "proposal_cancel_dest": "",
+        "proposal_cancel_ratio": "0.500000000000000000",
+        "quorum": "0.334000000000000000",
+        "threshold": "0.500000000000000000",
+        "veto_threshold": "0.334000000000000000",
+        "voting_period": "432000s"
+      },
+      "proposals": [],
+      "starting_proposal_id": "1",
+      "tally_params": null,
+      "votes": [],
+      "voting_params": null
+    },
+    "guardian": {},
+    "ibc": {
+      "channel_genesis": {
+        "ack_sequences": [],
+        "acknowledgements": [],
+        "channels": [],
+        "commitments": [],
+        "next_channel_sequence": "0",
+        "receipts": [],
+        "recv_sequences": [],
+        "send_sequences": []
+      },
+      "channel_v2_genesis": {
+        "acknowledgements": [],
+        "async_packets": [],
+        "commitments": [],
+        "receipts": [],
+        "send_sequences": []
+      },
+      "client_genesis": {
+        "clients": [],
+        "clients_consensus": [],
+        "clients_metadata": [],
+        "create_localhost": false,
+        "next_client_sequence": "0",
+        "params": {
+          "allowed_clients": [
+            "*"
+          ]
+        }
+      },
+      "client_v2_genesis": {
+        "counterparty_infos": []
+      },
+      "connection_genesis": {
+        "client_connection_paths": [],
+        "connections": [],
+        "next_connection_sequence": "0",
+        "params": {
+          "max_expected_time_per_block": "30000000000"
+        }
+      }
+    },
+    "identity": {
+      "allow_chain_id_mismatch": true,
+      "identity": {
+        "bond_denom": "uspark.sparkdream",
+        "bond_display_decimals": 6,
+        "bond_display_name": "Sparkdream Spark",
+        "bond_display_symbol": "SPARK",
+        "chain_human_name": "Sparkdream",
+        "chain_ticker_prefix": "SDR",
+        "dream_denom": "udream.sparkdream",
+        "dream_display_decimals": 6,
+        "dream_display_name": "Sparkdream Dream",
+        "dream_display_symbol": "DREAM",
+        "founded_at": "1735689600"
+      }
+    },
+    "interchainaccounts": {
+      "controller_genesis_state": {
+        "active_channels": [],
+        "interchain_accounts": [],
+        "params": {
+          "controller_enabled": true
+        },
+        "ports": []
+      },
+      "host_genesis_state": {
+        "active_channels": [],
+        "interchain_accounts": [],
+        "params": {
+          "allow_messages": [
+            "*"
+          ],
+          "host_enabled": true
+        },
+        "port": "icahost"
+      }
+    },
+    "mint": {
+      "minter": {
+        "annual_provisions": "0.000000000000000000",
+        "inflation": "0.130000000000000000"
+      },
+      "params": {
+        "blocks_per_year": "6311520",
+        "goal_bonded": "0.67",
+        "inflation_max": "0.05",
+        "inflation_min": "0.02",
+        "inflation_rate_change": "0.13",
+        "mint_denom": "uspark.sparkdream"
+      }
+    },
+    "name": {
+      "dispute_map": [],
+      "name_records": [],
+      "owner_infos": [],
+      "params": {
+        "blocked_names": [
+          "admin",
+          "administrator",
+          "root",
+          "sysadmin",
+          "mod",
+          "moderator",
+          "system",
+          "net",
+          "network",
+          "bot",
+          "support",
+          "help",
+          "helpdesk",
+          "security",
+          "verify",
+          "verification",
+          "kyc",
+          "airdrop",
+          "claim",
+          "mint",
+          "wallet",
+          "vault",
+          "safe",
+          "refund",
+          "validator",
+          "faucet",
+          "council",
+          "treasury",
+          "gov",
+          "governance",
+          "ecosystem",
+          "community",
+          "bank",
+          "stake",
+          "staking",
+          "ibc",
+          "transfer",
+          "bitcoin",
+          "btc",
+          "ethereum",
+          "eth",
+          "cosmos",
+          "atom",
+          "tendermint",
+          "ignite",
+          "satoshi",
+          "nakamoto",
+          "sparkdream",
+          "sparkdreamnft",
+          "sparkdreamatelier",
+          "sparkdreamofficial",
+          "sparkdreamfoundation",
+          "sparkdreamdao",
+          "sparkdreamio",
+          "atelier",
+          "atelierdao",
+          "official",
+          "team",
+          "founder",
+          "ceo",
+          "owner"
+        ],
+        "contest_stake_dream": "100000000",
+        "dispute_stake_dream": "50000000",
+        "dispute_timeout_blocks": "100800",
+        "expiration_duration": "31536000s",
+        "max_name_length": "30",
+        "max_names_per_address": "5",
+        "min_name_length": "3",
+        "registration_fee_amount": "10000000"
+      }
+    },
+    "params": null,
+    "rep": {
+      "bonded_role_config_list": [
+        {
+          "demotion_cooldown": "604800",
+          "demotion_threshold": "500",
+          "min_age_blocks": "0",
+          "min_bond": "1000",
+          "min_rep_tier": "3",
+          "min_trust_level": "",
+          "role_type": "ROLE_TYPE_CONTENT_SENTINEL",
+          "unbond_cooldown": "1209600"
+        },
+        {
+          "demotion_cooldown": "604800",
+          "demotion_threshold": "250",
+          "min_age_blocks": "0",
+          "min_bond": "500",
+          "min_rep_tier": "0",
+          "min_trust_level": "TRUST_LEVEL_PROVISIONAL",
+          "role_type": "ROLE_TYPE_COLLECT_CURATOR",
+          "unbond_cooldown": "604800"
+        },
+        {
+          "demotion_cooldown": "604800",
+          "demotion_threshold": "250",
+          "min_age_blocks": "0",
+          "min_bond": "500",
+          "min_rep_tier": "0",
+          "min_trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "role_type": "ROLE_TYPE_FEDERATION_VERIFIER",
+          "unbond_cooldown": "1209600"
+        }
+      ],
+      "bonded_role_list": [],
+      "challenge_count": "1",
+      "challenge_list": [],
+      "content_challenge_count": "1",
+      "content_challenge_list": [],
+      "content_initiative_links": [],
+      "gov_action_appeal_count": "0",
+      "gov_action_appeal_list": [],
+      "initiative_count": "1",
+      "initiative_list": [],
+      "interim_count": "1",
+      "interim_list": [],
+      "interim_template_map": [],
+      "invitation_count": "1",
+      "invitation_list": [],
+      "jury_participation_map": [],
+      "jury_review_count": "1",
+      "jury_review_list": [],
+      "member_map": [
+        {
+          "address": "sprkdrm19wsctgkpk93wkquu7t8g07gnvwzwdupshys9mu",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "5000000000",
+          "invitation_chain": [],
+          "invitation_credits": 10,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "5000000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_CORE",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1emtnqs9qw9vrg5lsa58dyt8llq5fyenylmqy3p",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "3500000000",
+          "invitation_chain": [],
+          "invitation_credits": 7,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "3500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_TRUSTED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1yhjdr8kxsrer3kcqpdrc2zd0kggvsj4c3vazkd",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1psq079p8erng2pf37nvvvmpqpetkknpmwxx4r8",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1wk6eh9zrw7n6xqmyw2yqja58ekpwy3h5u4gkge",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1crwfn2z2230jhtlaxwphyz0xrmuwc5ntc47vak",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1dqpr060l2pxy08j7q4gaahnmchs7qlhmf2w4y9",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2000000000",
+          "invitation_chain": [],
+          "invitation_credits": 3,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2000000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_PROVISIONAL",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1jqyzam9sewlmf704c84ysmkvhaqy8l0tpwysfs",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2000000000",
+          "invitation_chain": [],
+          "invitation_credits": 3,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2000000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_PROVISIONAL",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        }
+      ],
+      "member_report_map": [],
+      "member_stake_pool_list": [],
+      "member_warning_count": "0",
+      "member_warning_list": [],
+      "params": {
+        "allow_self_member_stake": false,
+        "apprentice_tier": {
+          "max_budget": "100000000",
+          "min_reputation": "0.000000000000000000",
+          "reputation_cap": "25.000000000000000000",
+          "reward_multiplier": "0.500000000000000000"
+        },
+        "author_bond_slash_on_moderation": true,
+        "challenge_queue_max_size": 10,
+        "challenge_response_deadline_epochs": "3",
+        "challenger_reward_rate": "0.200000000000000000",
+        "completer_share": "0.900000000000000000",
+        "complex_complexity_budget": "400000000",
+        "content_challenge_reward_share": "0.500000000000000000",
+        "content_conviction_half_life_epochs": "14",
+        "conviction_half_life_epochs": "7",
+        "conviction_per_dream": "0.2",
+        "conviction_propagation_ratio": "0.100000000000000000",
+        "default_challenge_period_epochs": "7",
+        "default_review_period_epochs": "7",
+        "epic_tier": {
+          "max_budget": "10000000000",
+          "min_reputation": "250.000000000000000000",
+          "reputation_cap": "1000.000000000000000000",
+          "reward_multiplier": "2.000000000000000000"
+        },
+        "epoch_blocks": "14400",
+        "expert_complexity_budget": "1000000000",
+        "expert_tier": {
+          "max_budget": "2000000000",
+          "min_reputation": "100.000000000000000000",
+          "reputation_cap": "500.000000000000000000",
+          "reward_multiplier": "1.500000000000000000"
+        },
+        "external_conviction_ratio": "0.500000000000000000",
+        "gift_cooldown_blocks": "14400",
+        "gift_only_to_invitees": true,
+        "initiative_creation_fee_apprentice": "1000000",
+        "initiative_creation_fee_standard": "3000000",
+        "interim_deadline_epochs": "7",
+        "invitation_accountability_epochs": "150",
+        "invitation_cost_multiplier": "1.100000000000000000",
+        "invitation_stake_burn_rate": "0.100000000000000000",
+        "jury_size": 5,
+        "jury_super_majority": "0.670000000000000000",
+        "large_project_budget_threshold": "10000000000",
+        "max_active_challenges_per_committee": 3,
+        "max_active_initiatives_per_member": 10,
+        "max_active_interims_per_member": 10,
+        "max_author_bond_per_content": "1000000000",
+        "max_content_stake_per_member": "10000000000",
+        "max_conviction_share_per_member": "0.330000000000000000",
+        "max_dream_mint_per_epoch": "10000000000000",
+        "max_gift_amount": "500000000",
+        "max_gifts_per_sender_epoch": "2000000000",
+        "max_initiative_rewards_per_season": "100000000000000",
+        "max_initiative_stake_per_member": "50000000000",
+        "max_new_challenges_per_epoch": 2,
+        "max_project_requested_budget": "1000000000000",
+        "max_project_requested_spark": "100000000000",
+        "max_reputation_gain_per_epoch": "50.000000000000000000",
+        "max_sentinel_reward_pool": "100000000000",
+        "max_staking_rewards_per_season": "25000000000000",
+        "max_tags_per_initiative": 3,
+        "max_tip_amount": "100000000",
+        "max_tips_per_epoch": 10,
+        "max_treasury_balance": "100000000000000",
+        "member_stake_revenue_share": "0.050000000000000000",
+        "min_appeal_rate": "0.050000000000000000",
+        "min_appeals_for_accuracy": "10",
+        "min_challenge_stake": "50000000",
+        "min_epoch_activity_for_reward": "1",
+        "min_invitation_stake": "100000000",
+        "min_juror_reputation": "50",
+        "min_reputation_multiplier": "0.100000000000000000",
+        "min_sentinel_accuracy": "0.700000000000000000",
+        "min_stake_duration_seconds": "86400",
+        "minor_slash_penalty": "0.050000000000000000",
+        "moderate_slash_penalty": "0.150000000000000000",
+        "new_member_decay_grace_epochs": "30",
+        "permissionless_max_tier": 1,
+        "permissionless_min_trust_level": 2,
+        "project_completion_bonus_rate": "0.050000000000000000",
+        "project_creation_fee": "5000000",
+        "proposed_project_expiry_blocks": "200000",
+        "referral_reward_rate": "0.050000000000000000",
+        "reputation_decay_rate": "0.005000000000000000",
+        "season_duration_epochs": "150",
+        "sentinel_accuracy_window_epochs": "6",
+        "sentinel_reward_epoch_blocks": "14400",
+        "sentinel_reward_pool_overflow_burn_ratio": "0.500000000000000000",
+        "severe_slash_penalty": "0.300000000000000000",
+        "simple_complexity_budget": "50000000",
+        "solo_expert_bonus_rate": "0.5",
+        "staked_decay_rate": "0.000500000000000000",
+        "standard_complexity_budget": "150000000",
+        "standard_tier": {
+          "max_budget": "500000000",
+          "min_reputation": "25.000000000000000000",
+          "reputation_cap": "100.000000000000000000",
+          "reward_multiplier": "1.000000000000000000"
+        },
+        "tag_creation_fee": "100",
+        "tag_stake_revenue_share": "0.020000000000000000",
+        "transfer_tax_rate": "0.030000000000000000",
+        "treasury_funds_interims": true,
+        "treasury_funds_retro_pgf": true,
+        "treasury_share": "0.100000000000000000",
+        "trust_level_config": {
+          "core_invitation_credits": 20,
+          "core_min_rep": "1000.000000000000000000",
+          "core_min_seasons": 2,
+          "established_invitation_credits": 6,
+          "established_min_interims": 10,
+          "established_min_rep": "200.000000000000000000",
+          "new_invitation_credits": 0,
+          "provisional_invitation_credits": 3,
+          "provisional_min_interims": 3,
+          "provisional_min_rep": "50.000000000000000000",
+          "trusted_invitation_credits": 10,
+          "trusted_min_rep": "500.000000000000000000",
+          "trusted_min_seasons": 1
+        },
+        "unstaked_decay_rate": "0.002000000000000000",
+        "zeroing_slash_penalty": "1.000000000000000000"
+      },
+      "project_count": "1",
+      "project_list": [],
+      "project_stake_info_list": [],
+      "reserved_tag_map": [],
+      "role_activity_list": [],
+      "stake_count": "1",
+      "stake_list": [],
+      "tag_budget_award_count": "1",
+      "tag_budget_award_list": [],
+      "tag_budget_count": "1",
+      "tag_budget_list": [],
+      "tag_map": [
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "commons-council",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "technical-council",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "ecosystem-council",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "commons-ops-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "commons-gov-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "technical-ops-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "technical-gov-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "ecosystem-ops-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "ecosystem-gov-committee",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "security",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "documentation",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "budget",
+          "usage_count": 0
+        },
+        {
+          "created_at": 0,
+          "last_used_at": 0,
+          "name": "staking",
+          "usage_count": 0
+        }
+      ],
+      "tag_report_map": [],
+      "tag_stake_pool_list": []
+    },
+    "reveal": {
+      "contributions": [],
+      "next_contribution_id": "1",
+      "next_stake_id": "1",
+      "params": {
+        "bond_rate": "0.100000000000000000",
+        "dispute_resolution_epochs": "518400",
+        "max_total_valuation": "50000000000",
+        "max_tranche_valuation": "50000000000",
+        "max_tranches": 10,
+        "min_proposer_trust_level": 2,
+        "min_stake_amount": "100000000",
+        "min_verification_votes": 3,
+        "payout_holdback_rate": "0.200000000000000000",
+        "proposal_cooldown_epochs": "241920",
+        "reveal_deadline_epochs": "241920",
+        "stake_deadline_epochs": "1036800",
+        "verification_period_epochs": "241920",
+        "verification_threshold": "0.600000000000000000"
+      },
+      "stakes": [],
+      "votes": []
+    },
+    "runtime": null,
+    "season": {
+      "achievement_map": [],
+      "display_name_appeal_stake_map": [],
+      "display_name_moderation_map": [],
+      "display_name_report_stake_map": [],
+      "epoch_xp_tracker_map": [],
+      "forum_xp_cooldown_map": [],
+      "guild_count": "0",
+      "guild_invite_map": [],
+      "guild_list": [],
+      "guild_membership_map": [],
+      "member_profile_map": [
+        {
+          "achievements": [
+            "first_spark",
+            "genesis_founder"
+          ],
+          "address": "sprkdrm19wsctgkpk93wkquu7t8g07gnvwzwdupshys9mu",
+          "challenges_won": 0,
+          "display_name": "Valya",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "valya",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1emtnqs9qw9vrg5lsa58dyt8llq5fyenylmqy3p",
+          "challenges_won": 0,
+          "display_name": "Cozmonika",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "cozmonika",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1yhjdr8kxsrer3kcqpdrc2zd0kggvsj4c3vazkd",
+          "challenges_won": 0,
+          "display_name": "King of Bitchain",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "kingofbitchain",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1psq079p8erng2pf37nvvvmpqpetkknpmwxx4r8",
+          "challenges_won": 0,
+          "display_name": "Viorika",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "viorika",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1wk6eh9zrw7n6xqmyw2yqja58ekpwy3h5u4gkge",
+          "challenges_won": 0,
+          "display_name": "Uyen",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "uyen",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1crwfn2z2230jhtlaxwphyz0xrmuwc5ntc47vak",
+          "challenges_won": 0,
+          "display_name": "Houri",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "houri",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "challenges_won": 0,
+          "display_name": "Gilda",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "gilda",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1dqpr060l2pxy08j7q4gaahnmchs7qlhmf2w4y9",
+          "challenges_won": 0,
+          "display_name": "",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1jqyzam9sewlmf704c84ysmkvhaqy8l0tpwysfs",
+          "challenges_won": 0,
+          "display_name": "",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "",
+          "votes_cast": 0
+        }
+      ],
+      "member_quest_progress_map": [],
+      "member_registration_map": [],
+      "member_season_snapshot_map": [],
+      "next_season_info": null,
+      "nomination_count": "0",
+      "nomination_list": [],
+      "nomination_stake_list": [],
+      "params": {
+        "baseline_reputation": "0.500000000000000000",
+        "display_name_appeal_period_blocks": "100800",
+        "display_name_appeal_stake_dream": "100000000",
+        "display_name_change_cooldown_epochs": "1",
+        "display_name_max_length": 50,
+        "display_name_min_length": 1,
+        "display_name_report_stake_dream": "50000000",
+        "epoch_blocks": "17280",
+        "epoch_tracker_retention_epochs": 30,
+        "forum_cooldown_retention_epochs": 30,
+        "forum_xp_min_account_age_epochs": "7",
+        "forum_xp_reciprocal_cooldown_epochs": "1",
+        "forum_xp_self_reply_cooldown_epochs": "3",
+        "guild_creation_cost": "100000000",
+        "guild_description_max_length": 500,
+        "guild_hop_cooldown_epochs": "30",
+        "guild_invite_ttl_epochs": "30",
+        "invite_cleanup_batch_size": 50,
+        "invite_cleanup_interval_blocks": 100,
+        "level_thresholds": [
+          "0",
+          "100",
+          "300",
+          "600",
+          "1000",
+          "1500",
+          "2100",
+          "2800",
+          "3600",
+          "4500"
+        ],
+        "max_active_quests_per_member": 10,
+        "max_archived_titles": 200,
+        "max_displayable_titles": 50,
+        "max_extension_epochs": "14",
+        "max_forum_xp_per_epoch": "50",
+        "max_guild_members": 100,
+        "max_guild_officers": 5,
+        "max_guilds_per_season": 3,
+        "max_nominations_per_member": "3",
+        "max_objective_description_length": 200,
+        "max_pending_invites": 20,
+        "max_quest_objectives": 5,
+        "max_quest_xp_reward": "100",
+        "max_season_extensions": 3,
+        "max_transition_epochs": "7",
+        "max_vote_xp_per_epoch": 10,
+        "max_xp_per_epoch": "200",
+        "min_guild_age_epochs": "7",
+        "min_guild_members": 3,
+        "nomination_conviction_half_life_epochs": "3",
+        "nomination_min_stake": "10",
+        "nomination_min_trust_level": 2,
+        "nomination_rationale_max_length": 500,
+        "nomination_stake_min_trust_level": 1,
+        "nomination_window_epochs": "5",
+        "retro_reward_budget_max": "75000000000",
+        "retro_reward_budget_min": "10000000000",
+        "retro_reward_budget_ratio": "0.250000000000000000",
+        "retro_reward_max_recipients": "20",
+        "retro_reward_min_conviction": "50",
+        "season_duration_epochs": "150",
+        "season_transition_epochs": "7",
+        "snapshot_retention_seasons": 10,
+        "transition_batch_size": "100",
+        "transition_grace_period": "50400",
+        "transition_max_retries": 3,
+        "username_change_cooldown_epochs": "30",
+        "username_cost_dream": "10000000",
+        "username_max_length": 20,
+        "username_min_length": 3,
+        "vote_xp_record_retention_seasons": 2,
+        "xp_forum_marked_helpful": "5",
+        "xp_forum_reply_received": "2",
+        "xp_invitee_established": "50",
+        "xp_invitee_first_initiative": "20",
+        "xp_proposal_created": "10",
+        "xp_vote_cast": "5"
+      },
+      "quest_map": [],
+      "retro_reward_record_list": [],
+      "season": {
+        "end_block": 2592001,
+        "extensions_count": 0,
+        "name": "Genesis Season",
+        "number": 1,
+        "original_end_block": 2592001,
+        "start_block": 1,
+        "status": "SEASON_STATUS_ACTIVE",
+        "theme": "The Beginning",
+        "total_extension_epochs": 0
+      },
+      "season_snapshot_map": [],
+      "season_title_eligibility_map": [],
+      "season_transition_state": null,
+      "title_map": [],
+      "transition_recovery_state": null,
+      "vote_xp_record_map": []
+    },
+    "service": {
+      "archived_operators": [],
+      "controller_transfer_cases": [],
+      "next_escrow_id": "0",
+      "next_report_id": "0",
+      "operators": [],
+      "params": {
+        "default_pagination_limit": 100,
+        "default_tier1_aggregate_cap_bps": 1500,
+        "default_tier1_cooldown_blocks": "120960",
+        "default_tier1_window_blocks": "1555200",
+        "default_unbonding_period_blocks": "241920",
+        "default_underfunded_grace_blocks": "120960",
+        "default_unilateral_slash_cap_bps": 500,
+        "endblocker_sweep_limit": 100,
+        "max_active_operators_per_address": 16,
+        "max_escalated_blocks": "1036800",
+        "max_metadata_bytes": 4096,
+        "max_pagination_limit": 1000,
+        "max_pending_blocks": "518400",
+        "max_reason_bytes": 512,
+        "max_reports_per_reporter_per_operator_per_window": 3,
+        "max_system_reports_per_caller_per_window": 50,
+        "min_reporter_trust_level": "TRUST_LEVEL_ESTABLISHED",
+        "rate_limit_window_blocks": "17280",
+        "report_contest_window_blocks": "17280",
+        "report_deposit_amount": "10000000",
+        "report_refile_cooldown_blocks": "518400",
+        "reporter_rate_limit_window_blocks": "518400",
+        "reputation_grant_per_bond_block": "0.000000000001000000"
+      },
+      "refile_cooldowns": [],
+      "reporter_rate_limits": [],
+      "reports": [],
+      "service_types": [
+        {
+          "challenge_default_slash_bps": 100,
+          "description": "Off-chain bridge operator for ActivityPub federation",
+          "enabled": true,
+          "min_bond_amount": "1000000000",
+          "report_timeout_action": "REPORT_TIMEOUT_ACTION_ESCALATE",
+          "service_type": "federation-bridge-activitypub",
+          "tier1_aggregate_cap_bps": 1500,
+          "tier1_cooldown_blocks": "120960",
+          "tier1_window_blocks": "1555200",
+          "unbonding_period_blocks": "241920",
+          "underfunded_grace_blocks": "120960",
+          "unilateral_slash_cap_bps": 500
+        },
+        {
+          "challenge_default_slash_bps": 100,
+          "description": "Off-chain bridge operator for AT Protocol federation",
+          "enabled": true,
+          "min_bond_amount": "1000000000",
+          "report_timeout_action": "REPORT_TIMEOUT_ACTION_ESCALATE",
+          "service_type": "federation-bridge-atproto",
+          "tier1_aggregate_cap_bps": 1500,
+          "tier1_cooldown_blocks": "120960",
+          "tier1_window_blocks": "1555200",
+          "unbonding_period_blocks": "241920",
+          "underfunded_grace_blocks": "120960",
+          "unilateral_slash_cap_bps": 500
+        },
+        {
+          "challenge_default_slash_bps": 100,
+          "description": "Off-chain bridge operator for NOSTR federation",
+          "enabled": true,
+          "min_bond_amount": "1000000000",
+          "report_timeout_action": "REPORT_TIMEOUT_ACTION_ESCALATE",
+          "service_type": "federation-bridge-nostr",
+          "tier1_aggregate_cap_bps": 1500,
+          "tier1_cooldown_blocks": "120960",
+          "tier1_window_blocks": "1555200",
+          "unbonding_period_blocks": "241920",
+          "underfunded_grace_blocks": "120960",
+          "unilateral_slash_cap_bps": 500
+        },
+        {
+          "challenge_default_slash_bps": 100,
+          "description": "Off-chain bridge operator for Lens Protocol federation",
+          "enabled": true,
+          "min_bond_amount": "1000000000",
+          "report_timeout_action": "REPORT_TIMEOUT_ACTION_ESCALATE",
+          "service_type": "federation-bridge-lens",
+          "tier1_aggregate_cap_bps": 1500,
+          "tier1_cooldown_blocks": "120960",
+          "tier1_window_blocks": "1555200",
+          "unbonding_period_blocks": "241920",
+          "underfunded_grace_blocks": "120960",
+          "unilateral_slash_cap_bps": 500
+        }
+      ],
+      "tier1_escrow": [],
+      "tier1_last_slash": []
+    },
+    "session": {
+      "active_grant_counts": [],
+      "grant_seq": "0",
+      "grants": [],
+      "params": {
+        "allowed_denoms": [],
+        "allowed_msg_types": [
+          "/sparkdream.blog.v1.MsgCreatePost",
+          "/sparkdream.blog.v1.MsgUpdatePost",
+          "/sparkdream.blog.v1.MsgCreateReply",
+          "/sparkdream.blog.v1.MsgEditReply",
+          "/sparkdream.blog.v1.MsgReact",
+          "/sparkdream.blog.v1.MsgRemoveReaction",
+          "/sparkdream.blog.v1.MsgHidePost",
+          "/sparkdream.blog.v1.MsgUnhidePost",
+          "/sparkdream.blog.v1.MsgHideReply",
+          "/sparkdream.blog.v1.MsgUnhideReply",
+          "/sparkdream.blog.v1.MsgPinPost",
+          "/sparkdream.blog.v1.MsgUnpinPost",
+          "/sparkdream.blog.v1.MsgPinReply",
+          "/sparkdream.blog.v1.MsgUnpinReply",
+          "/sparkdream.forum.v1.MsgCreatePost",
+          "/sparkdream.forum.v1.MsgEditPost",
+          "/sparkdream.forum.v1.MsgUpvotePost",
+          "/sparkdream.forum.v1.MsgDownvotePost",
+          "/sparkdream.forum.v1.MsgFollowThread",
+          "/sparkdream.forum.v1.MsgUnfollowThread",
+          "/sparkdream.forum.v1.MsgMarkAcceptedReply",
+          "/sparkdream.forum.v1.MsgConfirmProposedReply",
+          "/sparkdream.forum.v1.MsgRejectProposedReply",
+          "/sparkdream.forum.v1.MsgHidePost",
+          "/sparkdream.forum.v1.MsgUnhidePost",
+          "/sparkdream.name.v1.MsgSetPrimary",
+          "/sparkdream.name.v1.MsgUpdateName",
+          "/sparkdream.name.v1.MsgSetDisplayName",
+          "/sparkdream.name.v1.MsgSetTarget",
+          "/sparkdream.name.v1.MsgAcceptTarget",
+          "/sparkdream.collect.v1.MsgReact",
+          "/sparkdream.collect.v1.MsgRemoveReaction",
+          "/sparkdream.collect.v1.MsgUpvoteContent",
+          "/sparkdream.collect.v1.MsgUpdateItem",
+          "/sparkdream.collect.v1.MsgReorderItem",
+          "/sparkdream.collect.v1.MsgSetSeekingEndorsement",
+          "/sparkdream.season.v1.MsgJoinGuild",
+          "/sparkdream.season.v1.MsgLeaveGuild",
+          "/sparkdream.season.v1.MsgAcceptGuildInvite",
+          "/sparkdream.season.v1.MsgInviteToGuild",
+          "/sparkdream.season.v1.MsgRevokeGuildInvite",
+          "/sparkdream.season.v1.MsgKickFromGuild",
+          "/sparkdream.season.v1.MsgUpdateGuildDescription",
+          "/sparkdream.season.v1.MsgSetGuildInviteOnly",
+          "/sparkdream.season.v1.MsgPromoteToOfficer",
+          "/sparkdream.season.v1.MsgDemoteOfficer",
+          "/sparkdream.season.v1.MsgSetDisplayName",
+          "/sparkdream.season.v1.MsgSetDisplayTitle",
+          "/sparkdream.season.v1.MsgStartQuest",
+          "/sparkdream.season.v1.MsgAbandonQuest",
+          "/sparkdream.season.v1.MsgClaimQuestReward",
+          "/sparkdream.service.v1.MsgUnbondOperator",
+          "/sparkdream.service.v1.MsgTopUpBond",
+          "/sparkdream.service.v1.MsgUpdateMetadata",
+          "/sparkdream.service.v1.MsgClaimUnbondedBond"
+        ],
+        "authorized_grant_creators": [
+          "sprkdrm1m0a2t448gsfxq5nr6el96jmm6svj43sym0derq"
+        ],
+        "fire_to_expiry_buffer_seconds": "3600",
+        "max_allowance_recipient_list": 50,
+        "max_allowances_per_granter": 20,
+        "max_allowed_msg_types": [
+          "/sparkdream.blog.v1.MsgCreatePost",
+          "/sparkdream.blog.v1.MsgUpdatePost",
+          "/sparkdream.blog.v1.MsgCreateReply",
+          "/sparkdream.blog.v1.MsgEditReply",
+          "/sparkdream.blog.v1.MsgReact",
+          "/sparkdream.blog.v1.MsgRemoveReaction",
+          "/sparkdream.blog.v1.MsgHidePost",
+          "/sparkdream.blog.v1.MsgUnhidePost",
+          "/sparkdream.blog.v1.MsgHideReply",
+          "/sparkdream.blog.v1.MsgUnhideReply",
+          "/sparkdream.blog.v1.MsgPinPost",
+          "/sparkdream.blog.v1.MsgUnpinPost",
+          "/sparkdream.blog.v1.MsgPinReply",
+          "/sparkdream.blog.v1.MsgUnpinReply",
+          "/sparkdream.forum.v1.MsgCreatePost",
+          "/sparkdream.forum.v1.MsgEditPost",
+          "/sparkdream.forum.v1.MsgUpvotePost",
+          "/sparkdream.forum.v1.MsgDownvotePost",
+          "/sparkdream.forum.v1.MsgFollowThread",
+          "/sparkdream.forum.v1.MsgUnfollowThread",
+          "/sparkdream.forum.v1.MsgMarkAcceptedReply",
+          "/sparkdream.forum.v1.MsgConfirmProposedReply",
+          "/sparkdream.forum.v1.MsgRejectProposedReply",
+          "/sparkdream.forum.v1.MsgHidePost",
+          "/sparkdream.forum.v1.MsgUnhidePost",
+          "/sparkdream.name.v1.MsgSetPrimary",
+          "/sparkdream.name.v1.MsgUpdateName",
+          "/sparkdream.name.v1.MsgSetDisplayName",
+          "/sparkdream.name.v1.MsgSetTarget",
+          "/sparkdream.name.v1.MsgAcceptTarget",
+          "/sparkdream.collect.v1.MsgReact",
+          "/sparkdream.collect.v1.MsgRemoveReaction",
+          "/sparkdream.collect.v1.MsgUpvoteContent",
+          "/sparkdream.collect.v1.MsgUpdateItem",
+          "/sparkdream.collect.v1.MsgReorderItem",
+          "/sparkdream.collect.v1.MsgSetSeekingEndorsement",
+          "/sparkdream.season.v1.MsgJoinGuild",
+          "/sparkdream.season.v1.MsgLeaveGuild",
+          "/sparkdream.season.v1.MsgAcceptGuildInvite",
+          "/sparkdream.season.v1.MsgInviteToGuild",
+          "/sparkdream.season.v1.MsgRevokeGuildInvite",
+          "/sparkdream.season.v1.MsgKickFromGuild",
+          "/sparkdream.season.v1.MsgUpdateGuildDescription",
+          "/sparkdream.season.v1.MsgSetGuildInviteOnly",
+          "/sparkdream.season.v1.MsgPromoteToOfficer",
+          "/sparkdream.season.v1.MsgDemoteOfficer",
+          "/sparkdream.season.v1.MsgSetDisplayName",
+          "/sparkdream.season.v1.MsgSetDisplayTitle",
+          "/sparkdream.season.v1.MsgStartQuest",
+          "/sparkdream.season.v1.MsgAbandonQuest",
+          "/sparkdream.season.v1.MsgClaimQuestReward",
+          "/sparkdream.service.v1.MsgUnbondOperator",
+          "/sparkdream.service.v1.MsgTopUpBond",
+          "/sparkdream.service.v1.MsgUpdateMetadata",
+          "/sparkdream.service.v1.MsgClaimUnbondedBond"
+        ],
+        "max_endblocker_dispatches_per_pass": 100,
+        "max_exec_count": "10000",
+        "max_expiration": "604800s",
+        "max_grant_lifetime_seconds": "31536000",
+        "max_msg_types_per_session": "20",
+        "max_oneshot_exec_gas": "200000",
+        "max_paused_oneshots_per_granter": 20,
+        "max_pending_oneshots_per_granter": 100,
+        "max_recurring_duration_seconds": "31536000",
+        "max_recurring_pulls_per_granter": 50,
+        "max_schedule_horizon_seconds": "31536000",
+        "max_sessions_per_granter": "10",
+        "max_spend_limit_amount": "100000000",
+        "min_allowance_period_seconds": "3600",
+        "min_oneshot_deposit": "1000",
+        "min_oneshot_exec_gas": "30000",
+        "min_pull_amount": "1000",
+        "min_recurring_period_seconds": "86400",
+        "min_schedule_delay_seconds": "60",
+        "oneshot_creation_fee": "1000",
+        "oneshot_gas_price": "0.0025",
+        "paused_oneshot_ttl_seconds": "604800"
+      }
+    },
+    "shield": {
+      "day_fundings": [],
+      "decryption_keys": [],
+      "decryption_shares": [],
+      "dkg_contributions": [],
+      "dkg_registrations": [],
+      "dkg_state": {
+        "contribution_deadline": "0",
+        "contributions_received": "0",
+        "expected_validators": [],
+        "open_at_height": "0",
+        "phase": "DKG_PHASE_INACTIVE",
+        "registration_deadline": "0",
+        "round": "0",
+        "threshold_denominator": "0",
+        "threshold_numerator": "0"
+      },
+      "identity_rate_limits": [],
+      "next_pending_op_id": "0",
+      "params": {
+        "dkg_window_blocks": "200",
+        "enabled": true,
+        "encrypted_batch_enabled": false,
+        "max_encrypted_payload_size": 16384,
+        "max_execs_per_identity_per_epoch": "50",
+        "max_funding_per_day": "200000000",
+        "max_gas_per_exec": "500000",
+        "max_ops_per_batch": 100,
+        "max_pending_epochs": 6,
+        "max_pending_queue_size": 1000,
+        "max_validator_set_drift": 33,
+        "min_batch_size": 3,
+        "min_gas_reserve": "100000000",
+        "min_tle_validators": 5,
+        "shield_epoch_interval": "50",
+        "tle_jail_duration": "600",
+        "tle_miss_tolerance": "10",
+        "tle_miss_window": "100"
+      },
+      "pending_nullifiers": [],
+      "pending_ops": [],
+      "registered_ops": [
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.blog.v1.MsgCreatePost",
+          "min_trust_level": 1,
+          "nullifier_domain": 1,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.blog.v1.MsgCreateReply",
+          "min_trust_level": 1,
+          "nullifier_domain": 2,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "post_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.blog.v1.MsgReact",
+          "min_trust_level": 1,
+          "nullifier_domain": 8,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "post_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.forum.v1.MsgCreatePost",
+          "min_trust_level": 1,
+          "nullifier_domain": 11,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.forum.v1.MsgUpvotePost",
+          "min_trust_level": 1,
+          "nullifier_domain": 12,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "post_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.forum.v1.MsgDownvotePost",
+          "min_trust_level": 1,
+          "nullifier_domain": 13,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "post_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.collect.v1.MsgCreateCollection",
+          "min_trust_level": 1,
+          "nullifier_domain": 21,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.collect.v1.MsgUpvoteContent",
+          "min_trust_level": 1,
+          "nullifier_domain": 22,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "target_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.collect.v1.MsgDownvoteContent",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "target_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_ENCRYPTED_ONLY",
+          "message_type_url": "/sparkdream.rep.v1.MsgCreateChallenge",
+          "min_trust_level": 0,
+          "nullifier_domain": 41,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_GLOBAL",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.commons.v1.MsgSubmitAnonymousProposal",
+          "min_trust_level": 0,
+          "nullifier_domain": 31,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.commons.v1.MsgAnonymousVoteProposal",
+          "min_trust_level": 0,
+          "nullifier_domain": 32,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "proposal_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "message_type_url": "/sparkdream.federation.v1.MsgSubmitArbiterHash",
+          "min_trust_level": 2,
+          "nullifier_domain": 51,
+          "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": "content_id"
+        }
+      ],
+      "shield_epoch_state": {
+        "current_epoch": "0",
+        "decryption_key_available": false,
+        "epoch_start_height": "0"
+      },
+      "tle_key_set": {
+        "created_at_height": "0",
+        "master_public_key": null,
+        "threshold_denominator": "0",
+        "threshold_numerator": "0",
+        "validator_shares": []
+      },
+      "tle_miss_counters": [],
+      "used_nullifiers": [],
+      "verification_keys": []
+    },
+    "slashing": {
+      "missed_blocks": [],
+      "params": {
+        "downtime_jail_duration": "600s",
+        "min_signed_per_window": "0.500000000000000000",
+        "signed_blocks_window": "100",
+        "slash_fraction_double_sign": "0.050000000000000000",
+        "slash_fraction_downtime": "0.010000000000000000"
+      },
+      "signing_infos": []
+    },
+    "sparkdream": {
+      "params": {}
+    },
+    "split": {
+      "params": {},
+      "share_map": []
+    },
+    "staking": {
+      "delegations": [],
+      "exported": false,
+      "last_total_power": "0",
+      "last_validator_powers": [],
+      "params": {
+        "bond_denom": "uspark.sparkdream",
+        "historical_entries": 10000,
+        "max_entries": 7,
+        "max_validators": 100,
+        "min_commission_rate": "0.000000000000000000",
+        "unbonding_time": "1814400s"
+      },
+      "redelegations": [],
+      "unbonding_delegations": [],
+      "validators": []
+    },
+    "transfer": {
+      "denoms": [],
+      "params": {
+        "receive_enabled": true,
+        "send_enabled": true
+      },
+      "port_id": "transfer",
+      "total_escrowed": []
+    },
+    "upgrade": {},
+    "vesting": {}
+  },
+  "app_version": "",
+  "chain_id": "sparkdream-1",
+  "consensus": {
+    "params": {
+      "abci": {
+        "vote_extensions_enable_height": "0"
+      },
+      "block": {
+        "max_bytes": "22020096",
+        "max_gas": "-1"
+      },
+      "evidence": {
+        "max_age_duration": "172800000000000",
+        "max_age_num_blocks": "100000",
+        "max_bytes": "1048576"
+      },
+      "validator": {
+        "pub_key_types": [
+          "ed25519"
+        ]
+      },
+      "version": {
+        "app": "0"
+      }
+    }
+  },
+  "genesis_time": "2026-04-20T16:52:28.536298323Z",
+  "initial_height": 1
+}

@@ -5,6 +5,19 @@ export function chainId(spec: LaunchSpec): string {
   return `${spec.network.name}-${spec.network.chainIdSuffix}`;
 }
 
+/**
+ * The chain's second token. The identity module hardcodes its prefix
+ * (`^udream\.<suffix>$`), so the default is "udream." + the bond denom's
+ * suffix. Returns undefined when the bond denom has no suffix to borrow —
+ * validateSpec turns that into an error unless token.dreamDenom is set.
+ */
+export function deriveDreamDenom(token: LaunchSpec["token"]): string | undefined {
+  if (token.dreamDenom) return token.dreamDenom;
+  const bond = token.bondDenom ?? token.baseDenom;
+  const dot = bond.indexOf(".");
+  return dot > 0 ? `udream${bond.slice(dot)}` : undefined;
+}
+
 export function validatorMoniker(spec: LaunchSpec, v: number): string {
   return `${spec.network.name}-val-${v}`;
 }

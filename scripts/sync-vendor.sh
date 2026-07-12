@@ -19,6 +19,7 @@ rsync -a --delete \
   --include='network/' \
   --include='network/*/' \
   --include='network/*/chain.env' \
+  --include='network/*/genesis.json' \
   --include='network/*/*.sdl.yaml' \
   --exclude='*' \
   "$SRC/" "$DEST/"

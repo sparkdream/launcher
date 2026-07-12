@@ -58,6 +58,31 @@ describe("validateSpec", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("enforces the chain's identity denom shapes", () => {
+    // "usparkz" has six letters after the u — the chain caps it at five
+    const badBond = testnetSpec({ token: { baseDenom: "usparkz.sparkdreamdev", displayDenom: "SPARKZ" } });
+    expect(validateSpec(badBond).errors.some((e) => e.path === "token.baseDenom")).toBe(true);
+    // the dream denom prefix is hardcoded "udream." by x/identity
+    const badDream = testnetSpec({
+      token: {
+        baseDenom: "uspark.sparkdreamdev",
+        displayDenom: "SPARK",
+        dreamDenom: "udreamz.sparkdreamdev",
+      },
+    });
+    expect(validateSpec(badDream).errors.some((e) => e.path === "token.dreamDenom")).toBe(true);
+    // display symbols are 3-8 chars on-chain (schema alone allows more)
+    const badSymbol = testnetSpec({
+      token: { baseDenom: "uspark.sparkdreamdev", displayDenom: "SPARKLETONS" },
+    });
+    expect(validateSpec(badSymbol).errors.some((e) => e.path === "token.displayDenom")).toBe(true);
+    // valid alternative naming passes: suffix varies, prefix rules hold
+    const ok = testnetSpec({
+      token: { baseDenom: "uspkz.sparkdreamdev", displayDenom: "SPARKZ", dreamDisplayDenom: "DREAMZ" },
+    });
+    expect(validateSpec(ok).errors).toEqual([]);
+  });
+
   it("requires persistent storage for nodes", () => {
     const spec = testnetSpec();
     spec.infra.resources.sentry.storage.persistent = false;
