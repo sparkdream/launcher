@@ -3,8 +3,9 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
-import { withDefaults } from "@sparkdream/launch-spec";
+import { checkSpec, type SpecCheck } from "@sparkdream/launch-spec";
 import yaml from "js-yaml";
+import { specPathLine } from "../lib/spec-lines";
 import {
   createLaunch,
   getFleet,
@@ -448,40 +449,72 @@ export default function Page() {
       ? Math.max(0, requiredDeposit - Number(balanceOf(chain.denom) ?? "0"))
       : 0;
 
+  // complete validation on every keystroke: YAML parse, then the same
+  // pipeline the conductor runs on submit (profile defaults + schema with
+  // every issue collected + cross-field checks)
+  const specCheck = useMemo((): SpecCheck => {
+    let doc: unknown;
+    try {
+      doc = yaml.load(specText);
+    } catch (e: any) {
+      const line = typeof e?.mark?.line === "number" ? `line ${e.mark.line + 1}: ` : "";
+      const reason = String(e?.reason ?? e?.message ?? e).split("\n")[0]!;
+      return {
+        spec: null,
+        errors: [{ path: "", message: `${line}${reason} (YAML syntax)` }],
+        warnings: [],
+        ok: false,
+      };
+    }
+    if (doc == null || typeof doc !== "object") {
+      return {
+        spec: null,
+        errors: [{ path: "", message: "spec is empty" }],
+        warnings: [],
+        ok: false,
+      };
+    }
+    return checkSpec(doc);
+  }, [specText]);
+
+  // issue paths are semantic; point them back into the textarea where we can
+  const issueLine = useCallback(
+    (path: string) => (path ? specPathLine(specText, path) : null),
+    [specText],
+  );
+  const specRef = useRef<HTMLTextAreaElement>(null);
+  const jumpToLine = (line: number) => {
+    const ta = specRef.current;
+    if (!ta) return;
+    const start = specText.split("\n").slice(0, line - 1).join("\n").length + (line > 1 ? 1 : 0);
+    const end = specText.indexOf("\n", start);
+    ta.focus();
+    ta.setSelectionRange(start, end < 0 ? specText.length : end);
+  };
+
   // the deployment plan this spec resolves to (profile defaults applied) —
   // one row per role with count + image, joined with the cost estimate in
-  // the render. When the spec fails the schema, carry the FIRST issue: a
-  // silently missing preview gives no clue what to fix.
-  const specPreview = useMemo((): {
-    plan: Array<{ role: string; count: number; image: string }> | null;
-    error: string | null;
-  } => {
-    try {
-      const spec = withDefaults(yaml.load(specText));
-      // role names match the estimator's perRole keys
-      const rows: Array<{ role: string; count: number; image: string }> = [
-        { role: "validators", count: spec.topology.validators.count, image: spec.images.sparkdreamd },
-      ];
-      if (spec.topology.sentries.count > 0) {
-        rows.push({ role: "sentries", count: spec.topology.sentries.count, image: spec.images.sparkdreamd });
-      }
-      rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
-      if (spec.topology.components.explorer.enabled && spec.images.explorer) {
-        rows.push({ role: "explorer", count: 1, image: spec.images.explorer });
-      }
-      if (spec.topology.components.frontend.enabled && spec.images.frontend) {
-        rows.push({ role: "frontend", count: 1, image: spec.images.frontend });
-      }
-      return { plan: rows, error: null };
-    } catch (e: any) {
-      // zod puts issues in .issues; yaml throws a plain message
-      const issue = Array.isArray(e?.issues) && e.issues[0]
-        ? `${e.issues[0].path.join(".")}: ${e.issues[0].message}`
-        : String(e?.message ?? e).split("\n")[0]!;
-      return { plan: null, error: issue };
+  // the render. Shown whenever the schema parses, even with cross-field
+  // errors outstanding.
+  const resolvedImages = useMemo(() => {
+    const spec = specCheck.spec;
+    if (!spec) return null;
+    // role names match the estimator's perRole keys
+    const rows: Array<{ role: string; count: number; image: string }> = [
+      { role: "validators", count: spec.topology.validators.count, image: spec.images.sparkdreamd },
+    ];
+    if (spec.topology.sentries.count > 0) {
+      rows.push({ role: "sentries", count: spec.topology.sentries.count, image: spec.images.sparkdreamd });
     }
-  }, [specText]);
-  const resolvedImages = specPreview.plan;
+    rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
+    if (spec.topology.components.explorer.enabled && spec.images.explorer) {
+      rows.push({ role: "explorer", count: 1, image: spec.images.explorer });
+    }
+    if (spec.topology.components.frontend.enabled && spec.images.frontend) {
+      rows.push({ role: "frontend", count: 1, image: spec.images.frontend });
+    }
+    return rows;
+  }, [specCheck]);
 
   // market-based running-cost estimate for the current spec (conductor →
   // console pricing API), debounced so we only price a settled spec
@@ -840,13 +873,20 @@ export default function Page() {
       <section className="panel">
         <h2>Launch spec</h2>
         <textarea
+          ref={specRef}
           value={specText}
           onChange={(e) => updateSpec(e.target.value)}
           rows={18}
           spellCheck={false}
+          className={specCheck.errors.length > 0 ? "invalid" : undefined}
         />
         <div className="row">
-          <button onClick={create} className="primary" disabled={!wallet || busy !== null}>
+          <button
+            onClick={create}
+            className="primary"
+            disabled={!wallet || busy !== null || !specCheck.ok}
+            title={specCheck.ok ? undefined : "fix the spec errors below first"}
+          >
             Create &amp; start launch
           </button>
           <button onClick={exportSpec}>Export spec</button>
@@ -869,11 +909,39 @@ export default function Page() {
             />
           </label>
         </div>
-        {specPreview.error && (
-          <p className="dim-note">
-            <span className="warnings">⚠ {specPreview.error}</span> — image and cost previews
-            appear once the spec parses.
-          </p>
+        {(specCheck.errors.length > 0 || specCheck.warnings.length > 0) && (
+          <ul className="spec-issues">
+            {specCheck.errors.map((iss, i) => {
+              const line = issueLine(iss.path);
+              return (
+                <li
+                  key={`e-${iss.path}-${i}`}
+                  className={line ? "err jump" : "err"}
+                  onClick={line ? () => jumpToLine(line) : undefined}
+                  title={line ? "click to jump to the line" : undefined}
+                >
+                  ✕ {line ? `line ${line}, ` : ""}
+                  {iss.path ? `${iss.path}: ` : ""}
+                  {iss.message}
+                </li>
+              );
+            })}
+            {specCheck.warnings.map((iss, i) => {
+              const line = issueLine(iss.path);
+              return (
+                <li
+                  key={`w-${iss.path}-${i}`}
+                  className={line ? "warn jump" : "warn"}
+                  onClick={line ? () => jumpToLine(line) : undefined}
+                  title={line ? "click to jump to the line" : undefined}
+                >
+                  ⚠ {line ? `line ${line}, ` : ""}
+                  {iss.path ? `${iss.path}: ` : ""}
+                  {iss.message}
+                </li>
+              );
+            })}
+          </ul>
         )}
         {resolvedImages && (
           <>
@@ -978,13 +1046,22 @@ export default function Page() {
               : "."}
           </div>
         )}
-        {warnings.length > 0 && (
+        {/* server-side extras only (e.g. the launcher-on-Akash notice) — the
+            shared validateSpec warnings already show live above */}
+        {warnings.filter(
+          (w) => !specCheck.warnings.some((l) => l.path === w.path && l.message === w.message),
+        ).length > 0 && (
           <ul className="warnings">
-            {warnings.map((w) => (
-              <li key={w.path}>
-                ⚠ {w.path}: {w.message}
-              </li>
-            ))}
+            {warnings
+              .filter(
+                (w) =>
+                  !specCheck.warnings.some((l) => l.path === w.path && l.message === w.message),
+              )
+              .map((w) => (
+                <li key={w.path}>
+                  ⚠ {w.path}: {w.message}
+                </li>
+              ))}
           </ul>
         )}
       </section>

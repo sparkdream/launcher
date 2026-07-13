@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   chainId,
+  checkSpec,
   lcdRequired,
   resolveTopology,
   statelessComponents,
@@ -9,6 +10,12 @@ import {
   withDefaults,
 } from "../src/index.js";
 import { testnetSpec, testnetSpecInput } from "../src/fixtures.js";
+
+// valid bech32 (20-byte payload) test addresses
+const SPARK_A = "spark1qyqszqgpqyqszqgpqyqszqgpqyqszqgpy8v2rs";
+const SPARK_B = "spark1qgpqyqszqgpqyqszqgpqyqszqgpqyqsz4r20gx";
+const COSMOS_A = "cosmos1qyqszqgpqyqszqgpqyqszqgpqyqszqgpjnp7du";
+const AKASH_A = "akash1qyqszqgpqyqszqgpqyqszqgpqyqszqgplgve5x";
 
 describe("withDefaults", () => {
   it("fills a minimal wizard output from the testnet profile", () => {
@@ -127,14 +134,14 @@ describe("validateSpec", () => {
       headscale: { domain: "headscale.sparkdream.io" },
     };
     const wrongCount = testnetSpec({
-      topology: { ...base, validators: { count: 2, operators: ["spark1abc"] } },
+      topology: { ...base, validators: { count: 2, operators: [SPARK_A] } },
     });
     expect(
       validateSpec(wrongCount).errors.some((e) => e.message.includes("1 operator addresses")),
     ).toBe(true);
 
     const wrongPrefix = testnetSpec({
-      topology: { ...base, validators: { count: 1, operators: ["cosmos1abc"] } },
+      topology: { ...base, validators: { count: 1, operators: [COSMOS_A] } },
     });
     expect(
       validateSpec(wrongPrefix).errors.some((e) =>
@@ -142,10 +149,46 @@ describe("validateSpec", () => {
       ),
     ).toBe(true);
 
-    const ok = testnetSpec({
+    const badChecksum = testnetSpec({
       topology: { ...base, validators: { count: 1, operators: ["spark1abc"] } },
     });
+    expect(
+      validateSpec(badChecksum).errors.some(
+        (e) => e.path === "topology.validators.operators[0]" && e.message.includes("bech32"),
+      ),
+    ).toBe(true);
+
+    const ok = testnetSpec({
+      topology: { ...base, validators: { count: 1, operators: [SPARK_A] } },
+    });
     expect(validateSpec(ok).errors).toEqual([]);
+  });
+
+  it("rejects an operator whose genesis allocation is below the self-delegation", () => {
+    const spec = testnetSpec({
+      accounts: {
+        initial: [{ name: "op", address: SPARK_A, amount: "5" }],
+        validatorSelfDelegation: "1000000000000",
+      },
+      topology: {
+        validators: { count: 1, operators: [SPARK_A] },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const res = validateSpec(spec);
+    expect(
+      res.errors.some(
+        (e) =>
+          e.path === "topology.validators.operators[0]" &&
+          e.message.includes("validatorSelfDelegation"),
+      ),
+    ).toBe(true);
   });
 
   it("warns on generated operators for mainnet", () => {
@@ -154,15 +197,164 @@ describe("validateSpec", () => {
     expect(res.warnings.some((w) => w.path === "topology.validators.operators")).toBe(true);
   });
 
-  it("rejects addresses with the wrong bech32 prefix", () => {
+  it("rejects addresses with the wrong bech32 prefix or a bad checksum", () => {
+    for (const address of [COSMOS_A, "spark1abcdef", "notanaddress"]) {
+      const spec = testnetSpec({
+        accounts: {
+          initial: [{ name: "treasury", address, amount: "1000" }],
+          validatorSelfDelegation: "1000000000000",
+        },
+      });
+      const res = validateSpec(spec);
+      expect(res.errors.some((e) => e.path.startsWith("accounts.initial[0]"))).toBe(true);
+    }
+    const ok = testnetSpec({
+      accounts: {
+        initial: [{ name: "treasury", address: SPARK_A, amount: "1000" }],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    expect(validateSpec(ok).errors).toEqual([]);
+  });
+
+  it("rejects duplicate account names and addresses", () => {
     const spec = testnetSpec({
       accounts: {
-        initial: [{ name: "treasury", address: "cosmos1abcdef", amount: "1000" }],
+        initial: [
+          { name: "treasury", address: SPARK_A, amount: "1000" },
+          { name: "treasury", address: SPARK_B, amount: "1000" },
+          { name: "other", address: SPARK_A, amount: "1000" },
+        ],
         validatorSelfDelegation: "1000000000000",
       },
     });
     const res = validateSpec(spec);
-    expect(res.errors.some((e) => e.path.startsWith("accounts.initial[0]"))).toBe(true);
+    expect(res.errors.some((e) => e.path === "accounts.initial[1].name")).toBe(true);
+    expect(res.errors.some((e) => e.path === "accounts.initial[2].address")).toBe(true);
+  });
+
+  it("flags round-robin leaving validators without sentries", () => {
+    const spec = testnetSpec({
+      topology: {
+        validators: { count: 3 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    expect(validateSpec(spec).warnings.some((w) => w.path === "topology.sentries.count")).toBe(true);
+    const asMainnet = testnetSpec({
+      network: { name: "sparkdream", type: "mainnet" },
+      topology: {
+        validators: { count: 3 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    expect(validateSpec(asMainnet).errors.some((e) => e.path === "topology.sentries.count")).toBe(true);
+  });
+
+  it("rejects a domain reused across services", () => {
+    const spec = testnetSpec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: true, domain: "chain.sparkdream.io" },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        publicEndpoints: { api: "chain.sparkdream.io", rpc: "rpc.sparkdream.io" },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const res = validateSpec(spec);
+    expect(
+      res.errors.some(
+        (e) => e.path === "topology.publicEndpoints.api" && e.message.includes("already used"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects inconsistent mint and commission parameters", () => {
+    const spec = testnetSpec({
+      chainParams: {
+        mint: { inflationMin: 0.2, inflationMax: 0.1 },
+        validatorDefaults: {
+          commissionRate: 0.5,
+          commissionMaxRate: 0.2,
+          commissionMaxChangeRate: 0.3,
+        },
+      },
+    });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "chainParams.mint.inflationMin")).toBe(true);
+    expect(res.errors.some((e) => e.path === "chainParams.validatorDefaults.commissionRate")).toBe(true);
+    expect(
+      res.errors.some((e) => e.path === "chainParams.validatorDefaults.commissionMaxChangeRate"),
+    ).toBe(true);
+  });
+
+  it("rejects non-akash provider preference entries and malformed ssh keys", () => {
+    const spec = testnetSpec();
+    spec.providers.policy.preference = [AKASH_A, SPARK_A, "garbage"];
+    spec.security.sshPublicKey = "definitely not a key";
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "providers.policy.preference[1]")).toBe(true);
+    expect(res.errors.some((e) => e.path === "providers.policy.preference[2]")).toBe(true);
+    expect(res.errors.some((e) => e.path === "providers.policy.preference[0]")).toBe(false);
+    expect(res.errors.some((e) => e.path === "security.sshPublicKey")).toBe(true);
+    spec.security.sshPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF00 kob@laptop";
+    spec.providers.policy.preference = [AKASH_A];
+    expect(validateSpec(spec).errors).toEqual([]);
+  });
+});
+
+describe("checkSpec", () => {
+  it("returns the parsed spec plus cross-field results", () => {
+    const res = checkSpec(testnetSpecInput());
+    expect(res.spec).not.toBeNull();
+    expect(res.ok).toBe(true);
+  });
+
+  it("collects every schema issue, not just the first", () => {
+    const res = checkSpec(
+      testnetSpecInput({
+        network: { name: "BAD NAME", bech32Prefix: "NOPE" },
+      }),
+    );
+    expect(res.spec).toBeNull();
+    expect(res.ok).toBe(false);
+    expect(res.errors.length).toBeGreaterThanOrEqual(2);
+    expect(res.errors.some((e) => e.path === "network.name")).toBe(true);
+    expect(res.errors.some((e) => e.path === "network.bech32Prefix")).toBe(true);
+  });
+
+  it("formats array paths with brackets", () => {
+    const res = checkSpec(
+      testnetSpecInput({
+        accounts: {
+          initial: [{ name: "x", generate: true, amount: "not-a-number" }],
+          validatorSelfDelegation: "1",
+        },
+      }),
+    );
+    expect(res.errors.some((e) => e.path === "accounts.initial[0].amount")).toBe(true);
+  });
+
+  it("never throws on garbage", () => {
+    expect(checkSpec(null).ok).toBe(false);
+    expect(checkSpec("nonsense").ok).toBe(false);
+    expect(checkSpec(42).ok).toBe(false);
   });
 });
 

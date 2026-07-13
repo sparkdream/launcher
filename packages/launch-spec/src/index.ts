@@ -9,6 +9,8 @@ export { profiles, type Profile } from "./profiles.js";
 export {
   withDefaults,
   validateSpec,
+  checkSpec,
+  type SpecCheck,
   type ValidationIssue,
   type ValidationResult,
 } from "./validate.js";

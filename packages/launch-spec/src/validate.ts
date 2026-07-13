@@ -1,3 +1,5 @@
+import { ZodError } from "zod";
+import { fromBech32 } from "@cosmjs/encoding";
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
 import { deriveDreamDenom } from "./derive.js";
 import { profiles } from "./profiles.js";
@@ -40,6 +42,61 @@ export interface ValidationResult {
   errors: ValidationIssue[];
   warnings: ValidationIssue[];
   ok: boolean;
+}
+
+export interface SpecCheck extends ValidationResult {
+  /** The parsed spec, or null when it failed the schema. */
+  spec: LaunchSpec | null;
+}
+
+/** "accounts.initial.0.address" (zod) → "accounts.initial[0].address". */
+function formatPath(path: (string | number)[]): string {
+  return path.reduce<string>(
+    (out, seg) => (typeof seg === "number" ? `${out}[${seg}]` : out ? `${out}.${seg}` : seg),
+    "",
+  );
+}
+
+/**
+ * The one-call validation pipeline: profile defaults + schema parse (all
+ * issues collected, not just the first) followed by the cross-field checks.
+ * Never throws; schema failures come back as issues with zod paths.
+ */
+export function checkSpec(input: unknown): SpecCheck {
+  let spec: LaunchSpec;
+  try {
+    spec = withDefaults(input);
+  } catch (e) {
+    const errors: ValidationIssue[] =
+      e instanceof ZodError
+        ? e.issues.map((i) => ({ path: formatPath(i.path), message: i.message }))
+        : [{ path: "", message: String(e instanceof Error ? e.message : e) }];
+    return { spec: null, errors, warnings: [], ok: false };
+  }
+  return { spec, ...validateSpec(spec) };
+}
+
+/**
+ * Strict account-address check: bech32 checksum, expected prefix, 20-byte
+ * payload. Returns the problem or null. A bad address passes genesis
+ * assembly but wedges the launch at add-genesis-account (or worse, mints to
+ * an unspendable account), so it must fail here.
+ */
+function addressProblem(addr: string, expectedPrefix: string): string | null {
+  let prefix: string;
+  let data: Uint8Array;
+  try {
+    ({ prefix, data } = fromBech32(addr));
+  } catch {
+    return "not a valid bech32 address (bad checksum or format)";
+  }
+  if (prefix !== expectedPrefix) {
+    return `address prefix "${prefix}" does not match bech32 prefix "${expectedPrefix}"`;
+  }
+  if (data.length !== 20) {
+    return `address payload is ${data.length} bytes, expected 20 (account address)`;
+  }
+  return null;
 }
 
 /**
@@ -86,12 +143,31 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       err(field, `"${symbol}" violates the chain's display symbol rule: 3-8 chars, [A-Z][A-Z0-9]+ (x/identity)`);
     }
   }
+  const seenNames = new Map<string, number>();
+  const seenAddrs = new Map<string, number>();
   for (const [i, acct] of spec.accounts.initial.entries()) {
-    if (acct.address && !acct.address.startsWith(spec.network.bech32Prefix + "1")) {
-      err(
-        `accounts.initial[${i}].address`,
-        `address does not match bech32 prefix "${spec.network.bech32Prefix}"`,
-      );
+    if (acct.address) {
+      const problem = addressProblem(acct.address, spec.network.bech32Prefix);
+      if (problem) err(`accounts.initial[${i}].address`, problem);
+    }
+    // duplicate names collide in the launcher's key map; a duplicate address
+    // is silently skipped at add-genesis-account, losing the second allocation
+    const prevName = seenNames.get(acct.name);
+    if (prevName !== undefined) {
+      err(`accounts.initial[${i}].name`, `duplicate account name "${acct.name}" (also accounts.initial[${prevName}])`);
+    } else {
+      seenNames.set(acct.name, i);
+    }
+    if (acct.address) {
+      const prevAddr = seenAddrs.get(acct.address);
+      if (prevAddr !== undefined) {
+        err(
+          `accounts.initial[${i}].address`,
+          `duplicate address (also accounts.initial[${prevAddr}]): only the first allocation would reach genesis`,
+        );
+      } else {
+        seenAddrs.set(acct.address, i);
+      }
     }
   }
 
@@ -110,6 +186,14 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     );
   }
   const mapping = spec.topology.sentries.mapping;
+  if (mapping === "round-robin" && S > 0 && S < V) {
+    // round-robin assigns sentry s to validator s % V, so with fewer
+    // sentries than validators the tail validators get none
+    (mainnet ? err : warn)(
+      "topology.sentries.count",
+      `round-robin with ${S} sentries covers only the first ${S} of ${V} validators; the rest would be publicly exposed`,
+    );
+  }
   if (Array.isArray(mapping)) {
     if (mapping.length !== S) {
       err("topology.sentries.mapping", `mapping has ${mapping.length} entries for ${S} sentries`);
@@ -139,10 +223,19 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       );
     }
     for (const [i, addr] of operators.entries()) {
-      if (!addr.startsWith(spec.network.bech32Prefix + "1")) {
+      const problem = addressProblem(addr, spec.network.bech32Prefix);
+      if (problem) {
+        err(`topology.validators.operators[${i}]`, problem);
+        continue;
+      }
+      // an operator listed in accounts.initial keeps that allocation instead
+      // of the automatic self-delegation funding, so it must cover the gentx
+      const acct = spec.accounts.initial.find((a) => a.address === addr);
+      if (acct && BigInt(acct.amount) < BigInt(spec.accounts.validatorSelfDelegation)) {
         err(
           `topology.validators.operators[${i}]`,
-          `address does not match bech32 prefix "${spec.network.bech32Prefix}"`,
+          `operator is account "${acct.name}" whose amount ${acct.amount} is less than ` +
+            `validatorSelfDelegation ${spec.accounts.validatorSelfDelegation} (the gentx self-delegates that much)`,
         );
       }
     }
@@ -185,6 +278,77 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   }
   if ((pub?.api || pub?.rpc) && S === 0) {
     err("topology.publicEndpoints", "public endpoints are served by sentry-0 — add a sentry");
+  }
+
+  // Every ingress hostname routes to a different service, so a domain can
+  // appear only once across the fleet
+  const domainUses: [string, string | undefined][] = [
+    ["topology.components.explorer.domain", comps.explorer.enabled ? comps.explorer.domain : undefined],
+    ["topology.components.frontend.domain", comps.frontend.enabled ? comps.frontend.domain : undefined],
+    ["topology.components.hub.domain", comps.hub.enabled ? comps.hub.domain : undefined],
+    ["topology.publicEndpoints.api", pub?.api],
+    ["topology.publicEndpoints.rpc", pub?.rpc],
+    ["topology.headscale.domain", spec.topology.headscale.domain],
+  ];
+  const seenDomains = new Map<string, string>();
+  for (const [path, dom] of domainUses) {
+    if (!dom) continue;
+    const first = seenDomains.get(dom);
+    if (first) {
+      err(path, `domain "${dom}" is already used by ${first}`);
+    } else {
+      seenDomains.set(dom, path);
+    }
+  }
+
+  // Chain parameter sanity: values the chain would accept structurally but
+  // that reject the gentx or misconfigure minting
+  const mint = spec.chainParams.mint;
+  if (
+    mint?.inflationMin !== undefined &&
+    mint?.inflationMax !== undefined &&
+    mint.inflationMin > mint.inflationMax
+  ) {
+    err("chainParams.mint.inflationMin", `inflationMin ${mint.inflationMin} exceeds inflationMax ${mint.inflationMax}`);
+  }
+  const comm = spec.chainParams.validatorDefaults;
+  if (
+    comm?.commissionRate !== undefined &&
+    comm?.commissionMaxRate !== undefined &&
+    comm.commissionRate > comm.commissionMaxRate
+  ) {
+    err(
+      "chainParams.validatorDefaults.commissionRate",
+      `commissionRate ${comm.commissionRate} exceeds commissionMaxRate ${comm.commissionMaxRate} (gentx would be rejected)`,
+    );
+  }
+  if (
+    comm?.commissionMaxChangeRate !== undefined &&
+    comm?.commissionMaxRate !== undefined &&
+    comm.commissionMaxChangeRate > comm.commissionMaxRate
+  ) {
+    err(
+      "chainParams.validatorDefaults.commissionMaxChangeRate",
+      `commissionMaxChangeRate ${comm.commissionMaxChangeRate} exceeds commissionMaxRate ${comm.commissionMaxRate} (gentx would be rejected)`,
+    );
+  }
+
+  // Provider preference entries are Akash owner addresses regardless of the
+  // chain being launched
+  for (const [i, addr] of spec.providers.policy.preference.entries()) {
+    const problem = addressProblem(addr, "akash");
+    if (problem) err(`providers.policy.preference[${i}]`, problem);
+  }
+
+  // SSH keys land verbatim in authorized_keys; a malformed one silently
+  // locks the operator out of every node
+  if (
+    spec.security.sshPublicKey !== null &&
+    !/^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/=]+/.test(
+      spec.security.sshPublicKey.trim(),
+    )
+  ) {
+    err("security.sshPublicKey", "not an OpenSSH public key (authorized_keys format, e.g. \"ssh-ed25519 AAAA... comment\")");
   }
 
   // Mainnet hardening

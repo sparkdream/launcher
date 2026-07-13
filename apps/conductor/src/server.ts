@@ -3,7 +3,7 @@ import websocket from "@fastify/websocket";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { checkSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb } from "./db.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
@@ -183,14 +183,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.post("/api/launches", async (req, reply) => {
     const body = req.body as { spec: unknown; owner?: string };
-    let spec: LaunchSpec;
-    try {
-      spec = withDefaults(body.spec);
-    } catch (e) {
-      return reply.status(400).send({ error: "schema", detail: String(e) });
+    // schema and cross-field failures share one issue-list shape
+    const result = checkSpec(body.spec);
+    if (!result.ok || !result.spec) {
+      return reply.status(400).send({ error: "validation", issues: result.errors });
     }
-    const result = validateSpec(spec);
-    if (!result.ok) return reply.status(400).send({ error: "validation", issues: result.errors });
+    const spec: LaunchSpec = result.spec;
     const warnings = [...result.warnings];
     if (deps.onAkash && spec.network.type === "mainnet") {
       // §2 security model: mainnet secrets do not belong on provider disk

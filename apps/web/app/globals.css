@@ -41,6 +41,14 @@ code { color: var(--dim); font-size: 0.8rem; }
   max-height: 40vh; overflow-y: auto;
 }
 .warnings { color: var(--warn); font-size: 0.85rem; }
+/* live spec validation (Launch spec panel): errors and warnings as edited */
+textarea.invalid { border-color: var(--err); }
+.spec-issues { list-style: none; padding: 0; margin: 12px 0 0; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+.spec-issues li { padding: 2px 0; }
+.spec-issues li.err { color: var(--err); }
+.spec-issues li.warn { color: var(--warn); }
+.spec-issues li.jump { cursor: pointer; }
+.spec-issues li.jump:hover { text-decoration: underline; }
 .steps { list-style: none; padding: 0; margin: 8px 0 0; }
 .steps-toggle {
   display: block; margin: 2px auto 0; background: none; border: none;
