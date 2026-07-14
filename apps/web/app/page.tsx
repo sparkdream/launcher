@@ -65,18 +65,24 @@ accounts:
     # member: seed as an active genesis member (people, not treasury/operators);
     # true → core founder defaults, or pick trustLevel (new|provisional|
     # established|trusted|core) and dreamBalance per account
+    # council: seat on the founding governance councils (exactly one sets
+    # founder: true). Without council accounts the chain's compiled-in
+    # founder addresses must exist in genesis or governance never bootstraps
     - name: alice
       generate: true
       amount: "1000000000000"
       member: true
+      council: { founder: true, handles: [alice] }
     - name: bob
       generate: true
       amount: "1000000000000"
       member: { trustLevel: established }
+      council: true
     - name: carol
       generate: true
       amount: "1000000000000"
       member: { trustLevel: provisional }
+      council: true
     - name: dave
       generate: true
       amount: "1000000000000"
@@ -1514,14 +1520,18 @@ export default function Page() {
                         : "";
                     // node fleet only — prefill with a current node image so
                     // the expected ns/repo:tag format is obvious
-                    const node = f.components.find(
+                    const nodes = f.components.filter(
                       (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
                     );
+                    const node = nodes[0];
                     const image = window.prompt(
                       `New sparkdreamd image for validators + sentries:${feeNote}`,
                       node?.image ?? undefined,
                     );
-                    if (image && node && image !== node.image)
+                    // skip only when the whole node fleet already runs the
+                    // image — after an aborted mid-upgrade the fleet is mixed
+                    // and re-running with the same tag is the retry path
+                    if (image && node && nodes.some((c) => c.image !== image))
                       fleetAction(f.launchId, node.dseq, "upgrade", { image });
                   }}
                 >

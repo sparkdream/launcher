@@ -249,6 +249,67 @@ describe("rolling upgrade op", () => {
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
     expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.sparkdreamd).toBe(image);
   }, 120_000);
+
+  it("passes the sentry gate on RPC height progress even when SSH is dead", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    // sshd broken in the new image: the sentry refuses SSH connections,
+    // but its RPC keeps answering with progressing heights (FakeRpc)
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    w.services.ssh.failHosts.add(`${sentry.ssh_host}:${sentry.ssh_port}`);
+    w.fleet.requestUpgrade(launch, ["sentry-0"], "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26",
+    );
+  }, 120_000);
+
+  it("retried op skips components already updated on-chain; fee rides the next tx", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26";
+    // first attempt lands sentry-0's update on-chain (then imagine an abort)
+    w.fleet.requestUpgrade(launch, ["sentry-0"], image);
+    const sigs0 = w.signer.signed.length;
+    expect((await driveOps(w)).status).toBe("completed");
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const updMsg = w.signer.signed[sigs0]![0]!;
+    w.services.api.deploymentHashes.set(sentry.dseq, (updMsg.value as any).hash);
+
+    // retry over the whole node fleet with the same image: sentry-0's tx
+    // would be rejected ("invalid: deployment hash") so it must be skipped,
+    // and the flat fee rides the first tx that actually happens
+    w.fleet.requestUpgrade(launch, ["sentry-0", "sentry-1", "val-0", "val-1"], image);
+    const sigs1 = w.signer.signed.length;
+    const manifestsBefore = w.services.provider.manifests.length;
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const retryTxs = w.signer.signed.slice(sigs1);
+    expect(retryTxs).toHaveLength(3); // sentry-1, val-0, val-1 — no sentry-0
+    expect(retryTxs.map((msgs) => msgs.length)).toEqual([2, 1, 1]); // fee on sentry-1's
+    expect(retryTxs[0]![1]!.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
+    // manifests still re-sent for all four, skipped component included
+    expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
+  }, 120_000);
+
+  it("fails a sentry whose height stalls, reporting the last probe result", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    w.services.rpc.status = async () => ({ latestBlockHeight: 42, catchingUp: false });
+    const opId = w.fleet.requestUpgrade(
+      launch,
+      ["sentry-0"],
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26",
+    );
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("paused");
+    expect(result.failedStep).toBe(`op${opId}:sentry-0:verify`);
+    const step = w.db.getStep("fl", `op${opId}:sentry-0:verify`)!;
+    expect(step.error).toContain("height is stalled at 42");
+  }, 120_000);
 });
 
 describe("component upgrade", () => {
@@ -472,13 +533,14 @@ describe("chain reset op", () => {
     // account seeded as a member, spec override applied
     const keys = w.db.stepOutput<{ accounts: Record<string, string> }>("fl", "generate-keys")!;
     const newcomer = keys.accounts["acct-newcomer"]!;
+    const founder = keys.accounts["acct-founder"]!;
     for (const key of ["val-0", "val-1", "sentry-0", "sentry-1"]) {
       const g = JSON.parse(
         fs.readFileSync(path.join(w.work, `launches/fl/nodes/${key}/config/genesis.json`), "utf8"),
       );
       expect(g.chain_id).toBe("sparkdream-2");
       expect(g.app_state.gov.params.voting_period).toBe("600s");
-      expect(g.app_state.rep.member_map.map((m: any) => m.address)).toEqual([newcomer]);
+      expect(g.app_state.rep.member_map.map((m: any) => m.address)).toEqual([founder, newcomer]);
       expect(g.app_state.bank.balances.some((b: any) => b.address === newcomer)).toBe(true);
       expect(g.app_state.genutil.gen_txs).toHaveLength(2);
     }
@@ -568,6 +630,29 @@ describe("chain reset op", () => {
     expect(explorerSdl).not.toContain("{{TAILNET_IP");
     expect(explorerSdl).not.toContain("{{TS_AUTHKEY");
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("inherits deployed images when the reset spec omits them", async () => {
+    const w = await launched(specWithComponents());
+    const launch0 = w.db.getLaunch("fl")!;
+    w.fleet.requestUpgrade(launch0, ["explorer"], "sparkdreamnft/sparkdream-explorer:v1.0.7");
+    expect((await driveOps(w)).status).toBe("completed");
+
+    // editor-style spec: the user never pinned images, so the raw input
+    // omits them — the resolved profile default (an older explorer tag)
+    // must not read as an image change and reject the reset
+    const launch = w.db.getLaunch("fl")!;
+    const nodeImage = JSON.parse(launch.spec_json).images.sparkdreamd;
+    const edited = JSON.parse(launch.spec_json);
+    delete edited.images;
+    const opId = w.fleet.requestChainReset(launch, edited);
+
+    const stored = JSON.parse(w.db.getLaunch("fl")!.spec_json);
+    expect(stored.images.explorer).toBe("sparkdreamnft/sparkdream-explorer:v1.0.7");
+    expect(stored.images.sparkdreamd).toBe(nodeImage);
+    // and no unintended node-image swap rides the reset
+    const op = w.db.listFleetOps("fl").find((o) => o.id === opId)!;
+    expect(JSON.parse(op.params_json).image).toBeUndefined();
   }, 120_000);
 
   it("rejects edits the deployed fleet embodies", async () => {

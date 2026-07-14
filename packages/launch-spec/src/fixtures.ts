@@ -15,7 +15,10 @@ export function testnetSpecInput(overrides: Record<string, unknown> = {}): unkno
       ...(overrides.token as object),
     },
     accounts: {
-      initial: [{ name: "treasury", generate: true, amount: "500000000000000" }],
+      initial: [
+        { name: "treasury", generate: true, amount: "500000000000000" },
+        { name: "founder", generate: true, amount: "1000000000000", member: true, council: { founder: true } },
+      ],
       validatorSelfDelegation: "1000000000000",
       ...(overrides.accounts as object),
     },

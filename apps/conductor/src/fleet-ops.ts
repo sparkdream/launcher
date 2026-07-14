@@ -485,7 +485,7 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
 
   for (const key of ordered) {
     const p = (s: string) => `op${opId}:${key}:${s}`;
-    const isFirst = key === ordered[0];
+    const earlier = ordered.slice(0, ordered.indexOf(key));
 
     steps.push({
       name: p("update"),
@@ -511,27 +511,40 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           path.join(ctx.dirs.sdl, `${key}.manifest.json`),
           artifacts.manifestJson,
         );
-        const msgs: Msg[] = [
-          {
-            typeUrl: TypeUrl.UpdateDeployment,
-            value: {
-              id: { owner, dseq: row.dseq },
-              hash: Buffer.from(artifacts.hash).toString("base64"),
+        // convergent, like retarget: a retried op re-walks components an
+        // earlier attempt already updated on-chain, and an update tx whose
+        // hash matches the live version is rejected ("invalid: deployment
+        // hash") — re-send the manifest only for those
+        const wantHash = Buffer.from(artifacts.hash).toString("base64");
+        const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+        if (onChain?.hash === wantHash) {
+          ctx.log(`${key}: on-chain version already matches — skipping update tx`);
+          ctx.db.deletePendingTx(ctx.launchId, p("update"));
+        } else {
+          const msgs: Msg[] = [
+            {
+              typeUrl: TypeUrl.UpdateDeployment,
+              value: { id: { owner, dseq: row.dseq }, hash: wantHash },
             },
-          },
-        ];
-        // upgrade service fee — flat, once per op, on the first update tx
-        const fee = feeConfig();
-        if (isFirst && fee.upgradeFlat > 0) {
-          const coin = await feeCoin(
-            PRICING_DENOM[spec.infra.akashNetwork],
-            String(fee.upgradeFlat),
-            ctx.services.api,
+          ];
+          // upgrade service fee — flat, once per op, riding the first
+          // update tx that actually happens (skipped components can't
+          // carry it: there's no tx to batch it into)
+          const fee = feeConfig();
+          const feeDue = earlier.every(
+            (k) => ctx.output<{ txSkipped?: boolean }>(`op${opId}:${k}:update`)?.txSkipped,
           );
-          if (coin) msgs.push(sendMsg(owner, fee.address, coin));
-          else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
+          if (feeDue && fee.upgradeFlat > 0) {
+            const coin = await feeCoin(
+              PRICING_DENOM[spec.infra.akashNetwork],
+              String(fee.upgradeFlat),
+              ctx.services.api,
+            );
+            if (coin) msgs.push(sendMsg(owner, fee.address, coin));
+            else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
+          }
+          await ctx.requireTx(p("update"), msgs);
         }
-        await ctx.requireTx(p("update"), msgs);
         const cert = loadCert(ctx);
         await ctx.services.provider.sendManifest(
           cert,
@@ -540,7 +553,7 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
         );
         ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
-        return { image: params.image };
+        return { image: params.image, txSkipped: onChain?.hash === wantHash };
       },
     });
 
@@ -560,29 +573,50 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         }
         const row = componentRow(ctx, key);
         // persistent volume → same tailnet IP, supervised restart (§5): the
-        // gate is "node back and progressing" before the next component
+        // gate is "node back and progressing" before the next component.
+        // Probe failures are expected while the provider restarts the
+        // container, so they only log (deduped) instead of failing the step.
+        let lastNote = "";
+        const note = (m: string) => {
+          if (m === lastNote) return;
+          lastNote = m;
+          ctx.log(`${key} verify: ${m}`);
+        };
+        const cause = (e: unknown) =>
+          (e instanceof Error ? e.message : String(e)).slice(0, 200);
         for (let i = 0; i < 60; i++) {
-          try {
-            const running = await ctx.services.ssh.exec(
-              rowTarget(ctx, row),
-              "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-            );
-            if (running.stdout.trim() === "yes") {
-              if (key.startsWith("sentry-")) {
-                const url = await nodeRpcUrl(ctx, row.host_uri, row.dseq);
-                const a = await ctx.services.rpc.status(url);
-                await ctx.services.sleep(3000);
-                const b = await ctx.services.rpc.status(url);
-                if (b.latestBlockHeight <= a.latestBlockHeight) throw new Error("height stalled");
-              }
-              return { healthy: true };
+          if (key.startsWith("sentry-")) {
+            // a sentry proves itself over its public RPC — height progress
+            // is the gate, so a broken sshd can't wedge the rollout
+            try {
+              const url = await nodeRpcUrl(ctx, row.host_uri, row.dseq);
+              const a = await ctx.services.rpc.status(url);
+              await ctx.services.sleep(3000);
+              const b = await ctx.services.rpc.status(url);
+              if (b.latestBlockHeight > a.latestBlockHeight) return { healthy: true };
+              note(`rpc answers but height is stalled at ${b.latestBlockHeight}`);
+            } catch (e) {
+              note(`rpc not up yet: ${cause(e)}`);
             }
-          } catch {
-            // provider still restarting the container
+          } else {
+            // validators expose no public RPC — the supervised process
+            // being back is the best signal available over SSH
+            try {
+              const running = await ctx.services.ssh.exec(
+                rowTarget(ctx, row),
+                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+              );
+              if (running.stdout.trim() === "yes") return { healthy: true };
+              note("ssh reachable, sparkdreamd not running yet");
+            } catch (e) {
+              note(`ssh probe failed: ${cause(e)}`);
+            }
           }
           await ctx.services.sleep(5000);
         }
-        throw new Error(`${key} did not come back healthy after upgrade`);
+        throw new Error(
+          `${key} did not come back healthy after upgrade (last: ${lastNote || "no probe ran"})`,
+        );
       },
     });
   }

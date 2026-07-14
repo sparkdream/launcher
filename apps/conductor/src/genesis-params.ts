@@ -193,6 +193,41 @@ export function applyGenesisMembers(
 }
 
 /**
+ * Write x/commons founding_members from spec accounts flagged `council`.
+ * The chain's InitGenesis bootstrap builds the founding councils from this
+ * list when it is non-empty, instead of the image's compiled-in founder
+ * addresses (GenesisNames), which a launched chain's generated accounts can
+ * never match. Runs after applyReferenceGenesis (the vendored reference
+ * genesis carries an empty founding_members, so nothing is overwritten). With no
+ * council accounts the field is left unset: the compiled-in founders apply,
+ * which validateSpec only allows when explicit-address accounts might match
+ * them.
+ */
+export function applyFoundingMembers(
+  genesis: Json,
+  spec: LaunchSpec,
+  accounts: Record<string, string>,
+): Json {
+  const councils = spec.accounts.initial.filter((a) => a.council);
+  if (councils.length === 0) return genesis;
+
+  const app = genesis.app_state as Json;
+  if (!app.commons) throw new Error("genesis has no commons module state");
+  app.commons.founding_members = councils.map((acct) => {
+    const address = acct.address ?? accounts[`acct-${acct.name}`];
+    if (!address) throw new Error(`no address for council account ${acct.name}`);
+    const opts = typeof acct.council === "object" ? acct.council : {};
+    return {
+      address,
+      display_name: opts.displayName ?? acct.name.charAt(0).toUpperCase() + acct.name.slice(1),
+      handles: opts.handles ?? [],
+      founder: opts.founder ?? false,
+    };
+  });
+  return genesis;
+}
+
+/**
  * Apply spec.chainParams + denoms directly onto genesis JSON (§12.4:
  * direct manipulation, no Python dependency). Runs after
  * applyReferenceGenesis: only touches fields the spec sets, so the

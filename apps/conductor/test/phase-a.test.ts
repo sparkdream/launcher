@@ -56,12 +56,19 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
       accounts: {
         initial: [
           { name: "treasury", generate: true, amount: "500000000000000" },
-          { name: "founder", generate: true, amount: "1000000000000", member: true },
+          {
+            name: "founder",
+            generate: true,
+            amount: "1000000000000",
+            member: true,
+            council: { founder: true, displayName: "The Founder", handles: ["founder", "fndr"] },
+          },
           {
             name: "helper",
             generate: true,
             amount: "1000000000000",
             member: { trustLevel: "provisional" },
+            council: true,
           },
           {
             name: "whale",
@@ -151,6 +158,23 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
       keys.accounts["acct-founder"],
     );
     expect(genesis.app_state.season.member_profile_map[0].username).toBe("");
+
+    // council accounts land in x/commons founding_members so the chain
+    // bootstraps governance around them instead of its compiled-in founders
+    expect(genesis.app_state.commons.founding_members).toEqual([
+      {
+        address: keys.accounts["acct-founder"],
+        display_name: "The Founder",
+        handles: ["founder", "fndr"],
+        founder: true,
+      },
+      {
+        address: keys.accounts["acct-helper"],
+        display_name: "Helper",
+        handles: [],
+        founder: false,
+      },
+    ]);
 
     // default token naming reproduces the reference exactly
     const dreamMeta = genesis.app_state.bank.denom_metadata.find(

@@ -26,6 +26,25 @@ const memberOptions = z.object({
   dreamBalance: amount.optional(),
 });
 
+const councilOptions = z.object({
+  /**
+   * Marks this account as the founder: it anchors the Technical and
+   * Ecosystem councils and their committees. Exactly one council account
+   * must set it (validateSpec enforces this).
+   */
+  founder: z.boolean().optional(),
+  /** Seeded as the x/name display name. Defaults to the capitalized account name. */
+  displayName: z.string().min(1).max(64).optional(),
+  /**
+   * x/name handles claimed for this account at genesis (first becomes
+   * primary), so a squatter cannot snipe a founder's identity in the open
+   * registration window. Defaults to none — handles can be claimed on-chain
+   * later. Names on the chain's blocked list ("gov", "treasury", ...) fail
+   * the claim with only a chain-log warning, so avoid reserved-sounding ones.
+   */
+  handles: z.array(z.string().regex(/^[a-z0-9_]([a-z0-9_-]{1,28}[a-z0-9_])?$/)).optional(),
+});
+
 const initialAccount = z
   .object({
     name: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/),
@@ -40,6 +59,16 @@ const initialAccount = z
      * operators).
      */
     member: z.union([z.boolean(), memberOptions]).optional(),
+    /**
+     * Seat this account on the founding governance councils. Council
+     * accounts are written to x/commons genesis founding_members, which
+     * overrides the chain image's compiled-in founders (GenesisNames) so
+     * governance bootstraps around the spec's own accounts. Without any
+     * council accounts the image's compiled-in founder addresses must exist
+     * in accounts.initial, or the chain starts with no councils at all.
+     * Requires a sparkdreamd image built after founding_members support.
+     */
+    council: z.union([z.boolean(), councilOptions]).optional(),
   })
   .refine((a) => Boolean(a.address) !== Boolean(a.generate), {
     message: "exactly one of address or generate must be set",

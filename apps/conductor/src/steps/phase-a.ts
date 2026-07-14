@@ -16,6 +16,7 @@ import { sparkdreamd, run } from "../exec.js";
 import { generateAgeKeypair, generateSshKeypair } from "../keys.js";
 import {
   applyChainParams,
+  applyFoundingMembers,
   applyGenesisMembers,
   applyReferenceGenesis,
   commissionFlags,
@@ -238,6 +239,7 @@ export async function buildGenesisFiles(
   );
   applyReferenceGenesis(genesis, reference, spec);
   applyGenesisMembers(genesis, reference, spec, keys.accounts);
+  applyFoundingMembers(genesis, spec, keys.accounts);
   applyChainParams(genesis, spec);
   fs.writeFileSync(genesisPath, JSON.stringify(genesis, null, 2));
 

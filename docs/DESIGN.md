@@ -262,6 +262,17 @@ accounts:
                                      # network's seeds). Omit for non-person accounts
                                      # (treasury, operators). Reference-genesis member
                                      # seeds never carry over — membership is spec-driven.
+      council:                       # seat on the founding governance councils:
+        founder: true                # written to x/commons founding_members, which
+        displayName: Team            # overrides the image's compiled-in founders
+        handles: [team]              # (GenesisNames). Exactly one council account
+                                     # sets founder: true; displayName defaults to
+                                     # the capitalized account name, handles to none
+                                     # (claimed at genesis, first becomes primary).
+                                     # council: true takes the defaults. Without any
+                                     # council accounts the compiled-in founder
+                                     # addresses must be present in accounts.initial
+                                     # or the chain starts with no councils at all.
   validatorSelfDelegation: "1000000000000"
 
 topology:

@@ -47,14 +47,21 @@ export class FakeAkashApi implements AkashApi {
   staleFirstOrder = false;
   private firstDseq: string | undefined;
 
+  /** On-chain deployment version hashes (base64), for tests exercising
+   *  the "version already matches — skip update tx" reconciliation. */
+  deploymentHashes = new Map<string, string>();
+
   async deploymentInfo(
     _owner: string,
     dseq: string,
   ): Promise<{ state: string; hash?: string } | undefined> {
     if (!this.knownDseqs.has(dseq)) return undefined;
     // a stale order still has an active deployment awaiting the close;
-    // no hash → the steps skip on-chain hash reconciliation in tests
-    return { state: this.leaseStates.get(dseq) === "closed" ? "closed" : "active" };
+    // no hash (unless set above) → steps skip hash reconciliation in tests
+    return {
+      state: this.leaseStates.get(dseq) === "closed" ? "closed" : "active",
+      hash: this.deploymentHashes.get(dseq),
+    };
   }
 
   /** dseqs whose bids have all expired (create-leases stale-bid recovery). */

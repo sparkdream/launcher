@@ -233,6 +233,69 @@ describe("validateSpec", () => {
     expect(res.errors.some((e) => e.path === "accounts.initial[2].address")).toBe(true);
   });
 
+  it("requires exactly one founder among council accounts", () => {
+    const councilSpec = (councils: [boolean | object, boolean | object]) =>
+      testnetSpec({
+        accounts: {
+          initial: [
+            { name: "alice", generate: true, amount: "1000", council: councils[0] },
+            { name: "bob", generate: true, amount: "1000", council: councils[1] },
+          ],
+          validatorSelfDelegation: "1000000000000",
+        },
+      });
+
+    const noFounder = validateSpec(councilSpec([true, true]));
+    expect(noFounder.errors.some((e) => e.message.includes("exactly one founder"))).toBe(true);
+
+    const twoFounders = validateSpec(councilSpec([{ founder: true }, { founder: true }]));
+    expect(
+      twoFounders.errors.some((e) => e.path === "accounts.initial[1].council.founder"),
+    ).toBe(true);
+
+    const ok = validateSpec(councilSpec([{ founder: true }, true]));
+    expect(ok.errors).toEqual([]);
+    // 2 council accounts < the Commons Council minimum of 3
+    expect(ok.warnings.some((w) => w.message.includes("minimum membership of 3"))).toBe(true);
+  });
+
+  it("rejects handles claimed by two council accounts", () => {
+    const spec = testnetSpec({
+      accounts: {
+        initial: [
+          { name: "alice", generate: true, amount: "1000", council: { founder: true, handles: ["dreamer"] } },
+          { name: "bob", generate: true, amount: "1000", council: { handles: ["dreamer"] } },
+        ],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "accounts.initial[1].council.handles")).toBe(true);
+  });
+
+  it("errors when governance can never bootstrap: no council flags, all accounts generated", () => {
+    const spec = testnetSpec({
+      accounts: {
+        initial: [{ name: "treasury", generate: true, amount: "1000" }],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.message.includes("no governance councils"))).toBe(true);
+
+    // explicit addresses might match the image's compiled-in founders, so
+    // that case only warns
+    const explicit = testnetSpec({
+      accounts: {
+        initial: [{ name: "alice", address: SPARK_A, amount: "1000" }],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    const relaxed = validateSpec(explicit);
+    expect(relaxed.errors).toEqual([]);
+    expect(relaxed.warnings.some((w) => w.path === "accounts.initial")).toBe(true);
+  });
+
   it("flags round-robin leaving validators without sentries", () => {
     const spec = testnetSpec({
       topology: {

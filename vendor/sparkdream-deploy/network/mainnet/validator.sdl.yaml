@@ -2,7 +2,7 @@
 version: "2.0"
 services:
   sparkdreamd:
-    image: sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.24
+    image: sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.25
     expose:
       # SSH for emergency access (can be removed once Tailscale SSH works)
       - port: 2222

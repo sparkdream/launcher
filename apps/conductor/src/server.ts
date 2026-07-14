@@ -143,7 +143,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // fleet ops (relaunch/upgrade) compose onto the launch's step list —
     // completed launch steps checkpoint-skip, then op steps run
     const steps = [...deps.steps, ...buildOpSteps(deps.db, id)];
-    void runLaunch(deps.db, id, spec, deps.workRoot, steps, deps.services)
+    void runLaunch(deps.db, id, spec, deps.workRoot, steps, deps.services, (m) =>
+      app.log.info(`launch ${id}: ${m}`),
+    )
       .catch((e) => {
         deps.db.setLaunchStatus(id, "paused");
         app.log.error(e, `launch ${id} driver crashed`);

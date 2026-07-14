@@ -171,6 +171,75 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     }
   }
 
+  // Governance bootstrap: x/commons builds the founding councils at genesis
+  // from the spec's council accounts (founding_members), or, when the spec
+  // has none, from the image's compiled-in founder addresses. A chain that
+  // ends up with neither starts without any councils, permanently: council
+  // creation permissions live on the councils themselves.
+  const councilAccounts = spec.accounts.initial
+    .map((a, i) => ({ acct: a, i }))
+    .filter(({ acct }) => acct.council);
+  if (councilAccounts.length > 0) {
+    const founders = councilAccounts.filter(
+      ({ acct }) => typeof acct.council === "object" && acct.council.founder,
+    );
+    if (founders.length === 0) {
+      err(
+        "accounts.initial",
+        "council accounts need exactly one founder: set council: { founder: true } on one of them " +
+          "(the chain panics at genesis on a founderless council set)",
+      );
+    } else if (founders.length > 1) {
+      for (const { i } of founders.slice(1)) {
+        err(
+          `accounts.initial[${i}].council.founder`,
+          `only one account can be the founder (also accounts.initial[${founders[0]!.i}])`,
+        );
+      }
+    }
+    if (councilAccounts.length < 3) {
+      warn(
+        "accounts.initial",
+        `${councilAccounts.length} council account(s): the Commons Council starts below its minimum membership of 3`,
+      );
+    }
+    const seenHandles = new Map<string, number>();
+    for (const { acct, i } of councilAccounts) {
+      if (typeof acct.council !== "object" || !acct.council.handles) continue;
+      for (const handle of acct.council.handles) {
+        const prev = seenHandles.get(handle);
+        if (prev !== undefined) {
+          err(
+            `accounts.initial[${i}].council.handles`,
+            `handle "${handle}" is already claimed by accounts.initial[${prev}]`,
+          );
+        } else {
+          seenHandles.set(handle, i);
+        }
+      }
+    }
+  } else {
+    // Without council accounts the bootstrap falls back to the image's
+    // compiled-in founder addresses. Generated accounts can never match
+    // them; explicit addresses might (a canonical-network relaunch), so
+    // only the all-generated case is a certainty.
+    const anyExplicit = spec.accounts.initial.some((a) => a.address);
+    if (!anyExplicit) {
+      err(
+        "accounts.initial",
+        "no account is flagged council and all accounts are generated, so none can match the image's " +
+          "compiled-in founder addresses, so the chain would start with no governance councils. " +
+          "Flag the founding members with council (one of them founder: true)",
+      );
+    } else {
+      warn(
+        "accounts.initial",
+        "no account is flagged council: governance only bootstraps if the image's compiled-in founder " +
+          "addresses are among accounts.initial; flag council accounts to override them explicitly",
+      );
+    }
+  }
+
   // Storage persistence (§4): validators and sentries must keep persistent data volumes.
   for (const role of ["validator", "sentry"] as const) {
     if (!spec.infra.resources[role].storage.persistent) {

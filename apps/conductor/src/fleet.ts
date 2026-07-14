@@ -876,6 +876,21 @@ export class FleetService {
   requestChainReset(launch: LaunchRow, proposedInput: unknown): number {
     const current = this.spec(launch);
     const proposed = withDefaults(proposedInput);
+    // an editor spec that omits an image resolves the profile default,
+    // which lags behind what upgrade ops installed (the stored spec tracks
+    // those via recordSpecImage) — omission is not a request to change the
+    // fleet, so inherit the deployed value; only an image the editor spells
+    // out counts as intent (still subject to the frozen-field check below)
+    const rawImages =
+      ((proposedInput ?? {}) as { images?: Record<string, string | undefined> }).images ?? {};
+    const images = proposed.images as Record<string, string | undefined>;
+    for (const key of ["sparkdreamd", "headscale", "explorer", "frontend", "hub"]) {
+      if (rawImages[key] === undefined) {
+        const cur = (current.images as Record<string, string | undefined>)[key];
+        if (cur === undefined) delete images[key];
+        else images[key] = cur;
+      }
+    }
     if (this.db.listFleetOps(launch.id, "active").length > 0) {
       throw new Error("another fleet op is in progress — finish or abort it first");
     }
