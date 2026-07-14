@@ -327,8 +327,12 @@ describe("Phase A golden run — explorer + frontend enabled", () => {
     const sentryApp = fs.readFileSync(path.join(dirs.node("sentry-0"), "config", "app.toml"), "utf8");
     expect(sentryApp).toContain('address = "tcp://0.0.0.0:1317"');
     expect(sentryApp).not.toContain("enable = false");
+    // Keplr reads balances from the public api domain in the browser, so
+    // the LCD must serve CORS headers
+    expect(sentryApp).toContain("enabled-unsafe-cors = true");
     const valApp = fs.readFileSync(path.join(dirs.node("val-0"), "config", "app.toml"), "utf8");
     expect(valApp).not.toContain('address = "tcp://0.0.0.0:1317"');
+    expect(valApp).toContain("enabled-unsafe-cors = false");
     db.close();
   }, 120_000);
 });

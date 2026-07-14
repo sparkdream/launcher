@@ -125,6 +125,14 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
         'address = "tcp://localhost:1317"',
         'address = "tcp://0.0.0.0:1317"',
       );
+      // Keplr fetches balances straight from the browser against the public
+      // api domain, so the LCD must answer with CORS headers (the RPC side
+      // already ships cors_allowed_origins = ["*"] in config.toml.sentry).
+      app = replaceOnce(
+        app,
+        "enabled-unsafe-cors = false",
+        "enabled-unsafe-cors = true",
+      );
     }
   }
   fs.writeFileSync(path.join(configDir, "app.toml"), app);
