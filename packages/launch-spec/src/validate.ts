@@ -110,8 +110,67 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   const warn = (path: string, message: string) => warnings.push({ path, message });
 
   const mainnet = spec.network.type === "mainnet";
+  const join = spec.join;
   const V = spec.topology.validators.count;
   const S = spec.topology.sentries.count;
+
+  // Join mode (§5 "Join mode"): the chain already exists, so every
+  // genesis-shaping field is rejected. What survives parameterizes the
+  // joiner's own nodes: token (min gas price, verified against the fetched
+  // genesis), chainParams.consensus + validatorDefaults, and
+  // accounts.validatorSelfDelegation (the create-validator stake).
+  if (join) {
+    if (spec.accounts.initial.length > 0) {
+      err(
+        "accounts.initial",
+        "join mode joins an existing chain: genesis accounts cannot be created; " +
+          "fund the operator accounts on the live chain instead (§5 await-funds)",
+      );
+    }
+    for (const section of ["staking", "gov", "mint", "distribution", "slashing"] as const) {
+      if (spec.chainParams[section] && Object.keys(spec.chainParams[section]!).length > 0) {
+        err(
+          `chainParams.${section}`,
+          "join mode: these parameters already exist on the live chain; only consensus " +
+            "(node-local timing) and validatorDefaults (your create-validator tx) apply",
+        );
+      }
+    }
+    if (!join.genesisSha256) {
+      (mainnet ? err : warn)(
+        "join.genesisSha256",
+        "pin the genesis sha256 (from the join bundle) so the genesis host is not trusted for integrity",
+      );
+    }
+    if (S === 0) {
+      err(
+        "topology.sentries.count",
+        "join mode needs at least one sentry: sentries state-sync from the network and front your validators",
+      );
+    }
+    const seenPeers = new Set<string>();
+    for (const [i, peer] of join.peers.entries()) {
+      const id = peer.split("@")[0]!;
+      if (seenPeers.has(id)) {
+        warn(`join.peers[${i}]`, `duplicate peer node id ${id}`);
+      }
+      seenPeers.add(id);
+    }
+    // the light-client trust hash is cross-checked across two RPCs; the
+    // same endpoint listed twice would "cross-check" a lying RPC against
+    // itself, so duplicates are an error, not a warning
+    const seenRpcs = new Set<string>();
+    for (const [i, rpc] of join.stateSyncRpcs.entries()) {
+      const normalized = rpc.replace(/\/+$/, "");
+      if (seenRpcs.has(normalized)) {
+        err(
+          `join.stateSyncRpcs[${i}]`,
+          `duplicate state-sync RPC ${rpc}: the trust-hash cross-check needs two distinct endpoints`,
+        );
+      }
+      seenRpcs.add(normalized);
+    }
+  }
 
   // Denoms & addresses — the shapes below are enforced by the chain's
   // identity module at genesis (x/identity ChainIdentity.Validate); catching
@@ -175,7 +234,8 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   // from the spec's council accounts (founding_members), or, when the spec
   // has none, from the image's compiled-in founder addresses. A chain that
   // ends up with neither starts without any councils, permanently: council
-  // creation permissions live on the councils themselves.
+  // creation permissions live on the councils themselves. Join mode skips
+  // all of this — governance already exists on the live chain.
   const councilAccounts = spec.accounts.initial
     .map((a, i) => ({ acct: a, i }))
     .filter(({ acct }) => acct.council);
@@ -218,7 +278,7 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         }
       }
     }
-  } else {
+  } else if (!join) {
     // Without council accounts the bootstrap falls back to the image's
     // compiled-in founder addresses. Generated accounts can never match
     // them; explicit addresses might (a canonical-network relaunch), so
@@ -438,9 +498,38 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     warn("token.minGasPrice", "zero min gas price on mainnet invites spam");
   }
 
-  // stateSync serving at genesis is meaningless (no snapshots exist yet)
-  if (spec.infra.sentrySettings.stateSync) {
+  // stateSync serving at genesis is meaningless (no snapshots exist yet) —
+  // a joined fleet syncs into a live chain, where serving makes sense
+  if (spec.infra.sentrySettings.stateSync && !join) {
     warn("infra.sentrySettings.stateSync", "state-sync serving is pointless at genesis launch");
+  }
+
+  // The vendored reference genesis requires a binary that knows every param
+  // it carries; older images reject it at InitChain — AFTER deployments and
+  // escrow are funded, so this must fail at validation. Only enforceable for
+  // the known image naming scheme with a semver tag; join mode is exempt
+  // (the live chain's genesis, not the vendored reference, is what matters —
+  // run whatever the join bundle names). Bump alongside genesis regeneration.
+  if (!join) {
+    const minVersion = [1, 0, 26] as const;
+    const m = /^sparkdreamnft\/sparkdreamd-[a-z]+-ssh:v(\d+)\.(\d+)\.(\d+)$/.exec(
+      spec.images.sparkdreamd,
+    );
+    if (m) {
+      const tag = [Number(m[1]), Number(m[2]), Number(m[3])];
+      const older =
+        tag[0]! !== minVersion[0] ? tag[0]! < minVersion[0]
+        : tag[1]! !== minVersion[1] ? tag[1]! < minVersion[1]
+        : tag[2]! < minVersion[2];
+      if (older) {
+        err(
+          "images.sparkdreamd",
+          `${spec.images.sparkdreamd} predates the vendored reference genesis: binaries before ` +
+            `v${minVersion.join(".")} reject its x/rep params at InitChain (the chain would ` +
+            "never reach block 1, after deployments are already funded)",
+        );
+      }
+    }
   }
 
   return { errors, warnings, ok: errors.length === 0 };

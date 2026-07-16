@@ -1,8 +1,11 @@
 import type { LaunchSpec } from "./schema.js";
 
-/** sparkdream + suffix 1 → "sparkdream-1" (§4). */
+/**
+ * sparkdream + suffix 1 → "sparkdream-1" (§4). In join mode the chain
+ * already exists, so its id comes from the join bundle instead.
+ */
 export function chainId(spec: LaunchSpec): string {
-  return `${spec.network.name}-${spec.network.chainIdSuffix}`;
+  return spec.join?.chainId ?? `${spec.network.name}-${spec.network.chainIdSuffix}`;
 }
 
 /**

@@ -85,6 +85,24 @@ export function buildGentxSignDoc(input: GentxInputs): StdSignDoc {
   return makeSignDoc([aminoMsg], GENTX_FEE, input.chainId, memo, 0, 0);
 }
 
+/** Real account coordinates + fee for an ONLINE MsgCreateValidator (join mode). */
+export interface OnlineTxParams {
+  accountNumber: number;
+  sequence: number;
+  fee: StdFee;
+}
+
+/**
+ * Sign doc for promote-validator (§5 "Join mode" Phase G): the same
+ * MsgCreateValidator as a gentx, but a live on-chain tx — real account
+ * number and sequence, a real fee, and no node-id memo (peer discovery is
+ * long past by the time the validator bonds).
+ */
+export function buildCreateValidatorSignDoc(input: GentxInputs, online: OnlineTxParams): StdSignDoc {
+  const aminoMsg: AminoMsg = aminoTypes.toAmino(createValidatorMsg(input));
+  return makeSignDoc([aminoMsg], online.fee, input.chainId, "", online.accountNumber, online.sequence);
+}
+
 /** Keplr's AminoSignResponse shape. */
 export interface GentxSignResponse {
   signed: StdSignDoc;
@@ -100,33 +118,42 @@ export interface GentxVerifyResult {
 }
 
 /**
- * Verify before accepting into genesis (§5 step 3b): the signature must be
- * valid over the doc the wallet actually signed, the signer must be the
- * declared operator, and the signed doc must not have drifted from ours in
- * any consensus-relevant way.
+ * Verify a wallet's amino sign response against the doc the conductor
+ * built, before the tx is assembled (§5 step 3b, and Phase G's
+ * promote-validator): the signature must be valid over the doc the wallet
+ * actually signed, the signer must be the declared operator, and the
+ * signed doc must not have drifted from ours in any consensus-relevant
+ * way. Every expectation, including the gentx path's pinned zero
+ * account_number/sequence and the promote path's live coordinates, lives
+ * in `expected`, so both flows share one set of drift rules.
+ *
+ * The wallet may adjust gas, but memo and fee amount must not drift: both
+ * are copied from the signed doc into the assembled tx, where a changed
+ * fee fails at InitChain / broadcast (too low) or spends past the balance
+ * the conductor verified (too high), with a far less useful error.
  */
-export async function verifyGentxSignature(
+export async function verifySignedDoc(
   expected: StdSignDoc,
   response: GentxSignResponse,
   operatorAddress: string,
 ): Promise<GentxVerifyResult> {
   const { signed, signature } = response;
   if (signed.chain_id !== expected.chain_id) return { ok: false, reason: "chain_id mismatch" };
-  if (signed.account_number !== "0") return { ok: false, reason: "account_number must be 0" };
-  if (signed.sequence !== "0") return { ok: false, reason: "sequence must be 0" };
+  if (signed.account_number !== expected.account_number) {
+    return { ok: false, reason: `account_number must be ${expected.account_number}` };
+  }
+  if (signed.sequence !== expected.sequence) {
+    return { ok: false, reason: `sequence must be ${expected.sequence}` };
+  }
   if (JSON.stringify(signed.msgs) !== JSON.stringify(expected.msgs)) {
     return { ok: false, reason: "msgs differ from the conductor-built sign doc" };
   }
-  // memo and fee are copied from the signed doc into the genesis-hashed
-  // gentx (assembleGentxJson) — the wallet may adjust gas, but memo and fee
-  // amount must not drift (a fee the account can't cover fails at InitChain)
   if (signed.memo !== expected.memo) {
     return { ok: false, reason: "memo differs from the conductor-built sign doc" };
   }
   if (JSON.stringify(signed.fee.amount) !== JSON.stringify(expected.fee.amount)) {
     return { ok: false, reason: "fee amount differs from the conductor-built sign doc" };
   }
-
   return verifyAminoSignature(signed, operatorAddress, signature);
 }
 
@@ -180,7 +207,8 @@ export function assembleGentxJson(input: GentxInputs, response: GentxSignRespons
               key: response.signature.pub_key.value,
             },
             mode_info: { single: { mode: "SIGN_MODE_LEGACY_AMINO_JSON" } },
-            sequence: "0",
+            // "0" for gentxs; the live sequence for promote-validator txs
+            sequence: String(signed.sequence),
           },
         ],
         fee: {

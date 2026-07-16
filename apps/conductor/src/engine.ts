@@ -144,7 +144,17 @@ export async function runLaunch(
         db.enqueuePendingGentx(launchId, valIndex, address, signDocJson);
         throw new AwaitGentx(valIndex);
       }
-      if (row.status !== "signed" || !row.response_json) throw new AwaitGentx(valIndex);
+      if (row.status !== "signed" || !row.response_json) {
+        // doc drift mirrors requireTx's msgs refresh: genesis gentx docs are
+        // deterministic (no-op), but promote-validator docs carry the live
+        // account sequence — after a broadcast failure the caller resets the
+        // row and rebuilds the doc, and the wallet must be served the fresh
+        // one or it re-signs a stale sequence forever
+        if (row.sign_doc_json !== signDocJson) {
+          db.updatePendingGentxDoc(launchId, valIndex, signDocJson);
+        }
+        throw new AwaitGentx(valIndex);
+      }
       return row.response_json;
     },
   };

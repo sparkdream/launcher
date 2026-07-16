@@ -136,7 +136,8 @@ export interface ConnectedWallet {
  * sign call itself is fully offline.
  */
 export async function suggestNewChain(spec: any): Promise<string> {
-  const chainId = `${spec.network.name}-${spec.network.chainIdSuffix ?? 1}`;
+  // join mode signs against the LIVE chain, whose id comes from the bundle
+  const chainId = spec.join?.chainId ?? `${spec.network.name}-${spec.network.chainIdSuffix ?? 1}`;
   const coinDenom = spec.token.displayDenom;
   const currency = {
     coinDenom,

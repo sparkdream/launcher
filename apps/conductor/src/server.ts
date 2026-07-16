@@ -3,7 +3,7 @@ import websocket from "@fastify/websocket";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { checkSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, checkSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb } from "./db.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
@@ -429,6 +429,22 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.type("application/json").send(fs.readFileSync(file, "utf8"));
   });
 
+  // join bundle (§5 "Public peering & the join bundle"): the public
+  // document a third-party operator pastes into their own launcher's spec
+  // join block — peer strings computed live from lease status
+  app.get("/api/fleet/:launchId/join-bundle", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      const bundle = await fleet.joinBundle(launch);
+      return reply.type("application/json").send(JSON.stringify(bundle, null, 2));
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   // abandon a stuck op (e.g. relaunch on a broken provider)
   app.post("/api/fleet/:launchId/ops/:opId/abort", async (req, reply) => {
     const { launchId, opId } = req.params as { launchId: string; opId: string };
@@ -585,7 +601,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const dirs = launchDirs(deps.workRoot, id);
     return buildTmkmsSetup({
       spec,
-      chainId: `${spec.network.name}-${spec.network.chainIdSuffix}`,
+      // join-aware: a joined validator signs for the LIVE chain's id
+      chainId: chainId(spec),
       meshIps: mesh?.ips,
       homePreauthKey: preauth?.home,
       nodeDir: dirs.node,

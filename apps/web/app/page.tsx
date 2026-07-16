@@ -1617,6 +1617,15 @@ export default function Page() {
                 >
                   download genesis
                 </button>
+                <button
+                  title="Public join document for third-party operators (genesis sha256, sentry peer strings, state-sync RPCs); they paste it into their own launcher's spec join block"
+                  onClick={async () => {
+                    const { downloadJoinBundle } = await import("../lib/api");
+                    await downloadJoinBundle(f.launchId, f.chainId).catch((e) => setError(String(e)));
+                  }}
+                >
+                  join bundle
+                </button>
                 {!shutDown && (
                   <button
                     title="Wipe all chain state and restart from a genesis rebuilt from the spec editor above — accounts and members are re-seeded (fresh mnemonics!), the chain-id suffix bumps, deployments stay"

@@ -16,6 +16,30 @@ function dec(n: number): string {
 type Json = Record<string, any>;
 
 /**
+ * Deep-fill: keys the reference genesis predates fall back to the init
+ * skeleton's values — the defaults of the very binary that will validate
+ * them. The reference wins wherever it says anything (arrays and scalars
+ * replace outright); only genuinely missing object keys are filled. Without
+ * this, a binary that grew a module param after the reference genesis was
+ * cut sees it as nil and refuses the genesis at gentx/validate time
+ * (observed: x/rep self_assigned_* params, sparkdreamd v1.0.25).
+ */
+function fillDefaults(value: any, defaults: any): any {
+  if (
+    value === null || defaults === null ||
+    typeof value !== "object" || typeof defaults !== "object" ||
+    Array.isArray(value) || Array.isArray(defaults)
+  ) {
+    return value;
+  }
+  const out: Json = { ...value };
+  for (const [key, def] of Object.entries(defaults)) {
+    out[key] = key in out ? fillDefaults(out[key], def) : def;
+  }
+  return out;
+}
+
+/**
  * Overlay the vendored per-network reference genesis (chain repo
  * deploy/config/network/<type>/genesis.json) onto the freshly-init'd
  * genesis, so a launched chain starts from the same module parameters and
@@ -55,7 +79,10 @@ export function applyReferenceGenesis(genesis: Json, reference: Json, spec: Laun
 
   for (const [module, refState] of Object.entries(refApp)) {
     if (module === "genutil") continue;
-    const overlaid = substituteDenoms(refState) as Json;
+    // a module the binary no longer ships (x/crisis left with sdk 0.53):
+    // its state is dead weight the running chain can never read
+    if (!(module in app)) continue;
+    const overlaid = fillDefaults(substituteDenoms(refState), app[module]) as Json;
     if (module === "auth") overlaid.accounts = app.auth?.accounts ?? [];
     if (module === "bank") {
       overlaid.balances = app.bank?.balances ?? [];

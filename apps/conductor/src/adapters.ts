@@ -194,6 +194,13 @@ export class FetchRpcProber implements RpcProber {
       return 0;
     }
   }
+
+  async getText(url: string): Promise<string> {
+    // 60s: a genesis document can be tens of MB
+    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`GET ${url}: HTTP ${res.status}`);
+    return res.text();
+  }
 }
 
 /**

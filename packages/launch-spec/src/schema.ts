@@ -104,6 +104,42 @@ const roleResources = z.object({
 const durationSeconds = z.string().regex(/^[0-9]+s$/, "duration like '3s'");
 const rate = z.number().min(0).max(1);
 
+/** CometBFT peer string: 40-hex node id @ host:port. */
+const peerString = z
+  .string()
+  .regex(/^[0-9a-f]{40}@[a-z0-9.-]+:[0-9]{1,5}$/i, "peer must be <node_id>@<host>:<port>");
+
+/**
+ * Join mode (§5 "Join mode"): deploy a sovereign sentry/validator set onto
+ * an EXISTING chain instead of creating one. The fields mirror the origin
+ * fleet's published join bundle (GET /api/fleet/:id/join-bundle), so the
+ * bundle values paste straight in. Presence of this block forbids every
+ * genesis-shaping field (validateSpec enforces the complement).
+ */
+const joinBlock = z.object({
+  /** The live chain's id — network.chainIdSuffix is ignored in join mode. */
+  chainId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{2,49}$/),
+  /**
+   * Where fetch-genesis downloads the genesis document: a raw genesis.json
+   * or a CometBFT RPC /genesis response (both are handled).
+   */
+  genesisUrl: z.string().url(),
+  /**
+   * sha256 over the canonical (recursively key-sorted) JSON of the genesis
+   * document — serialization-independent, so a raw file and an RPC-wrapped
+   * copy verify identically. Required on mainnet so the genesis host is
+   * never trusted for integrity.
+   */
+  genesisSha256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/, "64 hex chars (lowercase sha256)")
+    .optional(),
+  /** Public sentry peers of the existing network. */
+  peers: z.array(peerString).min(1),
+  /** RPC endpoints for state-sync light-client verification (CometBFT needs two). */
+  stateSyncRpcs: z.array(z.string().url()).min(2),
+});
+
 export const launchSpecSchema = z.object({
   version: z.literal(1),
 
@@ -115,6 +151,8 @@ export const launchSpecSchema = z.object({
     /** Human-readable name shown by the frontend (CHAIN_NAME). Defaults to name. */
     displayName: z.string().min(1).max(64).optional(),
   }),
+
+  join: joinBlock.optional(),
 
   token: z.object({
     baseDenom: denom,

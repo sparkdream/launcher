@@ -159,6 +159,9 @@ export class FakeProviderGateway {
           { host: ep.host, port: 2222, externalPort: ep.port },
           // RPC rides a RANDOM_PORT too — nodeRpcUrl resolves it from here
           { host: ep.host, port: 26657, externalPort: ep.port + 10000 },
+          // P2P is global on sentries (§5 "Public peering") — the source of
+          // external_address and the join bundle's peer strings
+          { host: ep.host, port: 26656, externalPort: ep.port + 20000 },
         ],
       },
     };
@@ -281,6 +284,16 @@ export class FakeRpc {
   async httpOk(url?: string): Promise<boolean> {
     if (url && [...this.darkUrls].some((d) => url.includes(d))) return false;
     return this.httpOkResult;
+  }
+
+  /** url (or a substring of it) → body served by getText (join mode). */
+  texts = new Map<string, string>();
+
+  async getText(url: string): Promise<string> {
+    for (const [key, body] of this.texts) {
+      if (url.includes(key)) return body;
+    }
+    throw new Error(`FakeRpc.getText: no body registered for ${url}`);
   }
 }
 

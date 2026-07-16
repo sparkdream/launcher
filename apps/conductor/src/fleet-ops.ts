@@ -23,6 +23,7 @@ import {
 import { sparkdreamd } from "./exec.js";
 import { explorerChainEnv, renderComponentSdl } from "./render-component-sdl.js";
 import { ingressHost } from "./steps/phase-ef.js";
+import { resolveStateSyncTrust } from "./steps/join.js";
 import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "./node-ops.js";
 import type { SshTarget } from "./services.js";
 
@@ -366,6 +367,47 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         target,
         `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME} && touch ${NODE_HOME}/.node-data-uploaded`,
       );
+      if (spec.join) {
+        // join fleets: the bundle's [statesync] block still carries the
+        // launch-time trust anchor, long outside the light-client trust
+        // period by relaunch time. The relaunched node starts on an empty
+        // volume and MUST state-sync, so re-resolve a fresh anchor (the
+        // same refresh start-chain performs) and re-enable [statesync] in
+        // case the bundle was packaged with it flipped off.
+        const trust = await resolveStateSyncTrust(ctx);
+        await ctx.services.ssh.exec(
+          target,
+          `sed -i 's|^rpc_servers = .*|rpc_servers = "${trust.rpcServers.join(",")}"|; ` +
+            `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
+            `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|; ` +
+            `/^\\[statesync\\]$/,/^\\[/ s|^enable = false|enable = true|' ${NODE_HOME}/config/config.toml`,
+        );
+        ctx.log(`${key}: state-sync trust anchor refreshed at height ${trust.trustHeight}`);
+      }
+      if (!isValidator) {
+        // advertise-peers: the new lease assigned a new forwarded 26656 —
+        // re-stamp external_address so the sentry keeps advertising a
+        // reachable public peer address (§5 "Public peering"). The uploaded
+        // node data still carries the OLD lease's address, so on failure it
+        // must be blanked, not kept: a stale address gossips a dead endpoint.
+        const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+        const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+        let advertised = "";
+        try {
+          const status = await waitLeaseStatus(
+            ctx, loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq,
+            { forwardedPort: 26656, attempts: 6 },
+          );
+          const ep = extractForwardedPort(status, 26656);
+          advertised = `${ep.host}:${ep.port}`;
+        } catch {
+          ctx.log(`${key}: provider forwards no P2P port; clearing the stale external_address`);
+        }
+        await ctx.services.ssh.exec(
+          target,
+          `sed -i 's|^external_address = .*|external_address = "${advertised}"|' ${NODE_HOME}/config/config.toml`,
+        );
+      }
       // await mesh join → new tailnet IP
       let ip = "";
       for (let attempt = 1; attempt <= 30; attempt++) {

@@ -40,7 +40,16 @@ interface RoleResources {
   storage: { root: string; data: string; persistent: boolean; class: "beta1" | "beta2" | "beta3" };
 }
 
-const SPARKDREAMD_VERSION = "v1.0.24";
+// The vendored reference genesis (v1.0.26 regeneration) carries x/rep params
+// that binaries before v1.0.26 reject at InitChain, so every network's image
+// must be >= v1.0.26 (validateSpec enforces the floor). No mainnet image is
+// published yet: mainnet launches fail fast at validate-spec's Docker Hub
+// check until one is pushed.
+const SPARKDREAMD_VERSION = {
+  devnet: "v1.0.26",
+  testnet: "v1.0.26",
+  mainnet: "v1.0.26",
+};
 const HEADSCALE_IMAGE = "sparkdreamnft/headscale:v0.28.0";
 // v1.0.6+: renders its chain config from env at runtime (CHAIN_NAME,
 // CHAIN_DENOM, ...) — earlier tags serve the config baked at build time
@@ -93,7 +102,7 @@ export const profiles: Record<NetworkType, Profile> = {
       consensus: { timeoutCommit: "1s" },
     },
     images: {
-      sparkdreamd: `sparkdreamnft/sparkdreamd-devnet-ssh:${SPARKDREAMD_VERSION}`,
+      sparkdreamd: `sparkdreamnft/sparkdreamd-devnet-ssh:${SPARKDREAMD_VERSION.devnet}`,
       headscale: HEADSCALE_IMAGE,
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,
@@ -126,7 +135,7 @@ export const profiles: Record<NetworkType, Profile> = {
     },
     chainParams: { ...commonChainParams },
     images: {
-      sparkdreamd: `sparkdreamnft/sparkdreamd-testnet-ssh:${SPARKDREAMD_VERSION}`,
+      sparkdreamd: `sparkdreamnft/sparkdreamd-testnet-ssh:${SPARKDREAMD_VERSION.testnet}`,
       headscale: HEADSCALE_IMAGE,
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,
@@ -157,7 +166,7 @@ export const profiles: Record<NetworkType, Profile> = {
     },
     chainParams: { ...commonChainParams },
     images: {
-      sparkdreamd: `sparkdreamnft/sparkdreamd-mainnet-ssh:${SPARKDREAMD_VERSION}`,
+      sparkdreamd: `sparkdreamnft/sparkdreamd-mainnet-ssh:${SPARKDREAMD_VERSION.mainnet}`,
       headscale: HEADSCALE_IMAGE,
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,

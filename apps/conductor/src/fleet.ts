@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -13,6 +13,7 @@ import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
+import { canonicalGenesisSha256 } from "./steps/join.js";
 import type { ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
@@ -305,7 +306,8 @@ export class FleetService {
       fleets.push({
         launchId: launch.id,
         launchStatus: launch.status,
-        chainId: `${spec.network.name}-${spec.network.chainIdSuffix}`,
+        // join-aware: a joined fleet runs the LIVE chain, not name-suffix
+        chainId: chainId(spec),
         components,
         ops: this.db.listFleetOps(launch.id).map((o) => ({
           id: o.id,
@@ -876,6 +878,12 @@ export class FleetService {
   requestChainReset(launch: LaunchRow, proposedInput: unknown): number {
     const current = this.spec(launch);
     const proposed = withDefaults(proposedInput);
+    if (current.join || proposed.join) {
+      throw new Error(
+        "chain reset is not available for join-mode fleets: the chain belongs to the " +
+          "network, not this fleet (to leave it, unbond, then shut down the fleet)",
+      );
+    }
     // an editor spec that omits an image resolves the profile default,
     // which lags behind what upgrade ops installed (the stored spec tracks
     // those via recordSpecImage) — omission is not a request to change the
@@ -957,6 +965,137 @@ export class FleetService {
       keyPem: readSecretFile(path.join(dirs.secrets, "akash-cert-key.pem")),
     };
     return this.services.provider.leaseLogs(cert, component.host_uri, component.dseq, 1, 1, tail);
+  }
+
+  /**
+   * Join bundle (§5 "Public peering & the join bundle"): the public
+   * document a third-party operator pastes into their own launcher's spec
+   * `join` block. Computed live from lease status so the peer strings can
+   * never carry stale forwarded ports; everything in it is public
+   * information. Sentries whose provider forwards no P2P port (or whose
+   * lease is unreachable) are skipped rather than failing the export.
+   */
+  async joinBundle(launch: LaunchRow): Promise<Record<string, unknown>> {
+    const spec = this.spec(launch);
+    const built = this.db.stepOutput<{ chainId: string }>(launch.id, "build-genesis");
+    const keys = this.db.stepOutput<{ nodeIds: Record<string, string> }>(launch.id, "generate-keys");
+    if (!built || !keys) throw new Error("chain not built yet: no genesis to join");
+    const genesisPath = path.join(
+      launchDirs(this.workRoot, launch.id).node("val-0"), "config", "genesis.json",
+    );
+    if (!fs.existsSync(genesisPath)) throw new Error("genesis file missing from the launch workdir");
+    // the on-disk genesis is the authority for both hash and chain id: a
+    // chain reset rewrites this file (and bumps the chain id) under an
+    // op-scoped step, so the original build-genesis output can be stale
+    const genesisDoc = JSON.parse(fs.readFileSync(genesisPath, "utf8")) as { chain_id?: unknown };
+    const genesisSha256 = canonicalGenesisSha256(genesisDoc);
+    const bundleChainId =
+      typeof genesisDoc.chain_id === "string" ? genesisDoc.chain_id : built.chainId;
+
+    this.materialize(launch.id);
+    const sentries = this.db
+      .listFleetComponents(launch.id)
+      .filter((c) => c.key.startsWith("sentry-") && c.state !== "closed");
+    const creds = this.mtlsCreds(launch);
+    // the queries are independent and a dead provider costs its full request
+    // timeout, so fetch every lease status concurrently
+    const leases = await Promise.allSettled(
+      sentries.map((c) => this.services.provider.leaseStatus(creds, c.host_uri, c.dseq, 1, 1)),
+    );
+    const peers: string[] = [];
+    const forwardedRpcs: Array<{ sentry: string; url: string }> = [];
+    sentries.forEach((c, i) => {
+      const settled = leases[i]!;
+      if (settled.status !== "fulfilled") return; // provider unreachable: skip this sentry entirely
+      const lease = settled.value;
+      // P2P and RPC extraction are independent: a provider that forwards
+      // only one of the two still contributes that one to the bundle
+      try {
+        const p2p = extractForwardedPort(lease, 26656);
+        const nodeId = keys.nodeIds[c.key];
+        if (nodeId) peers.push(`${nodeId}@${p2p.host}:${p2p.port}`);
+      } catch {
+        // no forwarded P2P port on this sentry
+      }
+      try {
+        const rpc = extractForwardedPort(lease, 26657);
+        forwardedRpcs.push({ sentry: c.key, url: `http://${rpc.host}:${rpc.port}` });
+      } catch {
+        // no forwarded RPC port on this sentry
+      }
+    });
+    if (peers.length === 0) {
+      throw new Error(
+        "no sentry advertises a public P2P port, so the fleet is not joinable " +
+          "(providers must forward 26656; redeploy or relaunch the sentries)",
+      );
+    }
+    // Track which sentry backs each RPC: the joiner cross-checks the trust
+    // hash across two endpoints, which is meaningless when both terminate
+    // at the same node (publicEndpoints.rpc is served by sentry-0's
+    // ingress). Exporting a bundle whose "two" RPCs share one sentry would
+    // silently void that check on the other side.
+    const publicRpc = spec.topology.publicEndpoints?.rpc;
+    const rpcSources = [
+      ...(publicRpc ? [{ sentry: "sentry-0", url: `https://${publicRpc}` }] : []),
+      ...forwardedRpcs,
+    ].slice(0, 4);
+    // the joiner's schema and CometBFT's own rpc_servers config both
+    // hard-require two RPC URLs, so exporting fewer produces a bundle that
+    // fails on the other side with no hint the origin is at fault
+    if (rpcSources.length < 2) {
+      throw new Error(
+        "the join bundle needs at least two state-sync RPC endpoints and this fleet " +
+          `exposes ${rpcSources.length}: add a second sentry or set topology.publicEndpoints.rpc`,
+      );
+    }
+    // Distinct backing sentries make the cross-check meaningful against a
+    // single compromised node or stale forwarded port. On mainnet that is
+    // required; elsewhere a single-sentry fleet exports with a notice (the
+    // origin operator is the trust root either way, and joiners can add
+    // independent RPCs to join.stateSyncRpcs themselves).
+    const distinctSentries = new Set(rpcSources.map((r) => r.sentry));
+    const selfReferential = distinctSentries.size < 2;
+    if (selfReferential && spec.network.type === "mainnet") {
+      throw new Error(
+        "a mainnet join bundle needs state-sync RPCs backed by at least two distinct " +
+          "sentries (the joiner cross-checks the trust hash across them; endpoints of one " +
+          "sentry verify a single node against itself): add a second sentry whose provider " +
+          "forwards 26657",
+      );
+    }
+    const stateSyncRpcs = rpcSources.map((r) => r.url);
+    const genesisUrl = stateSyncRpcs[0] ? `${stateSyncRpcs[0]}/genesis` : undefined;
+
+    return {
+      version: 1,
+      chainId: bundleChainId,
+      bech32Prefix: spec.network.bech32Prefix,
+      token: {
+        baseDenom: spec.token.baseDenom,
+        displayDenom: spec.token.displayDenom,
+        exponent: spec.token.exponent,
+        minGasPrice: spec.token.minGasPrice,
+        ...(spec.token.bondDenom ? { bondDenom: spec.token.bondDenom } : {}),
+        ...(spec.token.dreamDenom ? { dreamDenom: spec.token.dreamDenom } : {}),
+        dreamDisplayDenom: spec.token.dreamDisplayDenom,
+      },
+      image: spec.images.sparkdreamd,
+      // /genesis may exceed CometBFT's response cap on grown chains; the
+      // origin's "download genesis" file, hosted anywhere, also works
+      genesisUrl,
+      genesisSha256,
+      peers,
+      stateSyncRpcs,
+      ...(selfReferential
+        ? {
+            notice:
+              "both state-sync RPCs terminate at this fleet's only sentry, so the " +
+              "joiner's trust-hash cross-check verifies one node against itself; add a " +
+              "second sentry (or have joiners put an independent RPC in join.stateSyncRpcs)",
+          }
+        : {}),
+    };
   }
 
   /**

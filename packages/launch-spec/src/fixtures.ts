@@ -44,3 +44,27 @@ export function testnetSpecInput(overrides: Record<string, unknown> = {}): unkno
 export function testnetSpec(overrides: Record<string, unknown> = {}): LaunchSpec {
   return withDefaults(testnetSpecInput(overrides));
 }
+
+/**
+ * Join-mode variant (§5 "Join mode"): same fleet shape, but onto an
+ * existing chain — no genesis accounts, a join block instead.
+ */
+export function joinSpecInput(overrides: Record<string, unknown> = {}): unknown {
+  return testnetSpecInput({
+    accounts: { initial: [], validatorSelfDelegation: "1000000000000" },
+    join: {
+      chainId: "sparkdream-1",
+      genesisUrl: "https://rpc.sparkdream.io/genesis",
+      genesisSha256: "a".repeat(64),
+      peers: [`${"ab".repeat(20)}@p2p.example.com:31234`],
+      stateSyncRpcs: ["https://rpc.sparkdream.io", "http://rpc2.example.com:26657"],
+      ...(overrides.join as object),
+    },
+    ...Object.fromEntries(Object.entries(overrides).filter(([k]) => !["join", "accounts"].includes(k))),
+    ...(overrides.accounts ? { accounts: overrides.accounts } : {}),
+  });
+}
+
+export function joinSpec(overrides: Record<string, unknown> = {}): LaunchSpec {
+  return withDefaults(joinSpecInput(overrides));
+}

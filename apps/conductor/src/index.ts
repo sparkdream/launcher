@@ -31,7 +31,7 @@ export { FleetService, type FleetView, type FleetSummary, type ComponentView } f
 export { CliSigner, toEncodeObject, launcherRegistry, type CliSignerOpts } from "./signer.js";
 export {
   buildGentxSignDoc,
-  verifyGentxSignature,
+  verifySignedDoc,
   assembleGentxJson,
   valoperAddress,
   type GentxInputs,

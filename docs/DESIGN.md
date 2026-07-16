@@ -1,7 +1,8 @@
 # SparkDream Chain Launcher — Design & Implementation Plan
 
 Status: draft — 2026-07-04 (assumptions source-verified against the chain
-repo and console-air; see §12 for resolutions and remaining chain-repo work)
+repo and console-air; see §12 for resolutions and remaining chain-repo work);
+third-party join design added 2026-07-14 (§5 "Public peering", "Join mode"; M8)
 
 A web app that launches a complete SparkDream chain (headscale mesh, N validators,
 M sentries, block explorer, chain frontend) onto Akash Network with minimal user
@@ -44,12 +45,21 @@ Source material:
    status and per-component actions; connect a fresh wallet → land on the
    wizard.
 
-Non-goals (v1): joining existing chains as a new validator, **multi-party**
-coordinated genesis (collecting gentxs from other people — the single
-operator signing their own gentxs with a hardware wallet IS supported, §3
-"Operator keys"), TMKMS automation (we pause and hand off), cosmovisor /
-gov-upgrade automation (coordinated halt-height upgrades are guided, not
-automatic — §5 "Node upgrades"), archive-node / Arweave archival automation.
+9. **Third-party joiners** (later milestone, M8): a launched chain is
+   joinable. Sentries advertise a real public peer address, the dashboard
+   exports a **join bundle**, and an independent operator runs their own
+   launcher instance in **join mode** to deploy a sovereign
+   headscale/sentry/validator set against the live chain, then promote it
+   to a bonded validator (§5 "Public peering & the join bundle", "Join
+   mode").
+
+Non-goals (v1): **multi-party** coordinated genesis (collecting gentxs from
+other people: the single operator signing their own gentxs with a hardware
+wallet IS supported, §3 "Operator keys"; joining an existing chain
+*post-genesis* is goal 9, not a genesis concern), TMKMS automation (we pause
+and hand off), cosmovisor / gov-upgrade automation (coordinated halt-height
+upgrades are guided, not automatic, §5 "Node upgrades"), archive-node /
+Arweave archival automation.
 
 ---
 
@@ -232,6 +242,23 @@ network:
   chainIdSuffix: 1            # bump for relaunches: sparkdream-2
   bech32Prefix: sprkdrm       # must match the binary's baked-in prefix;
                               # the conductor fails fast on mismatch
+
+# join:                            # presence flips the launch into JOIN MODE
+#   chainId: sparkdream-1          # (§5 "Join mode"): deploy a sovereign
+#   genesisUrl: https://…/genesis  # sentry/validator set onto an EXISTING
+#   genesisSha256: <hex>           # chain instead of creating one. The fields
+#   peers:                         # mirror the origin fleet's join bundle
+#     - <node_id>@<host>:<port>    # 1:1, so its values paste straight in.
+#   stateSyncRpcs:                 # genesisSha256 (canonical key-sorted JSON,
+#     - https://rpc.…/             # required for mainnet) makes the genesis
+#     - http://…:31235             # host untrusted for integrity. Join mode
+#                                  # forbids genesis-shaping fields (accounts.
+#                                  # initial, chainParams except consensus +
+#                                  # validatorDefaults); token stays (it
+#                                  # renders min gas price and is verified
+#                                  # against the fetched genesis); network.
+#                                  # name still names the fleet + monikers,
+#                                  # chainIdSuffix is ignored.
 
 token:
   baseDenom: uspark.sparkdreamtest   # bond + fee denom (bondDenom override allowed)
@@ -718,6 +745,174 @@ until the user updates `chain_id` in tmkms.toml and the privval probe
 passes). Node keys, consensus keys, tailnet IPs, and SSH endpoints all
 survive.
 
+### Public peering & the join bundle
+
+The sentry layer is designed to be the chain's public edge: the sentry SDL
+exposes P2P 26656 `global: true` ("so other nodes can join the network"),
+sentries run `pex = true`, and `private_peer_ids` keeps their validators
+out of gossip. As launched today the port is nevertheless unusable by
+strangers: Akash forwards 26656 to a provider-assigned random port while
+`external_address` stays `""` (so the sentry advertises a
+container-internal address, which also poisons PEX gossip), nothing
+publishes the sentries' node IDs, and there is no genesis download. Two
+additions make a launched chain actually joinable (they also unblock
+fully *manual* joiners following the chain repo's
+`DEPLOYMENT.md`/`state-sync.md` path, independent of join mode below):
+
+- **`advertise-peers`**: part of each sentry's config rendering at
+  upload time (step 16), once the forwarded 26656 port is readable from
+  lease status (same extraction step 15 already does for SSH/RPC ports):
+  set `external_address = "<provider-host>:<forwarded-port>"`. Forwarded
+  ports are lease-scoped, so a relaunch (new lease) re-renders it
+  automatically by re-running steps 12–20, and upgrades (same lease) keep
+  it. Validators are untouched: no public port, `pex = false`, mesh-only,
+  exactly as before.
+- **Join bundle**: `GET /api/fleet/:launchId/join-bundle` plus a "join
+  bundle" download button on the dashboard. A public JSON document
+  computed live from lease status (so it can never carry stale ports)
+  with `chainId`, `bech32Prefix`, the token block, the fleet's current
+  `sparkdreamd` image tag, a genesis URL + sha256, `peers` (each sentry's
+  `<node_id>@<host>:<port>`), and ≥2 state-sync RPC endpoints (the public
+  `rpc.` domain plus per-sentry forwarded 26657 ports; fewer than two
+  fails the export loudly, since the joiner's schema and CometBFT's
+  rpc_servers both require two). The joiner cross-checks the trust hash
+  across two of those RPCs, which only means something when they are
+  backed by DISTINCT sentries (two URLs terminating at one node verify
+  that node against itself). Mainnet bundles therefore require two
+  sentries; testnet/devnet single-sentry fleets export with a `notice`
+  saying the cross-check is self-referential. Either way the origin
+  operator is the trust root (see "Trust model"), and a cautious joiner
+  can put any independent RPC they know into `join.stateSyncRpcs`.
+  The sha256 is over the CANONICAL JSON of the genesis document
+  (normalized to the CometBFT GenesisDoc shape, then recursively
+  key-sorted), so the SDK's on-disk genesis.json, the same document
+  re-serialized by a CometBFT RPC's `/genesis`, and an RPC-wrapped copy
+  all verify identically (the two formats differ in `consensus.params`
+  vs `consensus_params`, app metadata, `app_hash` null vs "", and
+  initial_height type; observed live on the first devnet join). The default genesis URL is a
+  sentry RPC `/genesis` (CometBFT caps the response on grown chains; the
+  origin's "download genesis" file, hosted anywhere, also works; genesis
+  is equally served at `GET /api/launches/:id/genesis`). Everything in
+  the bundle is public information; the origin operator hands the JSON to
+  prospective operators out of band.
+
+No new sync machinery is needed: snapshot production is already on
+(`snapshotInterval`, §4 `sentrySettings`, whose "so later joiners can
+sync" comment was written for exactly this), so a joiner state-syncs off
+the sentry RPCs.
+
+### Join mode: sovereign third-party sentry/validator sets
+
+A spec with a `join` block (§4) launches nodes onto an EXISTING chain
+instead of creating one. The intended user is a third-party operator
+running their **own launcher instance**: their wallet pays for compute,
+their headscale is their own private validator↔sentry mesh, their
+consensus and operator keys are generated on and never leave their
+machine, and the only thing that crosses between operators is the public
+join bundle. This is deliberate: sovereignty is the point, not fleet
+growth for the origin operator (though nothing stops the same person
+using join mode to expand). The origin fleet and the joined fleet never
+share a mesh, an SSH key, or a launcher database.
+
+**Spec semantics.** `join` carries the bundle's fields inline (chainId,
+genesis URL + sha256, public peers, state-sync RPCs; paste the bundle
+values in), with the sha256 pinned in the spec so the genesis host is
+not trusted for integrity (pin required on mainnet; testnet/devnet get a
+warning). `validate-spec` enforces the complement of the normal rules:
+`accounts.initial` and the chain-level `chainParams` sections (staking,
+gov, mint, distribution, slashing) are rejected (they already exist on
+the live chain) while node-local knobs survive: `token` (renders min
+gas price; the bond denom is verified against the fetched genesis),
+`chainParams.consensus`, `chainParams.validatorDefaults` and
+`accounts.validatorSelfDelegation` (they parameterize the
+create-validator tx below, exactly as they parameterize gentxs in a
+normal launch). `network.name` still names the fleet and monikers;
+`network.chainIdSuffix` is ignored (the chain id comes from the join
+block). Topology: validators (≥1, `generated` or external operators as
+usual, §3) + sentries (≥1) + headscale; explorer/frontend remain
+optional (they only consume the pair's own sentry endpoints);
+`publicEndpoints` optional as usual. Run the image the bundle names:
+a joiner on a different binary version than the live chain will
+state-sync into an apphash divergence or fail to sync at all.
+
+**Phase plan deltas** (everything not listed runs unchanged):
+
+- *Phase A (join variant)*: `generate-keys` unchanged (node keys,
+  consensus keys, SSH keypair; a mnemonic only for `generated`
+  operators). `build-genesis` and all gentx steps are replaced by
+  `fetch-genesis`: download, verify the pinned sha256, distribute to node
+  homes. `render-configs` adds the join wiring: sentry
+  `persistent_peers` = bundle peers + its own validators (local tunnels
+  as usual); sentry `[statesync]` enabled, `rpc_servers` from the bundle,
+  trust height/hash fetched live at render time (latest height minus an
+  offset, cross-checked against two bundle RPCs). The validator side is
+  byte-identical to a normal launch: it peers only with its own sentries
+  over the pair's own mesh.
+- *Phases B–E*: unchanged: own cert, own headscale, own
+  deployments/leases (the launch service fee applies; it is a new
+  fleet), own mesh wiring and tunnel patching.
+- *Phase F (join variant)*: start-chain first re-resolves the state-sync
+  trust anchor and rewrites it into every node's config over SSH (the
+  render-time anchor can outlive the light-client trust period when a
+  launch pauses on signatures for days). Then **sentries first**, gated
+  on state sync completing and catching up (`/status`
+  `catching_up = false`, polled ~20 min; snapshot restore takes
+  minutes), then validators, which **state-sync too**, off their own
+  sentries: a state-synced sentry's blockstore starts near chain head,
+  so a validator could never block-sync from height 0. The validator
+  gate polls the in-container RPC over SSH for up to ~60 min (its
+  sentries serve their first snapshot only when the chain next crosses
+  a snapshot-interval boundary), so Phase G only ever bonds a synced
+  validator. No 2/3 start coordination; the chain is already live. As
+  each node catches up, start-chain flips its `[statesync] enable` back
+  off (tidiness: CometBFT skips state sync on a non-empty data dir
+  anyway). `persist-start` (20b) and `verify-chain` run as usual.
+  Joined sentries get
+  `advertise-peers` and their own join bundle like any fleet, so the
+  chain's public edge grows with each joiner.
+- *Phase G, `promote-validator`* (optional; stopping before it ends the
+  launch as a sovereign synced sentry/full-node set, a valid product for
+  RPC operators):
+  1. `await-funds`: the blocking banner shows each operator address and
+     the required amount (`validatorSelfDelegation` plus the tx fee) and
+     re-checks balances through the pair's own sentry RPC on each
+     resume. How funds arrive is out of band (origin treasury, a
+     transfer from another member): the launcher cannot conjure stake,
+     and this is the one step where the joiner needs the origin
+     community's cooperation. Already-bonded operators skip the check,
+     so a resumed or repeated run never re-demands funds.
+  2. `create-validator`: `MsgCreateValidator` (consensus pubkey from the
+     validator's home, self-delegation, commission from
+     `validatorDefaults`, moniker), signed per operator mode (§3):
+     `generated` → conductor keyring; external → browser/Ledger via the
+     existing signing loop. Unlike a gentx this is an *online* tx (real
+     account number and sequence, real fee in the chain's fee denom),
+     broadcast through the pair's own sentry RPC, with
+     `experimentalSuggestChain` now pointing at live endpoints.
+  3. `verify-bonded`: the validator appears in the validator set and
+     then signs its first block (precommit visible via sentry RPC).
+     Multi-validator join specs repeat G per validator.
+
+**Fleet ops on a joined fleet.** Because a join lands in the same fleet
+model, the existing operations apply unchanged: restart, top-up, rolling
+upgrade (health-gated as usual), relaunch with the double-sign safety
+sequence, retarget, teardown, tmkms mode. Two exceptions: **chain reset
+is rejected** in join mode (the chain is not this fleet's to reset; the
+right exit is unbond, then teardown), and a **halt-height upgrade** takes
+its halt height from the chain's coordination (governance or the origin
+operator) rather than the joiner's choice; the launcher only executes it.
+
+**Trust model.** Genesis integrity comes from the spec-pinned sha256, not
+the bundle host. Peer strings are self-authenticating: CometBFT's
+handshake pins the peer's node ID, so a tampered host in a peer string
+fails loudly instead of connecting elsewhere. State-sync light-client
+trust (height/hash) is fetched from two bundle RPCs and cross-checked;
+ultimately the joiner trusts the bundle issuer to point at the real
+chain, which is the same trust they express by staking on it. The joined
+validator gets the full sentry-architecture protection from day one: no
+public port, `pex = false`, hidden by `private_peer_ids` on its own
+sentries.
+
 ### tmkms-mode fleets (day-2)
 
 The launcher still never manages the signer machine (non-goal §1); fleet
@@ -886,6 +1081,13 @@ GET  /api/fleet/:fleetId/bundle       encrypted export: spec + node keys +
 POST /api/fleet/import                import bundle → this instance can
                                       manage the fleet
 
+# third-party join (§5 "Public peering & the join bundle"; public info,
+# computed live from lease status). Genesis download for joiners is the
+# existing GET /api/launches/:id/genesis (also on any sentry RPC /genesis)
+GET  /api/fleet/:launchId/join-bundle chainId, token, image tag, genesis
+                                      URL + canonical sha256, sentry peer
+                                      strings, state-sync RPCs
+
 # auth (Akash mode)
 POST /api/auth/nonce ; POST /api/auth/verify   (signArbitrary, allowlist)
 ```
@@ -1012,6 +1214,21 @@ calling it done); publish image + SDL.
 **M7 — Polish.** fleet-visual launch board, spec import/export, preference
 list management UI, guided tmkms signer setup (§5 step 19 panel; a plain
 stanza-display pause ships earlier with M3's tmkms checkpoint).
+
+**M8 — Third-party join** (§5 "Public peering & the join bundle", "Join
+mode") — implemented 2026-07-14 (all three stages; the promote-validator
+external-operator path reuses the gentx signing loop and awaits its
+live-chain Ledger proof, like M6's gentx flow did).
+Three independently shippable stages: **(1) joinable origin**:
+`advertise-peers` external_address rendering, join-bundle + genesis
+endpoints, dashboard download; this alone unblocks manual joiners
+following the chain repo's DEPLOYMENT.md/state-sync.md path. **(2) join
+mode**: spec `join` block, validate-spec complement rules,
+fetch-genesis, state-sync boot, sentry-first start gating, ending at a
+sovereign synced sentry/full-node set. **(3) promote-validator**:
+await-funds pause, create-validator via both operator modes (verify the
+amino/Ledger path on a live chain like M6 does for gentxs), bonded
+verification.
 
 ---
 

@@ -280,6 +280,20 @@ export async function downloadGenesis(launchId: string, chainId: string): Promis
   await downloadBlob(res, `${chainId}-genesis.json`);
 }
 
+/**
+ * The public join bundle (§5): chain identity, genesis sha256, sentry peer
+ * strings, and state-sync RPCs — what a third-party operator pastes into
+ * their own launcher's spec `join` block.
+ */
+export async function downloadJoinBundle(launchId: string, chainId: string): Promise<void> {
+  const res = await afetch(`/api/fleet/${launchId}/join-bundle`);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `join bundle: HTTP ${res.status}`);
+  }
+  await downloadBlob(res, `${chainId}-join-bundle.json`);
+}
+
 /** Shut the whole fleet down — one batched close tx via the signing loop. */
 export async function postFleetShutdown(
   launchId: string,

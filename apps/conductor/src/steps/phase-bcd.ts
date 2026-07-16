@@ -704,6 +704,12 @@ export const createLeasesStep: StepDef = {
 
 export interface SshEndpoints {
   perNode: Record<string, { host: string; port: number }>;
+  /**
+   * Sentry P2P: provider-assigned forwarded 26656 (§5 "Public peering").
+   * upload-node-data writes it into external_address; the join bundle
+   * recomputes it live, so this copy is only the config-render source.
+   */
+  p2p?: Record<string, { host: string; port: number }>;
 }
 
 export const sendManifestsStep: StepDef = {
@@ -720,16 +726,37 @@ export const sendManifestsStep: StepDef = {
         .map((c) => c.key),
     );
     const perNode: SshEndpoints["perNode"] = {};
+    const p2p: NonNullable<SshEndpoints["p2p"]> = {};
     for (const [key, entry] of Object.entries(plan.perNode)) {
       const a = assignments.perNode[key]!;
       const manifest = fs.readFileSync(entry.manifestPath, "utf8");
       await ctx.services.provider.sendManifest(cert, a.hostUri, entry.dseq, manifest);
-      const status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
+      let status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
         ...(noSsh.has(key) ? {} : { forwardedPort: 2222 }),
       });
       if (!noSsh.has(key)) perNode[key] = extractForwardedPort(status, 2222);
+      if (key.startsWith("sentry-")) {
+        // sentries expose P2P 26656 global — usually in the same status
+        // payload as 2222, but give a slow provider a second look. A
+        // provider that never forwards it degrades the sentry to
+        // non-advertising (external_address stays empty) rather than
+        // failing the launch.
+        try {
+          p2p[key] = extractForwardedPort(status, 26656);
+        } catch {
+          try {
+            status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
+              forwardedPort: 26656,
+              attempts: 6,
+            });
+            p2p[key] = extractForwardedPort(status, 26656);
+          } catch {
+            ctx.log(`${key}: provider forwards no P2P port; sentry will not advertise a public peer address`);
+          }
+        }
+      }
     }
-    return { perNode };
+    return { perNode, p2p };
   },
 };
 

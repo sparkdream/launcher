@@ -599,6 +599,18 @@ export class ConductorDb {
       .run(launchId, valIndex, address, signDocJson);
   }
 
+  /** Replace a pending row's sign doc (promote-validator docs embed live
+   *  account coordinates, so a re-run after sequence drift must re-serve a
+   *  FRESH doc — the gentx counterpart of updatePendingTxMsgs). */
+  updatePendingGentxDoc(launchId: string, valIndex: number, signDocJson: string): void {
+    this.db
+      .prepare(
+        "UPDATE pending_gentxs SET sign_doc_json = ?, status = 'pending', response_json = NULL " +
+          "WHERE launch_id = ? AND val_index = ?",
+      )
+      .run(signDocJson, launchId, valIndex);
+  }
+
   setGentxSigned(launchId: string, valIndex: number, responseJson: string): void {
     this.db
       .prepare(

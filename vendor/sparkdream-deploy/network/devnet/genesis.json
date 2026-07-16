@@ -338,11 +338,6 @@
       "recurring_spends": []
     },
     "consensus": null,
-    "crisis": {
-      "constant_fee": {
-        "denom": "uspark.sparkdreamdev"
-      }
-    },
     "distribution": {
       "delegator_starting_infos": [],
       "delegator_withdraw_infos": [],
@@ -970,6 +965,9 @@
         "referral_reward_rate": "0.050000000000000000",
         "reputation_decay_rate": "0.005000000000000000",
         "season_duration_epochs": "30",
+        "self_assigned_bond_rate": "0.100000000000000000",
+        "self_assigned_challenge_multiplier": "2",
+        "self_assigned_external_conviction_ratio": "1.000000000000000000",
         "sentinel_accuracy_window_epochs": "6",
         "sentinel_reward_epoch_blocks": "3600",
         "sentinel_reward_pool_overflow_burn_ratio": "0.500000000000000000",

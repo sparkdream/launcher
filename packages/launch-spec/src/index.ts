@@ -14,7 +14,7 @@ export {
   type ValidationIssue,
   type ValidationResult,
 } from "./validate.js";
-export { testnetSpec, testnetSpecInput } from "./fixtures.js";
+export { testnetSpec, testnetSpecInput, joinSpec, joinSpecInput } from "./fixtures.js";
 export {
   chainId,
   deriveDreamDenom,

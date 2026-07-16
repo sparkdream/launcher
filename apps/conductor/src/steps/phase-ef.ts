@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { nodes, resolveTopology, statelessComponents, tunnelPort } from "@sparkdream/launch-spec";
+import { chainId, nodes, resolveTopology, statelessComponents, tunnelPort } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeShellFallback, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
 import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "../node-ops.js";
+import { phaseGSteps } from "./phase-g.js";
+import { resolveStateSyncTrust } from "./join.js";
 import type { SshTarget } from "../services.js";
 
 const UPLOAD_MARKER = `${NODE_HOME}/.node-data-uploaded`;
@@ -27,6 +29,7 @@ function nodeTarget(ctx: StepCtx, key: string): SshTarget {
 export const uploadNodeDataStep: StepDef = {
   name: "upload-node-data",
   async run(ctx) {
+    const ssh = ctx.output<SshEndpoints>("send-manifests");
     for (const node of nodes(ctx.spec)) {
       const target = nodeTarget(ctx, node.key);
       const marker = await ctx.services.ssh.exec(target, `test -f ${UPLOAD_MARKER} && echo yes || echo no`);
@@ -35,12 +38,24 @@ export const uploadNodeDataStep: StepDef = {
       await ctx.services.ssh.upload(target, bundle, "/tmp/node-data.tgz");
       await ctx.services.ssh.exec(
         target,
-        `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME} && touch ${UPLOAD_MARKER}`,
+        `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME}` +
+          `${externalAddressSed(ssh?.p2p?.[node.key])} && touch ${UPLOAD_MARKER}`,
       );
     }
     return { uploaded: nodes(ctx.spec).map((n) => n.key) };
   },
 };
+
+/**
+ * advertise-peers (§5 "Public peering & the join bundle"): stamp the
+ * sentry's provider-forwarded 26656 into external_address so PEX gossips a
+ * reachable peer string instead of the container-internal address. Rides
+ * the node-data extraction command so the marker file still gates both.
+ */
+export function externalAddressSed(ep: { host: string; port: number } | undefined): string {
+  if (!ep) return "";
+  return ` && sed -i 's|^external_address = .*|external_address = "${ep.host}:${ep.port}"|' ${NODE_HOME}/config/config.toml`;
+}
 
 export interface MeshTable {
   /** node key → tailnet IPv4. */
@@ -123,7 +138,7 @@ export const awaitSignerStep: StepDef = {
     const stanzas: Record<string, string> = {};
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
       stanzas[`val-${v}`] =
-        `[[validator]]\nchain_id = "${ctx.spec.network.name}-${ctx.spec.network.chainIdSuffix}"\n` +
+        `[[validator]]\nchain_id = "${chainId(ctx.spec)}"\n` +
         `addr = "tcp://${mesh.ips[`val-${v}`]}:26659"\nprotocol_version = "v0.34"\n`;
     }
     // Probe the privval keepalive port on each validator; pause until all pass.
@@ -155,6 +170,7 @@ export const startChainStep: StepDef = {
       if (running.stdout.trim() === "yes") return;
       await ctx.services.ssh.exec(target, START_NODE_CMD);
     };
+    if (ctx.spec.join) return startJoinChain(ctx, start);
     // validators near-simultaneously (>2/3 must be online for block 1), then sentries
     await Promise.all(
       Array.from({ length: ctx.spec.topology.validators.count }, (_, v) => start(`val-${v}`)),
@@ -163,6 +179,126 @@ export const startChainStep: StepDef = {
     return { started: true };
   },
 };
+
+/**
+ * Join mode (§5 "Join mode", Phase F variant): the chain is already live,
+ * so there is no 2/3 start coordination. The state-sync trust anchor is
+ * re-resolved right before boot (the render-time one can outlive the
+ * light-client trust period when a launch pauses on signatures for days).
+ * Sentries start FIRST and must state-sync + catch up to chain head; then
+ * validators start and state-sync off their own sentries (a state-synced
+ * sentry cannot serve blocks below its snapshot, so validators can never
+ * block-sync from height 0) — Phase G only bonds validators that are
+ * verified synced here.
+ */
+async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void>) {
+  const assignments = ctx.output<Assignments>("collect-bids")!;
+  const plan = ctx.output<DeploymentPlan>("create-deployments")!;
+  const S = ctx.spec.topology.sentries.count;
+  const V = ctx.spec.topology.validators.count;
+  const allKeys = [
+    ...Array.from({ length: S }, (_, s) => `sentry-${s}`),
+    ...Array.from({ length: V }, (_, v) => `val-${v}`),
+  ];
+
+  // refresh the trust anchor on every node's config before anything boots
+  const trust = await resolveStateSyncTrust(ctx);
+  for (const key of allKeys) {
+    await ctx.services.ssh.exec(
+      nodeTarget(ctx, key),
+      `sed -i 's|^rpc_servers = .*|rpc_servers = "${trust.rpcServers.join(",")}"|; ` +
+        `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
+        `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|' ${NODE_HOME}/config/config.toml`,
+    );
+  }
+  ctx.log(`state-sync trust anchor refreshed at height ${trust.trustHeight}`);
+
+  const disableStateSync = (key: string) =>
+    // one-shot bootstrap done — flip [statesync] off so a container restart
+    // can't try to re-sync (CometBFT skips it on non-empty state anyway)
+    ctx.services.ssh.exec(
+      nodeTarget(ctx, key),
+      `sed -i '/^\\[statesync\\]$/,/^\\[/ s|^enable = true|enable = false|' ${NODE_HOME}/config/config.toml`,
+    );
+
+  await Promise.all(Array.from({ length: S }, (_, s) => start(`sentry-${s}`)));
+
+  const caughtUp: Record<string, number> = {};
+  for (let s = 0; s < S; s++) {
+    const key = `sentry-${s}`;
+    const a = assignments.perNode[key]!;
+    const url = await nodeRpcUrl(ctx, a.hostUri, plan.perNode[key]!.dseq, a.gseq, a.oseq);
+    // state sync discovers, fetches, and restores a snapshot — minutes, not
+    // seconds; poll generously (~20 min) before declaring the join stuck
+    const attempts = 240;
+    let synced = false;
+    let lastProblem = "unreachable";
+    for (let i = 0; i < attempts && !synced; i++) {
+      if (i > 0) await ctx.services.sleep(5000);
+      try {
+        const st = await ctx.services.rpc.status(url);
+        if (!st.catchingUp && st.latestBlockHeight > 0) {
+          caughtUp[key] = st.latestBlockHeight;
+          synced = true;
+        } else {
+          lastProblem = `catching up at height ${st.latestBlockHeight}`;
+        }
+      } catch (e) {
+        lastProblem = `unreachable (${String(e).slice(0, 80)})`;
+      }
+    }
+    if (!synced) {
+      throw new Error(
+        `${key}: not synced to the network after ~20 min (${lastProblem}). ` +
+          "Check that the join peers and state-sync RPCs are reachable and serving snapshots.",
+      );
+    }
+    ctx.log(`${key}: synced at height ${caughtUp[key]}`);
+    await disableStateSync(key);
+  }
+
+  await Promise.all(Array.from({ length: V }, (_, v) => start(`val-${v}`)));
+
+  // validators state-sync via their sentries, which serve their first
+  // snapshot only when the chain height next crosses a snapshot-interval
+  // boundary — up to interval×blocktime away, so the budget is generous
+  // (~60 min). No public RPC on validators: probe localhost over SSH.
+  for (let v = 0; v < V; v++) {
+    const key = `val-${v}`;
+    const attempts = 720;
+    let synced = false;
+    let lastProblem = "unreachable";
+    for (let i = 0; i < attempts && !synced; i++) {
+      if (i > 0) await ctx.services.sleep(5000);
+      const probe = await ctx.services.ssh.exec(
+        nodeTarget(ctx, key),
+        "wget -qO- http://127.0.0.1:26657/status 2>/dev/null || true",
+        { quick: true },
+      );
+      const height = Number(/latest_block_height"?\s*:\s*"?(\d+)/.exec(probe.stdout)?.[1]);
+      const catchingUp = /catching_up"?\s*:\s*"?(\w+)/.exec(probe.stdout)?.[1] === "true";
+      if (Number.isFinite(height) && height > 0 && !catchingUp) {
+        caughtUp[key] = height;
+        synced = true;
+      } else {
+        lastProblem = Number.isFinite(height)
+          ? `catching up at height ${height}`
+          : "local RPC not answering";
+      }
+    }
+    if (!synced) {
+      throw new Error(
+        `${key}: not synced after ~60 min (${lastProblem}). Validators state-sync ` +
+          "from their own sentries, which serve their first snapshot only after the " +
+          "chain crosses a snapshot-interval boundary; check the sentries' snapshot settings.",
+      );
+    }
+    ctx.log(`${key}: synced at height ${caughtUp[key]}`);
+    await disableStateSync(key);
+  }
+
+  return { started: true, syncedAt: caughtUp };
+}
 
 export const persistStartStep: StepDef = {
   name: "persist-start",
@@ -347,6 +483,9 @@ export function phaseEFSteps(): StepDef[] {
     startChainStep,
     persistStartStep,
     verifyChainStep,
+    // Phase G (§5 "Join mode"): promote the joined pair to a bonded
+    // validator — no-ops outside join mode, runs before the dashboard flip
+    ...phaseGSteps(),
     finalizeStep,
   ];
 }

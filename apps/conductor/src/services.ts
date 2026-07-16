@@ -49,6 +49,8 @@ export interface RpcProber {
   httpOk(url: string): Promise<boolean>;
   /** HTTP status code of a GET, 0 on network error. */
   httpStatus(url: string): Promise<number>;
+  /** GET body as text; throws on network error or non-2xx (join mode: genesis + trust hash). */
+  getText(url: string): Promise<string>;
 }
 
 export interface Certificate extends MtlsCredentials {

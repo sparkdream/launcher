@@ -24,11 +24,12 @@ import {
 import {
   assembleGentxJson,
   buildGentxSignDoc,
-  verifyGentxSignature,
+  verifySignedDoc,
   type GentxInputs,
   type GentxSignResponse,
 } from "../gentx.js";
 import { renderNodeConfigs } from "../render-configs.js";
+import { fetchJoinGenesis, resolveStateSyncTrust } from "./join.js";
 import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
@@ -208,6 +209,9 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
 export const buildGenesisStep: StepDef = {
   name: "build-genesis",
   async run(ctx) {
+    // join mode: the chain exists — download + verify its genesis instead
+    // of building one (same output shape, so consumers don't branch)
+    if (ctx.spec.join) return fetchJoinGenesis(ctx);
     const keys = ctx.output<GenerateKeysOutput>("generate-keys");
     if (!keys) throw new Error("generate-keys output missing");
     return buildGenesisFiles(ctx, keys);
@@ -298,7 +302,7 @@ export async function buildGenesisFiles(
       const signDoc = buildGentxSignDoc(inputs);
       const responseJson = ctx.requireGentx(v, operators[v]!, JSON.stringify(signDoc));
       const response = JSON.parse(responseJson) as GentxSignResponse;
-      const verdict = await verifyGentxSignature(signDoc, response, operators[v]!);
+      const verdict = await verifySignedDoc(signDoc, response, operators[v]!);
       if (!verdict.ok) {
         // never let a bad signature into genesis — it bricks block 1
         ctx.db.resetGentx(ctx.launchId, v);
@@ -362,6 +366,9 @@ export const renderConfigsStep: StepDef = {
     const keys = ctx.output<GenerateKeysOutput>("generate-keys");
     if (!keys) throw new Error("generate-keys output missing");
     const topo = resolveTopology(ctx.spec);
+    // join mode: sentries boot with [statesync] pointed at the network —
+    // the trust anchor is resolved live, cross-checked across two RPCs
+    const stateSync = ctx.spec.join ? await resolveStateSyncTrust(ctx) : undefined;
     for (const node of nodes(ctx.spec)) {
       renderNodeConfigs({
         spec: ctx.spec,
@@ -370,9 +377,10 @@ export const renderConfigsStep: StepDef = {
         nodeIds: keys.nodeIds,
         topology: topo,
         tailnetIpPlaceholder: placeholder.tailnetIp,
+        ...(stateSync ? { join: { peers: ctx.spec.join!.peers, stateSync } } : {}),
       });
     }
-    return { rendered: nodes(ctx.spec).map((n) => n.key) };
+    return { rendered: nodes(ctx.spec).map((n) => n.key), ...(stateSync ? { stateSync } : {}) };
   },
 };
 

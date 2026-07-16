@@ -18,6 +18,19 @@ export interface RenderConfigsInput {
   topology: Topology;
   /** Marker for tailnet IPs unknown until Phase E (§5 step 4). */
   tailnetIpPlaceholder: (nodeKey: string) => string;
+  /**
+   * Join mode (§5 "Join mode"): sentries additionally peer with the
+   * network's public sentries; every node (sentries AND validators) boots
+   * with [statesync] wired to the resolved trust anchor. Validators still
+   * peer only with their own sentries over the pair's own mesh — which is
+   * exactly why they must state-sync too: a state-synced sentry's
+   * blockstore starts near chain head, so it can never serve a validator
+   * trying to block-sync from height 0.
+   */
+  join?: {
+    peers: string[];
+    stateSync: { rpcServers: string[]; trustHeight: number; trustHash: string };
+  };
 }
 
 /** envsubst for the template's ${VAR} references. Unknown vars throw. */
@@ -29,11 +42,30 @@ function substitute(template: string, vars: Record<string, string>): string {
   });
 }
 
-/** Replace a whole `key = value` TOML line (first occurrence). */
-function setTomlLine(content: string, key: string, rendered: string): string {
-  const re = new RegExp(`^${key} = .*$`, "m");
-  if (!re.test(content)) throw new Error(`expected "${key} = ..." line in template`);
-  return content.replace(re, rendered);
+/**
+ * Replace a whole `key = value` TOML line (first occurrence). With a
+ * section, the match is anchored inside that `[section]` block, so a
+ * vendor-synced template growing an earlier line with the same key (TOML
+ * reuses names like `enable` across sections) cannot redirect the edit.
+ */
+function setTomlLine(content: string, key: string, rendered: string, section?: string): string {
+  const lineRe = new RegExp(`^${key} = .*$`, "m");
+  let start = 0;
+  let end = content.length;
+  if (section) {
+    const header = new RegExp(`^\\[${section}\\]$`, "m").exec(content);
+    if (!header) throw new Error(`expected [${section}] section in template`);
+    start = header.index + header[0].length;
+    const next = /^\[[^\]]+\]$/m.exec(content.slice(start));
+    if (next) end = start + next.index;
+  }
+  const scope = content.slice(start, end);
+  if (!lineRe.test(scope)) {
+    throw new Error(
+      `expected "${key} = ..." line in template${section ? ` section [${section}]` : ""}`,
+    );
+  }
+  return content.slice(0, start) + scope.replace(lineRe, rendered) + content.slice(end);
 }
 
 /** Replace an exact string, asserting it appears exactly once. */
@@ -79,6 +111,7 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
     const fronted = topology.sentryValidators[node.index] ?? [];
     const peers = fronted
       .map((v) => `${nodeIds[`val-${v}`]}@127.0.0.1:${tunnelPort(v)}`)
+      .concat(input.join?.peers ?? [])
       .join(",");
     const privateIds = fronted.map((v) => nodeIds[`val-${v}`]).join(",");
     config = setTomlLine(config, "persistent_peers", `persistent_peers = "${peers}"`);
@@ -92,6 +125,17 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
       )
       .join(",");
     config = setTomlLine(config, "persistent_peers", `persistent_peers = "${peers}"`);
+  }
+
+  if (input.join) {
+    // every node syncs from the live chain instead of replaying from
+    // genesis. start-chain re-resolves the anchor right before boot (a
+    // launch can pause on signatures for days) — these are the initial values.
+    const ss = input.join.stateSync;
+    config = setTomlLine(config, "enable", "enable = true", "statesync");
+    config = setTomlLine(config, "rpc_servers", `rpc_servers = "${ss.rpcServers.join(",")}"`, "statesync");
+    config = setTomlLine(config, "trust_height", `trust_height = ${ss.trustHeight}`, "statesync");
+    config = setTomlLine(config, "trust_hash", `trust_hash = "${ss.trustHash}"`, "statesync");
   }
 
   const timeoutCommit = spec.chainParams.consensus?.timeoutCommit;

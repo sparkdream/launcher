@@ -94,4 +94,37 @@ describe("runLaunch checkpointing", () => {
     expect(db.getPendingTx("l2", "needs-sig")?.msgs_json).toContain("fixed-pubkey");
     db.close();
   });
+
+  it("refreshes an unsigned pending gentx sign doc when the caller rebuilds it", async () => {
+    // promote-validator sign docs embed the live account sequence: after a
+    // stale-sequence broadcast failure the caller resets the row and builds
+    // a fresh doc — the wallet must be served the fresh one, or it re-signs
+    // the stale sequence forever
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const spec = testnetSpec();
+    db.createLaunch("l3", JSON.stringify(spec));
+
+    let sequence = 4;
+    const steps: StepDef[] = [
+      {
+        name: "promote",
+        run: async (ctx) => ({
+          response: ctx.requireGentx(0, "spark1operator", JSON.stringify({ sequence })),
+        }),
+      },
+    ];
+
+    const services = fakeServices();
+    const first = await runLaunch(db, "l3", spec, work, steps, services);
+    expect(first.status).toBe("awaiting-gentx");
+    expect(db.getPendingGentx("l3", 0)?.sign_doc_json).toContain('"sequence":4');
+
+    sequence = 5; // the operator transacted; the rebuilt doc has new coordinates
+    const second = await runLaunch(db, "l3", spec, work, steps, services);
+    expect(second.status).toBe("awaiting-gentx");
+    expect(db.getPendingGentx("l3", 0)?.sign_doc_json).toContain('"sequence":5');
+    expect(db.getPendingGentx("l3", 0)?.status).toBe("pending");
+    db.close();
+  });
 });

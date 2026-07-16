@@ -9,7 +9,7 @@ import {
   validateSpec,
   withDefaults,
 } from "../src/index.js";
-import { testnetSpec, testnetSpecInput } from "../src/fixtures.js";
+import { joinSpec, joinSpecInput, testnetSpec, testnetSpecInput } from "../src/fixtures.js";
 
 // valid bech32 (20-byte payload) test addresses
 const SPARK_A = "spark1qyqszqgpqyqszqgpqyqszqgpqyqszqgpy8v2rs";
@@ -513,5 +513,126 @@ describe("stateless components", () => {
     const spec = testnetSpec();
     expect(statelessComponents(spec)).toEqual([]);
     expect(lcdRequired(spec)).toBe(false);
+  });
+});
+
+describe("join mode (§5 Join mode)", () => {
+  const PEER = `${"ab".repeat(20)}@p2p.example.com:31234`;
+
+  it("a well-formed join spec validates clean", () => {
+    const res = checkSpec(joinSpecInput());
+    expect(res.errors).toEqual([]);
+    expect(res.ok).toBe(true);
+  });
+
+  it("chainId comes from the join block, not name-suffix", () => {
+    expect(chainId(joinSpec())).toBe("sparkdream-1");
+    expect(chainId(joinSpec({ join: { chainId: "other-7" } }))).toBe("other-7");
+  });
+
+  it("rejects genesis accounts — the chain already exists", () => {
+    const spec = joinSpec({
+      accounts: {
+        initial: [{ name: "treasury", generate: true, amount: "1000" }],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    const res = validateSpec(spec);
+    expect(res.errors.some((e) => e.path === "accounts.initial")).toBe(true);
+  });
+
+  it("rejects chain-level params but keeps consensus + validatorDefaults", () => {
+    const bad = validateSpec(joinSpec({ chainParams: { gov: { votingPeriod: "600s" } } }));
+    expect(bad.errors.some((e) => e.path === "chainParams.gov")).toBe(true);
+    const good = validateSpec(
+      joinSpec({
+        chainParams: {
+          consensus: { timeoutCommit: "3s" },
+          validatorDefaults: { commissionRate: 0.05 },
+        },
+      }),
+    );
+    expect(good.errors).toEqual([]);
+  });
+
+  it("genesisSha256 pin: warning normally, error on mainnet", () => {
+    const unpinned = joinSpecInput({ join: { genesisSha256: undefined } });
+    const testnetRes = checkSpec(unpinned);
+    expect(testnetRes.warnings.some((w) => w.path === "join.genesisSha256")).toBe(true);
+    expect(testnetRes.errors.some((e) => e.path === "join.genesisSha256")).toBe(false);
+    const mainnetRes = checkSpec(
+      joinSpecInput({
+        network: { name: "sparkdream", type: "mainnet", bech32Prefix: "spark" },
+        join: { genesisSha256: undefined },
+      }),
+    );
+    expect(mainnetRes.errors.some((e) => e.path === "join.genesisSha256")).toBe(true);
+  });
+
+  it("needs at least one sentry", () => {
+    const res = checkSpec(
+      joinSpecInput({
+        topology: {
+          validators: { count: 1 },
+          sentries: { count: 0 },
+          components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+          headscale: { domain: "headscale.sparkdream.io" },
+        },
+      }),
+    );
+    expect(res.errors.some((e) => e.path === "topology.sentries.count")).toBe(true);
+  });
+
+  it("skips the founding-council requirement — governance already exists", () => {
+    // an empty accounts.initial without a council flag is an error at
+    // genesis launch but the normal state of a join spec
+    const res = checkSpec(joinSpecInput());
+    expect(res.errors.some((e) => e.path === "accounts.initial")).toBe(false);
+  });
+
+  it("schema rejects malformed peers and needs two state-sync RPCs", () => {
+    const badPeer = checkSpec(joinSpecInput({ join: { peers: ["not-a-peer"] } }));
+    expect(badPeer.spec).toBeNull();
+    const oneRpc = checkSpec(joinSpecInput({ join: { stateSyncRpcs: ["https://rpc.example.com"] } }));
+    expect(oneRpc.spec).toBeNull();
+    const ok = checkSpec(joinSpecInput({ join: { peers: [PEER] } }));
+    expect(ok.ok).toBe(true);
+  });
+
+  it("rejects duplicate state-sync RPCs: the cross-check needs distinct endpoints", () => {
+    const dup = checkSpec(
+      joinSpecInput({
+        join: { stateSyncRpcs: ["https://rpc.example.com", "https://rpc.example.com/"] },
+      }),
+    );
+    expect(dup.errors.some((e) => e.path === "join.stateSyncRpcs[1]")).toBe(true);
+  });
+});
+
+describe("image version floor (reference-genesis compatibility)", () => {
+  it("rejects sparkdreamd images older than the vendored reference genesis needs", () => {
+    const res = checkSpec(
+      testnetSpecInput({
+        images: { sparkdreamd: "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.24" },
+      }),
+    );
+    expect(res.errors.some((e) => e.path === "images.sparkdreamd")).toBe(true);
+  });
+
+  it("accepts the profile default and non-matching image names", () => {
+    expect(checkSpec(testnetSpecInput()).ok).toBe(true); // profile pins >= floor
+    const custom = checkSpec(
+      testnetSpecInput({ images: { sparkdreamd: "myorg/custom-sparkdreamd:latest" } }),
+    );
+    expect(custom.errors.some((e) => e.path === "images.sparkdreamd")).toBe(false);
+  });
+
+  it("exempts join mode (the live chain's genesis governs, not the vendored one)", () => {
+    const res = checkSpec(
+      joinSpecInput({
+        images: { sparkdreamd: "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.24" },
+      }),
+    );
+    expect(res.errors.some((e) => e.path === "images.sparkdreamd")).toBe(false);
   });
 });

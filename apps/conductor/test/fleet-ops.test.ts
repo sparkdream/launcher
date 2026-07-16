@@ -213,7 +213,7 @@ describe("rolling upgrade op", () => {
   it("upgrades sentries before validators, one MsgUpdateDeployment each", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
-    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.25";
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.27";
     w.fleet.requestUpgrade(
       launch,
       w.db
@@ -257,19 +257,19 @@ describe("rolling upgrade op", () => {
     // but its RPC keeps answering with progressing heights (FakeRpc)
     const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
     w.services.ssh.failHosts.add(`${sentry.ssh_host}:${sentry.ssh_port}`);
-    w.fleet.requestUpgrade(launch, ["sentry-0"], "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26");
+    w.fleet.requestUpgrade(launch, ["sentry-0"], "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28");
 
     const result = await driveOps(w);
     expect(result.status).toBe("completed");
     expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(
-      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26",
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28",
     );
   }, 120_000);
 
   it("retried op skips components already updated on-chain; fee rides the next tx", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
-    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26";
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28";
     // first attempt lands sentry-0's update on-chain (then imagine an abort)
     w.fleet.requestUpgrade(launch, ["sentry-0"], image);
     const sigs0 = w.signer.signed.length;
@@ -301,7 +301,7 @@ describe("rolling upgrade op", () => {
     const opId = w.fleet.requestUpgrade(
       launch,
       ["sentry-0"],
-      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26",
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28",
     );
 
     const result = await driveOps(w);
@@ -571,7 +571,7 @@ describe("chain reset op", () => {
   it("swaps the node image mid-reset when the reset rides an upgrade", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
-    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.25";
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.27";
     const edited = JSON.parse(launch.spec_json);
     edited.images = { ...edited.images, sparkdreamd: image };
     w.fleet.requestChainReset(launch, edited);
