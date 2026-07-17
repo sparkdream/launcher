@@ -203,6 +203,8 @@ export interface FleetSummary {
   fleets: Array<{
     launchId: string;
     launchStatus: string;
+    /** The spec's network name (distinguishes fleets sharing a chain id). */
+    name: string;
     chainId: string;
     components: ComponentView[];
     ops: Array<{ id: number; kind: string; status: string; params: unknown }>;

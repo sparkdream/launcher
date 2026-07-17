@@ -55,6 +55,9 @@ export interface ComponentView {
 export interface FleetView {
   launchId: string;
   launchStatus: string;
+  /** The spec's network name — distinguishes fleets that share a chain id
+   *  (e.g. an origin fleet and a joiner on the same chain). */
+  name: string;
   chainId: string;
   components: ComponentView[];
   ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
@@ -306,6 +309,7 @@ export class FleetService {
       fleets.push({
         launchId: launch.id,
         launchStatus: launch.status,
+        name: spec.network.name,
         // join-aware: a joined fleet runs the LIVE chain, not name-suffix
         chainId: chainId(spec),
         components,
