@@ -2,11 +2,16 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { currentAssets } from "./chain-assets/context.js";
+
 /**
- * Locate vendor/sparkdream-deploy: env override first (tests, Docker),
- * then walk up from this file to the repo root.
+ * Locate the vendor deploy data: the running launch's assets context first
+ * (per-launch version, §13), then the env override (tests, Docker), then
+ * walk up from this file to the repo root (the baked vendor/).
  */
 export function vendorDir(): string {
+  const fromLaunch = currentAssets()?.vendorDir;
+  if (fromLaunch) return fromLaunch;
   const fromEnv = process.env.SPARKDREAM_VENDOR_DIR;
   if (fromEnv) return fromEnv;
   let dir = path.dirname(fileURLToPath(import.meta.url));

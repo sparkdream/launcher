@@ -6,6 +6,9 @@ export {
   type NetworkType,
 } from "./schema.js";
 export { profiles, type Profile } from "./profiles.js";
+export { VENDORED_CHAIN_VERSION, VENDORED_CHAIN_COMMIT } from "./vendor-info.js";
+export { CHAIN_RELEASES, type ChainRelease, type ChainReleaseImage } from "./releases.js";
+export { findChainRelease, knownChainVersions } from "./release-lookup.js";
 export {
   withDefaults,
   validateSpec,

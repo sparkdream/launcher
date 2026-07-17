@@ -124,6 +124,56 @@ export async function getFee(): Promise<FeeInfo> {
   return json(await afetch("/api/fee"));
 }
 
+/** §13 chain-asset visibility + resolution preview for the launch panel. */
+export interface ChainAssetsView {
+  /** baked = Offline, fetch = Online. */
+  mode: "baked" | "fetch";
+  /** True when CHAIN_ASSET_MODE env pins the mode — the toggle renders locked. */
+  locked: boolean;
+  bakedVersion: string;
+  /** Release-manifest versions this launcher build knows, newest first. */
+  knownVersions: string[];
+  cached: {
+    image: string;
+    commit?: string;
+    via: string;
+    dirty: boolean;
+    lastUsedAt: string;
+    complete: boolean;
+  }[];
+  /** Only with ?image=: what prepare-chain-assets would do for it. */
+  resolution?:
+    | "baked"
+    | "cache"
+    | "release"
+    | "tag"
+    | "pin"
+    | "prompt"
+    | "unavailable"
+    | "unknown";
+  commit?: string;
+  headCommit?: string | null;
+}
+
+export async function getChainAssets(image?: string, pin?: string): Promise<ChainAssetsView> {
+  const q = new URLSearchParams();
+  if (image) q.set("image", image);
+  if (pin) q.set("pin", pin);
+  const qs = q.toString();
+  return json(await afetch(`/api/chain-assets${qs ? `?${qs}` : ""}`));
+}
+
+/** Flip the Offline/Online toggle (409 when env-locked). */
+export async function setChainAssetsMode(mode: "baked" | "fetch"): Promise<void> {
+  await json(
+    await afetch("/api/chain-assets/mode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode }),
+    }),
+  );
+}
+
 /** Market-based running-cost estimate for a spec (pre-launch, no wallet). */
 export async function postEstimate(spec: unknown): Promise<CostEstimate> {
   return json(

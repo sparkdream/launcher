@@ -1230,6 +1230,14 @@ await-funds pause, create-validator via both operator modes (verify the
 amino/Ledger path on a live chain like M6 does for gentxs), bonded
 verification.
 
+**M9 — Per-launch chain assets** (§13) — implemented 2026-07-17. The spec's
+`images.sparkdreamd` version drives which binary and deploy data a launch
+uses: registry-extracted binary + shallow-cloned deploy data, cached under
+`/app/data`, baked assets as the offline fallback. Consistent chain-repo
+tags (§12 "Remaining chain-repo dependencies") make resolution automatic;
+without one, the launch panel prompts for the commit to pair with the
+image.
+
 ---
 
 ## 12. Open questions — resolved 2026-07-04 (verified against chain repo &
@@ -1286,3 +1294,210 @@ Tracked asks, ordered by which milestone they block:
   launcher deploys both components.
 - Entrypoint touch-file start gate + file-based tunnel specs (nice-to-have
   before M3; removes step 20b's extra signature and step 18's fragility).
+- Tag chain releases consistently (smooths M9, no longer blocks it):
+  image tags currently run ahead of git tags (v1.0.26 images exist while
+  the repo's newest tag is v1.0.25). A matching `vX` git tag on the
+  commit a release's deploy data came from makes M9's asset resolution
+  fully automatic; without one, the launch panel falls back to prompting
+  the user for the commit to pair with the image (§13).
+
+---
+
+## 13. Per-launch chain assets (M9) — implemented 2026-07-17
+
+One launcher build currently serves one chain version: the `sparkdreamd`
+binary is baked in from the chain image at Docker build time, the deploy
+data (reference genesis, config templates, SDLs) is vendored at sync time,
+and validate-spec's minimum-image floor is the vendored version
+(`vendor-info.ts`). Targeting an older or newer chain means rebuilding the
+launcher (README "Building for a specific chain version"). M9 removes that
+coupling: the version the spec names in `images.sparkdreamd` drives which
+binary and deploy data the launch uses, fetched on demand.
+
+**Explicit non-goal: building `sparkdreamd` from source at runtime.** A
+source build needs a Go toolchain in the image (~1.5GB), a full Cosmos SDK
+module download per version, and more CPU/RAM than the launcher's own
+deployment profile carries; it executes repo-controlled build scripts inside
+the process that holds key custody; and the result is not guaranteed
+byte-identical to what the fleet nodes boot (ldflags, wasmvm libs, base
+image). The published chain image is the canonical build: for any version a
+spec can name, validate-spec already requires that image to exist on Docker
+Hub, so the launcher extracts the binary from it instead.
+
+### New step 0 — `prepare-chain-assets` (Phase A, after `validate-spec`)
+
+Resolves the spec's `images.sparkdreamd` into a local assets context. The
+cache is keyed by the full image tag (sanitized as a directory name) under
+`/app/data/chain-assets/<tag>/`; release tags matching the `vX` semver
+scheme are the special case that also supports automatic fetch, since only
+they have a chain-repo git tag to clone:
+
+1. **Binary — registry extraction.** Pull the chain image's layers straight
+   from the registry API (anonymous Docker Hub token, linux/amd64 manifest),
+   scan newest layer first for `usr/local/bin/sparkdreamd` (honoring
+   whiteouts), and stream it to `<version>/sparkdreamd`. Bit-identical to
+   the binary the fleet nodes run, ~240MB transfer once per version.
+   Record the resolved manifest digest in the launch row (tags are mutable;
+   the digest is the audit trail) and reuse the cache on digest match.
+2. **Deploy data — shallow clone at a resolved ref.** A clone of the
+   chain repo at the resolved commit, then the same extraction
+   `sync-vendor.sh` performs, into the cache entry. The clone source is
+   `SPARKDREAM_CHAIN_REPO` (the env `sync-vendor.sh` already honors): a
+   URL or a local path (git clones from both), defaulting to the
+   SparkDream repo. Fetch sources (repo location, registry namespace) are
+   operator env config, **never spec fields**: in Akash mode the spec is
+   user input, and a spec-controlled source would feed untrusted templates
+   and reference genesis into genesis generation.
+
+   Ref resolution: a git tag matching the image's `vX` version, when it
+   exists, resolves automatically. When it does not (untagged release,
+   dev image, a repo whose tags lag its images), the launch panel prompts
+   instead of failing: it proposes the repo's current HEAD (showing the
+   commit and whether `deploy/config` changed since the newest tag) and
+   accepts an explicit commit hash. The chosen commit is written into the
+   spec as an optional pin (`images.chainRepoCommit`, hex-validated, only
+   selecting a commit within the operator-configured repo, so it stays
+   outside the source-injection concern above), which keeps step 0
+   non-interactive and the launch reproducible: resume and relaunch use
+   the recorded commit, not whatever HEAD moved to. A spec may also set
+   the pin up front to skip the prompt entirely. Mismatched deploy data
+   and binary (HEAD data against an older image) is the user's informed
+   choice; the prompt says so, and the commit lands in the launch row's
+   audit trail either way.
+
+Both substeps are idempotent (download to a temp path, atomic rename, cache
+hit checked first) so resume never re-fetches, and the step reports
+progress like any other (the UI gains a "fetching chain vX" stage before
+deployment ops). Cache pruning is automatic: keep the three most recently
+used versions (recency of use, not version order: a user pinned to an older
+chain must not have their working binary evicted by newer fetches), and
+never evict a version referenced by a launch in a non-terminal state.
+Eviction is always recoverable (step 0 re-fetches on the next launch), so
+pruning can degrade only to a re-download, never to a broken launch.
+
+### Plumbing
+
+`exec.ts` resolves the binary once from `SPARKDREAMD_BIN`; `vendor.ts`
+resolves one global vendor dir from `SPARKDREAM_VENDOR_DIR`. Both become
+per-launch: the engine threads an assets context `{ binPath, vendorDir }`
+(resolved by step 0) through genesis build, config rendering, and SDL
+rendering. Env overrides keep top precedence (tests, local dev), and the
+baked-in binary + `vendor/` remain the context when fetching is off.
+
+### Modes, fallback, and floor semantics
+
+`CHAIN_ASSET_MODE` selects the behavior, defaulting to offline:
+
+- **`baked` (default)** — offline: the conductor makes no asset-related
+  network calls at all, validate-spec's Docker Hub probe included. The
+  release manifest (below) replaces the probe's job for chain images —
+  known versions validate authoritatively with zero packets, and a version
+  the manifest doesn't know escalates to the user (typo, or a release
+  newer than this launcher build) instead of proceeding. Custom image
+  overrides go unprobed in this mode — the informed tradeoff the offline
+  toggle expresses. Assets resolve from the baked binary +
+  `vendor/` (when the
+  spec's version matches `vendor-info.ts`) or from a pre-seeded cache
+  entry: airgapped operators can place `sparkdreamd` + vendor data under
+  `/app/data/chain-assets/<version>/` by hand (or from a local repo via a
+  seeding command) to serve several versions with zero downloads. A spec
+  naming a version satisfied by neither fails validation with a clear
+  error naming both escape hatches (rebuild for that version, or seed the
+  cache); the static floor from `vendor-info.ts` applies to the baked
+  assets exactly as today. This keeps the local/airgapped mainnet path
+  (§2 security model) free of runtime fetches by construction, not by
+  configuration discipline.
+- **`fetch`** — step 0 downloads missing assets as described above. The
+  static floor check is replaced by an availability check folded into
+  validate-spec's existing Docker Hub probe: the image must exist; deploy
+  data then resolves via the matching git tag when present, else the
+  spec's `images.chainRepoCommit` pin, else the launch-panel prompt (HEAD
+  proposed, explicit commit accepted): a missing tag is never a hard
+  failure. When tag and image do match, genesis-format compatibility
+  holds by construction (binary, reference genesis, and node image all
+  come from the same release); a prompted or pinned commit is the user's
+  informed pairing instead. Cache and baked assets are still preferred;
+  the network is only touched for versions not already local.
+
+### The release manifest and the mode toggle
+
+A generated, checked-in manifest of known chain releases
+(`packages/launch-spec/src/releases.ts`, regenerated by
+`pnpm sync-releases` — the launcher's counterpart to the chain repo's
+`prepare-release.sh`, run as one added line on the release checklist)
+records per release: version, the chain-repo commit its deploy data came
+from, and the published image names with their registry manifest digests.
+It layers ON TOP of the resolution ladder — a manifest miss means
+"unknown, escalate", never "invalid", because a launcher build only knows
+releases up to its last sync:
+
+- **Offline validation**: baked mode checks chain-image versions against
+  the manifest with no network; unknown versions fail validation with the
+  known-version list and the remediations (sync + rebuild, seed, pin, or
+  switch to online mode).
+- **Commit resolution without tags**: fetch mode resolves deploy data
+  from the manifest commit first (`via: release`), before the git-tag /
+  pin / prompt ladder. Release discovery keys off the chain repo's
+  "Bump deploy images to vX" release-commit convention (enforced by its
+  prepare-release script), so git-tag lag can never reintroduce the
+  v1.0.25/v1.0.26 drift.
+- **Digest pinning**: when the manifest records a digest for the image,
+  fetch mode verifies the registry's manifest digest against it before
+  trusting the download — a moved tag is a hard, explainable error, not a
+  silent swap.
+
+**Mode is a user-facing toggle, operator-lockable.** The UI exposes
+Offline/Online (baked/fetch), persisted server-side (`POST
+/api/chain-assets/mode`, stored in the state db). When the operator sets
+`CHAIN_ASSET_MODE` in the environment it is authoritative and the toggle
+renders locked — an airgapped or mainnet launcher's offline guarantee is
+enforced by deployment config, not one browser click away.
+
+### Surfacing: UI, seeding tooling, docs
+
+Offline mode only works if an operator can discover what their launcher can
+launch and how to extend it, so M9 ships these alongside the mechanics:
+
+- **Asset visibility in the UI.** The conductor exposes
+  `GET /api/chain-assets`: the active mode, the baked version, and the
+  cached versions with digests and last-use times. The spec editor shows
+  the launchable versions next to the image field, and a spec naming an
+  unavailable version in `baked` mode gets a validation message with the
+  concrete remediation, not just "version unavailable": the seeding
+  command to run, or the version string that would work now.
+- **A seeding command, not hand-placed files.** `pnpm seed-chain-assets
+  <image-tag> [--chain-repo <path|url>] [--out <dir>]`: resolves the
+  binary (from a reachable registry, or a local chain image via a
+  path/tar) and the deploy data (repo clone at the matching git tag, or
+  for dev builds the working tree as-is, `sync-vendor.sh` style, with the
+  commit hash and a dirty flag recorded in place of a clean tag), writing
+  a complete cache entry, or with `--out` a portable directory to copy
+  onto an airgapped launcher's data volume. The manual layout stays
+  documented as the contract the command fulfills, but no operator
+  instruction should require assembling it by hand.
+- **Dev versions ride the commit prompt or the seeder.** A non-semver
+  image tag (a locally built `dev-<sha>` push) has no git tag, so it
+  resolves like any tagless version: the commit prompt (or an
+  `images.chainRepoCommit` pin) covers any commit reachable in the
+  configured repo, and `seed-chain-assets` covers the rest — dirty or
+  unpushed working trees, and airgapped launchers. The workflow is push
+  the dev image (the fleet nodes need it pullable anyway), pin or prompt
+  the commit (or seed from the working tree), launch. The semver floor
+  check already skips non-semver tags today; dev users are on their own
+  recognizance for genesis compatibility, which pairing the image with
+  the commit it was built from gives them by construction.
+- **Docs land with the feature.** README gains an "Offline mode and
+  pre-seeding" section (mode table, seeding walkthrough for the airgapped
+  mainnet path, cache layout reference), and the §2 security-model
+  recommendation for local mainnet launchers is updated to point at
+  `baked` mode explicitly. The existing "Building for a specific chain
+  version" recipe stays as the zero-runtime-config alternative.
+
+### Failure modes
+
+Registry rate limits (anonymous pulls are limited per IP: surface a
+retryable step error, never partial-cache), disk pressure (~240MB per
+cached version, pruned), a pinned commit that no longer exists in the
+configured repo (fail at validate-spec naming the pin, never silently
+substitute HEAD), and offline launchers (step 0 skips instantly when the
+cache or baked assets already satisfy the spec).

@@ -3,7 +3,28 @@ import websocket from "@fastify/websocket";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { chainId, checkSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  chainId,
+  checkSpec,
+  findChainRelease,
+  knownChainVersions,
+  withDefaults,
+  VENDORED_CHAIN_VERSION,
+  type LaunchSpec,
+} from "@sparkdream/launch-spec";
+import {
+  bakedSatisfies,
+  cacheEntry,
+  chainAssetMode,
+  chainAssetModeLocked,
+  chainRepoSource,
+  entryComplete,
+  imageSemver,
+  listCache,
+  lsRemoteHead,
+  lsRemoteTag,
+  setChainAssetMode,
+} from "./chain-assets/index.js";
 import type { ConductorDb } from "./db.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
@@ -181,6 +202,63 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.status(400).send({ error: "schema", detail: String(e) });
     }
     return estimateLaunchCost(spec);
+  });
+
+  // §13: chain-asset visibility + a resolution preview for the launch
+  // panel. With ?image= it answers "what would prepare-chain-assets do":
+  // baked | cache | release (manifest commit) | tag | pin | prompt (needs
+  // a commit — headCommit is the proposal) | unavailable (offline, a known
+  // release with no local assets) | unknown (offline, not in the manifest —
+  // typo or newer than this build; escalate).
+  app.get("/api/chain-assets", async (req) => {
+    const { image, pin } = req.query as { image?: string; pin?: string };
+    const mode = chainAssetMode(deps.db);
+    const base = {
+      mode,
+      locked: chainAssetModeLocked(),
+      bakedVersion: VENDORED_CHAIN_VERSION,
+      knownVersions: knownChainVersions(),
+      cached: listCache(deps.workRoot).map((c) => ({
+        image: c.image,
+        commit: c.meta.commit,
+        via: c.meta.via,
+        manifestDigest: c.meta.manifestDigest,
+        dirty: c.meta.dirty ?? false,
+        lastUsedAt: c.meta.lastUsedAt,
+        complete: c.complete,
+      })),
+    };
+    if (!image) return base;
+    if (bakedSatisfies(image)) return { ...base, resolution: "baked" };
+    if (entryComplete(cacheEntry(deps.workRoot, image))) return { ...base, resolution: "cache" };
+    const release = findChainRelease(image);
+    if (mode === "baked") {
+      return { ...base, resolution: release ? "unavailable" : "unknown" };
+    }
+    if (release) return { ...base, resolution: "release", commit: release.release.commit };
+    const source = chainRepoSource();
+    const version = imageSemver(image);
+    const tagCommit = version ? await lsRemoteTag(source, version).catch(() => null) : null;
+    if (tagCommit) return { ...base, resolution: "tag", commit: tagCommit };
+    if (pin) return { ...base, resolution: "pin", commit: pin };
+    const headCommit = await lsRemoteHead(source).catch(() => null);
+    return { ...base, resolution: "prompt", headCommit };
+  });
+
+  // §13: the user-facing Offline/Online toggle. 409 when the operator's
+  // CHAIN_ASSET_MODE env pins the mode.
+  app.post("/api/chain-assets/mode", async (req, reply) => {
+    const { mode } = (req.body ?? {}) as { mode?: string };
+    if (chainAssetModeLocked()) {
+      return reply
+        .status(409)
+        .send({ error: "mode is locked by the CHAIN_ASSET_MODE environment variable" });
+    }
+    try {
+      return { mode: setChainAssetMode(deps.db, mode ?? ""), locked: false };
+    } catch (e) {
+      return reply.status(400).send({ error: String((e as Error).message) });
+    }
   });
 
   app.post("/api/launches", async (req, reply) => {

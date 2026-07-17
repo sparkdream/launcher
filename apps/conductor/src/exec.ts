@@ -32,8 +32,13 @@ export function run(
   });
 }
 
-const BINARY = process.env.SPARKDREAMD_BIN ?? "sparkdreamd";
+import { currentAssets } from "./chain-assets/context.js";
 
+/**
+ * Binary resolution (§13): the running launch's assets context first (set
+ * by runLaunch per launch), then the env override, then PATH.
+ */
 export function sparkdreamd(args: string[]): Promise<ExecResult> {
-  return run(BINARY, args);
+  const bin = currentAssets()?.bin ?? process.env.SPARKDREAMD_BIN ?? "sparkdreamd";
+  return run(bin, args);
 }

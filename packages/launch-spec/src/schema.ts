@@ -283,6 +283,17 @@ export const launchSpecSchema = z.object({
 
   images: z.object({
     sparkdreamd: z.string().min(1),
+    /**
+     * Chain-repo commit pinning the deploy data (reference genesis,
+     * templates, SDLs) paired with the sparkdreamd image (§13). Only
+     * consulted in fetch mode when the image's version has no matching git
+     * tag; selects a commit within the operator-configured repo, never a
+     * repo. Written by the launch panel's commit prompt, or set by hand.
+     */
+    chainRepoCommit: z
+      .string()
+      .regex(/^[0-9a-f]{7,40}$/, "expected a git commit hash (7-40 hex chars)")
+      .optional(),
     headscale: z.string().min(1),
     explorer: z.string().optional(),
     frontend: z.string().optional(),

@@ -3,12 +3,13 @@
 #
 # The sparkdreamd binary is copied from the chain image; keep the tag in sync
 # with the launch-spec profiles (packages/launch-spec/src/profiles.ts).
-ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.24
+ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.26
 
 FROM ${SPARKDREAMD_IMAGE} AS chainbin
 
 FROM node:22-alpine AS build
-RUN corepack enable
+# python3/make/g++: compile better-sqlite3's native addon (no musl prebuilt)
+RUN apk add --no-cache python3 make g++ && corepack enable
 WORKDIR /src
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY packages ./packages
@@ -19,7 +20,8 @@ RUN pnpm install --frozen-lockfile && pnpm -r build
 
 FROM node:22-alpine
 # openssl: Akash client certs · age: backup/bundle encryption · tar: bundles
-RUN apk add --no-cache openssl age tar openssh-client \
+# git: chain-asset fetch mode clones deploy data at the resolved commit (§13)
+RUN apk add --no-cache openssl age tar openssh-client git \
   && wget -qO- https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-amd64.tar.gz \
      | tar xz -C /usr/local/bin litestream || echo "litestream download failed (offline build?) — replication disabled"
 

@@ -1,0 +1,165 @@
+/**
+ * sync-releases (§13): regenerate the launcher's chain-release manifest
+ * (packages/launch-spec/src/releases.ts) from the chain repo's history —
+ * the launcher's counterpart to the chain repo's prepare-release.sh, run
+ * as one added line on the release checklist. Prints a summary and a
+ * suggested commit message; does NOT commit.
+ *
+ *   pnpm sync-releases [options]
+ *
+ * Options:
+ *   --chain-repo <path|url>  chain repo (default: SPARKDREAM_CHAIN_REPO or
+ *                            ~/cosmos/sparkdream/sparkdream). History
+ *                            scanning needs a local clone.
+ *   --no-digests             skip Docker Hub digest lookups (offline sync;
+ *                            digest pinning disabled for affected releases)
+ *
+ * Release discovery keys off the chain repo's release-commit convention
+ * ("Bump deploy images to vX ...", enforced by its prepare-release.sh),
+ * with git tags as fallback — so image tags running ahead of git tags
+ * cannot desync the manifest.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { run } from "../exec.js";
+import { parseImageRef, resolveManifest } from "./registry.js";
+import { chainRepoSource } from "./deploy-data.js";
+
+const argv = process.argv.slice(2);
+const flags: Record<string, string | boolean> = {};
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i]!;
+  if (a === "--no-digests") flags["no-digests"] = true;
+  else if (a === "--chain-repo") flags["chain-repo"] = argv[++i] ?? "";
+  else {
+    console.error(`unknown argument: ${a}`);
+    process.exit(2);
+  }
+}
+
+const repo = (flags["chain-repo"] as string) || chainRepoSource();
+if (!fs.existsSync(path.join(repo, ".git"))) {
+  console.error(`error: ${repo} is not a local git clone — pass --chain-repo`);
+  process.exit(1);
+}
+const git = (...args: string[]) => run("git", ["-C", repo, ...args]);
+
+// --- 1. discover releases: bump-commit convention first, tags as fallback
+const versionCommit = new Map<string, string>();
+const log = (await git("log", "--format=%H%x09%s")).stdout.trim().split("\n");
+for (const line of log) {
+  const [hash, subject] = line.split("\t");
+  const m = /^Bump deploy images to (v\d+\.\d+\.\d+)/.exec(subject ?? "");
+  // newest occurrence wins (log is newest-first, first hit per version)
+  if (m && hash && !versionCommit.has(m[1]!)) versionCommit.set(m[1]!, hash);
+}
+const tagList = (await git("tag", "--list", "v*")).stdout.trim().split("\n").filter(Boolean);
+for (const tag of tagList) {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag) || versionCommit.has(tag)) continue;
+  const commit = (await git("rev-list", "-n", "1", tag)).stdout.trim();
+  if (commit) versionCommit.set(tag, commit);
+}
+
+// --- 2. per release: image names from the SDLs at that commit
+interface ReleaseImage {
+  image: string;
+  digest?: string;
+}
+interface Release {
+  version: string;
+  commit: string;
+  images: ReleaseImage[];
+}
+
+const NETWORKS = ["devnet", "testnet", "mainnet"];
+const releases: Release[] = [];
+for (const [version, commit] of versionCommit) {
+  const images = new Set<string>();
+  for (const network of NETWORKS) {
+    const sdl = await git(
+      "show",
+      `${commit}:deploy/config/network/${network}/validator.sdl.yaml`,
+    ).catch(() => null);
+    const m = sdl && /image:\s*(sparkdreamnft\/sparkdreamd-[a-z]+-ssh:\S+)/.exec(sdl.stdout);
+    if (m) images.add(m[1]!);
+  }
+  if (images.size === 0) {
+    console.warn(`warn: ${version} (${commit.slice(0, 12)}) has no readable SDLs — skipped`);
+    continue;
+  }
+  // SDL image tags should match the release version; note drift loudly
+  for (const image of images) {
+    if (!image.endsWith(`:${version}`)) {
+      console.warn(`warn: ${version} SDL names ${image} (tag differs from release version)`);
+    }
+  }
+  releases.push({ version, commit, images: [...images].sort().map((image) => ({ image })) });
+}
+const semver = (v: string) => v.slice(1).split(".").map(Number) as [number, number, number];
+releases.sort((a, b) => {
+  const [a0, a1, a2] = semver(a.version);
+  const [b0, b1, b2] = semver(b.version);
+  return b0 - a0 || b1 - a1 || b2 - a2;
+});
+
+// --- 3. digests from the registry (skippable for offline syncs)
+if (!flags["no-digests"]) {
+  for (const release of releases) {
+    for (const entry of release.images) {
+      try {
+        const digest = (await resolveManifest(parseImageRef(entry.image))).digest;
+        if (digest) entry.digest = digest;
+        console.log(`digest ${entry.image} → ${digest || "(none)"}`);
+      } catch (e) {
+        console.warn(`warn: no digest for ${entry.image} (${(e as Error).message.split("\n")[0]})`);
+      }
+    }
+  }
+} else {
+  console.log("skipping digest lookups (--no-digests)");
+}
+
+// --- 4. generate releases.ts
+const outPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../../packages/launch-spec/src/releases.ts",
+);
+const body = `// Generated by scripts: pnpm sync-releases — do not edit by hand.
+//
+// Known chain releases (§13): version, the chain-repo commit each release's
+// deploy data came from, and the published sparkdreamd images with their
+// registry manifest digests (when resolvable at sync time). A version
+// missing here is UNKNOWN to this launcher build, not invalid — resolution
+// escalates to the user. Newest first.
+export interface ChainReleaseImage {
+  image: string;
+  /** Registry manifest digest at sync time — fetch mode verifies against it. */
+  digest?: string;
+}
+
+export interface ChainRelease {
+  version: string;
+  /** Chain-repo commit of this release's deploy data (its bump commit). */
+  commit: string;
+  images: ChainReleaseImage[];
+}
+
+export const CHAIN_RELEASES: ChainRelease[] = ${JSON.stringify(releases, null, 2)};
+`;
+const before = fs.existsSync(outPath) ? fs.readFileSync(outPath, "utf8") : "";
+fs.writeFileSync(outPath, body);
+
+console.log(`\n${releases.length} release(s) → ${outPath}`);
+for (const r of releases) {
+  const digests = r.images.filter((i) => i.digest).length;
+  console.log(`  ${r.version}  ${r.commit.slice(0, 12)}  images ${r.images.length} (${digests} digest-pinned)`);
+}
+if (before === body) {
+  console.log("\nmanifest unchanged — nothing to commit");
+} else {
+  console.log(
+    "\nnot committing — suggested commit message:\n" +
+      `  Sync the chain-release manifest (${releases[0]?.version ?? "no releases"} latest).`,
+  );
+}

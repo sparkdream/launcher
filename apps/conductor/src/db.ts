@@ -23,6 +23,10 @@ export interface StepRow {
 }
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS launches (
   id         TEXT PRIMARY KEY,
   owner      TEXT NOT NULL DEFAULT '',
@@ -144,6 +148,21 @@ export class ConductorDb {
        FROM provider_prefs pp JOIN launches l ON l.id = pp.launch_id
        WHERE l.owner <> ''`,
     );
+  }
+
+  getSetting(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  setSetting(key: string, value: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(key, value);
   }
 
   close(): void {
@@ -363,6 +382,15 @@ export class ConductorDb {
     return this.db
       .prepare("SELECT * FROM launches WHERE owner = ? ORDER BY created_at")
       .all(owner) as LaunchRow[];
+  }
+
+  /** Launches in a non-terminal state — their chain assets must not be pruned (§13). */
+  listActiveLaunches(): LaunchRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM launches WHERE status NOT IN ('completed','aborted') ORDER BY created_at",
+      )
+      .all() as LaunchRow[];
   }
 
   /** Launches whose driver was mid-run when the process died (boot resume). */

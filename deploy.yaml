@@ -5,7 +5,7 @@
 version: "2.0"
 services:
   launcher:
-    image: sparkdreamnft/launcher:v0.1.0
+    image: sparkdreamnft/launcher:v1.0.0
     expose:
       - port: 8080
         as: 80
@@ -24,6 +24,10 @@ services:
       # chain + provider-metadata endpoints for the compute network
       - "AKASH_LCD=https://rest.example.com"
       - "CONSOLE_API=https://console-api.example.com"
+      # optional: fetch chain assets for spec versions this image doesn't
+      # bake (needs a chain repo URL reachable from the provider)
+      # - "CHAIN_ASSET_MODE=fetch"
+      # - "SPARKDREAM_CHAIN_REPO=https://github.com/YOUR_ORG/sparkdream.git"
       # optional: replicate the SQLite state db (same pattern as headscale)
       # - "LITESTREAM_REPLICA_URL=s3://BUCKET/launcher-state"
       # - "LITESTREAM_ACCESS_KEY_ID=..."

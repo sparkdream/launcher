@@ -636,3 +636,27 @@ describe("image version floor (reference-genesis compatibility)", () => {
     expect(res.errors.some((e) => e.path === "images.sparkdreamd")).toBe(false);
   });
 });
+
+describe("images.chainRepoCommit (§13 deploy-data pin)", () => {
+  it("accepts a hex commit hash, short or full", () => {
+    expect(
+      checkSpec(testnetSpecInput({ images: { chainRepoCommit: "c8e0014" } })).ok,
+    ).toBe(true);
+    expect(
+      checkSpec(
+        testnetSpecInput({
+          images: { chainRepoCommit: "c8e001433d833339b3ea6378d57930eede7777ab" },
+        }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it("rejects non-hex refs (branch names, tags)", () => {
+    const res = checkSpec(testnetSpecInput({ images: { chainRepoCommit: "main" } }));
+    expect(res.errors.some((e) => e.path === "images.chainRepoCommit")).toBe(true);
+  });
+
+  it("is optional", () => {
+    expect(checkSpec(testnetSpecInput()).ok).toBe(true);
+  });
+});

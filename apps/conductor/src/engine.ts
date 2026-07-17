@@ -4,6 +4,7 @@ import type { LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb } from "./db.js";
 import type { Msg } from "./akash/messages.js";
 import type { Services } from "./services.js";
+import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
 
 export interface LaunchDirs {
   /** Root of this launch's workspace. */
@@ -57,6 +58,8 @@ export interface StepCtx {
   launchId: string;
   spec: LaunchSpec;
   dirs: LaunchDirs;
+  /** DATA_DIR root — launch workspaces and the chain-asset cache live under it. */
+  workRoot: string;
   db: ConductorDb;
   services: Services;
   log: (message: string) => void;
@@ -107,6 +110,7 @@ export async function runLaunch(
     launchId,
     spec,
     dirs,
+    workRoot,
     db,
     services,
     log,
@@ -167,7 +171,11 @@ export async function runLaunch(
     log(`run ${step.name}`);
     db.stepStarted(launchId, step.name);
     try {
-      const output = await step.run(ctx);
+      // §13: every step runs inside this launch's chain-assets context so
+      // sparkdreamd()/vendorDir() resolve the per-version binary and deploy
+      // data. Null (nothing resolved yet — before prepare-chain-assets
+      // materializes, or a pre-M9 launch) falls through to baked behavior.
+      const output = await runWithAssets(resolveChainAssets(spec, workRoot), () => step.run(ctx));
       db.stepDone(launchId, step.name, output);
     } catch (cause) {
       if (cause instanceof AwaitSignature) {

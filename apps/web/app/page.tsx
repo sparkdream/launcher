@@ -8,6 +8,7 @@ import yaml from "js-yaml";
 import { specPathLine } from "../lib/spec-lines";
 import {
   createLaunch,
+  getChainAssets,
   getFleet,
   getLaunch,
   getPendingGentx,
@@ -17,7 +18,9 @@ import {
   postTxResult,
   resumeLaunch,
   startLaunch,
+  setChainAssetsMode,
   type AccountView,
+  type ChainAssetsView,
   type ComponentView,
   type CostEstimate,
   type FeeInfo,
@@ -675,6 +678,52 @@ export default function Page() {
     updateSpec(yaml.dump(doc, { lineWidth: 120, noRefs: true }));
   };
 
+  // ---- §13 chain assets: ask the conductor what the spec's chain version
+  // resolves to (baked/cache/tag/pin), or whether it needs a commit prompt
+  // (no matching chain-repo tag) or is unavailable (baked mode, not local).
+  const specImage: string | undefined = (specCheck.spec as any)?.images?.sparkdreamd;
+  const specRepoPin: string | undefined = (specCheck.spec as any)?.images?.chainRepoCommit;
+  const [chainAssets, setChainAssets] = useState<ChainAssetsView | null>(null);
+  const [assetsNonce, setAssetsNonce] = useState(0);
+  useEffect(() => {
+    if (!specImage) {
+      setChainAssets(null);
+      return;
+    }
+    let stale = false;
+    const t = setTimeout(() => {
+      getChainAssets(specImage, specRepoPin)
+        .then((v) => !stale && setChainAssets(v))
+        .catch(() => !stale && setChainAssets(null));
+    }, 400);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [specImage, specRepoPin, assetsNonce]);
+  const toggleAssetsMode = async (mode: "baked" | "fetch") => {
+    try {
+      await setChainAssetsMode(mode);
+    } catch {
+      // locked or unreachable — the refresh below re-syncs the display
+    }
+    setAssetsNonce((n) => n + 1);
+  };
+  const assetsNeedCommit = chainAssets?.resolution === "prompt";
+  const assetsUnavailable = chainAssets?.resolution === "unavailable";
+  const assetsUnknown = chainAssets?.resolution === "unknown";
+  const [repoCommitDraft, setRepoCommitDraft] = useState("");
+  useEffect(() => {
+    if (assetsNeedCommit) setRepoCommitDraft(chainAssets?.headCommit ?? "");
+  }, [assetsNeedCommit, chainAssets?.headCommit]);
+  const repoCommitValid = /^[0-9a-f]{7,40}$/.test(repoCommitDraft.trim());
+  const pinRepoCommit = () => {
+    if (!repoCommitValid) return;
+    patchSpec((doc) => {
+      doc.images = { ...(doc.images ?? {}), chainRepoCommit: repoCommitDraft.trim() };
+    });
+  };
+
   const specName: string = specDoc?.network?.name ?? "";
   const specType: string = specDoc?.network?.type ?? "devnet";
   const specSym: string = specDoc?.token?.displayDenom ?? "";
@@ -1104,14 +1153,25 @@ export default function Page() {
     ? `$${costEstimate.totalLowUsd.toFixed(2)}–${costEstimate.totalHighUsd.toFixed(2)}`
     : null;
 
-  const launchDisabled = !wallet || busy !== null || !specCheck.ok || depositShortfall > 0;
+  const launchDisabled =
+    !wallet ||
+    busy !== null ||
+    !specCheck.ok ||
+    depositShortfall > 0 ||
+    assetsNeedCommit ||
+    assetsUnavailable ||
+    assetsUnknown;
   const launchDisabledWhy = !wallet
     ? "connect Keplr first"
     : !specCheck.ok
       ? "fix the spec errors first"
-      : depositShortfall > 0
-        ? `the wallet is short ${microToDisplay(String(depositShortfall))} ${denomLabel} for deposits`
-        : undefined;
+      : assetsNeedCommit
+        ? "pin the chain-repo commit for this chain version first"
+        : assetsUnavailable || assetsUnknown
+          ? "this launcher cannot serve the spec's chain version (see the chain-assets note)"
+          : depositShortfall > 0
+            ? `the wallet is short ${microToDisplay(String(depositShortfall))} ${denomLabel} for deposits`
+            : undefined;
 
   const wizardGo = (i: number) => {
     if (i <= wizMax) setWizStep(i);
@@ -1159,6 +1219,122 @@ export default function Page() {
         })}
       </ul>
     ) : null;
+
+  // §13: chain-asset controls — the Offline/Online toggle (locked when the
+  // operator env pins the mode), the commit prompt when nothing else
+  // resolves, escalation for unknown versions, remediation for known ones,
+  // a quiet confirmation otherwise
+  const assetsModeToggle = () =>
+    chainAssets && (
+      <div className="ready-banner" style={{ gap: 8 }}>
+        <span className="grow">
+          Chain assets: {chainAssets.mode === "baked" ? "Offline" : "Online"} mode
+          {chainAssets.locked ? " (set by the operator)" : ""}
+        </span>
+        {!chainAssets.locked && (
+          <button
+            className="btn"
+            style={{ flex: "none" }}
+            onClick={() => toggleAssetsMode(chainAssets.mode === "baked" ? "fetch" : "baked")}
+          >
+            {chainAssets.mode === "baked" ? "Switch to Online" : "Switch to Offline"}
+          </button>
+        )}
+      </div>
+    );
+  const assetsBanner = () => {
+    if (assetsUnknown) {
+      const known = chainAssets?.knownVersions ?? [];
+      return (
+        <div className="ready-banner warn">
+          <span className="grow">
+            {specImage} is unknown to this launcher: a typo, or a release newer than this
+            build. Known versions: {known.slice(0, 5).join(", ")}
+            {known.length > 5 ? ", …" : ""}. Fix the version, seed the cache (pnpm
+            seed-chain-assets {specImage}){chainAssets?.locked ? "" : ", or go online"}.
+          </span>
+          {!chainAssets?.locked && (
+            <button
+              className="btn amber"
+              style={{ flex: "none" }}
+              onClick={() => toggleAssetsMode("fetch")}
+            >
+              Switch to Online
+            </button>
+          )}
+        </div>
+      );
+    }
+    if (assetsUnavailable)
+      return (
+        <div className="ready-banner warn">
+          <span className="grow">
+            {specImage} is a known release, but this launcher is in Offline mode with no
+            local assets for it (baked: {chainAssets?.bakedVersion}). Seed the cache (pnpm
+            seed-chain-assets {specImage}), rebuild for that version
+            {chainAssets?.locked ? "." : ", or go online."}
+          </span>
+          {!chainAssets?.locked && (
+            <button
+              className="btn amber"
+              style={{ flex: "none" }}
+              onClick={() => toggleAssetsMode("fetch")}
+            >
+              Switch to Online
+            </button>
+          )}
+        </div>
+      );
+    if (assetsNeedCommit)
+      return (
+        <div className="ready-banner warn">
+          <span className="grow">
+            No chain release or repo tag matches {specImage}. Pin the commit to pair its
+            deploy data with{chainAssets?.headCommit ? " (repo HEAD proposed)" : ""}:
+          </span>
+          <input
+            className="field"
+            style={{ flex: "1 1 300px", fontFamily: "var(--mono, monospace)" }}
+            value={repoCommitDraft}
+            onChange={(e) => setRepoCommitDraft(e.target.value)}
+            placeholder="chain-repo commit hash"
+          />
+          <button
+            className="btn amber"
+            style={{ flex: "none" }}
+            onClick={pinRepoCommit}
+            disabled={!repoCommitValid}
+          >
+            Pin commit
+          </button>
+        </div>
+      );
+    if (
+      chainAssets &&
+      (chainAssets.resolution === "release" ||
+        chainAssets.resolution === "tag" ||
+        chainAssets.resolution === "pin" ||
+        chainAssets.resolution === "cache")
+    )
+      return (
+        <div className="ready-banner ok">
+          <span className="grow">
+            ✓ Chain assets{" "}
+            {chainAssets.resolution === "cache"
+              ? "are cached locally"
+              : `will be fetched (deploy data via ${
+                  chainAssets.resolution === "release"
+                    ? "the release manifest"
+                    : chainAssets.resolution === "tag"
+                      ? "matching tag"
+                      : "pinned commit"
+                }${chainAssets.commit ? ` @ ${chainAssets.commit.slice(0, 12)}` : ""})`}
+            .
+          </span>
+        </div>
+      );
+    return null;
+  };
 
   const costBreakdownRows = (short: boolean) => {
     if (!resolvedImages) return null;
@@ -1933,6 +2109,8 @@ export default function Page() {
                       </button>
                     )}
                   </div>
+                  {assetsModeToggle()}
+                  {assetsBanner()}
                   {specIssueList(true)}
                   <div className="wiz-nav">
                     <button className="btn" onClick={() => setWizStep(1)}>
@@ -2019,6 +2197,8 @@ export default function Page() {
                       </div>
                     </>
                   )}
+                  {assetsModeToggle()}
+                  {assetsBanner()}
                   {specIssueList(mode !== "yaml")}
                 </div>
                 {editorRail}

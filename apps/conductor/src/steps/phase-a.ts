@@ -33,6 +33,13 @@ import { fetchJoinGenesis, resolveStateSyncTrust } from "./join.js";
 import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
+import {
+  bakedModeError,
+  chainAssetMode,
+  fetchChainAssets,
+  pruneCache,
+  resolveChainAssets,
+} from "../chain-assets/index.js";
 
 /**
  * Placeholder for values only known in Phase E (tailnet IPs) or Phase C
@@ -70,17 +77,67 @@ export const validateSpecStep: StepDef = {
       );
     }
     for (const w of result.warnings) ctx.log(`warning: ${w.path}: ${w.message}`);
-    // fail fast on unpublished images — otherwise the pods ImagePullBackOff
-    // silently 15 steps later, after real deposits are on-chain
-    for (const image of Object.values(ctx.spec.images).filter((i): i is string => Boolean(i))) {
-      if (await dockerHubTagMissing(ctx, image)) {
-        throw new Error(
-          `image ${image} not found on Docker Hub — push it (chain repo: ` +
-            `make docker-build-*-ssh VERSION=<tag> && docker push) or override spec.images`,
-        );
+    // §13 image checks by mode. OFFLINE (baked): zero network — the release
+    // manifest answers for chain images (an unresolvable version escalates
+    // to the user here, before any deposit), custom overrides are the
+    // user's informed risk. ONLINE (fetch): probe Docker Hub for every
+    // image — unpushed images otherwise ImagePullBackOff 15 steps later,
+    // after real deposits are on-chain (errors are non-gating, only a
+    // positive 404 fails).
+    if (chainAssetMode(ctx.db) === "baked") {
+      if (!resolveChainAssets(ctx.spec, ctx.workRoot)) {
+        throw bakedModeError(ctx.spec.images.sparkdreamd);
       }
+      return result;
+    }
+    const { chainRepoCommit: _pin, ...imageRefs } = ctx.spec.images;
+    const images = Object.values(imageRefs).filter((i): i is string => Boolean(i));
+    const missing = (
+      await Promise.all(
+        images.map(async (image) => ((await dockerHubTagMissing(ctx, image)) ? image : null)),
+      )
+    ).filter((i): i is string => i !== null);
+    if (missing.length > 0) {
+      throw new Error(
+        `image ${missing[0]} not found on Docker Hub — push it (chain repo: ` +
+          `make docker-build-*-ssh VERSION=<tag> && docker push) or override spec.images`,
+      );
     }
     return result;
+  },
+};
+
+/**
+ * §13 step 0: resolve the spec's chain version into a binary + vendor dir.
+ * Baked build and cache hits are instant; fetch mode materializes missing
+ * assets (registry-extracted binary, deploy data cloned at the resolved
+ * commit) and prunes the cache to the recently used versions afterwards.
+ * The returned output is the launch's asset audit record.
+ */
+const KEEP_CACHED_VERSIONS = 3;
+
+export const prepareChainAssetsStep: StepDef = {
+  name: "prepare-chain-assets",
+  async run(ctx) {
+    const mode = chainAssetMode(ctx.db);
+    let assets = resolveChainAssets(ctx.spec, ctx.workRoot);
+    if (!assets) {
+      if (mode === "baked") throw bakedModeError(ctx.spec.images.sparkdreamd);
+      assets = await fetchChainAssets(ctx.spec, ctx.workRoot, ctx.log);
+    }
+    // prune AFTER materializing so the new entry counts as most recent;
+    // versions referenced by any non-terminal launch are never evicted
+    const active = new Set<string>();
+    for (const row of ctx.db.listActiveLaunches()) {
+      try {
+        active.add((JSON.parse(row.spec_json) as LaunchSpec).images.sparkdreamd);
+      } catch {
+        // unparseable legacy row — nothing to protect
+      }
+    }
+    const evicted = pruneCache(ctx.workRoot, KEEP_CACHED_VERSIONS, active);
+    for (const image of evicted) ctx.log(`evicted cached chain assets for ${image}`);
+    return { mode, ...assets };
   },
 };
 
@@ -444,6 +501,7 @@ export const renderSdlsStep: StepDef = {
 export function phaseASteps(): StepDef[] {
   return [
     validateSpecStep,
+    prepareChainAssetsStep,
     generateKeysStep,
     buildGenesisStep,
     renderConfigsStep,
