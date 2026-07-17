@@ -70,6 +70,8 @@ main.shell {
 .topbar {
   display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   padding: 16px 26px; border-bottom: 1px solid var(--line);
+  /* above .content (z-index 1) so the settings dropdown overlays it */
+  z-index: 2;
 }
 /* wordmark matches sparkdream-ui's .sd-wordmark / .sd-glyph */
 .logo { display: flex; align-items: center; gap: 10px; }
@@ -129,6 +131,70 @@ main.shell {
 }
 .net-grid .actions { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
 .net-mint { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+
+/* ---------- settings cog (launcher-wide controls) ---------- */
+.settings-wrap { position: relative; }
+.settings-cog {
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line);
+  color: var(--mid); border-radius: 8px; width: 34px; height: 34px;
+  font-size: 15px; line-height: 1; cursor: pointer;
+}
+.settings-cog:hover { background: rgba(255, 255, 255, 0.09); color: var(--fg); }
+/* dropdown rows follow sparkdream-ui's settings menu: stroke icon on the
+   left, semibold title, dim one-line subtitle underneath */
+.settings-menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 40;
+  min-width: 258px; background: #131318; border: 1px solid var(--line);
+  border-radius: 12px; padding: 8px; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+}
+.settings-menu .menu-item {
+  display: flex; align-items: flex-start; gap: 12px;
+  width: 100%; text-align: left; background: none; border: none; cursor: pointer;
+  color: var(--fg); padding: 10px 12px; border-radius: 9px;
+}
+.settings-menu .menu-item:hover { background: rgba(255, 255, 255, 0.06); }
+.settings-menu .menu-item svg {
+  width: 17px; height: 17px; flex: none; margin-top: 2px; color: var(--dim);
+}
+.settings-menu .mi-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.settings-menu .mi-title { font-weight: 600; font-size: 13.5px; line-height: 1.2; }
+.settings-menu .mi-sub { font-size: 12px; color: var(--dim); line-height: 1.3; }
+
+/* ---------- system panel (above the Launch panel) ---------- */
+.sys-panel { margin-bottom: 18px; }
+.sys-blocks { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.sys-block {
+  border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px; align-items: flex-start;
+}
+.sys-block.focus { border-color: rgba(109, 106, 248, 0.5); }
+.sys-block .ready-banner { width: 100%; }
+/* same tier as .fleet-row .provider so the panels read like the fleet list */
+.sys-desc { font-size: 12px; color: var(--dim); line-height: 1.5; }
+.sys-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sys-actions input[type="file"] { display: none; }
+.sys-mode { font-size: 12.5px; color: var(--mid); }
+/* online = actively networked, shown in the same green as live/healthy states */
+.sys-mode.on { color: var(--ok); font-weight: 600; }
+.settings-menu .mi-sub.on { color: var(--ok); }
+@media (max-width: 900px) {
+  .sys-blocks { grid-template-columns: 1fr; }
+}
+
+/* ---------- modal (passphrase prompt) ---------- */
+.modal-scrim {
+  position: fixed; inset: 0; z-index: 50; background: rgba(4, 4, 8, 0.66);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.modal {
+  width: 100%; max-width: 420px; background: #14141c; border: 1px solid var(--line);
+  border-radius: 12px; padding: 22px; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+.modal .k {
+  font-family: var(--font-head); font-size: 15px; font-weight: 600; margin-bottom: 8px;
+}
+.modal .note { font-size: 12px; color: var(--faint); line-height: 1.5; margin: 0 0 14px; }
+.modal .actions { display: flex; gap: 8px; }
 
 /* ---------- fields ---------- */
 .f-label {

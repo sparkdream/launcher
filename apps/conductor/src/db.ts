@@ -169,6 +169,114 @@ export class ConductorDb {
     this.db.close();
   }
 
+  /** Consistent point-in-time snapshot via the online backup API (safe
+   *  under WAL with the handle open — never copy state.db directly). */
+  backupTo(dest: string): Promise<unknown> {
+    return this.db.backup(dest);
+  }
+
+  listLaunches(): LaunchRow[] {
+    return this.db.prepare("SELECT * FROM launches ORDER BY created_at").all() as LaunchRow[];
+  }
+
+  /** Insert a setting only when the key is absent; true when inserted. */
+  addSettingIfAbsent(key: string, value: string): boolean {
+    return (
+      this.db
+        .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
+        .run(key, value).changes > 0
+    );
+  }
+
+  /** Insert a wallet-global provider pref only when absent; true when inserted. */
+  addProviderPrefIfAbsent(
+    owner: string,
+    provider: string,
+    kind: string,
+    name: string | null,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO provider_prefs_global (owner, provider, kind, name) VALUES (?, ?, ?, ?)",
+        )
+        .run(owner, provider, kind, name).changes > 0
+    );
+  }
+
+  /**
+   * Re-insert a launch and all its launch-scoped rows from a backup
+   * snapshot, atomically (backup import). AUTOINCREMENT ids are not
+   * preserved; every insert names its columns so snapshots from older
+   * schemas restore cleanly.
+   */
+  restoreLaunch(data: {
+    launch: LaunchRow;
+    steps: Array<Omit<StepRow, "id">>;
+    components: Array<Omit<FleetComponentRow, "id">>;
+    ops: Array<Omit<FleetOpRow, "id">>;
+    gentxs: Array<Omit<PendingGentxRow, "id">>;
+    txs: Array<Omit<PendingTxRow, "id">>;
+    prefs: Array<{ launch_id: string; provider: string; kind: string; name: string | null }>;
+  }): void {
+    const restore = this.db.transaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO launches (id, owner, spec_json, status, created_at) VALUES (@id, @owner, @spec_json, @status, @created_at)",
+        )
+        .run(data.launch);
+      for (const s of data.steps) {
+        this.db
+          .prepare(
+            `INSERT INTO launch_steps (launch_id, name, status, started_at, finished_at, output_json, error)
+             VALUES (@launch_id, @name, @status, @started_at, @finished_at, @output_json, @error)`,
+          )
+          .run(s);
+      }
+      for (const c of data.components) {
+        this.db
+          .prepare(
+            `INSERT INTO fleet_components
+               (launch_id, key, dseq, provider, host_uri, price, state, generation, ssh_host, ssh_port, tailnet_ip, image)
+             VALUES (@launch_id, @key, @dseq, @provider, @host_uri, @price, @state, @generation,
+                     @ssh_host, @ssh_port, @tailnet_ip, @image)`,
+          )
+          .run(c);
+      }
+      for (const o of data.ops) {
+        this.db
+          .prepare(
+            "INSERT INTO fleet_ops (launch_id, kind, params_json, status, created_at) VALUES (@launch_id, @kind, @params_json, @status, @created_at)",
+          )
+          .run(o);
+      }
+      for (const g of data.gentxs) {
+        this.db
+          .prepare(
+            `INSERT INTO pending_gentxs (launch_id, val_index, address, sign_doc_json, status, response_json)
+             VALUES (@launch_id, @val_index, @address, @sign_doc_json, @status, @response_json)`,
+          )
+          .run(g);
+      }
+      for (const t of data.txs) {
+        this.db
+          .prepare(
+            `INSERT INTO pending_txs (launch_id, step, msgs_json, status, tx_hash, created_at)
+             VALUES (@launch_id, @step, @msgs_json, @status, @tx_hash, @created_at)`,
+          )
+          .run(t);
+      }
+      for (const p of data.prefs) {
+        this.db
+          .prepare(
+            "INSERT INTO provider_prefs (launch_id, provider, kind, name) VALUES (@launch_id, @provider, @kind, @name)",
+          )
+          .run(p);
+      }
+    });
+    restore();
+  }
+
   createLaunch(id: string, specJson: string, owner = ""): void {
     this.db
       .prepare("INSERT INTO launches (id, owner, spec_json) VALUES (?, ?, ?)")

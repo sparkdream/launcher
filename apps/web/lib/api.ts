@@ -465,6 +465,46 @@ export async function downloadFleetBundle(launchId: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
+/** Download a passphrase-encrypted backup of the whole launcher. */
+export async function exportLauncherBackup(passphrase: string): Promise<void> {
+  const res = await afetch("/api/backup/export", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ passphrase }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})))?.error ?? `backup: HTTP ${res.status}`);
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `launcher-backup-${stamp}.tar.gz.enc`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export interface BackupImportReport {
+  restored: string[];
+  skipped: string[];
+  settingsAdded: string[];
+  prefsAdded: number;
+}
+
+/** Restore launches from a backup file; existing launches are left alone. */
+export async function importLauncherBackup(
+  file: File,
+  passphrase: string,
+): Promise<BackupImportReport> {
+  const res = await afetch("/api/backup/import", {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream", "x-backup-passphrase": passphrase },
+    body: file,
+  });
+  if (!res.ok) {
+    throw new Error((await res.json().catch(() => ({})))?.error ?? `restore: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function postGentxResult(
   id: string,
   valIndex: number,

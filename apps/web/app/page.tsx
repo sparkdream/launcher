@@ -8,11 +8,13 @@ import yaml from "js-yaml";
 import { specPathLine } from "../lib/spec-lines";
 import {
   createLaunch,
+  exportLauncherBackup,
   getChainAssets,
   getFleet,
   getLaunch,
   getPendingGentx,
   getPendingTx,
+  importLauncherBackup,
   postFleetAction,
   postGentxResult,
   postTxResult,
@@ -20,6 +22,7 @@ import {
   startLaunch,
   setChainAssetsMode,
   type AccountView,
+  type BackupImportReport,
   type ChainAssetsView,
   type ComponentView,
   type CostEstimate,
@@ -396,6 +399,66 @@ export default function Page() {
     URL.revokeObjectURL(url);
   };
 
+  // launcher backup (machine migration): a passphrase modal drives both the
+  // encrypted export and the merge-import
+  const [backupPrompt, setBackupPrompt] = useState<
+    null | { mode: "export" } | { mode: "import"; file: File }
+  >(null);
+  const [backupPass, setBackupPass] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupReport, setBackupReport] = useState<BackupImportReport | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
+
+  // settings cog: menu items open the System panel above the Launch panel
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsRef = useRef<HTMLDivElement>(null);
+  const [systemOpen, setSystemOpen] = usePersistedState("launcher.panel.system", false);
+  const [sysFocus, setSysFocus] = useState<"backup" | "assets" | null>(null);
+  const openSystem = (section: "backup" | "assets") => {
+    setSettingsOpen(false);
+    setSystemOpen(true);
+    setSysFocus(section);
+  };
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!settingsRef.current?.contains(e.target as Node)) setSettingsOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSettingsOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [settingsOpen]);
+
+  const runBackup = async () => {
+    if (!backupPrompt || !backupPass) return;
+    setBackupBusy(true);
+    setBackupError(null);
+    try {
+      if (backupPrompt.mode === "export") {
+        await exportLauncherBackup(backupPass);
+      } else {
+        setBackupReport(await importLauncherBackup(backupPrompt.file, backupPass));
+      }
+      setBackupPrompt(null);
+      setBackupPass("");
+      // pull the restored fleets in now rather than waiting for the 5s poll
+      if (backupPrompt.mode === "import" && wallet) setFleet(await getFleet(wallet.address));
+    } catch (e) {
+      // surfaced in the System panel's backup block, next to the buttons
+      setBackupError(e instanceof Error ? e.message : String(e));
+      setBackupPrompt(null);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
   const [tmkms, setTmkms] = useState<import("../lib/api").TmkmsSetup | null>(null);
   const showTmkms = async (id: string) => {
     setError(null);
@@ -686,13 +749,11 @@ export default function Page() {
   const [chainAssets, setChainAssets] = useState<ChainAssetsView | null>(null);
   const [assetsNonce, setAssetsNonce] = useState(0);
   useEffect(() => {
-    if (!specImage) {
-      setChainAssets(null);
-      return;
-    }
+    // without a spec image there is no resolution preview, but mode/locked
+    // still power the settings-menu Offline/Online toggle
     let stale = false;
     const t = setTimeout(() => {
-      getChainAssets(specImage, specRepoPin)
+      getChainAssets(specImage, specImage ? specRepoPin : undefined)
         .then((v) => !stale && setChainAssets(v))
         .catch(() => !stale && setChainAssets(null));
     }, 400);
@@ -1220,28 +1281,10 @@ export default function Page() {
       </ul>
     ) : null;
 
-  // §13: chain-asset controls — the Offline/Online toggle (locked when the
-  // operator env pins the mode), the commit prompt when nothing else
-  // resolves, escalation for unknown versions, remediation for known ones,
-  // a quiet confirmation otherwise
-  const assetsModeToggle = () =>
-    chainAssets && (
-      <div className="ready-banner" style={{ gap: 8 }}>
-        <span className="grow">
-          Chain assets: {chainAssets.mode === "baked" ? "Offline" : "Online"} mode
-          {chainAssets.locked ? " (set by the operator)" : ""}
-        </span>
-        {!chainAssets.locked && (
-          <button
-            className="btn"
-            style={{ flex: "none" }}
-            onClick={() => toggleAssetsMode(chainAssets.mode === "baked" ? "fetch" : "baked")}
-          >
-            {chainAssets.mode === "baked" ? "Switch to Online" : "Switch to Offline"}
-          </button>
-        )}
-      </div>
-    );
+  // §13: chain-asset banners — the plain Offline/Online toggle lives in the
+  // settings cog menu; these are the spec-scoped states: the commit prompt
+  // when nothing else resolves, escalation for unknown versions, remediation
+  // for known ones, a quiet confirmation otherwise
   const assetsBanner = () => {
     if (assetsUnknown) {
       const known = chainAssets?.knownVersions ?? [];
@@ -1707,6 +1750,48 @@ export default function Page() {
           {ledger && ledger.pending > 0 && <span className="bal">⟳ {ledger.pending} settling</span>}
           <span className="chev">{networkOpen ? "▴" : "▾"}</span>
         </div>
+        <div className="settings-wrap" ref={settingsRef}>
+          <button
+            className="settings-cog"
+            title="Launcher settings"
+            aria-haspopup="menu"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((v) => !v)}
+          >
+            ⚙
+          </button>
+          {settingsOpen && (
+            <div className="settings-menu" role="menu">
+              <button className="menu-item" role="menuitem" onClick={() => openSystem("backup")}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="3" width="20" height="5" rx="1" />
+                  <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" />
+                  <path d="M10 12h4" />
+                </svg>
+                <span className="mi-text">
+                  <span className="mi-title">Backup</span>
+                  <span className="mi-sub">Export or import launcher data</span>
+                </span>
+              </button>
+              <button className="menu-item" role="menuitem" onClick={() => openSystem("assets")}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m7.5 4.27 9 5.15" />
+                  <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+                  <path d="M3.3 7 12 12l8.7-5" />
+                  <path d="M12 22V12" />
+                </svg>
+                <span className="mi-text">
+                  <span className="mi-title">Chain asset source</span>
+                  <span className={`mi-sub${chainAssets?.mode === "fetch" ? " on" : ""}`}>
+                    {chainAssets
+                      ? `${chainAssets.mode === "baked" ? "Offline" : "Online"}${chainAssets.locked ? " (locked)" : ""}`
+                      : "Offline or Online chain versions"}
+                  </span>
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
       {/* ---------- network settings ---------- */}
@@ -1773,7 +1858,156 @@ export default function Page() {
         </section>
       )}
 
+      {backupPrompt && (
+        <div className="modal-scrim" onClick={() => !backupBusy && setBackupPrompt(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="k">
+              {backupPrompt.mode === "export" ? "Create launcher backup" : "Restore launcher backup"}
+            </div>
+            <p className="note">
+              {backupPrompt.mode === "export"
+                ? "Choose a passphrase to encrypt the archive. You will need the same passphrase to restore it, and it cannot be recovered if lost."
+                : "Enter the passphrase this backup was encrypted with. Launches already present here are left untouched."}
+            </p>
+            <input
+              className="field"
+              type="password"
+              autoFocus
+              placeholder="passphrase"
+              value={backupPass}
+              onChange={(e) => setBackupPass(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && backupPass && !backupBusy) runBackup();
+              }}
+            />
+            <div className="actions" style={{ marginTop: 12 }}>
+              <button
+                className="btn primary small"
+                disabled={!backupPass || backupBusy}
+                onClick={runBackup}
+              >
+                {backupBusy
+                  ? "Working…"
+                  : backupPrompt.mode === "export"
+                    ? "Create"
+                    : "Restore"}
+              </button>
+              <button className="btn" disabled={backupBusy} onClick={() => setBackupPrompt(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="content">
+        {/* ---------- system panel (opened from the settings cog) ---------- */}
+        {systemOpen && (
+          <section className="card sys-panel">
+            <div className="card-head">
+              <div>
+                <div className="card-title">System</div>
+                <div className="card-sub">launcher-wide tools and settings</div>
+              </div>
+              <button className="btn" onClick={() => setSystemOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="card-body sys-blocks">
+              <div className={`sys-block${sysFocus === "backup" ? " focus" : ""}`}>
+                <div className="f-label">Backup</div>
+                <div className="sys-desc">
+                  One encrypted archive of every fleet: keys, deployment records and settings.
+                  Create one to move this launcher to another machine, or restore one here
+                  (launches already present are left untouched).
+                </div>
+                <div className="sys-actions">
+                  <button
+                    className="btn accent-ghost"
+                    title="Best done while no launch is running"
+                    onClick={() => {
+                      setBackupReport(null);
+                      setBackupError(null);
+                      setBackupPass("");
+                      setBackupPrompt({ mode: "export" });
+                    }}
+                  >
+                    Create backup
+                  </button>
+                  <label className="btn">
+                    Restore backup
+                    <input
+                      ref={backupInputRef}
+                      type="file"
+                      accept=".enc"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setBackupReport(null);
+                        setBackupError(null);
+                        setBackupPass("");
+                        setBackupPrompt({ mode: "import", file });
+                        e.target.value = ""; // allow re-selecting the same file
+                      }}
+                    />
+                  </label>
+                </div>
+                {backupReport && (
+                  <div className="ready-banner ok">
+                    <span className="grow">
+                      Restored {backupReport.restored.length} launch(es)
+                      {backupReport.restored.length > 0 && `: ${backupReport.restored.join(", ")}`}.
+                      {backupReport.skipped.length > 0 &&
+                        ` Skipped ${backupReport.skipped.length} already present: ${backupReport.skipped.join(", ")}.`}
+                      {backupReport.settingsAdded.length > 0 &&
+                        ` Filled ${backupReport.settingsAdded.length} setting(s).`}
+                    </span>
+                    <button className="btn" style={{ flex: "none" }} onClick={() => setBackupReport(null)}>
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+                {backupError && (
+                  <div className="ready-banner warn">
+                    <span className="grow">{backupError}</span>
+                    <button className="btn" style={{ flex: "none" }} onClick={() => setBackupError(null)}>
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className={`sys-block${sysFocus === "assets" ? " focus" : ""}`}>
+                <div className="f-label">Chain asset source</div>
+                <div className="sys-desc">
+                  Where the chain node binary and its deploy config come from when a launch
+                  needs a version. Offline uses only locally cached versions with zero
+                  network; Online fetches and verifies them as needed. Service images
+                  (frontend, explorer, ...) are unaffected: providers pull those directly.
+                </div>
+                {chainAssets ? (
+                  <div className="sys-actions">
+                    <span className={`sys-mode${chainAssets.mode === "fetch" ? " on" : ""}`}>
+                      {chainAssets.mode === "baked" ? "Offline" : "Online"}
+                      {chainAssets.locked ? " (set by the operator)" : ""}
+                    </span>
+                    {!chainAssets.locked && (
+                      <button
+                        className="btn"
+                        onClick={() =>
+                          toggleAssetsMode(chainAssets.mode === "baked" ? "fetch" : "baked")
+                        }
+                      >
+                        Switch to {chainAssets.mode === "baked" ? "Online" : "Offline"}
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="sys-desc">mode unavailable (conductor unreachable)</div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
         {/* ---------- launch card ---------- */}
         {/* the accent border matches the selected fleet pair below, tying the
             step log to the fleet it belongs to */}
@@ -2109,7 +2343,6 @@ export default function Page() {
                       </button>
                     )}
                   </div>
-                  {assetsModeToggle()}
                   {assetsBanner()}
                   {specIssueList(true)}
                   <div className="wiz-nav">
@@ -2197,7 +2430,6 @@ export default function Page() {
                       </div>
                     </>
                   )}
-                  {assetsModeToggle()}
                   {assetsBanner()}
                   {specIssueList(mode !== "yaml")}
                 </div>

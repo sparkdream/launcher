@@ -1103,10 +1103,13 @@ export class FleetService {
   }
 
   /**
-   * Fleet bundle export (§5 "Fleet bundle"): spec + secrets + component
-   * records, tar'd and age-encrypted to the launch's recipient. Consensus
-   * keys never enter it in tmkms mode (they were never uploaded and the
-   * bundle only includes config the nodes already have in softsign mode).
+   * Fleet bundle export (§5 "Fleet bundle"): spec + secrets + node homes +
+   * component records, tar'd and age-encrypted to the launch's recipient.
+   * Since v2 the bundle carries the node homes (node_key.json,
+   * priv_validator_key.json, the val-0 keyring) so an imported launch can
+   * relaunch nodes and serve tmkms setup on the new instance; in tmkms mode
+   * that means consensus keys DO enter the bundle now, protected by the
+   * owner's age recipient like the mnemonics already were.
    */
   async exportBundle(launch: LaunchRow): Promise<string> {
     const dirs = launchDirs(this.workRoot, launch.id);
@@ -1119,7 +1122,7 @@ export class FleetService {
       path.join(stage, "metadata.json"),
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           launchId: launch.id,
           owner: launch.owner,
           spec: JSON.parse(launch.spec_json),
@@ -1137,6 +1140,10 @@ export class FleetService {
     // bundle carries plaintext inside its age encryption — portable across
     // instances with different LAUNCHER_SECRETs
     copySecretsDecrypted(dirs.secrets, path.join(stage, "secrets"));
+    const nodes = path.join(dirs.root, "nodes");
+    if (fs.existsSync(nodes)) {
+      fs.cpSync(nodes, path.join(stage, "nodes"), { recursive: true });
+    }
     const out = path.join(dirs.root, "fleet-bundle.tar.age");
     await this.services.encryptBackup(stage, keys.ageRecipient, out);
     fs.rmSync(stage, { recursive: true, force: true });
@@ -1153,6 +1160,16 @@ export class FleetService {
     const meta = JSON.parse(fs.readFileSync(path.join(extractedDir, "metadata.json"), "utf8"));
     const launchId: string = meta.launchId;
     if (this.db.getLaunch(launchId)) throw new Error(`launch ${launchId} already exists here`);
+    // files first, DB rows last: a launch row must never exist without its
+    // secrets (a v1 bundle has no nodes/ dir — the guard keeps it importable)
+    const dirs = launchDirs(this.workRoot, launchId);
+    fs.mkdirSync(dirs.root, { recursive: true });
+    copySecretsEncrypted(path.join(extractedDir, "secrets"), dirs.secrets);
+    fs.chmodSync(dirs.secrets, 0o700);
+    const nodes = path.join(extractedDir, "nodes");
+    if (fs.existsSync(nodes)) {
+      fs.cpSync(nodes, path.join(dirs.root, "nodes"), { recursive: true });
+    }
     this.db.createLaunch(launchId, JSON.stringify(meta.spec), meta.owner);
     this.db.setLaunchStatus(launchId, "completed");
     for (const step of meta.steps as Array<{ name: string; status: string; output_json: string | null }>) {
@@ -1164,10 +1181,6 @@ export class FleetService {
       this.db.upsertFleetComponent({ ...(c as any), launch_id: launchId });
       if (c.state === "closed") this.db.setComponentState(launchId, c.key as string, "closed");
     }
-    const dirs = launchDirs(this.workRoot, launchId);
-    fs.mkdirSync(dirs.root, { recursive: true });
-    copySecretsEncrypted(path.join(extractedDir, "secrets"), dirs.secrets);
-    fs.chmodSync(dirs.secrets, 0o700);
     return { launchId };
   }
 }

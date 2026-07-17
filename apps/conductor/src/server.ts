@@ -30,6 +30,7 @@ import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
 import { buildTmkmsSetup } from "./tmkms.js";
 import { FleetService } from "./fleet.js";
+import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps } from "./fleet-ops.js";
 import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
@@ -67,6 +68,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   );
   const running = new Set<string>();
   const fleet = new FleetService(deps.db, deps.services, deps.workRoot);
+  const backup = new BackupService(deps.db, deps.workRoot);
   const auth = deps.auth ? new AuthService(deps.auth.allowlist) : undefined;
 
   // §2 scoping rule: with auth on, owner comes from the session; locally,
@@ -687,10 +689,52 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
   });
 
+  // --- full launcher backup (machine migration) ---
+  // Both routes sit behind the bearer preHandler like everything else, but
+  // note the export crosses owner boundaries: any allowlisted operator gets
+  // every launch's secrets. There is no admin tier; allowlisted operators
+  // are trusted.
+
+  // POST (not GET) keeps the passphrase out of URLs and access logs
+  app.post("/api/backup/export", async (req, reply) => {
+    const { passphrase } = (req.body ?? {}) as { passphrase?: string };
+    if (!passphrase) return reply.status(400).send({ error: "passphrase required" });
+    const file = await backup.exportBackup(passphrase);
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+    const stream = fs.createReadStream(file);
+    stream.on("close", () => fs.rmSync(file, { force: true }));
+    return reply
+      .type("application/octet-stream")
+      .header("content-disposition", `attachment; filename="launcher-backup-${stamp}.tar.gz.enc"`)
+      .send(stream);
+  });
+
+  // body is the encrypted archive; passphrase travels in a header so the
+  // octet-stream body stays raw
+  app.post(
+    "/api/backup/import",
+    { bodyLimit: 512 * 1024 * 1024 },
+    async (req, reply) => {
+      const passphrase = String(req.headers["x-backup-passphrase"] ?? "");
+      if (!passphrase) return reply.status(400).send({ error: "passphrase required" });
+      const tmp = fs.mkdtempSync(`${deps.workRoot}/backup-upload-`);
+      try {
+        const archive = `${tmp}/backup.tar.gz.enc`;
+        fs.writeFileSync(archive, req.body as Buffer);
+        return await backup.importBackup(archive, passphrase);
+      } catch (e) {
+        const status = e instanceof BackupError ? 400 : 500;
+        return reply.status(status).send({ error: String(e instanceof Error ? e.message : e) });
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+  );
+
   // bundle import: body is the DECRYPTED tarball (`age -d bundle.tar.age`)
   app.post(
     "/api/fleet/import",
-    { bodyLimit: 64 * 1024 * 1024 },
+    { bodyLimit: 256 * 1024 * 1024 },
     async (req, reply) => {
       const tmp = fs.mkdtempSync(`${deps.workRoot}/import-`);
       try {

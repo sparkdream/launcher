@@ -401,6 +401,10 @@ describe("fleet bundle", () => {
     const fleet = new FleetService(db, services, work);
     await fleet.fleetForOwner("akash1owner"); // materialize
     const launch = db.getLaunch("fl")!;
+    // node homes ride in the bundle since v2 (consensus/node keys + keyring)
+    const nodeCfg = path.join(work, "launches/fl/nodes/val-0/config");
+    fs.mkdirSync(nodeCfg, { recursive: true });
+    fs.writeFileSync(path.join(nodeCfg, "node_key.json"), '{"priv_key":"fake"}');
     const bundlePath = await fleet.exportBundle(launch);
     expect(fs.existsSync(bundlePath)).toBe(true);
 
@@ -436,6 +440,46 @@ describe("fleet bundle", () => {
     expect(
       fs.existsSync(path.join(work2, "launches/fl/secrets/ssh_ed25519.pem")),
     ).toBe(true);
+    expect(
+      fs.existsSync(path.join(work2, "launches/fl/nodes/val-0/config/node_key.json")),
+    ).toBe(true);
+    db2.close();
+    db.close();
+  }, 120_000);
+
+  it("still imports a v1 bundle that has no nodes directory", async () => {
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    await fleet.fleetForOwner("akash1owner"); // materialize
+    const bundlePath = await fleet.exportBundle(db.getLaunch("fl")!);
+
+    // reshape into a v1 bundle: extract (fake encryptBackup is a plain
+    // tarball), drop nodes/, re-tar
+    const { execFileSync } = await import("node:child_process");
+    const unpack = tmp();
+    execFileSync("tar", ["xzf", bundlePath, "-C", unpack]);
+    fs.rmSync(path.join(unpack, "nodes"), { recursive: true, force: true });
+    const v1Bundle = path.join(tmp(), "v1-bundle.tar.gz");
+    execFileSync("tar", ["czf", v1Bundle, "-C", unpack, "."]);
+
+    const work2 = tmp();
+    const db2 = new ConductorDb(path.join(work2, "state.db"));
+    const app2 = buildServer({
+      db: db2,
+      services: fakeServices(),
+      workRoot: work2,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    const res = await app2.inject({
+      method: "POST",
+      url: "/api/fleet/import",
+      headers: { "content-type": "application/octet-stream" },
+      payload: fs.readFileSync(v1Bundle),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(db2.getLaunch("fl")).toBeTruthy();
+    expect(fs.existsSync(path.join(work2, "launches/fl/nodes"))).toBe(false);
     db2.close();
     db.close();
   }, 120_000);
