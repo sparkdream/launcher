@@ -393,7 +393,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.post("/api/fleet/:launchId/:dseq/actions", async (req, reply) => {
     const { launchId, dseq } = req.params as { launchId: string; dseq: string };
     const body = req.body as {
-      action: "close" | "restart" | "relaunch" | "upgrade" | "halt-upgrade" | "topup";
+      action: "close" | "restart" | "relaunch" | "upgrade" | "halt-upgrade" | "topup" | "unjail";
       confirm?: boolean;
       image?: string;
       components?: string[];
@@ -424,8 +424,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return { status: "restarted" };
       }
       case "relaunch": {
-        const warnings = fleet.closeWarnings(launch, component);
-        if (warnings.length > 0 && !body.confirm) return reply.status(409).send({ warnings });
+        const warnings = fleet.relaunchWarnings(launch, component);
+        if (warnings.length > 0 && !body.confirm) {
+          // a validator relaunch note is informational (the op is safe by
+          // design), so it confirms with "Proceed?"; sentry isolation and
+          // the other guards warn against the action ("Proceed anyway?")
+          return reply.status(409).send({
+            warnings,
+            ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
+          });
+        }
         const opId = fleet.requestRelaunch(launch, component);
         drive(launchId, spec);
         return { status: "relaunch-started", opId };
@@ -452,6 +460,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         const opId = fleet.requestHaltUpgrade(launch, body.image, body.haltHeight);
         drive(launchId, spec);
         return { status: "halt-upgrade-started", opId };
+      }
+      case "unjail": {
+        try {
+          // pre-action guard (§5): slow/relayed vote path → re-jail + slash
+          const warnings = await fleet.unjailWarnings(launch, component);
+          if (warnings.length > 0 && !body.confirm) return reply.status(409).send({ warnings });
+          const opId = fleet.requestUnjail(launch, component);
+          drive(launchId, spec);
+          return { status: "unjail-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
       }
       case "topup": {
         if (!body.amount) return reply.status(400).send({ error: "amount required" });

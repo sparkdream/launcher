@@ -863,7 +863,15 @@ state-sync into an apphash divergence or fail to sync at all.
   gate polls the in-container RPC over SSH for up to ~60 min (its
   sentries serve their first snapshot only when the chain next crosses
   a snapshot-interval boundary), so Phase G only ever bonds a synced
-  validator. No 2/3 start coordination; the chain is already live. As
+  validator. A validator's light client gets its OWN sentry as primary,
+  proxied to `127.0.0.1:26658` by a socat tunnel over the mesh, with
+  the bundle's RPCs kept as cross-check witnesses (the relaunch
+  configure step does the same). The bundle RPCs alone are fragile
+  from an arbitrary provider: they ride non-443 forwarded ports that
+  egress-filtered hosts block, and tailnet IPs are not directly
+  dialable under userspace tailscale — observed live when a relaunched
+  validator's state sync died with "no witnesses connected" on a
+  provider that refused all non-443 egress. No 2/3 start coordination; the chain is already live. As
   each node catches up, start-chain flips its `[statesync] enable` back
   off (tidiness: CometBFT skips state sync on a non-empty data dir
   anyway). `persist-start` (20b) and `verify-chain` run as usual.
@@ -889,14 +897,55 @@ state-sync into an apphash divergence or fail to sync at all.
      account number and sequence, real fee in the chain's fee denom),
      broadcast through the pair's own sentry RPC, with
      `experimentalSuggestChain` now pointing at live endpoints.
-  3. `verify-bonded`: the validator appears in the validator set and
-     then signs its first block (precommit visible via sentry RPC).
-     Multi-validator join specs repeat G per validator.
+     **Bond gate**: immediately before each broadcast the step re-probes
+     the validator's in-container RPC and requires `catching_up = false`
+     at (within a few blocks of) the sentry's current head. The
+     start-chain sync check is minutes-to-days stale by now (await-funds
+     pauses indefinitely, and persist-start's manifest push restarts the
+     containers), and a validator bonded while its node is silent is
+     downtime-jailed within the first signed-blocks window — observed on
+     the first devnet join (bonded 20:35:36, jailed 20:37:21, zero
+     blocks signed, 1% of the stake slashed).
+  3. `verify-bonded`: the validator appears in the validator set as
+     BONDED. Multi-validator join specs repeat G per validator.
+  4. `verify-signing`: bonding proves the chain accepted the stake, not
+     that the node signs. This step watches `x/slashing` signing-info
+     until the validator has lived through a quarter of the
+     signed-blocks window, and fails loudly if it misses more than half
+     the observed blocks. A validator found already *jailed* is a logged
+     warning, not a failure: the launch completes (a valid full-node
+     deployment) so the fleet panel — and with it the unjail op, whose
+     steps only run once the launch steps are through — becomes
+     reachable. A hard error here would block the very op that fixes it.
 
 **Fleet ops on a joined fleet.** Because a join lands in the same fleet
 model, the existing operations apply unchanged: restart, top-up, rolling
 upgrade (health-gated as usual), relaunch with the double-sign safety
-sequence, retarget, teardown, tmkms mode. Two exceptions: **chain reset
+sequence, retarget, teardown, tmkms mode. An **unjail op** (any fleet,
+not just joiners) recovers a downtime-jailed validator: the health
+monitor surfaces the chain-side `jailed` flag on the fleet card, and the
+op gates on the node being back at the chain head (unjailing a lagging
+node just re-jails it one window later), broadcasts `MsgUnjail`, and
+verifies the validator re-enters the bonded set. Requesting it first
+runs a **vote-latency guard** (same 409-confirm pattern as the close
+warnings): a validator can be synced and signing yet still doomed — the
+origin seals each block ~timeout_commit after the last, so a precommit
+must cross sentry→validator and back inside that window. The guard
+`tailscale ping`s the validator from its own sentry and warns when
+2×RTT exceeds timeout_commit (4×RTT for a DERP-relayed path, whose
+latency spikes above its ping floor); observed live: a joiner validator
+on a provider that blocked direct tailscale (~400ms DERP RTT) against
+1s devnet blocks signed every precommit on time yet landed none,
+burning a 1% slash per unjail attempt. The remedy the warning points
+at is relaunching the validator onto a closer provider. Signing follows the
+operator mode (§3): `generated` → the conductor-held operator key;
+external → the wallet signs an amino `MsgUnjail` doc through the same
+signing loop as promote-validator (the amino shape is hand-written —
+cosmjs ships no slashing converter — with field name `address` per the
+SDK's proto annotations, while the broadcast proto-JSON uses
+`validator_addr`). The op clears a leftover signed create-validator
+gentx row for the same validator index first, so the wallet is served
+the unjail doc rather than a replay. Two exceptions: **chain reset
 is rejected** in join mode (the chain is not this fleet's to reset; the
 right exit is unbond, then teardown), and a **halt-height upgrade** takes
 its halt height from the chain's coordination (governance or the origin

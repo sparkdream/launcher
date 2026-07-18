@@ -4,25 +4,12 @@ import { chainId, nodes, resolveTopology, statelessComponents, tunnelPort } from
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
-import { loadCert, nodeRpcUrl, nodeShellFallback, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
-import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "../node-ops.js";
+import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, WITNESS_RPC_PORT } from "../node-ops.js";
 import { phaseGSteps } from "./phase-g.js";
 import { resolveStateSyncTrust } from "./join.js";
-import type { SshTarget } from "../services.js";
 
 const UPLOAD_MARKER = `${NODE_HOME}/.node-data-uploaded`;
-
-function nodeTarget(ctx: StepCtx, key: string): SshTarget {
-  const ssh = ctx.output<SshEndpoints>("send-manifests");
-  const ep = ssh?.perNode[key];
-  if (!ep) throw new Error(`no SSH endpoint for ${key}`);
-  // lease-shell fallback for providers whose forwarded ports drop SSH
-  const entry = ctx.output<DeploymentPlan>("create-deployments")?.perNode[key];
-  const a = ctx.output<Assignments>("collect-bids")?.perNode[key];
-  const fallback =
-    a && entry ? nodeShellFallback(ctx, a.hostUri, entry.dseq, a.gseq, a.oseq) : undefined;
-  return sshTarget(ctx, ep.host, ep.port, fallback);
-}
 
 // --- Phase E ---
 
@@ -203,10 +190,32 @@ async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void
 
   // refresh the trust anchor on every node's config before anything boots
   const trust = await resolveStateSyncTrust(ctx);
+  const topo = resolveTopology(ctx.spec);
+  const mesh = ctx.output<MeshTable>("await-mesh");
   for (const key of allKeys) {
+    // Validators get their OWN sentry as light-client primary, proxied to
+    // localhost over the mesh: the bundle's RPCs ride forwarded ports that
+    // egress-filtered providers block (observed live: datanode.uk refused
+    // every non-443 port and state sync died "no witnesses connected"),
+    // and tailnet IPs are not directly dialable (userspace tailscale). The
+    // bundle RPCs stay in the list as cross-check witnesses. Sentries keep
+    // the bundle list unchanged — they sync from the public network and
+    // have no synced sentry of their own to lean on.
+    let servers = trust.rpcServers.join(",");
+    if (key.startsWith("val-")) {
+      const s = topo.validatorSentries[Number(key.split("-")[1])]?.[0];
+      const sentryIp = s !== undefined ? mesh?.ips[`sentry-${s}`] : undefined;
+      if (sentryIp) {
+        await ctx.services.ssh.exec(
+          nodeTarget(ctx, key),
+          socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657),
+        );
+        servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
+      }
+    }
     await ctx.services.ssh.exec(
       nodeTarget(ctx, key),
-      `sed -i 's|^rpc_servers = .*|rpc_servers = "${trust.rpcServers.join(",")}"|; ` +
+      `sed -i 's|^rpc_servers = .*|rpc_servers = "${servers}"|; ` +
         `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
         `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|' ${NODE_HOME}/config/config.toml`,
     );

@@ -127,6 +127,66 @@ describe("fleet health monitor", () => {
       "lease-not-active",
     );
   }, 120_000);
+
+  it("warns before an unjail when the validator's vote path is relayed or slow", async () => {
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    const launch = db.getLaunch("fl")!;
+    const val = db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+
+    // fast direct path → no warning (testnet profile blocks are roomy)
+    expect(await fleet.unjailWarnings(launch, val)).toEqual([]);
+
+    // DERP-relayed 400ms path against 1s blocks → precommits can't land
+    const edited = JSON.parse(launch.spec_json);
+    edited.chainParams = { ...edited.chainParams, consensus: { timeoutCommit: "1s" } };
+    db.setLaunchSpec("fl", JSON.stringify(edited));
+    services.ssh.pingOutput =
+      'pong from val-0 (100.64.0.10) via DERP(sparkdream) in 400ms\ndirect connection not established';
+    const warnings = await fleet.unjailWarnings(db.getLaunch("fl")!, val);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/DERP\(sparkdream\)/);
+    expect(warnings[0]).toMatch(/400ms/);
+    expect(warnings[0]).toMatch(/relaunching val-0/);
+
+    // probe failure → best-effort, no warning and no throw
+    services.ssh.pingOutput = "ping: no reply";
+    expect(await fleet.unjailWarnings(db.getLaunch("fl")!, val)).toEqual([]);
+  }, 120_000);
+
+  it("flags a downtime-jailed validator (and never on a probe failure)", async () => {
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    for (const c of db.listFleetComponents("fl")) {
+      services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+
+    // chain says jailed → the monitor flags it
+    const dir = tmp();
+    const bin = path.join(dir, "sparkdreamd");
+    fs.writeFileSync(bin, '#!/bin/sh\necho \'{"validator":{"jailed":true}}\'\n');
+    fs.chmodSync(bin, 0o755);
+    const prev = process.env.SPARKDREAMD_BIN;
+    process.env.SPARKDREAMD_BIN = bin;
+    try {
+      await fleet.tick("fl");
+      expect(db.listComponentHealth("fl").find((h) => h.component === "val-0")!.status).toBe(
+        "jailed",
+      );
+
+      // CLI/RPC failure → unknown, not "jailed" (and not "unreachable")
+      fs.writeFileSync(bin, "#!/bin/sh\nexit 1\n");
+      await fleet.tick("fl");
+      expect(db.listComponentHealth("fl").find((h) => h.component === "val-0")!.status).toBe(
+        "healthy",
+      );
+    } finally {
+      if (prev === undefined) delete process.env.SPARKDREAMD_BIN;
+      else process.env.SPARKDREAMD_BIN = prev;
+    }
+  }, 120_000);
 });
 
 describe("fleet actions over HTTP", () => {
@@ -154,7 +214,7 @@ describe("fleet actions over HTTP", () => {
       payload: { action: "close" },
     });
     expect(guarded.statusCode).toBe(409);
-    expect((guarded.json() as any).warnings[0]).toContain("only peer path");
+    expect((guarded.json() as any).warnings[0]).toContain("only connection to the chain");
 
     // confirmed close → pending signature in the launch's signing loop
     const confirmed = await app.inject({
@@ -237,9 +297,14 @@ describe("abort op", () => {
     db.stepStarted("fl", `op${opId}:deploy`);
     db.stepDone("fl", `op${opId}:deploy`, { dseq: "555001" });
     services.api.knownDseqs.add("555001"); // deploymentInfo → active
+    // an unsignable lease request (expired bid) is what usually strands the op
+    db.enqueuePendingTx("fl", `op${opId}:lease`, "[]");
 
     const res = await app.inject({ method: "POST", url: `/api/fleet/fl/ops/${opId}/abort` });
     expect(res.statusCode).toBe(200);
+    // the dead lease request is gone — it must not shadow the close in the
+    // oldest-first signing queue
+    expect(db.getPendingTx("fl", `op${opId}:lease`)).toBeUndefined();
     // op no longer contributes steps, and its deployment close is queued
     expect(db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("aborted");
     // and its step rows are erased so they stop showing as the launch error

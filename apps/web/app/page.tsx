@@ -958,14 +958,20 @@ export default function Page() {
   const fleetAction = async (
     launchId: string,
     dseq: string,
-    action: "close" | "restart" | "relaunch" | "upgrade" | "topup",
+    action: "close" | "restart" | "relaunch" | "upgrade" | "topup" | "unjail",
     extra: { image?: string; components?: string[]; amount?: string; haltHeight?: number } = {},
   ) => {
     setError(null);
     try {
       const first = await postFleetAction(launchId, dseq, action, extra);
+      if (first.error) {
+        setError(first.error);
+        return;
+      }
       if (first.warnings?.length) {
-        const ok = window.confirm(`${first.warnings.join("\n")}\n\nProceed?`);
+        const ok = window.confirm(
+          `${first.warnings.join("\n")}\n\n${first.confirmPrompt ?? "Proceed anyway?"}`,
+        );
         if (!ok) return;
         await postFleetAction(launchId, dseq, action, { ...extra, confirm: true });
       }
@@ -1631,18 +1637,33 @@ export default function Page() {
           )}
         </div>
       )}
-      {pendingGentx && (
-        <div className="banner sign">
-          <span>
-            Gentx signature needed for <b>validator {pendingGentx.valIndex}</b>, operator{" "}
-            <code>{pendingGentx.address}</code> (offline, on the new chain; select the matching
-            account in Keplr)
-          </span>
-          <button onClick={signGentxNow} className="btn primary small" disabled={busy !== null}>
-            Sign gentx with Keplr
-          </button>
-        </div>
-      )}
+      {pendingGentx &&
+        (() => {
+          const msgType = (pendingGentx.signDoc as { msgs?: Array<{ type?: string }> })?.msgs?.[0]?.type;
+          const isUnjail = msgType === "cosmos-sdk/MsgUnjail";
+          return (
+            <div className="banner sign">
+              <span>
+                {isUnjail ? (
+                  <>
+                    Unjail signature needed for <b>validator {pendingGentx.valIndex}</b>, operator{" "}
+                    <code>{pendingGentx.address}</code> (live tx on the chain; select the matching
+                    account in Keplr)
+                  </>
+                ) : (
+                  <>
+                    Gentx signature needed for <b>validator {pendingGentx.valIndex}</b>, operator{" "}
+                    <code>{pendingGentx.address}</code> (offline, on the new chain; select the
+                    matching account in Keplr)
+                  </>
+                )}
+              </span>
+              <button onClick={signGentxNow} className="btn primary small" disabled={busy !== null}>
+                {isUnjail ? "Sign unjail with Keplr" : "Sign gentx with Keplr"}
+              </button>
+            </div>
+          );
+        })()}
       {launch.status === "aborted" && (
         <div className="banner wait">
           This launch was aborted: its deployments are closed (deposits refunded). Adjust the
@@ -2976,6 +2997,15 @@ export default function Page() {
                             <div className="acts">
                               {c.state === "active" && (
                                 <>
+                                  {c.key.startsWith("val-") && c.health?.status === "jailed" && (
+                                    <button
+                                      className="btn amber"
+                                      title="Broadcast an unjail tx from the operator key. Waits until the node is back at the chain head first, so the validator doesn't get re-jailed."
+                                      onClick={() => fleetAction(f.launchId, c.dseq, "unjail")}
+                                    >
+                                      unjail
+                                    </button>
+                                  )}
                                   <button
                                     className="btn"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "restart")}

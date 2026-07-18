@@ -7,7 +7,10 @@ import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
 import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
-import { restartNode, rpcUrl } from "./node-ops.js";
+import { NODE_HOME, restartNode, rpcUrl } from "./node-ops.js";
+import { sparkdreamd } from "./exec.js";
+import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
+import { valoperAddress } from "./gentx.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
@@ -249,6 +252,62 @@ export class FleetService {
     }
   }
 
+  /** Forwarded RPC URL of the first active sentry (cached), or null. */
+  private async sentryRpcUrl(launch: LaunchRow): Promise<string | null> {
+    const sentry = this.db
+      .listFleetComponents(launch.id)
+      .find((c) => c.key.startsWith("sentry-") && c.state === "active");
+    if (!sentry) return null;
+    let cached = this.rpcUrlCache.get(sentry.dseq);
+    if (!cached || Date.now() - cached.at > 120_000) {
+      let url: string | null = null;
+      try {
+        const lease = await this.services.provider.leaseStatus(
+          this.mtlsCreds(launch), sentry.host_uri, sentry.dseq, 1, 1,
+        );
+        const ep = extractForwardedPort(lease, 26657);
+        url = `http://${ep.host}:${ep.port}`;
+      } catch {
+        url = null;
+      }
+      cached = { url, at: Date.now() };
+      this.rpcUrlCache.set(sentry.dseq, cached);
+    }
+    return cached.url;
+  }
+
+  /**
+   * Chain-side jailed flag for a validator component. undefined = unknown
+   * (RPC unreachable, no operator account, validator never promoted) — the
+   * monitor must never report "jailed" on a probe failure.
+   */
+  private async validatorJailed(
+    launch: LaunchRow,
+    spec: LaunchSpec,
+    key: string,
+  ): Promise<boolean | undefined> {
+    try {
+      const keys = this.db.stepOutput<{ accounts: Record<string, string> }>(
+        launch.id,
+        "generate-keys",
+      );
+      const address = keys?.accounts[`op-${key}`];
+      if (!address) return undefined;
+      const rpc = await this.sentryRpcUrl(launch);
+      if (!rpc) return undefined;
+      const { stdout } = await runWithAssets(resolveChainAssets(spec, this.workRoot), () =>
+        sparkdreamd([
+          "query", "staking", "validator", valoperAddress(address),
+          "--node", rpc, "--output", "json",
+        ]),
+      );
+      const out = JSON.parse(stdout);
+      return Boolean((out.validator ?? out).jailed);
+    } catch {
+      return undefined; // includes "not found" for a not-yet-promoted joiner
+    }
+  }
+
   /** dseq → escrow balance + when. Escrow drains over days, so a short
    *  cache keeps the 5s fleet poll from hitting the LCD every time. */
   private escrowCache = new Map<string, { amount: string | null; at: number }>();
@@ -402,6 +461,16 @@ export class FleetService {
               this.db.setComponentHealth(launchId, c.key, "catching-up", details.join("; "));
               return;
             }
+          } else if (c.key.startsWith("val-")) {
+            // chain-side jailed flag (downtime-jailing is invisible to the
+            // lease/escrow checks — the container hums along fine)
+            if (await this.validatorJailed(launch, spec, c.key)) {
+              this.db.setComponentHealth(
+                launchId, c.key, "jailed",
+                "downtime-jailed on chain — unjail re-enters the set once the node is synced",
+              );
+              return;
+            }
           } else if (componentDomains.has(c.key)) {
             // stateless components: HTTP 200 on the public domain (§5 step 21)
             const url = `https://${componentDomains.get(c.key)}/`;
@@ -428,28 +497,63 @@ export class FleetService {
    * Topology guard: closing a sentry that is some validator's only peer
    * path isolates that validator (§5 pre-action guards).
    */
-  closeWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
+  /** Sentries whose loss (close or relaunch downtime) isolates a validator. */
+  private sentryIsolationWarnings(
+    spec: LaunchSpec,
+    component: FleetComponentRow,
+    while_: string,
+  ): string[] {
     const warnings: string[] = [];
-    const spec = this.spec(launch);
-    if (component.key.startsWith("sentry-")) {
-      const s = Number(component.key.split("-")[1]);
-      const topo = resolveTopology(spec);
-      for (const v of topo.sentryValidators[s] ?? []) {
-        const others = (topo.validatorSentries[v] ?? []).filter((x) => x !== s);
-        if (others.length === 0) {
-          warnings.push(
-            `sentry-${s} is validator ${v}'s only peer path — the validator will miss blocks ` +
-              `and risks downtime-jailing while it has no sentry`,
-          );
-        }
+    if (!component.key.startsWith("sentry-")) return warnings;
+    const s = Number(component.key.split("-")[1]);
+    const topo = resolveTopology(spec);
+    for (const v of topo.sentryValidators[s] ?? []) {
+      const others = (topo.validatorSentries[v] ?? []).filter((x) => x !== s);
+      if (others.length === 0) {
+        warnings.push(
+          `sentry-${s} is validator ${v}'s only connection to the chain: ${while_}, ` +
+            `the validator misses blocks and risks being downtime-jailed`,
+        );
       }
     }
+    return warnings;
+  }
+
+  closeWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
+    const spec = this.spec(launch);
+    const warnings = this.sentryIsolationWarnings(spec, component, "while it is closed");
     if (component.key === "headscale") {
       warnings.push("closing headscale severs the mesh: nodes keep running but cannot re-wire");
     }
     if (component.key.startsWith("val-")) {
       warnings.push(
-        `closing ${component.key} destroys its lease-scoped volume; consensus key custody per §3 still applies`,
+        `closing ${component.key} deletes its node data, and the chain keeps expecting its ` +
+          "signatures: it will be downtime-jailed unless it is relaunched or its stake is " +
+          "unbonded. Its keys stay safe in the launcher" +
+          (spec.security.keyMode === "tmkms" ? " and your tmkms signer" : "") +
+          ", so a later relaunch can restore it.",
+      );
+    }
+    return warnings;
+  }
+
+  /**
+   * Relaunch is close plus redeploy, so the transient risks differ from a
+   * plain close: keys/config are restored automatically and the op enforces
+   * the double-sign safety window, but the node is down until the
+   * replacement syncs.
+   */
+  relaunchWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
+    const spec = this.spec(launch);
+    const warnings = this.sentryIsolationWarnings(spec, component, "while it relaunches");
+    if (component.key.startsWith("val-")) {
+      warnings.push(
+        `relaunching ${component.key} closes its current deployment and redeploys it on a ` +
+          "different provider. The node is offline until the replacement syncs; its keys and " +
+          "config are restored automatically" +
+          (spec.security.keyMode === "tmkms"
+            ? ", and you will be prompted to repoint your tmkms signer to the new node."
+            : ", and the launcher waits a safety window before it signs again, so there is no double-sign risk."),
       );
     }
     return warnings;
@@ -714,6 +818,72 @@ export class FleetService {
   }
 
   /**
+   * Pre-unjail guard (§5 pre-action guards): a validator that is synced and
+   * signing can still be re-jailed if its votes travel too slowly — the
+   * origin seals each block ~timeout_commit after the last, so a precommit
+   * must cross sentry→validator and back inside that window. Seen live on
+   * the first devnet join: a DERP-relayed path at ~400ms RTT against 1s
+   * blocks meant every precommit arrived late; each unjail burned another
+   * 1% slash. Measure the path from the validator's own sentry and warn
+   * BEFORE the op exists. Best-effort: probe failures never block the op.
+   */
+  async unjailWarnings(launch: LaunchRow, component: FleetComponentRow): Promise<string[]> {
+    const warnings: string[] = [];
+    try {
+      const spec = this.spec(launch);
+      const v = Number(component.key.split("-")[1]);
+      const sIndex = (resolveTopology(spec).validatorSentries[v] ?? [])[0];
+      if (sIndex === undefined || !component.tailnet_ip) return warnings;
+      const sentry = this.db
+        .listFleetComponents(launch.id)
+        .find((c) => c.key === `sentry-${sIndex}` && c.state === "active");
+      if (!sentry) return warnings;
+      const res = await this.services.ssh.exec(
+        this.sshTargetFor(launch, sentry),
+        `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ping -c 3 --timeout 2s ${component.tailnet_ip} 2>&1 || true`,
+      );
+      const rtts = [...res.stdout.matchAll(/ in ([\d.]+)ms/g)].map((m) => Number(m[1]));
+      if (rtts.length === 0) return warnings;
+      const rtt = Math.min(...rtts);
+      const relay = /via DERP\(([^)]+)\)/.exec(res.stdout)?.[1];
+      const timeoutMs =
+        1000 * Number((spec.chainParams.consensus?.timeoutCommit ?? "5s").replace(/s$/, ""));
+      // ~2×RTT is the practical floor for proposal-in + precommit-out across
+      // the sentry link; a relayed path gets a tighter bar because DERP
+      // latency spikes far above its ping-time floor
+      if (2 * rtt > timeoutMs || (relay !== undefined && 4 * rtt > timeoutMs)) {
+        warnings.push(
+          `${component.key}'s vote path from its sentry is ${
+            relay ? `relayed via DERP(${relay})` : "direct"
+          } at ~${Math.round(rtt)}ms RTT. With ${timeoutMs / 1000}s blocks its precommits will ` +
+            "likely arrive after each block is sealed, so it would be downtime-jailed (and " +
+            `slashed) again shortly after the unjail. Consider relaunching ${component.key} ` +
+            "onto a provider closer to its sentry first.",
+        );
+      }
+    } catch {
+      // latency probe is best-effort — never block the unjail on it
+    }
+    return warnings;
+  }
+
+  /**
+   * Unjail a downtime-jailed validator: sync-gate → MsgUnjail (conductor
+   * keyring for generated operators; the wallet signing loop for external
+   * ones) → verify it re-enters the bonded set.
+   */
+  requestUnjail(launch: LaunchRow, component: FleetComponentRow): number {
+    if (!component.key.startsWith("val-")) {
+      throw new Error(`unjail applies to validators, not ${component.key}`);
+    }
+    const running = this.db
+      .listFleetOps(launch.id)
+      .find((o) => o.kind === "unjail" && o.status === "active");
+    if (running) throw new Error(`an unjail op (#${running.id}) is already in progress`);
+    return this.db.createFleetOp(launch.id, "unjail", { key: component.key });
+  }
+
+  /**
    * Abandon an in-progress op (e.g. a relaunch stuck on a broken provider).
    * Its steps stop running (aborted ops contribute none to buildOpSteps),
    * and its new deployment — if leased — is closed through the signing loop
@@ -728,6 +898,9 @@ export class FleetService {
     // step rows so the abandoned op stops surfacing as the launch's error
     const deploy = this.db.stepOutput<{ dseq: string }>(launch.id, `op${opId}:deploy`);
     this.db.deleteOpSteps(launch.id, opId);
+    // and its unsigned txs: the signing queue serves oldest-first, so an
+    // abandoned op's dead lease request would shadow the close below forever
+    this.db.deleteUnsignedPendingTxsLike(launch.id, `op${opId}:%`);
     if (deploy?.dseq) {
       const info = await this.services.api
         .deploymentInfo(launch.owner, deploy.dseq)

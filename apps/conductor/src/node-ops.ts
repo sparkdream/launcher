@@ -40,10 +40,27 @@ export function rpcUrl(hostUri: string): string {
 }
 
 /**
- * Mesh tunnel: listen on the local peer port and pipe to the target node's
- * p2p port over tailscale, then probe that the listener is up.
+ * Local port a joining validator's light client uses to reach its own
+ * sentry's RPC (§5 join mode): tailnet IPs are not dialable from normal
+ * sockets (userspace tailscale), and bundle RPCs ride forwarded ports that
+ * egress-filtered providers block — localhost is always reachable.
  */
-export function socatTunnelCmd(listenPort: number, targetIp: string): string {
+export const WITNESS_RPC_PORT = 26658;
+
+/**
+ * Local port a joining validator dials to reach its own sentry's p2p port:
+ * outbound tailnet dials need a proxy (userspace tailscale), and dialing
+ * out lets the validator re-establish its only peer link itself instead of
+ * waiting out the sentry dialer's exponential backoff after downtime.
+ */
+export const VAL_PEER_TUNNEL_PORT = 16657;
+
+/**
+ * Mesh tunnel: listen on the local port and pipe to the target node's p2p
+ * port (or another port, e.g. RPC for the statesync witness) over
+ * tailscale, then probe that the listener is up.
+ */
+export function socatTunnelCmd(listenPort: number, targetIp: string, targetPort = 26656): string {
   // Self-cleaning: kill any existing listener on this port FIRST, so a
   // re-run (e.g. relaunch configure) can't stack duplicate fork listeners
   // on the same port — two listeners churn out "connection reset" noise.
@@ -55,8 +72,8 @@ export function socatTunnelCmd(listenPort: number, targetIp: string): string {
   return (
     `pkill -f "^socat TCP-LISTEN:${listenPort}," 2>/dev/null; sleep 0.3; ` +
     `nohup socat TCP-LISTEN:${listenPort},fork,reuseaddr ` +
-    `EXEC:"tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock nc ${targetIp} 26656" ` +
+    `EXEC:"tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock nc ${targetIp} ${targetPort}" ` +
     `>/dev/null 2>&1 & sleep 1 && nc -z 127.0.0.1 ${listenPort} && ` +
-    `pgrep -f "^socat.*nc ${targetIp} 26656" >/dev/null`
+    `pgrep -f "^socat.*nc ${targetIp} ${targetPort}" >/dev/null`
   );
 }

@@ -158,42 +158,16 @@ export async function verifySignedDoc(
 }
 
 /**
- * Assemble the gentx file (proto-JSON Tx, the format `collect-gentxs`
- * reads). Message fields come from the same source as the sign doc; fee and
- * memo come from the doc the wallet signed (Keplr may adjust gas).
+ * Wrap proto-JSON messages and a wallet's amino sign response into a
+ * broadcastable Tx (also the format `collect-gentxs` reads). Fee and memo
+ * come from the doc the wallet signed (Keplr may adjust gas).
  */
-export function assembleGentxJson(input: GentxInputs, response: GentxSignResponse): string {
-  const msg = createValidatorMsg(input).value;
-  const commission = commissionFlags(input.spec); // protojson decimal form
+function assembleSignedTxJson(messages: unknown[], response: GentxSignResponse): string {
   const signed = response.signed;
   return JSON.stringify(
     {
       body: {
-        messages: [
-          {
-            "@type": CREATE_VALIDATOR_TYPE_URL,
-            description: {
-              moniker: msg.description.moniker,
-              identity: "",
-              website: "",
-              security_contact: "",
-              details: "",
-            },
-            commission: {
-              rate: commission.rate,
-              max_rate: commission.maxRate,
-              max_change_rate: commission.maxChangeRate,
-            },
-            min_self_delegation: msg.minSelfDelegation,
-            delegator_address: msg.delegatorAddress,
-            validator_address: msg.validatorAddress,
-            pubkey: {
-              "@type": "/cosmos.crypto.ed25519.PubKey",
-              key: input.consensusPubkey,
-            },
-            value: msg.value,
-          },
-        ],
+        messages,
         memo: signed.memo,
         timeout_height: "0",
         extension_options: [],
@@ -207,7 +181,7 @@ export function assembleGentxJson(input: GentxInputs, response: GentxSignRespons
               key: response.signature.pub_key.value,
             },
             mode_info: { single: { mode: "SIGN_MODE_LEGACY_AMINO_JSON" } },
-            // "0" for gentxs; the live sequence for promote-validator txs
+            // "0" for gentxs; the live sequence for online txs
             sequence: String(signed.sequence),
           },
         ],
@@ -223,5 +197,79 @@ export function assembleGentxJson(input: GentxInputs, response: GentxSignRespons
     },
     null,
     2,
+  );
+}
+
+/**
+ * Assemble the gentx file. Message fields come from the same source as the
+ * sign doc.
+ */
+export function assembleGentxJson(input: GentxInputs, response: GentxSignResponse): string {
+  const msg = createValidatorMsg(input).value;
+  const commission = commissionFlags(input.spec); // protojson decimal form
+  return assembleSignedTxJson(
+    [
+      {
+        "@type": CREATE_VALIDATOR_TYPE_URL,
+        description: {
+          moniker: msg.description.moniker,
+          identity: "",
+          website: "",
+          security_contact: "",
+          details: "",
+        },
+        commission: {
+          rate: commission.rate,
+          max_rate: commission.maxRate,
+          max_change_rate: commission.maxChangeRate,
+        },
+        min_self_delegation: msg.minSelfDelegation,
+        delegator_address: msg.delegatorAddress,
+        validator_address: msg.validatorAddress,
+        pubkey: {
+          "@type": "/cosmos.crypto.ed25519.PubKey",
+          key: input.consensusPubkey,
+        },
+        value: msg.value,
+      },
+    ],
+    response,
+  );
+}
+
+const UNJAIL_TYPE_URL = "/cosmos.slashing.v1beta1.MsgUnjail";
+
+/**
+ * Amino sign doc for an external operator's MsgUnjail (§5 unjail op).
+ * Hand-written amino shape: cosmjs ships no slashing converter
+ * (createSlashingAminoConverters throws "Not implemented", and its
+ * AminoMsgUnjail declaration predates the SDK's annotations). The chain
+ * regenerates the sign bytes from the decoded tx via the proto annotations
+ * (SDK 0.53 cosmos/slashing/v1beta1/tx.proto: amino.name
+ * "cosmos-sdk/MsgUnjail", amino.field_name "address"), so the field here
+ * MUST be "address" or signature verification fails on-chain.
+ */
+export function buildUnjailSignDoc(
+  operatorAddress: string,
+  chainId: string,
+  online: OnlineTxParams,
+): StdSignDoc {
+  const aminoMsg: AminoMsg = {
+    type: "cosmos-sdk/MsgUnjail",
+    value: { address: valoperAddress(operatorAddress) },
+  };
+  return makeSignDoc([aminoMsg], online.fee, chainId, "", online.accountNumber, online.sequence);
+}
+
+/** Broadcastable proto-JSON Tx from the wallet's signed unjail doc. */
+export function assembleUnjailTxJson(
+  operatorAddress: string,
+  response: GentxSignResponse,
+): string {
+  // proto-JSON uses the proto field name (validator_addr), NOT the amino
+  // field name the sign doc carries — jsonpb ignores Go struct json tags
+  return assembleSignedTxJson(
+    [{ "@type": UNJAIL_TYPE_URL, validator_addr: valoperAddress(operatorAddress) }],
+    response,
   );
 }

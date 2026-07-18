@@ -206,6 +206,10 @@ export class FakeSsh {
   signerConnected = true;
   /** host:port targets that refuse connections (torn-down containers). */
   failHosts = new Set<string>();
+  /** What `tailscale ping` reports (unjail latency guard). */
+  pingOutput = "pong from val-0 (100.64.0.10) via 10.0.0.1:41641 in 12ms";
+  /** host:port whose old container still answers after close (zombie check). */
+  zombieHosts = new Set<string>();
   execLog: Array<{ target: string; command: string }> = [];
   private ipCounter = 10;
   private ips = new Map<string, string>();
@@ -227,6 +231,13 @@ export class FakeSsh {
       this.uploaded.add(id);
       return ok();
     }
+    if (command.includes("echo zombie-probe")) {
+      // a torn-down lease answers with empty success on some gateways
+      return ok(this.zombieHosts.has(id) ? "zombie-probe" : "");
+    }
+    if (command.includes("tailscale") && command.includes(" ping ")) {
+      return ok(this.pingOutput);
+    }
     if (command.includes("tailscale") && command.includes("ip -4")) {
       if (!this.ips.has(id)) this.ips.set(id, `100.64.0.${this.ipCounter++}`);
       return ok(this.ips.get(id)!);
@@ -237,6 +248,10 @@ export class FakeSsh {
     if (command.includes("SELECT count(*) FROM users")) return ok("1");
     if (command.includes("nc -z 127.0.0.1 26660")) {
       return ok(this.signerConnected ? "ok" : "no");
+    }
+    if (command.includes("127.0.0.1:26657/status")) {
+      // sync gates (phase-g bond gate, unjail op) read the node's local RPC
+      return ok('{"result":{"sync_info":{"latest_block_height":"1000000","catching_up":false}}}');
     }
     if (command.includes("pgrep -x sparkdreamd")) {
       return ok(this.started.has(id) ? "yes" : "no");

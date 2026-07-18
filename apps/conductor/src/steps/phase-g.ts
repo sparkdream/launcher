@@ -12,7 +12,7 @@ import {
   type GentxInputs,
   type GentxSignResponse,
 } from "../gentx.js";
-import { nodeRpcUrl, type Assignments, type DeploymentPlan } from "./phase-bcd.js";
+import { nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan } from "./phase-bcd.js";
 import type { GenerateKeysOutput } from "./phase-a.js";
 
 /**
@@ -54,9 +54,54 @@ function keysOutput(ctx: StepCtx): GenerateKeysOutput {
   return keys;
 }
 
-async function queryJson(args: string[], rpc: string): Promise<any> {
+export async function queryJson(args: string[], rpc: string): Promise<any> {
   const { stdout } = await sparkdreamd([...args, "--node", rpc, "--output", "json"]);
   return JSON.parse(stdout);
+}
+
+/**
+ * Bond gate: verify-bonded can only see the chain-side bond — a validator
+ * whose NODE is still catching up (or was just restarted by persist-start's
+ * manifest push) enters the active set signing nothing and is downtime-
+ * jailed within the first signed-blocks window (observed on the first
+ * devnet join: bonded 20:35:36, jailed 20:37:21, zero blocks signed). The
+ * start-chain sync check is minutes stale by now — await-funds pauses for
+ * arbitrarily long — so re-verify the node is AT THE HEAD right before the
+ * bond, not merely that it was synced once.
+ */
+async function awaitValidatorAtHead(ctx: StepCtx, v: number, rpc: string): Promise<number> {
+  const key = `val-${v}`;
+  let lastProblem = "no probe yet";
+  for (let i = 0; i < 60; i++) {
+    if (i > 0) await ctx.services.sleep(5000);
+    let head: number;
+    try {
+      head = (await ctx.services.rpc.status(rpc)).latestBlockHeight;
+    } catch (e) {
+      lastProblem = `sentry rpc unreachable (${String(e).slice(0, 80)})`;
+      continue;
+    }
+    // validators expose no public RPC — probe localhost over SSH, exactly
+    // like the start-chain sync gate
+    const probe = await ctx.services.ssh.exec(
+      nodeTarget(ctx, key),
+      "wget -qO- http://127.0.0.1:26657/status 2>/dev/null || true",
+      { quick: true },
+    );
+    const height = Number(/latest_block_height"?\s*:\s*"?(\d+)/.exec(probe.stdout)?.[1]);
+    const catchingUp = /catching_up"?\s*:\s*"?(\w+)/.exec(probe.stdout)?.[1] === "true";
+    if (Number.isFinite(height) && !catchingUp && height >= head - 3) {
+      ctx.log(`${key}: at the chain head (${height}/${head}) — safe to bond`);
+      return height;
+    }
+    lastProblem = Number.isFinite(height)
+      ? `${catchingUp ? "catching up " : ""}at height ${height}, chain head ${head}`
+      : "local RPC not answering";
+  }
+  throw new Error(
+    `${key} is not at the chain head after ~5 min (${lastProblem}) — bonding it now ` +
+      "would downtime-jail it as soon as it enters the set. Fix the node, then resume.",
+  );
 }
 
 /** Does the operator's valoper address already exist in the validator set machinery? */
@@ -137,7 +182,7 @@ function validatorJson(ctx: StepCtx, v: number, consensusPubkey: string): string
 }
 
 /** Poll a broadcast tx to inclusion; throws on a non-zero code. */
-async function awaitTxIncluded(ctx: StepCtx, rpc: string, txHash: string): Promise<void> {
+export async function awaitTxIncluded(ctx: StepCtx, rpc: string, txHash: string): Promise<void> {
   let lastError = "not found";
   for (let i = 0; i < 24; i++) {
     if (i > 0) await ctx.services.sleep(5000);
@@ -157,7 +202,7 @@ async function awaitTxIncluded(ctx: StepCtx, rpc: string, txHash: string): Promi
 }
 
 /** account_number/sequence for the operator, tolerant of wrapped account types. */
-async function accountCoordinates(
+export async function accountCoordinates(
   ctx: StepCtx,
   rpc: string,
   address: string,
@@ -186,6 +231,9 @@ export const createValidatorsStep: StepDef = {
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
       const address = keys.accounts[`op-val-${v}`]!;
       if (await validatorExists(ctx, rpc, address)) continue; // idempotent re-run
+      // never bond a node that isn't participating in consensus RIGHT NOW —
+      // re-checked on every resume (a signature pause can last days)
+      await awaitValidatorAtHead(ctx, v, rpc);
 
       if (!Array.isArray(operators)) {
         // generated operator: the conductor holds the key — sign via the
@@ -289,6 +337,94 @@ export const verifyBondedStep: StepDef = {
   },
 };
 
+/** Blocks of live signing we insist on observing before declaring the
+ *  promotion healthy — a quarter of the devnet's 100-block window, reached
+ *  well before the jail threshold can. */
+const SIGNING_PROBE_BLOCKS = 25;
+
+export const verifySigningStep: StepDef = {
+  name: "verify-signing",
+  async run(ctx) {
+    if (!ctx.spec.join) return { skipped: true };
+    // verify-bonded proves the chain accepted the stake; this proves the
+    // node is actually SIGNING — the failure mode bonding can't see (a
+    // bonded-but-silent validator is downtime-jailed within the window)
+    const keys = keysOutput(ctx);
+    const rpc = await ownRpcUrl(ctx);
+    const observed: Record<string, { signed: number; missed: number }> = {};
+    const jailedVals: string[] = [];
+    for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
+      const valoper = valoperAddress(keys.accounts[`op-val-${v}`]!);
+      const pubkeyArg = JSON.stringify({
+        "@type": "/cosmos.crypto.ed25519.PubKey",
+        key: keys.consensusPubkeys[`val-${v}`]!,
+      });
+      let baseline: { offset: number; missed: number } | undefined;
+      let verdict: { signed: number; missed: number } | undefined;
+      let jailed = false;
+      let lastProblem = "no signing info yet";
+      for (let i = 0; i < 90 && !verdict && !jailed; i++) {
+        if (i > 0) await ctx.services.sleep(5000);
+        try {
+          const out = await queryJson(["query", "staking", "validator", valoper], rpc);
+          jailed = Boolean((out.validator ?? out).jailed);
+        } catch (e) {
+          lastProblem = `validator query failed (${String(e).slice(0, 80)})`;
+          continue;
+        }
+        if (jailed) break;
+        let info: any;
+        try {
+          const out = await queryJson(["query", "slashing", "signing-info", pubkeyArg], rpc);
+          info = out.val_signing_info ?? out;
+        } catch (e) {
+          lastProblem = `signing-info query failed (${String(e).slice(0, 80)})`;
+          continue;
+        }
+        // index_offset advances for every block the validator spends in the
+        // active set; missed_blocks_counter for every one it failed to sign
+        const offset = Number(info.index_offset ?? 0);
+        const missed = Number(info.missed_blocks_counter ?? 0);
+        if (!baseline) baseline = { offset, missed };
+        const seen = offset - baseline.offset;
+        const missedDelta = Math.max(0, missed - baseline.missed);
+        if (seen < SIGNING_PROBE_BLOCKS) {
+          lastProblem = `observed ${Math.max(0, seen)} of ${SIGNING_PROBE_BLOCKS} blocks`;
+          continue;
+        }
+        if (missedDelta * 2 > seen) {
+          throw new Error(
+            `val-${v} is bonded but missed ${missedDelta} of the last ${seen} blocks — the ` +
+              "node is not signing and will be downtime-jailed; check its sync state and peers",
+          );
+        }
+        verdict = { signed: seen - missedDelta, missed: missedDelta };
+      }
+      if (jailed) {
+        // NOT a step failure: the recovery is the fleet panel's unjail op,
+        // and op steps only run once the launch steps are through — a hard
+        // error here would block the very op that fixes it. The monitor
+        // flags the jailed validator on the fleet card.
+        ctx.log(
+          `val-${v} is downtime-jailed — its node was not signing while bonded. The launch ` +
+            "completes as a full-node deployment; once the node is back at the chain head, " +
+            "use the fleet panel's unjail action to re-enter the set.",
+        );
+        jailedVals.push(`val-${v}`);
+        continue;
+      }
+      if (!verdict) {
+        throw new Error(`val-${v}: could not confirm signing after ~7 min (${lastProblem})`);
+      }
+      ctx.log(
+        `val-${v}: signing confirmed (${verdict.signed}/${verdict.signed + verdict.missed} blocks in the probe window)`,
+      );
+      observed[`val-${v}`] = verdict;
+    }
+    return jailedVals.length > 0 ? { observed, jailed: jailedVals } : { observed };
+  },
+};
+
 export function phaseGSteps(): StepDef[] {
-  return [awaitFundsStep, createValidatorsStep, verifyBondedStep];
+  return [awaitFundsStep, createValidatorsStep, verifyBondedStep, verifySigningStep];
 }

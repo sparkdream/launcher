@@ -24,7 +24,15 @@ import { sparkdreamd } from "./exec.js";
 import { explorerChainEnv, renderComponentSdl } from "./render-component-sdl.js";
 import { ingressHost } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
-import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD } from "./node-ops.js";
+import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
+import {
+  assembleUnjailTxJson,
+  buildUnjailSignDoc,
+  valoperAddress,
+  verifySignedDoc,
+  type GentxSignResponse,
+} from "./gentx.js";
+import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import type { SshTarget } from "./services.js";
 
 /**
@@ -109,14 +117,20 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq: row.dseq } } },
         ]);
       }
-      // old node must actually be gone (zombie check, §5)
+      // old node must actually be gone (zombie check, §5). Proof of
+      // execution required, not mere reachability: some provider gateways
+      // (observed on jjozzietech) answer lease-shell for an already-closed
+      // lease with empty success, which read as "still alive" and wedged
+      // the op behind a container that was long torn down.
       if (row.ssh_host && row.ssh_port) {
         try {
-          await ctx.services.ssh.exec(rowTarget(ctx, row), "true");
-          throw new AwaitUser(
-            p("close"),
-            `${key}'s old container still answers SSH after close — wait for the provider to tear it down, then resume`,
-          );
+          const probe = await ctx.services.ssh.exec(rowTarget(ctx, row), "echo zombie-probe");
+          if (probe.stdout.includes("zombie-probe")) {
+            throw new AwaitUser(
+              p("close"),
+              `${key}'s old container still answers SSH after close: wait for the provider to tear it down, then resume`,
+            );
+          }
         } catch (e) {
           if (e instanceof AwaitUser) throw e;
           // unreachable — exactly what we want
@@ -248,9 +262,19 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         providers,
       });
       if (!decision.chosen) {
+        // distinguish "market had nothing" from "the bids expired": a bid
+        // not leased within a few minutes closes, and providers do not
+        // re-bid on an old order — resuming here can never succeed, so
+        // point at the abandon path instead of looping on the same order
+        const expired = bids.length > 0 && bids.every((b) => b.bid.state !== "open");
         throw new AwaitUser(
           p("lease"),
-          `no acceptable bids for ${key} relaunch avoiding ${avoidProviders.size + exclude.size} provider(s): ${JSON.stringify(decision.rejected)}`,
+          expired
+            ? `the bids for ${key}'s relaunch deployment have expired (a lease must be signed ` +
+                "within a few minutes of the bids arriving). Resuming cannot recover this: " +
+                "use Abandon on this operation to close the deployment and refund its escrow, " +
+                `then relaunch ${key} again and sign the lease promptly`
+            : `no acceptable bids for ${key} relaunch avoiding ${avoidProviders.size + exclude.size} provider(s): ${JSON.stringify(decision.rejected)}`,
         );
       }
       const bidId = decision.chosen.bid.id;
@@ -375,9 +399,22 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         // same refresh start-chain performs) and re-enable [statesync] in
         // case the bundle was packaged with it flipped off.
         const trust = await resolveStateSyncTrust(ctx);
+        let servers = trust.rpcServers.join(",");
+        if (isValidator) {
+          // own-sentry witness on localhost, same rationale as start-chain:
+          // the bundle RPCs may be unreachable from the NEW provider
+          // (egress filtering killed exactly this relaunch's state sync on
+          // datanode.uk), and the local proxy is provider-agnostic
+          const s = resolveTopology(spec).validatorSentries[valIndex]?.[0];
+          const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
+          if (sentryIp) {
+            await ctx.services.ssh.exec(target, socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657));
+            servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
+          }
+        }
         await ctx.services.ssh.exec(
           target,
-          `sed -i 's|^rpc_servers = .*|rpc_servers = "${trust.rpcServers.join(",")}"|; ` +
+          `sed -i 's|^rpc_servers = .*|rpc_servers = "${servers}"|; ` +
             `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
             `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|; ` +
             `/^\\[statesync\\]$/,/^\\[/ s|^enable = false|enable = true|' ${NODE_HOME}/config/config.toml`,
@@ -440,6 +477,20 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           const sentryRow = componentRow(ctx, `sentry-${s}`);
           const port = tunnelPort(valIndex);
           await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
+        }
+        if (spec.join) {
+          // join validators also dial OUT through a local proxy: the sentry
+          // dial-in alone leaves the link hostage to the sentry dialer's
+          // exponential backoff whenever the validator was down a while
+          const s0 = (topo.validatorSentries[valIndex] ?? [])[0];
+          const sentryIp0 = s0 !== undefined ? componentRow(ctx, `sentry-${s0}`).tailnet_ip : null;
+          if (sentryIp0) {
+            await ctx.services.ssh.exec(target, socatTunnelCmd(VAL_PEER_TUNNEL_PORT, sentryIp0, 26656));
+            await ctx.services.ssh.exec(
+              target,
+              `sed -i 's|@${sentryIp0}:26656|@127.0.0.1:${VAL_PEER_TUNNEL_PORT}|' ${NODE_HOME}/config/config.toml`,
+            );
+          }
         }
       } else {
         // relaunched sentry: create its own tunnels to current validator IPs
@@ -504,8 +555,124 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         await ctx.services.ssh.exec(target, START_NODE_CMD);
       }
       ctx.db.setComponentState(ctx.launchId, key, "active");
-      ctx.db.setFleetOpStatus(opId, "done");
       return { started: true };
+    },
+  });
+
+  steps.push({
+    name: p("persist"),
+    async run(ctx) {
+      // §5 step 20b, relaunch edition: the deploy step ships the fresh
+      // volume in wait mode and the start step launches sparkdreamd over
+      // SSH — a process any provider-initiated container restart silently
+      // kills, leaving the node dead in wait mode behind stale env tunnels
+      // (observed live: a provider recycling its pod every ~30 min killed a
+      // relaunched validator twice mid-catchup, and a recycled sentry came
+      // back with its env tunnel aimed at the pre-relaunch validator IP).
+      // Persist the running state into the deployments: WAIT_FOR_CONFIG=false
+      // so the entrypoint owns sparkdreamd, current tunnel targets in env so
+      // restarts self-heal, and the same corrections for the counterpart
+      // sentries whose env still names the old validator IP. The manifest
+      // push restarts the containers into that self-healing shape.
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+      const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
+      const topo = resolveTopology(spec);
+      const targets: string[] = [key];
+      if (isValidator) targets.push(...(topo.validatorSentries[valIndex] ?? []).map((s) => `sentry-${s}`));
+
+      const msgs: Msg[] = [];
+      const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
+      for (const k of targets) {
+        const row = componentRow(ctx, k);
+        const sdlPath = sdlPathFor(ctx, k);
+        let text = fs.readFileSync(sdlPath, "utf8");
+        text = text.replace(/WAIT_FOR_CONFIG=true/g, "WAIT_FOR_CONFIG=false");
+        if (k === key && isValidator && spec.join) {
+          // own-sentry witness + outbound peer tunnels (what the configure
+          // step wired over SSH), baked so a container restart re-creates
+          // them — the entrypoint runs every TS_TUNNEL_* env entry
+          const s = topo.validatorSentries[valIndex]?.[0];
+          const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
+          if (sentryIp) {
+            const doc = yaml.load(text) as any;
+            const svc = doc.services?.sparkdreamd;
+            if (svc) {
+              const env: string[] = (svc.env ?? []).filter(
+                (e: string) => !e.startsWith("TS_TUNNEL_WITNESS=") && !e.startsWith("TS_TUNNEL_PEER="),
+              );
+              env.push(`TS_TUNNEL_WITNESS=${WITNESS_RPC_PORT}:${sentryIp}:26657`);
+              env.push(`TS_TUNNEL_PEER=${VAL_PEER_TUNNEL_PORT}:${sentryIp}:26656`);
+              svc.env = env;
+              text = yaml.dump(doc, { lineWidth: 120 });
+            }
+          }
+        }
+        if (k !== key) {
+          // counterpart sentry: re-aim its tunnel for THIS validator at the
+          // new tailnet IP (placeholder form covers never-persisted SDLs)
+          text = text
+            .replace(
+              new RegExp(`(TS_TUNNEL_\\d+=${tunnelPort(valIndex)}:)[0-9.]+(:26656)`, "g"),
+              `$1${cfg.tailnetIp}$2`,
+            )
+            .replaceAll(placeholder.tailnetIp(key), cfg.tailnetIp);
+        }
+        if (k === key && !isValidator) {
+          // relaunched sentry: re-aim its validator tunnels at current IPs
+          const sIndex = Number(key.split("-")[1]);
+          for (const v of topo.sentryValidators[sIndex] ?? []) {
+            const valIp = componentRow(ctx, `val-${v}`).tailnet_ip;
+            if (!valIp) continue;
+            text = text
+              .replace(
+                new RegExp(`(TS_TUNNEL_\\d+=${tunnelPort(v)}:)[0-9.]+(:26656)`, "g"),
+                `$1${valIp}$2`,
+              )
+              .replaceAll(placeholder.tailnetIp(`val-${v}`), valIp);
+          }
+        }
+        fs.writeFileSync(sdlPath, text);
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, `${k}.manifest.json`), artifacts.manifestJson);
+        manifests.push({ row, json: artifacts.manifestJson });
+        // convergent like retarget: skip deployments already at this version
+        const wantHash = Buffer.from(artifacts.hash).toString("base64");
+        const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+        if (onChain?.hash === wantHash) {
+          ctx.log(`${k}: on-chain version already matches — skipping update tx`);
+          continue;
+        }
+        msgs.push({
+          typeUrl: TypeUrl.UpdateDeployment,
+          value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+        });
+      }
+      if (msgs.length > 0) await ctx.requireTx(p("persist"), msgs);
+      else ctx.db.deletePendingTx(ctx.launchId, p("persist"));
+      const cert = loadCert(ctx);
+      for (const { row, json } of manifests) {
+        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+      }
+      // the push restarts the containers — wait for the relaunched node's
+      // process to be back (entrypoint-owned now) before declaring the op done
+      const row = componentRow(ctx, key);
+      let back = false;
+      for (let i = 0; i < 36 && !back; i++) {
+        if (i > 0) await ctx.services.sleep(5000);
+        try {
+          const r = await ctx.services.ssh.exec(
+            rowTarget(ctx, row),
+            "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+            { quick: true },
+          );
+          back = r.stdout.trim() === "yes";
+        } catch {
+          // container restarting
+        }
+      }
+      if (!back) throw new Error(`${key} did not come back after the persist restart`);
+      ctx.db.setFleetOpStatus(opId, "done");
+      return { persisted: targets };
     },
   });
 
@@ -1376,6 +1543,184 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
   return steps;
 }
 
+export interface UnjailParams {
+  /** Validator component key, e.g. "val-0". */
+  key: string;
+}
+
+/** Gas budget for MsgUnjail (a light tx; generous headroom). */
+const UNJAIL_GAS = 300_000;
+
+/**
+ * Unjail a downtime-jailed validator (§5): gate on the node being back at
+ * the chain head (unjailing a still-lagging node just re-jails it one
+ * signed-blocks window later), broadcast MsgUnjail from the operator key
+ * the conductor holds, and verify the validator re-enters the bonded set.
+ * Generated operators only — external operators hold their own keys and
+ * unjail from their own wallet (requestUnjail refuses them up front).
+ */
+export function unjailSteps(opId: number, params: UnjailParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const v = Number(params.key.split("-")[1]);
+  const cid = chainId(spec);
+
+  const ownRpc = async (ctx: StepCtx): Promise<string> => {
+    const sentry = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
+      (c) => c.key.startsWith("sentry-") && c.state === "active",
+    );
+    if (!sentry) throw new Error("no active sentry to reach the chain through");
+    return nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
+  };
+
+  const operator = (ctx: StepCtx): string => {
+    const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+    const address = keys?.accounts[`op-val-${v}`];
+    if (!address) throw new Error(`no operator account recorded for ${params.key}`);
+    return address;
+  };
+
+  return [
+    {
+      name: p("sync-gate"),
+      async run(ctx) {
+        // same rationale as the phase-g bond gate: the chain only lifts the
+        // jail; whether it sticks depends on the node signing immediately
+        const row = componentRow(ctx, params.key);
+        const target = rowTarget(ctx, row);
+        let lastProblem = "no probe yet";
+        for (let i = 0; i < 120; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          const head = await sentryRpcHeight(ctx);
+          const probe = await ctx.services.ssh.exec(
+            target,
+            "wget -qO- http://127.0.0.1:26657/status 2>/dev/null || true",
+            { quick: true },
+          );
+          const height = Number(/latest_block_height"?\s*:\s*"?(\d+)/.exec(probe.stdout)?.[1]);
+          const catchingUp = /catching_up"?\s*:\s*"?(\w+)/.exec(probe.stdout)?.[1] === "true";
+          if (Number.isFinite(height) && !catchingUp && (head === undefined || height >= head - 3)) {
+            return { height, head };
+          }
+          lastProblem = Number.isFinite(height)
+            ? `${catchingUp ? "catching up " : ""}at height ${height}, chain head ${head ?? "unknown"}`
+            : "local RPC not answering";
+        }
+        throw new Error(
+          `${params.key} is not at the chain head after ~10 min (${lastProblem}) — ` +
+            "unjailing now would only re-jail it; fix the node first, then resume",
+        );
+      },
+    },
+    {
+      name: p("unjail"),
+      async run(ctx) {
+        const rpc = await ownRpc(ctx);
+        const address = operator(ctx);
+        const valoper = valoperAddress(address);
+        const val = await queryJson(["query", "staking", "validator", valoper], rpc);
+        if (!(val.validator ?? val).jailed) {
+          return { alreadyUnjailed: true }; // idempotent re-run
+        }
+        const fee = Math.ceil(Number(spec.token.minGasPrice) * UNJAIL_GAS);
+
+        if (Array.isArray(spec.topology.validators.operators)) {
+          // external operator: the wallet signs MsgUnjail through the same
+          // amino signing loop as promote-validator's create-validator
+          const coords = await accountCoordinates(ctx, rpc, address);
+          const signDoc = buildUnjailSignDoc(address, cid, {
+            ...coords,
+            fee: {
+              amount: fee > 0 ? [{ denom: spec.token.baseDenom, amount: String(fee) }] : [],
+              gas: String(UNJAIL_GAS),
+            },
+          });
+          // the gentx row for this valIndex may still hold Phase G's SIGNED
+          // create-validator response — requireGentx would hand it straight
+          // back; clear it so the wallet is served the unjail doc instead
+          const row = ctx.db.getPendingGentx(ctx.launchId, v);
+          if (row?.status === "signed" && row.sign_doc_json !== JSON.stringify(signDoc)) {
+            ctx.db.resetGentx(ctx.launchId, v);
+          }
+          const responseJson = ctx.requireGentx(v, address, JSON.stringify(signDoc));
+          const response = JSON.parse(responseJson) as GentxSignResponse;
+          const verdict = await verifySignedDoc(signDoc, response, address);
+          if (!verdict.ok) {
+            ctx.db.resetGentx(ctx.launchId, v);
+            throw new Error(`unjail signature for ${params.key} rejected: ${verdict.reason}`);
+          }
+          const txFile = path.join(ctx.dirs.root, `op${opId}-unjail.signed.json`);
+          fs.writeFileSync(txFile, assembleUnjailTxJson(address, response));
+          try {
+            const { stdout } = await sparkdreamd([
+              "tx", "broadcast", txFile, "--node", rpc, "--output", "json",
+            ]);
+            const res = JSON.parse(stdout) as { txhash: string; code?: number; raw_log?: string };
+            if (res.code) {
+              throw new Error(`unjail rejected at broadcast (code ${res.code}): ${res.raw_log ?? ""}`);
+            }
+            await awaitTxIncluded(ctx, rpc, res.txhash);
+            return { txhash: res.txhash };
+          } catch (e) {
+            // a stale sequence (the operator transacted between sign and
+            // broadcast) needs a FRESH sign doc — never replay the cached one
+            ctx.db.resetGentx(ctx.launchId, v);
+            throw e;
+          }
+        }
+
+        // generated operator: the conductor holds the key in the master keyring
+        const { stdout } = await sparkdreamd([
+          "tx", "slashing", "unjail",
+          "--from", `op-val-${v}`,
+          "--keyring-backend", "test",
+          "--home", ctx.dirs.node("val-0"),
+          "--chain-id", cid,
+          "--node", rpc,
+          "--gas", String(UNJAIL_GAS),
+          "--fees", `${fee}${spec.token.baseDenom}`,
+          "--yes",
+          "--output", "json",
+        ]);
+        const res = JSON.parse(stdout) as { txhash: string; code?: number; raw_log?: string };
+        if (res.code) {
+          // e.g. still inside jailed_until, or slashed below min-self-delegation
+          throw new Error(`unjail rejected at broadcast (code ${res.code}): ${res.raw_log ?? ""}`);
+        }
+        await awaitTxIncluded(ctx, rpc, res.txhash);
+        return { txhash: res.txhash };
+      },
+    },
+    {
+      name: p("verify"),
+      async run(ctx) {
+        const rpc = await ownRpc(ctx);
+        const valoper = valoperAddress(operator(ctx));
+        let status = "";
+        let jailed = true;
+        for (let i = 0; i < 36 && (jailed || status !== "BOND_STATUS_BONDED"); i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          try {
+            const out = await queryJson(["query", "staking", "validator", valoper], rpc);
+            const val = out.validator ?? out;
+            jailed = Boolean(val.jailed);
+            status = val.status ?? "";
+          } catch {
+            // transient RPC failure — the loop is the retry
+          }
+        }
+        if (jailed || status !== "BOND_STATUS_BONDED") {
+          throw new Error(
+            `${params.key} did not re-enter the bonded set after ~3 min ` +
+              `(jailed: ${jailed}, status: ${status || "unknown"})`,
+          );
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { unjailed: true };
+      },
+    },
+  ];
+}
+
 /** Steps for every active op of a launch, in creation order. */
 export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
   const launch = db.getLaunch(launchId);
@@ -1391,6 +1736,7 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));
     if (op.kind === "reset-chain") steps.push(...resetChainSteps(op.id, params, spec));
+    if (op.kind === "unjail") steps.push(...unjailSteps(op.id, params, spec));
   }
   return steps;
 }

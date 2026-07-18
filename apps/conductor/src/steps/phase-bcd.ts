@@ -853,6 +853,19 @@ export function nodeShellFallback(
   };
 }
 
+/** SSH target for a deployed node, from the launch's own step outputs. */
+export function nodeTarget(ctx: StepCtx, key: string): SshTarget {
+  const ssh = ctx.output<SshEndpoints>("send-manifests");
+  const ep = ssh?.perNode[key];
+  if (!ep) throw new Error(`no SSH endpoint for ${key}`);
+  // lease-shell fallback for providers whose forwarded ports drop SSH
+  const entry = ctx.output<DeploymentPlan>("create-deployments")?.perNode[key];
+  const a = ctx.output<Assignments>("collect-bids")?.perNode[key];
+  const fallback =
+    a && entry ? nodeShellFallback(ctx, a.hostUri, entry.dseq, a.gseq, a.oseq) : undefined;
+  return sshTarget(ctx, ep.host, ep.port, fallback);
+}
+
 /**
  * External URL of a node's CometBFT RPC. The SDL exposes 26657 globally as a
  * RANDOM_PORT, so the reachable endpoint is a provider-assigned forwarded

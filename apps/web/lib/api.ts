@@ -272,7 +272,8 @@ export type FleetAction =
   | "relaunch"
   | "upgrade"
   | "halt-upgrade"
-  | "topup";
+  | "topup"
+  | "unjail";
 
 export async function postFleetAction(
   launchId: string,
@@ -285,13 +286,16 @@ export async function postFleetAction(
     amount?: string;
     haltHeight?: number;
   } = {},
-): Promise<{ status?: string; warnings?: string[] }> {
+): Promise<{ status?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ action, ...extra }),
   });
-  if (res.status === 409) return res.json() as Promise<{ warnings: string[] }>;
+  // 409 carries either pre-action warnings (confirmable) or a refusal error
+  if (res.status === 409) {
+    return res.json() as Promise<{ warnings?: string[]; confirmPrompt?: string; error?: string }>;
+  }
   return json(res);
 }
 

@@ -101,11 +101,13 @@ export class Ssh2Runner implements SshRunner {
   }
 
   /** Gateway/pod-level failures worth retrying, seen live as "Unexpected
-   *  server response: 500" (handshake) and "provider reported a failure"
-   *  (frame 103, pod mid-restart). A command that ran and exited non-zero
+   *  server response: 500" (handshake), "provider reported a failure"
+   *  (frame 103, pod mid-restart), and "no active replicase for service"
+   *  (pod not yet running — hit when a relaunch upload raced the fresh
+   *  container's first boot). A command that ran and exited non-zero
    *  surfaces as "lease shell: exit N" and is never retried. */
   private static readonly TRANSIENT_SHELL_ERROR =
-    /Unexpected server response: 5\d\d|ECONNRESET|socket hang up|provider reported a failure/;
+    /Unexpected server response: 5\d\d|ECONNRESET|socket hang up|provider reported a failure|no active replicase/;
 
   private async fallbackExec(
     target: SshTarget,

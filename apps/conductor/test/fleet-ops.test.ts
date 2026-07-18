@@ -3,10 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
+import { Secp256k1HdWallet, type StdSignDoc } from "@cosmjs/amino";
 import { toEncodeObject } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
-import { runWithSigner } from "../src/engine.js";
+import { runWithSigner, type GentxSigner } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
 import { buildOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
@@ -62,24 +63,25 @@ interface World {
   spec: LaunchSpec;
   fleet: FleetService;
   signer: FakeSigner;
+  gentxSigner?: GentxSigner;
 }
 
-async function launched(s: LaunchSpec = spec2x2()): Promise<World> {
+async function launched(s: LaunchSpec = spec2x2(), gentxSigner?: GentxSigner): Promise<World> {
   const work = tmp();
   const db = new ConductorDb(path.join(work, "state.db"));
   const services = fakeServices();
   const signer = new FakeSigner();
   db.createLaunch("fl", JSON.stringify(s), "akash1owner");
-  const result = await runWithSigner(db, "fl", s, work, allSteps(), services, signer);
+  const result = await runWithSigner(db, "fl", s, work, allSteps(), services, signer, undefined, gentxSigner);
   expect(result.status).toBe("completed");
   const fleet = new FleetService(db, services, work);
   fleet.materialize("fl");
-  return { work, db, services, spec: s, fleet, signer };
+  return { work, db, services, spec: s, fleet, signer, gentxSigner };
 }
 
 async function driveOps(w: World) {
   const steps = [...allSteps(), ...buildOpSteps(w.db, "fl")];
-  return runWithSigner(w.db, "fl", w.spec, w.work, steps, w.services, w.signer);
+  return runWithSigner(w.db, "fl", w.spec, w.work, steps, w.services, w.signer, undefined, w.gentxSigner);
 }
 
 describe("relaunch op", () => {
@@ -113,6 +115,25 @@ describe("relaunch op", () => {
       ),
     ).toBe(true);
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("pauses on a genuine zombie container, proceeds past a mute closed-lease gateway", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+
+    // container really still answering → pause for the provider teardown
+    w.services.ssh.zombieHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    const paused = await driveOps(w);
+    expect(paused.status).toBe("awaiting-user");
+
+    // gateway now answers with empty success for the closed lease (observed
+    // on jjozzietech) — execution proof fails, so the node counts as gone
+    w.services.ssh.zombieHosts.delete(`${before.ssh_host}:${before.ssh_port}`);
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
   }, 120_000);
 
   it("relaunches a softsign validator behind the double-sign window", async () => {
@@ -676,5 +697,165 @@ describe("chain reset op", () => {
     );
     expect(w.db.listFleetOps("fl")).toHaveLength(0);
     expect(w.services.ssh.execLog.length).toBe(execsBefore);
+  }, 120_000);
+});
+
+describe("unjail op", () => {
+  /** CLI stub standing in for the chain: jailed until an unjail tx lands. */
+  function stubSparkdreamd(): { bin: string; dir: string } {
+    const dir = tmp();
+    const bin = path.join(dir, "sparkdreamd");
+    fs.writeFileSync(
+      bin,
+      `#!/bin/sh
+dir=$(dirname "$0")
+case "$1 $2" in
+  "query staking")
+    if [ -f "$dir/unjailed" ]; then jailed=false; else jailed=true; fi
+    echo "{\\"validator\\":{\\"jailed\\":$jailed,\\"status\\":\\"BOND_STATUS_BONDED\\"}}"
+    ;;
+  "tx slashing")
+    echo "$@" >> "$dir/broadcasts"
+    touch "$dir/unjailed"
+    echo '{"txhash":"STUBHASH","code":0}'
+    ;;
+  "tx broadcast")
+    echo "$@" >> "$dir/broadcasts"
+    touch "$dir/unjailed"
+    echo '{"txhash":"STUBHASH","code":0}'
+    ;;
+  "query auth")
+    echo '{"account":{"account_number":"7","sequence":"3"}}'
+    ;;
+  "query tx")
+    echo '{"code":0}'
+    ;;
+  *)
+    echo '{}'
+    ;;
+esac
+`,
+    );
+    fs.chmodSync(bin, 0o755);
+    return { bin, dir };
+  }
+
+  it("gates on sync, broadcasts MsgUnjail from the operator key, verifies re-bonding", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const opId = w.fleet.requestUnjail(launch, val);
+
+    const stub = stubSparkdreamd();
+    const prev = process.env.SPARKDREAMD_BIN;
+    process.env.SPARKDREAMD_BIN = stub.bin;
+    try {
+      const result = await driveOps(w);
+      expect(result.status).toBe("completed");
+    } finally {
+      if (prev === undefined) delete process.env.SPARKDREAMD_BIN;
+      else process.env.SPARKDREAMD_BIN = prev;
+    }
+
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.db.stepOutput<any>("fl", `op${opId}:unjail`)!.txhash).toBe("STUBHASH");
+    expect(w.db.stepOutput<any>("fl", `op${opId}:verify`)!.unjailed).toBe(true);
+    // the tx was signed by the conductor-held operator key, not the wallet
+    const broadcast = fs.readFileSync(path.join(stub.dir, "broadcasts"), "utf8");
+    expect(broadcast).toContain("--from op-val-0");
+    expect(broadcast).toContain("--keyring-backend test");
+  }, 120_000);
+
+  it("no-ops cleanly when the validator is not jailed", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-1")!;
+    const opId = w.fleet.requestUnjail(launch, val);
+
+    const stub = stubSparkdreamd();
+    fs.writeFileSync(path.join(stub.dir, "unjailed"), ""); // already unjailed
+    const prev = process.env.SPARKDREAMD_BIN;
+    process.env.SPARKDREAMD_BIN = stub.bin;
+    try {
+      const result = await driveOps(w);
+      expect(result.status).toBe("completed");
+    } finally {
+      if (prev === undefined) delete process.env.SPARKDREAMD_BIN;
+      else process.env.SPARKDREAMD_BIN = prev;
+    }
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.db.stepOutput<any>("fl", `op${opId}:unjail`)!.alreadyUnjailed).toBe(true);
+    expect(fs.existsSync(path.join(stub.dir, "broadcasts"))).toBe(false);
+  }, 120_000);
+
+  it("refuses non-validators and doubled-up ops", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(() => w.fleet.requestUnjail(launch, sentry)).toThrow(/applies to validators/);
+
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const opId = w.fleet.requestUnjail(launch, val);
+    expect(() => w.fleet.requestUnjail(launch, val)).toThrow(new RegExp(`#${opId}`));
+  }, 120_000);
+
+  it("external operator: wallet signs MsgUnjail through the gentx loop, tx assembled and broadcast", async () => {
+    // the "wallet" is cosmjs amino signing — byte-identical to Keplr's path
+    const wallet = await Secp256k1HdWallet.fromMnemonic(
+      "surround miss nominee dream gap cross assault thank captain prosper drop duty group candy wealth weather scale put",
+      { prefix: "sprkdrm" },
+    );
+    const [account] = await wallet.getAccounts();
+    const address = account!.address;
+    const gentxSigner: GentxSigner = {
+      async signGentx(signDocJson: string): Promise<string> {
+        return JSON.stringify(await wallet.signAmino(address, JSON.parse(signDocJson) as StdSignDoc));
+      },
+    };
+    const s = testnetSpec({
+      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+      topology: {
+        validators: { count: 1, operators: [address] },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const w = await launched(s, gentxSigner);
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const opId = w.fleet.requestUnjail(launch, val);
+
+    // the genesis gentx left a SIGNED create-validator row for valIndex 0 —
+    // the op must serve the wallet a fresh unjail doc, not replay that one
+    expect(w.db.getPendingGentx("fl", 0)?.status).toBe("signed");
+
+    const stub = stubSparkdreamd();
+    const prev = process.env.SPARKDREAMD_BIN;
+    process.env.SPARKDREAMD_BIN = stub.bin;
+    try {
+      const result = await driveOps(w);
+      expect(result.status).toBe("completed");
+    } finally {
+      if (prev === undefined) delete process.env.SPARKDREAMD_BIN;
+      else process.env.SPARKDREAMD_BIN = prev;
+    }
+
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.db.stepOutput<any>("fl", `op${opId}:unjail`)!.txhash).toBe("STUBHASH");
+    // the broadcast tx file carries a proto-JSON MsgUnjail signed amino-mode
+    // by the operator's wallet, with the live account sequence from the stub
+    const txFile = path.join(w.work, "launches", "fl", `op${opId}-unjail.signed.json`);
+    const tx = JSON.parse(fs.readFileSync(txFile, "utf8"));
+    expect(tx.body.messages[0]["@type"]).toBe("/cosmos.slashing.v1beta1.MsgUnjail");
+    expect(tx.body.messages[0].validator_addr).toMatch(/^sprkdrmvaloper1/);
+    expect(tx.auth_info.signer_infos[0].mode_info.single.mode).toBe("SIGN_MODE_LEGACY_AMINO_JSON");
+    expect(tx.auth_info.signer_infos[0].sequence).toBe("3");
+    expect(fs.readFileSync(path.join(stub.dir, "broadcasts"), "utf8")).toContain("tx broadcast");
+    // and the signed doc the wallet saw was the unjail one (amino field "address")
+    const row = w.db.getPendingGentx("fl", 0)!;
+    const doc = JSON.parse(row.sign_doc_json);
+    expect(doc.msgs[0].type).toBe("cosmos-sdk/MsgUnjail");
+    expect(doc.msgs[0].value.address).toBe(tx.body.messages[0].validator_addr);
   }, 120_000);
 });
