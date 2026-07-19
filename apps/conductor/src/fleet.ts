@@ -838,6 +838,15 @@ export class FleetService {
         .listFleetComponents(launch.id)
         .find((c) => c.key === `sentry-${sIndex}` && c.state === "active");
       if (!sentry) return warnings;
+      // a validator peered over its sentry's PUBLIC endpoint doesn't ride
+      // the mesh for votes — the DERP round trip below would be measuring a
+      // path consensus no longer uses
+      const peers = await this.services.ssh.exec(
+        this.sshTargetFor(launch, component),
+        "grep ^persistent_peers /root/.sparkdream/config/config.toml",
+        { quick: true },
+      );
+      if (/@(?!100\.64\.|127\.0\.0\.1)[^:]+:/.test(peers.stdout)) return warnings;
       const res = await this.services.ssh.exec(
         this.sshTargetFor(launch, sentry),
         `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ping -c 3 --timeout 2s ${component.tailnet_ip} 2>&1 || true`,
@@ -889,10 +898,22 @@ export class FleetService {
    * and its new deployment — if leased — is closed through the signing loop
    * so escrow is refunded. The component stays 'closed', ready to relaunch.
    */
-  async requestAbortOp(launch: LaunchRow, opId: number): Promise<{ step?: string }> {
+  async requestAbortOp(
+    launch: LaunchRow,
+    opId: number,
+  ): Promise<{ step?: string; warning?: string }> {
     const op = this.db.listFleetOps(launch.id).find((o) => o.id === opId);
     if (!op) throw new Error(`op ${opId} not found`);
     if (op.status === "done") throw new Error(`op ${opId} already completed — nothing to abort`);
+    // a SIGNED tx is already broadcast — aborting the op cannot recall it
+    // (learned live: an op's close was signed moments before the abort, and
+    // the abort's cleanup hid the row while the close landed on-chain)
+    const signed = this.db.listSignedPendingTxsLike(launch.id, `op${opId}:%`);
+    const warning =
+      signed.length > 0
+        ? `already-signed transaction(s) for ${signed.map((s) => s.step).join(", ")} were ` +
+          "broadcast before the abort and may still take effect on-chain"
+        : undefined;
     this.db.setFleetOpStatus(opId, "aborted");
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error
@@ -912,10 +933,10 @@ export class FleetService {
           step,
           JSON.stringify([closeDeploymentMsg(launch.owner, deploy.dseq)]),
         );
-        return { step };
+        return { step, ...(warning ? { warning } : {}) };
       }
     }
-    return {};
+    return warning ? { warning } : {};
   }
 
   /** Add/remove a provider on a wallet's global avoid/prefer list (§6). */

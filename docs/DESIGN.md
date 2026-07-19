@@ -443,8 +443,8 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
    - sentry `persistent_peers` = `<validator_node_id>@127.0.0.1:<tunnelPort>`
      — fully renderable now (local tunnel address, no IP needed)
    - validator `persistent_peers` = `<sentry_node_id>@<SENTRY_TAILNET_IP>:26656`
-     (validators dial sentries at tailnet IPs directly, per doc Phase 6) —
-     rendered with a placeholder here, patched in Phase E step 18b
+     — rendered with a placeholder here, resolved in Phase E step 18b
+     (public sentry endpoint when reachable, tailnet IP otherwise; see 18b)
    - tunnel port allocation: sentry *s* → validator *v* uses `16656 + v`
      (`TS_TUNNEL_n=<port>:<validator_tailnet_ip>:26656`, IP patched in Phase E)
    - validator quirks baked in: `priv_validator_laddr = tcp://127.0.0.1:26660`
@@ -545,10 +545,27 @@ Per node, parallel where safe:
     — step 20b persists the real targets into the SDL env (the durable
     long-term fix is the entrypoint reading tunnel specs from a file;
     chain-repo image change, see §12.2).
-18b. `patch-validator-peers` — fill each validator's `persistent_peers`
-    placeholders with real sentry tailnet IPs (from the step-17 table) and
-    restart/reload; node IDs alone were not enough to pre-render this in
-    Phase A.
+18b. `patch-validator-peers` — resolve each validator's `persistent_peers`
+    placeholders, **public endpoint first**: for every assigned sentry, the
+    step probes the sentry's provider-forwarded public p2p port FROM INSIDE
+    the validator's container (`nc -zw 4`) and, when reachable, points the
+    peer entry at `<public-host>:<forwarded-port>` — one direct TCP hop.
+    Only unreachable sentries (the validator's provider filters that
+    egress) fall back to the tailnet IP, where the sentry's dial-in tunnel
+    still carries the link. Rationale, learned the expensive way on the
+    first devnet join: Akash providers never allow a direct tailscale path,
+    so the mesh rides the headscale DERP relay — ~400-500ms RTT with
+    silent stalls that hang a p2p connection until CometBFT's slow
+    ping/pong timeout. A validator on that path signed 0-45% of blocks in
+    bursts and was downtime-jailed five times; on the public path it signs
+    ~99.5%. The mesh remains the operational plane (SSH-less management,
+    tmkms, witness proxies) — consensus traffic just stops depending on
+    it. The same public-first probe runs in join mode's start-chain and in
+    the relaunch configure step, so relocated validators re-derive the
+    best path for their new provider. The remaining relay-dependent
+    fallback tunnels carry tight TCP keepalives
+    (`keepidle=10,keepintvl=5,keepcnt=3`, mirroring the tmkms proxy) so a
+    stalled flow dies in ~25s and redials instead of hanging.
 19. *(tmkms mode only)* `await-signer` — pause with a **guided signer
     setup** panel, one tab per validator. The launcher generates everything
     the local machine needs:
@@ -620,7 +637,21 @@ dashboard as mini state machines reusing the launch steps:
   volume regardless of the persistence settings: validators resync chain
   data from their sentries, and the node re-registers with headscale (new
   tailnet IP, hence the re-wiring above). Expired preauth keys are re-minted
-  via headscale SSH first.
+  via headscale SSH first. Validator peer wiring is public-first here too
+  (probe + fallback, per step 18b). The op ends with a **persist step** —
+  step 20b for relaunches: the deploy shipped the fresh volume in wait mode
+  and the start step launched `sparkdreamd` over SSH, a process any
+  provider-initiated container restart silently kills, leaving the node
+  dead in wait mode behind stale env tunnels (observed live: a provider
+  recycling its pod every ~30 min killed a relaunched validator twice
+  mid-catchup, and a recycled sentry came back with its env tunnel aimed at
+  the pre-relaunch validator IP). The persist step batches one
+  `MsgUpdateDeployment` (1 sig) across the relaunched component and its
+  counterpart sentries: `WAIT_FOR_CONFIG=false` so the entrypoint owns the
+  chain process from then on, current tunnel targets baked into the
+  `TS_TUNNEL_*` env, and the counterparts' env re-aimed at the new tailnet
+  IP — after which container restarts self-heal, same as a launch after
+  step 20b.
 
 **Validator relaunch: double-sign safety (mandatory, softsign mode).**
 Relaunch re-uploads the *same consensus key* to a new container, and
@@ -871,7 +902,13 @@ state-sync into an apphash divergence or fail to sync at all.
   egress-filtered hosts block, and tailnet IPs are not directly
   dialable under userspace tailscale — observed live when a relaunched
   validator's state sync died with "no witnesses connected" on a
-  provider that refused all non-443 egress. No 2/3 start coordination; the chain is already live. As
+  provider that refused all non-443 egress. For p2p, join validators get
+  the same public-first peering as step 18b (probe the own sentry's
+  public p2p port from the validator, peer directly when open); a
+  validator stuck on the mesh fallback additionally dials OUT through a
+  local proxy (`127.0.0.1:16657` → sentry p2p), so the link can be
+  re-established from either side instead of waiting out the sentry
+  dialer's exponential backoff after validator downtime. No 2/3 start coordination; the chain is already live. As
   each node catches up, start-chain flips its `[statesync] enable` back
   off (tidiness: CometBFT skips state sync on a non-empty data dir
   anyway). `persist-start` (20b) and `verify-chain` run as usual.
@@ -931,9 +968,11 @@ runs a **vote-latency guard** (same 409-confirm pattern as the close
 warnings): a validator can be synced and signing yet still doomed — the
 origin seals each block ~timeout_commit after the last, so a precommit
 must cross sentry→validator and back inside that window. The guard
-`tailscale ping`s the validator from its own sentry and warns when
-2×RTT exceeds timeout_commit (4×RTT for a DERP-relayed path, whose
-latency spikes above its ping floor); observed live: a joiner validator
+first reads the validator's `persistent_peers`: peered over a public
+endpoint (step 18b), consensus doesn't ride the mesh and the check is
+skipped. On a mesh-peered validator it `tailscale ping`s the validator
+from its own sentry and warns when 2×RTT exceeds timeout_commit (4×RTT
+for a DERP-relayed path, whose latency spikes above its ping floor); observed live: a joiner validator
 on a provider that blocked direct tailscale (~400ms DERP RTT) against
 1s devnet blocks signed every precommit on time yet landed none,
 burning a 1% slash per unjail attempt. The remedy the warning points

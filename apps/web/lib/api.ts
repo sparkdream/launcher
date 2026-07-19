@@ -428,7 +428,7 @@ export async function getComponentHeight(
 export async function postAbortOp(
   launchId: string,
   opId: number,
-): Promise<{ status: string; step?: string }> {
+): Promise<{ status: string; step?: string; warning?: string }> {
   return json(await afetch(`/api/fleet/${launchId}/ops/${opId}/abort`, { method: "POST" }));
 }
 

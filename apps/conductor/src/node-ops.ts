@@ -69,9 +69,14 @@ export function socatTunnelCmd(listenPort: number, targetIp: string, targetPort 
   // The probe then confirms THIS tunnel (target IP in the socat cmdline),
   // not merely that the port listens — a leftover placeholder tunnel also
   // satisfies a bare port check and silently blackholes p2p.
+  // keepalive on the listen leg (same timers as the entrypoint's tmkms
+  // proxy): a stalled DERP flow otherwise hangs the p2p connection silently
+  // until CometBFT's slow ping/pong timeout — tens of seconds of missed
+  // votes per stall. Tight keepalives surface the dead leg in ~25s so the
+  // peer drops cleanly and redials immediately.
   return (
     `pkill -f "^socat TCP-LISTEN:${listenPort}," 2>/dev/null; sleep 0.3; ` +
-    `nohup socat TCP-LISTEN:${listenPort},fork,reuseaddr ` +
+    `nohup socat TCP-LISTEN:${listenPort},fork,reuseaddr,keepalive,keepidle=10,keepintvl=5,keepcnt=3 ` +
     `EXEC:"tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock nc ${targetIp} ${targetPort}" ` +
     `>/dev/null 2>&1 & sleep 1 && nc -z 127.0.0.1 ${listenPort} && ` +
     `pgrep -f "^socat.*nc ${targetIp} ${targetPort}" >/dev/null`

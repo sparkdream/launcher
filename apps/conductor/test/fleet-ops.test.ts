@@ -155,10 +155,20 @@ describe("relaunch op", () => {
         (e) => e.command.includes("socat TCP-LISTEN:16656") && e.command.includes(after.tailnet_ip!),
       ),
     ).toBe(true);
-    // §5 double-sign safety: the start step polled the chain past the window
-    // (fake rpc heights advance per call; the guard required >= baseline+20)
-    const startExecs = w.services.ssh.execLog.filter((e) => e.command.includes("sparkdreamd start"));
-    expect(startExecs.length).toBeGreaterThan(0);
+    // single-boot rule: the relaunched node is never SSH-started — the
+    // persist step's manifest push is its first and only boot (an
+    // SSH-started node torn down by that push crash-looped live)
+    const newId = `${after.ssh_host}:${after.ssh_port}`;
+    expect(
+      w.services.ssh.execLog.some(
+        (e) => e.target === newId && e.command.includes("sparkdreamd start"),
+      ),
+    ).toBe(false);
+    // and the deployment left wait mode, so the entrypoint owns the process
+    expect(
+      fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "val-0.yaml"), "utf8"),
+    ).toContain("WAIT_FOR_CONFIG=false");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 });
 

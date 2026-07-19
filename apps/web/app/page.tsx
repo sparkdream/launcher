@@ -1616,8 +1616,12 @@ export default function Page() {
       {pending && (
         <div className="banner sign">
           <span>
-            Signature needed for <b>{pending.step}</b> ({pending.msgs.length} msg
-            {pending.msgs.length > 1 ? "s" : ""})
+            Signature needed for <b>{pending.step}</b>{" "}
+            {/* name the messages, not just a count: a user mid-task once
+                signed another op's MsgCloseDeployment believing it was part
+                of their own flow */}
+            ({[...new Set(pending.msgs.map((m) => m.typeUrl.split(".").pop() ?? m.typeUrl))].join(", ")}
+            {pending.msgs.length > 1 ? ` × ${pending.msgs.length}` : ""})
           </span>
           <button onClick={sign} className="btn primary small" disabled={busy !== null}>
             Sign with Keplr
@@ -2846,6 +2850,7 @@ export default function Page() {
                               const { postAbortOp } = await import("../lib/api");
                               try {
                                 const r = await postAbortOp(f.launchId, o.id);
+                                if (r.warning) setError(`Abandoned, but: ${r.warning}`);
                                 if (r.step) setLaunchId(f.launchId); // sign the close
                               } catch (e) {
                                 setError(String(e));

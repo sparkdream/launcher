@@ -445,6 +445,16 @@ export class ConductorDb {
       .run(launchId);
   }
 
+  /** Signed rows whose step matches a LIKE pattern — already broadcast, so
+   *  they cannot be recalled; callers can only warn about them. */
+  listSignedPendingTxsLike(launchId: string, pattern: string): PendingTxRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM pending_txs WHERE launch_id = ? AND step LIKE ? AND status = 'signed'",
+      )
+      .all(launchId, pattern) as PendingTxRow[];
+  }
+
   /** Drop unsigned rows whose step matches a LIKE pattern (orphan cleanup). */
   deleteUnsignedPendingTxsLike(launchId: string, pattern: string): void {
     this.db

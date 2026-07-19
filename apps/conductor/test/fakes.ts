@@ -131,9 +131,26 @@ export class FakeProviderGateway {
   manifests: Array<{ hostUri: string; dseq: string }> = [];
   private portCounter = 30000;
   private assigned = new Map<string, { host: string; port: number }>();
+  /** Wired by fakeServices: a node manifest push restarts the container,
+   *  and the entrypoint then owns sparkdreamd — WAIT_FOR_CONFIG=false boots
+   *  it, =true parks the container in wait mode. */
+  onNodeManifest?: (sshId: string, waitMode: boolean) => void;
 
-  async sendManifest(_creds: MtlsCredentials, hostUri: string, dseq: string): Promise<void> {
+  async sendManifest(
+    _creds: MtlsCredentials,
+    hostUri: string,
+    dseq: string,
+    manifestJson?: string,
+  ): Promise<void> {
     this.manifests.push({ hostUri, dseq });
+    if (manifestJson?.includes("WAIT_FOR_CONFIG=")) {
+      const key = `${hostUri}/${dseq}`;
+      if (!this.assigned.has(key)) {
+        this.assigned.set(key, { host: new URL(hostUri).hostname, port: ++this.portCounter });
+      }
+      const ep = this.assigned.get(key)!;
+      this.onNodeManifest?.(`${ep.host}:${ep.port}`, manifestJson.includes("WAIT_FOR_CONFIG=true"));
+    }
   }
 
   async leaseLogs(): Promise<string> {
@@ -326,10 +343,16 @@ export interface FakeWorld extends Services {
 }
 
 export function fakeServices(): FakeWorld {
+  const ssh = new FakeSsh();
+  const provider = new FakeProviderGateway();
+  provider.onNodeManifest = (sshId, waitMode) => {
+    if (waitMode) ssh.started.delete(sshId);
+    else ssh.started.add(sshId);
+  };
   return {
     api: new FakeAkashApi(),
-    provider: new FakeProviderGateway(),
-    ssh: new FakeSsh(),
+    provider,
+    ssh,
     rpc: new FakeRpc(),
     certs: { generate: async () => FAKE_CERT },
     // "encryption" placeholder: a plain tarball, so bundle round-trips are

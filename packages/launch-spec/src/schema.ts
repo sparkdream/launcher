@@ -101,7 +101,7 @@ const roleResources = z.object({
   storage: roleStorage,
 });
 
-const durationSeconds = z.string().regex(/^[0-9]+s$/, "duration like '3s'");
+const durationSeconds = z.string().regex(/^[0-9]+(\.[0-9]+)?s$/, "duration like '3s' or '2.5s'");
 const rate = z.number().min(0).max(1);
 
 /** CometBFT peer string: 40-hex node id @ host:port. */

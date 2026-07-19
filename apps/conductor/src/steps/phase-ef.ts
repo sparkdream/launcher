@@ -5,7 +5,7 @@ import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
-import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, WITNESS_RPC_PORT } from "../node-ops.js";
+import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "../node-ops.js";
 import { phaseGSteps } from "./phase-g.js";
 import { resolveStateSyncTrust } from "./join.js";
 
@@ -101,19 +101,43 @@ export const patchValidatorPeersStep: StepDef = {
   async run(ctx) {
     const mesh = ctx.output<MeshTable>("await-mesh")!;
     const topo = resolveTopology(ctx.spec);
+    const p2p = ctx.output<SshEndpoints>("send-manifests")?.p2p;
+    const publicPeers: Record<string, string[]> = {};
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
       const target = nodeTarget(ctx, `val-${v}`);
       for (const s of topo.validatorSentries[v] ?? []) {
         const token = placeholder.tailnetIp(`sentry-${s}`);
         const ip = mesh.ips[`sentry-${s}`];
         if (!ip) throw new Error(`no tailnet IP for sentry-${s}`);
+        // public-first (§5): the mesh path rides a DERP relay whose silent
+        // stalls drop votes in bursts — a validator that can reach its
+        // sentry's public p2p endpoint peers over one direct TCP hop
+        // instead. The tailnet form stays as the fallback (the sentry's
+        // dial-in tunnel still covers those providers).
+        const pub = p2p?.[`sentry-${s}`];
+        if (pub) {
+          const probe = await ctx.services.ssh.exec(
+            target,
+            `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
+            { quick: true },
+          );
+          if (probe.stdout.includes("open")) {
+            await ctx.services.ssh.exec(
+              target,
+              `sed -i 's|${token}:26656|${pub.host}:${pub.port}|g' ${NODE_HOME}/config/config.toml`,
+            );
+            ctx.log(`val-${v}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
+            (publicPeers[`val-${v}`] ??= []).push(`sentry-${s}`);
+          }
+        }
+        // any remaining references (tmkms addr blocks, non-peered fallback)
         await ctx.services.ssh.exec(
           target,
           `sed -i 's|${token}|${ip}|g' ${NODE_HOME}/config/config.toml`,
         );
       }
     }
-    return { patched: true };
+    return { patched: true, publicPeers };
   },
 };
 
@@ -211,6 +235,38 @@ async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void
           socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657),
         );
         servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
+        // p2p: prefer the own sentry's PUBLIC endpoint over the mesh — the
+        // DERP-relayed path stalls silently and drops votes in bursts
+        // (see the relaunch configure step); mesh proxy stays the fallback
+        const pub = s !== undefined
+          ? ctx.output<SshEndpoints>("send-manifests")?.p2p?.[`sentry-${s}`]
+          : undefined;
+        let peered = false;
+        if (pub) {
+          const probe = await ctx.services.ssh.exec(
+            nodeTarget(ctx, key),
+            `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
+            { quick: true },
+          );
+          if (probe.stdout.includes("open")) {
+            await ctx.services.ssh.exec(
+              nodeTarget(ctx, key),
+              `sed -i 's|@${sentryIp}:26656|@${pub.host}:${pub.port}|' ${NODE_HOME}/config/config.toml`,
+            );
+            ctx.log(`${key}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
+            peered = true;
+          }
+        }
+        if (!peered) {
+          await ctx.services.ssh.exec(
+            nodeTarget(ctx, key),
+            socatTunnelCmd(VAL_PEER_TUNNEL_PORT, sentryIp, 26656),
+          );
+          await ctx.services.ssh.exec(
+            nodeTarget(ctx, key),
+            `sed -i 's|@${sentryIp}:26656|@127.0.0.1:${VAL_PEER_TUNNEL_PORT}|' ${NODE_HOME}/config/config.toml`,
+          );
+        }
       }
     }
     await ctx.services.ssh.exec(

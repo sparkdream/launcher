@@ -460,14 +460,42 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
 
       const topo = resolveTopology(spec);
+      const publicPeered = new Set<number>();
       if (isValidator) {
-        // patch own config's sentry placeholders with CURRENT sentry IPs
+        // patch own config's sentry placeholders — public endpoint first
+        // (same rationale as patch-validator-peers), tailnet IP fallback
         for (const s of topo.validatorSentries[valIndex] ?? []) {
-          const sentryIp = componentRow(ctx, `sentry-${s}`).tailnet_ip;
+          const sentryRow = componentRow(ctx, `sentry-${s}`);
+          const sentryIp = sentryRow.tailnet_ip;
           if (!sentryIp) throw new Error(`sentry-${s} has no recorded tailnet IP`);
+          const token = placeholder.tailnetIp(`sentry-${s}`);
+          try {
+            const status = await ctx.services.provider.leaseStatus(
+              loadCert(ctx), sentryRow.host_uri, sentryRow.dseq, 1, 1,
+            );
+            const pub = extractForwardedPort(status, 26656);
+            const probe = await ctx.services.ssh.exec(
+              target,
+              `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
+              { quick: true },
+            );
+            if (probe.stdout.includes("open")) {
+              // cover both the placeholder form and an already-substituted
+              // tailnet form (bundles re-packaged after a launch carry IPs)
+              await ctx.services.ssh.exec(
+                target,
+                `sed -i 's|${token}:26656|${pub.host}:${pub.port}|g; ` +
+                  `s|@${sentryIp}:26656|@${pub.host}:${pub.port}|g' ${NODE_HOME}/config/config.toml`,
+              );
+              ctx.log(`${key}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
+              publicPeered.add(s);
+            }
+          } catch {
+            // no forwarded p2p or probe failure — tailnet fallback below
+          }
           await ctx.services.ssh.exec(
             target,
-            `sed -i 's|${placeholder.tailnetIp(`sentry-${s}`)}|${sentryIp}|g' ${NODE_HOME}/config/config.toml`,
+            `sed -i 's|${token}|${sentryIp}|g' ${NODE_HOME}/config/config.toml`,
           );
         }
         // §5: relaunching a validator re-wires its sentries' tunnels.
@@ -479,12 +507,13 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
         }
         if (spec.join) {
-          // join validators also dial OUT through a local proxy: the sentry
-          // dial-in alone leaves the link hostage to the sentry dialer's
-          // exponential backoff whenever the validator was down a while
+          // join validators with no public path still dial OUT through a
+          // local mesh proxy — the sentry dial-in alone leaves the link
+          // hostage to the sentry dialer's exponential backoff whenever the
+          // validator was down a while
           const s0 = (topo.validatorSentries[valIndex] ?? [])[0];
           const sentryIp0 = s0 !== undefined ? componentRow(ctx, `sentry-${s0}`).tailnet_ip : null;
-          if (sentryIp0) {
+          if (s0 !== undefined && !publicPeered.has(s0) && sentryIp0) {
             await ctx.services.ssh.exec(target, socatTunnelCmd(VAL_PEER_TUNNEL_PORT, sentryIp0, 26656));
             await ctx.services.ssh.exec(
               target,
@@ -547,15 +576,15 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           await ctx.services.sleep(5000);
         }
       }
-      const running = await ctx.services.ssh.exec(
-        target,
-        "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-      );
-      if (running.stdout.trim() !== "yes") {
-        await ctx.services.ssh.exec(target, START_NODE_CMD);
-      }
+      // Deliberately NOT starting sparkdreamd here. This step used to
+      // SSH-start it, and the persist step's manifest push then restarted
+      // the container underneath the young process — observed live killing
+      // a validator mid-first-commit right after its state-sync restore,
+      // leaving a torn state (storeHeight = appHeight + 1) whose boot-time
+      // replay panicked, i.e. a crash loop. The node boots exactly once,
+      // entrypoint-owned, when persist flips WAIT_FOR_CONFIG off.
       ctx.db.setComponentState(ctx.launchId, key, "active");
-      return { started: true };
+      return { gated: true };
     },
   });
 
@@ -563,17 +592,17 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     name: p("persist"),
     async run(ctx) {
       // §5 step 20b, relaunch edition: the deploy step ships the fresh
-      // volume in wait mode and the start step launches sparkdreamd over
-      // SSH — a process any provider-initiated container restart silently
-      // kills, leaving the node dead in wait mode behind stale env tunnels
-      // (observed live: a provider recycling its pod every ~30 min killed a
-      // relaunched validator twice mid-catchup, and a recycled sentry came
-      // back with its env tunnel aimed at the pre-relaunch validator IP).
-      // Persist the running state into the deployments: WAIT_FOR_CONFIG=false
-      // so the entrypoint owns sparkdreamd, current tunnel targets in env so
-      // restarts self-heal, and the same corrections for the counterpart
-      // sentries whose env still names the old validator IP. The manifest
-      // push restarts the containers into that self-healing shape.
+      // volume in wait mode; this step persists the final shape into the
+      // deployments — WAIT_FOR_CONFIG=false so the entrypoint owns
+      // sparkdreamd, current tunnel targets in env so restarts self-heal,
+      // and the same corrections for the counterpart sentries whose env
+      // still names the old validator IP. The manifest push restarts the
+      // containers, and THAT restart is the node's first boot: the start
+      // step gates but does not launch, so nothing can be killed mid-commit
+      // by this push (an SSH-started node torn down here left a replay-
+      // panicking crash loop, and a recycled sentry once came back with its
+      // env tunnel aimed at the pre-relaunch validator IP — both observed
+      // live).
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
       const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
       const topo = resolveTopology(spec);
@@ -650,11 +679,41 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       if (msgs.length > 0) await ctx.requireTx(p("persist"), msgs);
       else ctx.db.deletePendingTx(ctx.launchId, p("persist"));
       const cert = loadCert(ctx);
-      for (const { row, json } of manifests) {
-        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+      // Order matters: the counterpart sentries restart FIRST and must be
+      // serving at the head again before the relaunched validator boots.
+      // Pushing every manifest at once recycled the validator's only
+      // snapshot source in the middle of its state-sync restore — the
+      // restore completed against the interrupted chunk stream into a
+      // subtly corrupt state whose first block panics ("invalid denom"),
+      // i.e. a deterministic crash loop. Observed live twice; a restore
+      // from a stable sentry executed cleanly.
+      const counterparts = manifests.filter((m) => m.row.key !== key);
+      for (const { row: r, json } of counterparts) {
+        await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
       }
-      // the push restarts the containers — wait for the relaunched node's
-      // process to be back (entrypoint-owned now) before declaring the op done
+      for (const { row: r } of counterparts) {
+        let ok = false;
+        let lastProblem = "unreachable";
+        for (let i = 0; i < 60 && !ok; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          try {
+            const url = await nodeRpcUrl(ctx, r.host_uri, r.dseq);
+            const st = await ctx.services.rpc.status(url);
+            if (!st.catchingUp && st.latestBlockHeight > 0) ok = true;
+            else lastProblem = `catching up at ${st.latestBlockHeight}`;
+          } catch (e) {
+            lastProblem = String(e).slice(0, 80);
+          }
+        }
+        if (!ok) {
+          throw new Error(`${r.key} not back at the head after its persist restart (${lastProblem})`);
+        }
+      }
+      for (const { row: r, json } of manifests.filter((m) => m.row.key === key)) {
+        await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
+      }
+      // the push boots the relaunched node (entrypoint-owned, its first and
+      // only start) — wait for the process before declaring the op done
       const row = componentRow(ctx, key);
       let back = false;
       for (let i = 0; i < 36 && !back; i++) {
@@ -1620,6 +1679,27 @@ export function unjailSteps(opId: number, params: UnjailParams, spec: LaunchSpec
         const val = await queryJson(["query", "staking", "validator", valoper], rpc);
         if (!(val.validator ?? val).jailed) {
           return { alreadyUnjailed: true }; // idempotent re-run
+        }
+        // the chain refuses MsgUnjail before jailed_until — a fast relaunch
+        // can beat the 10-minute jail clock here (observed live: "validator
+        // still jailed" burned a fee); wait the window out instead
+        try {
+          const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+          const pubkey = keys?.consensusPubkeys[params.key];
+          if (pubkey) {
+            const pubkeyArg = JSON.stringify({ "@type": "/cosmos.crypto.ed25519.PubKey", key: pubkey });
+            const out = await queryJson(["query", "slashing", "signing-info", pubkeyArg], rpc);
+            const info = out.val_signing_info ?? out;
+            const until = info.jailed_until ? new Date(info.jailed_until).getTime() : 0;
+            const waitMs = until - Date.now() + 5000;
+            if (waitMs > 0 && waitMs < 3_600_000) {
+              ctx.log(`${params.key}: jailed until ${info.jailed_until} — waiting ${Math.ceil(waitMs / 1000)}s`);
+              await ctx.services.sleep(waitMs);
+            }
+          }
+        } catch {
+          // best-effort: a failed query falls through to the broadcast,
+          // whose own error stays the source of truth
         }
         const fee = Math.ceil(Number(spec.token.minGasPrice) * UNJAIL_GAS);
 
