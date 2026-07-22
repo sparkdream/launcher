@@ -2734,6 +2734,14 @@ export default function Page() {
           const shutDown =
             f.components.length > 0 && f.components.every((c) => c.state === "closed");
           const collapsed = shutDown && !showClosedFleet[f.launchId];
+          // delete is offered on shut-down fleets (collapsed or not) and on
+          // stale records that never placed anything (failed/aborted
+          // attempts). A live draft ("created") or driving launch ("running")
+          // gets no button; the server 409s a delete raced against the driver
+          const deletable =
+            shutDown ||
+            (f.components.length === 0 &&
+              (f.launchStatus === "aborted" || f.launchStatus === "paused"));
           const active = f.components.filter((c) => c.state === "active");
           const unhealthy = active.filter((c) => healthKind(c) !== "ok");
           const monthly = fleetMonthlyUsd(f.components);
@@ -2744,7 +2752,10 @@ export default function Page() {
             const ok = window.confirm(
               `Delete launch ${f.launchId.slice(0, 8)} (${f.chainId}) permanently?\n\n` +
                 "This erases its records AND secrets (account mnemonics, validator keys) " +
-                "from the launcher. Export the fleet bundle first if you want an archive.",
+                "from the launcher." +
+                (f.components.length > 0
+                  ? " Export the fleet bundle first if you want an archive."
+                  : ""),
             );
             if (!ok) return;
             try {
@@ -2821,37 +2832,25 @@ export default function Page() {
                         ${monthly.toFixed(2)}/mo
                       </span>
                     )}
-                    {shutDown && !collapsed && (
-                      <button
-                        className="btn red"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteFleet();
-                        }}
-                      >
-                        delete…
-                      </button>
-                    )}
-                    {!collapsed && (
-                      // stays visible on a collapsed panel (keeps the header
-                      // height constant); toggles only the actions row
-                      <button
-                        className="btn"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setFleetActsOpen((m) => ({ ...m, [f.launchId]: !actsOpen }));
-                        }}
-                      >
-                        Fleet actions {actsOpen ? "▴" : "▾"}
-                      </button>
-                    )}
+                    <button
+                      // always visible, even on a collapsed shut-down card
+                      // (keeps the header height constant); toggles only the
+                      // actions row
+                      className="btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setFleetActsOpen((m) => ({ ...m, [f.launchId]: !actsOpen }));
+                      }}
+                    >
+                      Fleet actions {actsOpen ? "▴" : "▾"}
+                    </button>
                     <span style={{ color: "var(--dim2)", fontSize: 13 }}>
                       {collapsed || !bodyOpen ? "▾" : "▴"}
                     </span>
                   </span>
                 </div>
 
-                {!collapsed && actsOpen && (
+                {actsOpen && (
                   <div className="fleet-acts">
                     {!shutDown && (
                       <>
@@ -3026,6 +3025,15 @@ export default function Page() {
                           shut down fleet…
                         </button>
                       </>
+                    )}
+                    {deletable && (
+                      <button
+                        className="btn red"
+                        title="Permanently delete this launch's records and secrets (account mnemonics, validator keys) from the launcher"
+                        onClick={() => deleteFleet()}
+                      >
+                        delete…
+                      </button>
                     )}
                     {f.ops
                       .filter((o) => o.status === "active")

@@ -534,6 +534,23 @@ describe("delete launch", () => {
     expect(w.db.listFleetComponents("fl")).toHaveLength(0);
     expect(fs.existsSync(path.join(w.work, "launches/fl"))).toBe(false);
   }, 120_000);
+
+  it("purges a stale record that never placed components", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec2x2();
+    db.createLaunch("stale", JSON.stringify(s), "akash1owner");
+    db.setLaunchStatus("stale", "aborted");
+    // a failed attempt still leaves generated keys behind in the work dir
+    const secrets = path.join(work, "launches/stale/secrets");
+    fs.mkdirSync(secrets, { recursive: true });
+    fs.writeFileSync(path.join(secrets, "mnemonics.json"), "{}");
+    const fleet = new FleetService(db, services, work);
+    await fleet.deleteLaunch(db.getLaunch("stale")!);
+    expect(db.getLaunch("stale")).toBeUndefined();
+    expect(fs.existsSync(path.join(work, "launches/stale"))).toBe(false);
+  });
 });
 
 describe("top-up", () => {
