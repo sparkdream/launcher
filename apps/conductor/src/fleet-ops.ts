@@ -10,9 +10,9 @@ import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/
 import { feeCoin, feeConfig } from "./fee.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
-import { selectProvider } from "./akash/policy.js";
+import { exclusionEntries, selectProvider } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
-import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, waitLeaseStatus } from "./steps/phase-bcd.js";
+import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
   createNamedAccounts,
@@ -33,6 +33,7 @@ import {
   type GentxSignResponse,
 } from "./gentx.js";
 import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
+import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import type { SshTarget } from "./services.js";
 
 /**
@@ -69,6 +70,23 @@ function componentRow(ctx: StepCtx, key: string): FleetComponentRow {
   );
   if (!row) throw new Error(`fleet component ${key} not found`);
   return row;
+}
+
+/**
+ * The headscale lease to mint preauth keys against. A fleet with its own
+ * mesh has a "headscale" component row; a shared-mesh fleet (reuseFleet)
+ * has none — its deploy-headscale output points at the owning fleet's
+ * lease (headscale never relaunches, so the output stays current).
+ */
+function headscaleRef(ctx: StepCtx): { hostUri: string; dseq: string; gseq: number; oseq: number } {
+  const row = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
+    (c) => c.key === "headscale",
+  );
+  // single-group SDL ⇒ gseq/oseq are always 1
+  if (row) return { hostUri: row.host_uri, dseq: row.dseq, gseq: 1, oseq: 1 };
+  const hs = ctx.db.stepOutput<HeadscaleOutput>(ctx.launchId, "deploy-headscale");
+  if (!hs) throw new Error("no headscale for this fleet (deploy-headscale never ran)");
+  return { hostUri: hs.hostUri, dseq: hs.dseq, gseq: hs.gseq, oseq: hs.oseq };
 }
 
 function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
@@ -147,11 +165,11 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
       // the frontend never joins the mesh — no preauth key to mint
       if (!stateless || stateless.mesh) {
-        const hsRow = componentRow(ctx, "headscale");
         // fresh preauth key via headscale lease-shell (§5: expired keys
-        // re-minted; the headscale image has no sshd). Single-group SDL ⇒
-        // gseq/oseq are always 1. preauthkeys --user needs the numeric id.
-        const hsRef = { hostUri: hsRow.host_uri, dseq: hsRow.dseq, gseq: 1, oseq: 1 };
+        // re-minted; the headscale image has no sshd) — own row or, for a
+        // shared mesh, the owning fleet's lease. preauthkeys --user needs
+        // the numeric id.
+        const hsRef = headscaleRef(ctx);
         // PINNED: this step re-runs after the signature pause — a re-minted
         // key would rewrite the SDL/manifest and drift from the SIGNED
         // deployment's hash (the provider then 422s the manifest)
@@ -258,6 +276,8 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         policy: { ...spec.providers.policy, preference },
         chosenProviders: exclude,
         avoidProviders,
+        excludeMatchers: exclusionEntries(spec, key),
+        log: ctx.log,
         requiredStorageClass: deploy.requiredStorageClass,
         providers,
       });
@@ -1801,9 +1821,157 @@ export function unjailSteps(opId: number, params: UnjailParams, spec: LaunchSpec
   ];
 }
 
+export interface ResumeSigningParams {
+  /** Validator component key, e.g. "val-0". */
+  key: string;
+}
+
+/** Blocks of live signing the verify step insists on observing. */
+const RESUME_PROBE_BLOCKS = 10;
+
+/**
+ * Resume signing on a stalled tmkms validator: the signer box went away
+ * (power, network, a mesh re-key) and its privval session dropped, so the
+ * validator started missing blocks — on a small fleet the chain stalls
+ * outright. Without this op the only recovery is bouncing the deployment by
+ * hand through another tool, and that out-of-band manifest update drifts the
+ * on-chain hash away from the launcher's SDL and 422s every later manifest
+ * send (seen live). Instead: gate on the signer session being back (the user
+ * brings the signer up first), restart sparkdreamd in place — no manifest
+ * change, no hash drift — then prove the validator is signing by watching
+ * its signing-info counters advance.
+ */
+export function resumeSigningSteps(opId: number, params: ResumeSigningParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const v = Number(params.key.split("-")[1]);
+
+  const ownRpc = async (ctx: StepCtx): Promise<string> => {
+    const sentry = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
+      (c) => c.key.startsWith("sentry-") && c.state === "active",
+    );
+    if (!sentry) throw new Error("no active sentry to reach the chain through");
+    return nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
+  };
+
+  return [
+    {
+      // named to rhyme with the launch's await-signer on purpose: the UI
+      // auto-opens the tmkms setup card for any *await-signer step that
+      // parks at AwaitUser
+      name: p("await-signer"),
+      async run(ctx) {
+        const row = componentRow(ctx, params.key);
+        const target = rowTarget(ctx, row);
+        // a ready signer's reconnect lands within seconds — poll a minute
+        // before parking (same cushion as the launch's await-signer)
+        for (let attempt = 0; attempt < 12; attempt++) {
+          if (attempt > 0) await ctx.services.sleep(5000);
+          const probe = await ctx.services.ssh.exec(target, SIGNER_CONNECTED_PROBE);
+          if (probeSaysConnected(probe.stdout)) return { connected: true };
+        }
+        throw new AwaitUser(
+          p("await-signer"),
+          `${params.key} has no connected tmkms signer: start (or restart) the signer and let ` +
+            "it rejoin the mesh (the tmkms panel shows the live session state). Resume once " +
+            "it reports connected; the op then restarts the validator process in place and " +
+            "watches it sign blocks again.",
+        );
+      },
+    },
+    {
+      name: p("restart"),
+      async run(ctx) {
+        // process bounce over SSH (lease-shell fallback): unlike a manifest
+        // update this changes nothing on-chain, so nothing can drift
+        const row = componentRow(ctx, params.key);
+        await restartNode(ctx.services.ssh, rowTarget(ctx, row));
+        return { restarted: true };
+      },
+    },
+    {
+      name: p("verify"),
+      async run(ctx) {
+        const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+        const address = keys?.accounts[`op-val-${v}`];
+        const pubkey =
+          keys?.consensusPubkeys[params.key] ?? spec.topology.validators.consensusPubkeys?.[v];
+        const rpc = await ownRpc(ctx);
+        if (!address || !pubkey) {
+          throw new Error(
+            `${params.key}: no operator account or consensus pubkey recorded; cannot probe signing`,
+          );
+        }
+        const valoper = valoperAddress(address);
+        const pubkeyArg = JSON.stringify({ "@type": "/cosmos.crypto.ed25519.PubKey", key: pubkey });
+        let baseline: { offset: number; missed: number } | undefined;
+        let lastProblem = "no signing info yet";
+        for (let i = 0; i < 90; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          // a stall long enough to jail means no restart can resume the
+          // chain — recovery is the unjail op, and making this step fail
+          // would only obscure that (same rationale as verify-signing)
+          try {
+            const out = await queryJson(["query", "staking", "validator", valoper], rpc);
+            if (Boolean((out.validator ?? out).jailed)) {
+              ctx.log(
+                `${params.key} was downtime-jailed during the stall. The process is restarted ` +
+                  "and the signer connected, but the chain re-admits it only via the fleet " +
+                  "panel's unjail action (it gates on the node being back at the head first).",
+              );
+              ctx.db.setFleetOpStatus(opId, "done");
+              return { restarted: true, jailed: true };
+            }
+          } catch (e) {
+            lastProblem = `validator query failed (${String(e).slice(0, 80)})`;
+            continue;
+          }
+          let info: any;
+          try {
+            const out = await queryJson(["query", "slashing", "signing-info", pubkeyArg], rpc);
+            info = out.val_signing_info ?? out;
+          } catch (e) {
+            lastProblem = `signing-info query failed (${String(e).slice(0, 80)})`;
+            continue;
+          }
+          // index_offset advances per block in the active set (so it also
+          // stands still while the whole chain is stalled);
+          // missed_blocks_counter grows per block this validator failed to sign
+          const offset = Number(info.index_offset ?? 0);
+          const missed = Number(info.missed_blocks_counter ?? 0);
+          if (!baseline) baseline = { offset, missed };
+          const seen = offset - baseline.offset;
+          const missedDelta = Math.max(0, missed - baseline.missed);
+          if (seen < RESUME_PROBE_BLOCKS) {
+            lastProblem =
+              seen <= 0
+                ? "no new blocks since the restart (chain stalled or node not in the set)"
+                : `observed ${Math.max(0, seen)} of ${RESUME_PROBE_BLOCKS} blocks`;
+            continue;
+          }
+          if (missedDelta * 2 > seen) {
+            throw new Error(
+              `${params.key} missed ${missedDelta} of the last ${seen} blocks after the restart, ` +
+                "so it is still not signing: check the signer session (tmkms panel), the key it " +
+                "holds, and the node's peers",
+            );
+          }
+          ctx.log(
+            `${params.key}: signing confirmed (${seen - missedDelta}/${seen} blocks in the probe window)`,
+          );
+          ctx.db.setFleetOpStatus(opId, "done");
+          return { restarted: true, signing: true };
+        }
+        throw new Error(
+          `${params.key}: could not confirm signing after ~7 min (${lastProblem}); the chain ` +
+            "only produces blocks when this validator signs, so check the signer session and the node",
+        );
+      },
+    },
+  ];
+}
+
 /** Steps for every active op of a launch, in creation order. */
-export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
-  const launch = db.getLaunch(launchId);
+export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {  const launch = db.getLaunch(launchId);
   if (!launch) return [];
   const spec = withDefaults(JSON.parse(launch.spec_json));
   const steps: StepDef[] = [];
@@ -1817,6 +1985,7 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));
     if (op.kind === "reset-chain") steps.push(...resetChainSteps(op.id, params, spec));
     if (op.kind === "unjail") steps.push(...unjailSteps(op.id, params, spec));
+    if (op.kind === "resume-signing") steps.push(...resumeSigningSteps(op.id, params, spec));
   }
   return steps;
 }

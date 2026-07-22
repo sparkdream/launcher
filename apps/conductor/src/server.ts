@@ -8,6 +8,8 @@ import {
   checkSpec,
   findChainRelease,
   knownChainVersions,
+  nodes,
+  statelessComponents,
   withDefaults,
   VENDORED_CHAIN_VERSION,
   type LaunchSpec,
@@ -28,10 +30,22 @@ import {
 import type { ConductorDb } from "./db.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
-import { buildTmkmsSetup } from "./tmkms.js";
+import { buildTmkmsSetup, probeSaysConnected, statusConsensusPubkey, SIGNER_CONNECTED_PROBE, VALIDATOR_STATUS_PROBE } from "./tmkms.js";
+import { toSsh2CompatiblePrivateKey } from "./keys.js";
+import { readSecretFile } from "./secrets.js";
+import type {
+  Assignments,
+  DeploymentPlan,
+  HeadscaleOutput,
+  SshEndpoints,
+} from "./steps/phase-bcd.js";
+import type { SshTarget } from "./services.js";
 import { FleetService } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps } from "./fleet-ops.js";
+import { resolveSharedHeadscale } from "./headscale-reuse.js";
+import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
+import { prefillSpecFromGenesis } from "./genesis-prefill.js";
 import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
@@ -263,6 +277,23 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // "Prefill spec from genesis" (spec editor helper): reverse-map a pasted
+  // genesis document into a spec draft + notes. Read-only — genesis is
+  // never an input to the launch pipeline itself.
+  app.post("/api/spec-prefill", async (req, reply) => {
+    const { genesis } = req.body as { genesis: unknown };
+    try {
+      const result = prefillSpecFromGenesis(genesis as Record<string, unknown>);
+      const check = checkSpec(result.spec);
+      return {
+        ...result,
+        issues: [...check.errors, ...check.warnings.map((w) => ({ ...w, warning: true }))],
+      };
+    } catch (e) {
+      return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   app.post("/api/launches", async (req, reply) => {
     const body = req.body as { spec: unknown; owner?: string };
     // schema and cross-field failures share one issue-list shape
@@ -272,6 +303,30 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     const spec: LaunchSpec = result.spec;
     const warnings = [...result.warnings];
+    // shared mesh: resolve reuseFleet now — the stored spec carries the
+    // owning fleet's launch id + domain so every later consumer (SDL env,
+    // tmkms panel, relaunch ops) reads a plain resolved value
+    if (spec.topology.headscale.reuseFleet) {
+      try {
+        const shared = resolveSharedHeadscale(
+          deps.db,
+          spec,
+          requestOwner(req, body.owner) ?? "",
+        )!;
+        spec.topology.headscale.reuseFleet = shared.launchId;
+        spec.topology.headscale.domain = shared.domain;
+      } catch (e) {
+        return reply.status(400).send({
+          error: "validation",
+          issues: [
+            {
+              path: "topology.headscale.reuseFleet",
+              message: String(e instanceof Error ? e.message : e),
+            },
+          ],
+        });
+      }
+    }
     if (deps.onAkash && spec.network.type === "mainnet") {
       // §2 security model: mainnet secrets do not belong on provider disk
       warnings.push({
@@ -393,7 +448,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.post("/api/fleet/:launchId/:dseq/actions", async (req, reply) => {
     const { launchId, dseq } = req.params as { launchId: string; dseq: string };
     const body = req.body as {
-      action: "close" | "restart" | "relaunch" | "upgrade" | "halt-upgrade" | "topup" | "unjail";
+      action: "close" | "restart" | "relaunch" | "upgrade" | "halt-upgrade" | "topup" | "unjail" | "resume-signing";
       confirm?: boolean;
       image?: string;
       components?: string[];
@@ -424,6 +479,43 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return { status: "restarted" };
       }
       case "relaunch": {
+        // "Move this component to another provider" is one user intent; how
+        // it is carried out depends on whether the launch has finished. A
+        // relaunch OP cannot run mid-launch (buildOpSteps appends op steps
+        // AFTER the launch steps, so a paused launch never reaches them), so
+        // the same intent is served by re-placing the component through the
+        // launch itself. The caller does not need to know the difference.
+        if (launch.status !== "completed") {
+          // The usual relaunch warnings (double-sign window, sentry
+          // isolation) are about a live chain — before start-chain nothing
+          // is signing or serving, so they would only be noise.
+          if (deps.db.getStep(launchId, "start-chain")?.status === "done") {
+            const warnings = fleet.relaunchWarnings(launch, component);
+            if (warnings.length > 0 && !body.confirm) {
+              return reply.status(409).send({
+                warnings,
+                ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
+              });
+            }
+          }
+          try {
+            const { step, closing } = await fleet.requestReplace(launch, component);
+            if (closing) return { status: "awaiting-signature", step };
+            // a driver already mid-step cannot start this now; it re-drives
+            // when the current step finishes, so say so rather than looking
+            // like the click did nothing
+            const started = drive(launchId, spec);
+            return {
+              status: "replacing",
+              note:
+                started === "started"
+                  ? `${component.key} is being re-placed on another provider`
+                  : `${component.key} will be re-placed when the current step finishes`,
+            };
+          } catch (e) {
+            return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+          }
+        }
         const warnings = fleet.relaunchWarnings(launch, component);
         if (warnings.length > 0 && !body.confirm) {
           // a validator relaunch note is informational (the op is safe by
@@ -477,6 +569,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (!body.amount) return reply.status(400).send({ error: "amount required" });
         const { step } = await fleet.requestTopUp(launch, component, body.amount);
         return { status: "awaiting-signature", step };
+      }
+      case "resume-signing": {
+        try {
+          // no pre-action guard: the op itself parks until the signer session
+          // is back, then restarts the process and watches it sign
+          const opId = fleet.requestResumeSigning(launch, component);
+          drive(launchId, spec);
+          return { status: "resume-signing-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
       }
       default:
         return reply.status(400).send({ error: "unknown action" });
@@ -709,6 +812,127 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     });
   });
 
+  // live signer status for the guided tmkms setup (§5 step 19): whether an
+  // external machine has joined the mesh, and per validator whether a signer
+  // holds a privval session right now (the same probe the await-signer gate
+  // uses). Polled by the setup panel; every probe failure reports as
+  // unknown/null rather than failing the whole status call.
+  app.get("/api/launches/:id/tmkms/status", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const launch = deps.db.getLaunch(id);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const spec = withDefaults(JSON.parse(launch.spec_json));
+    if (spec.security.keyMode !== "tmkms") {
+      return reply.status(400).send({ error: "launch is not in tmkms mode" });
+    }
+    const dirs = launchDirs(deps.workRoot, id);
+    const mtls = {
+      certPem: fs.readFileSync(path.join(dirs.secrets, "akash-cert.pem"), "utf8"),
+      keyPem: readSecretFile(path.join(dirs.secrets, "akash-cert-key.pem")),
+    };
+
+    // external machines on the mesh: headscale nodes whose name is not one
+    // of the fleet's components (the tmkms host, the operator's laptop, ...)
+    const fleetKeys = new Set([
+      ...nodes(spec).map((n) => n.key),
+      ...statelessComponents(spec).map((c) => c.key),
+    ]);
+    const externalNodes: { name: string; ip: string; online: boolean }[] = [];
+    const hs = deps.db.stepOutput<HeadscaleOutput>(id, "deploy-headscale");
+    if (hs) {
+      try {
+        const res = await deps.services.provider.shellExec(
+          mtls,
+          hs.hostUri,
+          hs.dseq,
+          hs.gseq,
+          hs.oseq,
+          "headscale",
+          ["sh", "-c", "headscale nodes list --output json"],
+        );
+        const list = JSON.parse(res.stdout.trim() || "[]") as Array<Record<string, any>>;
+        for (const n of list) {
+          const name: string = n.givenName ?? n.name ?? "";
+          if (!name || fleetKeys.has(name)) continue;
+          externalNodes.push({
+            name,
+            ip: n.ipAddresses?.[0] ?? n.ip_addresses?.[0] ?? "",
+            online: Boolean(n.online ?? n.is_online ?? false),
+          });
+        }
+      } catch {
+        // headscale unreachable: report none rather than fail the status call
+      }
+    }
+
+    // per-validator signer probe (same check the await-signer gate runs)
+    const mesh = deps.db.stepOutput<{ ips: Record<string, string> }>(id, "await-mesh");
+    const sshEps = deps.db.stepOutput<SshEndpoints>(id, "send-manifests");
+    const plan = deps.db.stepOutput<DeploymentPlan>(id, "create-deployments");
+    const assigns = deps.db.stepOutput<Assignments>(id, "collect-bids");
+    const validators: {
+      key: string;
+      tailnetIp: string | null;
+      signerConnected: boolean | null;
+      expectedPubkey: string | null;
+      pubkeyMatches: boolean | null;
+    }[] = [];
+    for (let v = 0; v < spec.topology.validators.count; v++) {
+      const key = `val-${v}`;
+      let connected: boolean | null = null;
+      let pubkeyMatches: boolean | null = null;
+      const expectedPubkey = spec.topology.validators.consensusPubkeys?.[v] ?? null;
+      const ep = sshEps?.perNode[key];
+      if (ep) {
+        try {
+          const entry = plan?.perNode[key];
+          const a = assigns?.perNode[key];
+          const target: SshTarget = {
+            host: ep.host,
+            port: ep.port,
+            user: "root",
+            privateKeyPem: toSsh2CompatiblePrivateKey(
+              readSecretFile(path.join(dirs.secrets, "ssh_ed25519.pem")),
+            ),
+            ...(a && entry
+              ? {
+                  shellFallback: {
+                    creds: { certPem: mtls.certPem, keyPem: mtls.keyPem },
+                    hostUri: a.hostUri,
+                    dseq: entry.dseq,
+                    gseq: a.gseq,
+                    oseq: a.oseq,
+                    service: "sparkdreamd",
+                  },
+                }
+              : {}),
+          };
+          const probe = await deps.services.ssh.exec(target, SIGNER_CONNECTED_PROBE);
+          connected = probeSaysConnected(probe.stdout);
+          // pinned key: the connected signer must hold it. Only probed on a
+          // live session (validator_info comes from the signer); an
+          // unparseable answer is unknown, never a mismatch
+          if (connected && expectedPubkey) {
+            const status = await deps.services.ssh.exec(target, VALIDATOR_STATUS_PROBE);
+            const signerKey = statusConsensusPubkey(status.stdout);
+            pubkeyMatches = signerKey === null ? null : signerKey === expectedPubkey;
+          }
+        } catch {
+          connected = null; // node unreachable: report unknown, not false
+        }
+      }
+      validators.push({
+        key,
+        tailnetIp: mesh?.ips?.[key] ?? null,
+        signerConnected: connected,
+        expectedPubkey,
+        pubkeyMatches,
+      });
+    }
+    return { externalNodes, validators };
+  });
+
   // --- full launcher backup (machine migration) ---
   // Both routes sit behind the bearer preHandler like everything else, but
   // note the export crosses owner boundaries: any allowlisted operator gets
@@ -782,16 +1006,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (denyForeign(req, reply, launch)) return;
     const pending = deps.db.nextPendingGentx(id);
     if (!pending) return reply.status(204).send();
+    const signDoc = JSON.parse(pending.sign_doc_json);
+    // offline signing (airgapped operator keys): the same doc as an
+    // unsigned tx file plus the exact command that signs it
     return {
       valIndex: pending.val_index,
       address: pending.address,
-      signDoc: JSON.parse(pending.sign_doc_json),
+      signDoc,
+      unsignedTx: JSON.parse(unsignedTxJsonFromSignDoc(signDoc)),
+      signCommand:
+        `sparkdreamd tx sign unsigned-tx.json --offline --from <key-name> ` +
+        `--chain-id ${signDoc.chain_id} --account-number ${signDoc.account_number} ` +
+        `--sequence ${signDoc.sequence} --sign-mode amino-json --output-document signed-tx.json`,
     };
   });
 
   app.post("/api/launches/:id/gentx-result", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const { valIndex, response } = req.body as { valIndex: number; response: unknown };
+    // response: a wallet's AminoSignResponse (browser path). signedTx: a
+    // pasted `tx sign --offline` output (airgapped path) — converted here
+    // into the same response shape; build-genesis verifies either.
+    const { valIndex, response, signedTx } = req.body as {
+      valIndex: number;
+      response?: unknown;
+      signedTx?: unknown;
+    };
     const launch = deps.db.getLaunch(id);
     if (!launch) return reply.status(404).send({ error: "not found" });
     if (denyForeign(req, reply, launch)) return;
@@ -799,7 +1038,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!pending || pending.status !== "pending") {
       return reply.status(409).send({ error: "no pending gentx for that validator" });
     }
-    deps.db.setGentxSigned(id, valIndex, JSON.stringify(response));
+    let stored = response;
+    if (stored === undefined) {
+      if (signedTx === undefined) {
+        return reply.status(400).send({ error: "provide response (wallet) or signedTx (offline)" });
+      }
+      try {
+        stored = gentxResponseFromSignedTx(signedTx, JSON.parse(pending.sign_doc_json));
+      } catch (e) {
+        return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+      }
+    }
+    deps.db.setGentxSigned(id, valIndex, JSON.stringify(stored));
     // build-genesis verifies the signature on resume; a bad one re-pauses
     return { status: drive(id, JSON.parse(launch.spec_json)) };
   });

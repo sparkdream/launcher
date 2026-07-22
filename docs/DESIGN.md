@@ -204,6 +204,11 @@ independent axes:
   user, never uploaded. The launcher can generate every input the signer
   needs — it just can't (and shouldn't) run it: the whole point is that the
   signing box is hardware the launcher never touches.
+  With a pre-existing key (a hardware HSM that already holds one),
+  `topology.validators.consensusPubkeys` pins the device's pubkey per
+  validator: the gentx is built with it, no consensus private key ever
+  exists launcher-side, and the guided setup configures the signer's
+  provider instead of importing a generated key.
 
 *Operator keys* (`topology.validators.operators`) — who owns the stake:
 
@@ -309,6 +314,11 @@ topology:
                                      # validator — gentxs then signed in the
                                      # browser (hardware-wallet capable, §3):
     # operators: [sprkdrm1aaa..., sprkdrm1bbb...]
+    # consensusPubkeys: [k0, k1]     # tmkms only: pre-existing consensus pubkeys
+                                     # (base64 ed25519, one per validator) for a
+                                     # signer that already holds its key, e.g. a
+                                     # hardware HSM. Pinned in the gentx; no
+                                     # consensus private key exists launcher-side
   sentries:
     count: 2
     mapping: round-robin             # or explicit [[0],[1]] sentry→validators
@@ -331,6 +341,12 @@ providers:
     maxPriceMultiplier: 2.0          # vs median bid, sanity ceiling
     preference: []                   # ordered provider addresses, tried first
     antiAffinity: strict             # headscale/validators/sentries all on distinct providers
+  exclude: []                        # fleet-wide: providers no component may use
+  components:                        # per-component exclusions, merged over the
+    headscale:                       # fleet-wide list. Entries: akash1... owner
+      exclude: ["provider-host"]     # address (exact) or hostname fragment
+    # sentries: { exclude: [] }      # (case-insensitive substring of the
+    # validators: { exclude: [] }    # provider's hostUri hostname)
   escrow:
     targetRunwayDays: 30             # sizes the initial deposit per deployment
 
@@ -425,6 +441,18 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
    collection; a bad signature re-pauses rather than poisoning genesis
    (signature failures at InitChain brick block 1 — see the chain repo's
    gentx-hash guard war story).
+   **Offline signing variant** (operator key on an airgapped machine, no
+   browser wallet): the pending-gentx endpoint also serves the sign doc as
+   an unsigned proto-JSON tx plus the exact
+   `sparkdreamd tx sign --offline --sign-mode amino-json` command (account
+   number and sequence filled in); the user signs it on the airgapped
+   machine and pastes the signed tx back. The conductor converts it into
+   the same amino sign-response shape ("expected doc + the signer's
+   fee/memo": tampered messages fail signature verification by
+   construction) and runs it through the identical verify-then-assemble
+   path — the pasted messages never enter genesis, only the
+   conductor-built ones do. The same paste-back works for join mode's
+   promote-validator and the unjail op, which ride the same gentx loop.
    Two account-number notions, deliberately kept apart:
    - the **sign-doc account number is pinned to 0 and MUST NOT be
      user-configurable**: the SDK's ante handler verifies all height-0
@@ -489,6 +517,26 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
     private keys, which litestream cannot replicate) is also added to the
     user's downloadable key bundle.
 
+    **Shared mesh** (`topology.headscale.reuseFleet`): a fleet can attach to
+    an existing fleet's headscale instead of deploying its own — the use
+    case is one tmkms signer machine serving several fleets, since a single
+    tailscale login only reaches one mesh. The spec names the owning fleet
+    (launch id or unique network name, same launcher instance and wallet;
+    resolved at launch creation, which also fills `domain` from the owning
+    fleet so SDL env and the tmkms panel render normally). Phase C then
+    attaches instead of deploying: step 9 verifies the owning fleet's
+    headscale lease + `/health` and returns it with `price: "0"` and
+    `reused: true` (two fewer signatures — no headscale deployment or
+    lease); step 10 skips the `server_url` restart (it would blip every
+    fleet on the mesh) and just creates this fleet's own user + preauth
+    keys; step 11 is skipped (the owning fleet backs up the mesh, and
+    validateSpec rejects `backup` alongside `reuseFleet`). The borrowed
+    headscale never becomes a fleet component here — nothing to close,
+    bill, estimate, or health-check — and relaunch ops mint their preauth
+    keys against the owning fleet's lease. In return the owning fleet's
+    shutdown, and closing its headscale component, are refused while any
+    sharing fleet is live ("shut those fleets down first").
+
 ### Phase D — NODE DEPLOYMENTS (2 Keplr signatures total)
 
 12. `create-deployments` — inject headscale URL + per-node `TS_AUTHKEY` into
@@ -526,6 +574,32 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
     provider's hostUri over mTLS (3 retries on "no lease", 5s pre-send
     delay); wait for services up; record SSH forwarded ports from lease
     status.
+    **Bad-placement recovery.** Two failures cannot be retried into working,
+    and looping their raw errors behind a Retry button strands the launch at
+    93% (both seen live in one session):
+    - *Provider unreachable* — DNS failure (a provider's zone started
+      answering SERVFAIL while its deployment was healthy on-chain) or a dead
+      TCP path. The provider is at fault, so it goes on the wallet's avoid
+      list and neither this re-bid nor any future launch picks it again.
+    - *Lease gone* — the gateway answers but 404s "no lease", after the
+      client's own propagation retries. Almost always a provider-side
+      **manifest timeout**: a lease whose manifest never arrived within the
+      provider's window is closed, which is what happens to the rest of a
+      fleet while a launch sits blocked on an unrelated failure. The provider
+      is **not** blamed here — it is typically hosting the rest of the fleet
+      fine, and avoiding it would needlessly shrink the bid pool.
+
+    Either way the component is re-placed: its deployment is closed (a chain
+    tx, so it works even when the gateway is unreachable, and escrow
+    refunds), it is redeployed under a fresh dseq and re-bid honoring
+    anti-affinity, and the `create-deployments` / `collect-bids` outputs are
+    rewritten so every later step and the fleet view follow the new
+    placement. Re-entrant: the dseq is pinned and each tx rides `requireTx`,
+    so signature pauses resume mid-recovery — and because leasing closes an
+    order's other bids, a signed lease is reused rather than re-polled (the
+    same guard `deploy-headscale` and the relaunch op carry; re-polling
+    reports a phantom "no acceptable replacement bid"). Only if no acceptable
+    replacement bid exists does it pause for the user.
 
 ### Phase E — NODE CONFIGURATION (conductor over SSH, no signatures)
 
@@ -535,6 +609,21 @@ Per node, parallel where safe:
     `/root/.sparkdream` (idempotent: skip if marker file present).
 17. `await-mesh` — poll `tailscale --socket=$TS_STATE_DIR/tailscaled.sock ip -4`
     until each node has a tailnet IP; build the name→IP table.
+    **IPv6 black-hole workaround:** Akash providers routinely give a container
+    an IPv6 stack with no working IPv6 route, and headscale sits behind
+    Cloudflare, which advertises AAAA records. The tailscale control client
+    tries IPv6 first, the SYN vanishes into the dead route, and `tailscale up`
+    hangs until timeout — the node never joins, with no hint why (seen live: a
+    fleet where the stateless explorer joined while every validator/sentry
+    hung). So a node that has not joined after ~20s is remediated: resolve the
+    headscale domain's IPv4 on the node and pin it in `/etc/hosts` (both musl
+    and glibc consult the hosts file before DNS and use its entries
+    exclusively for a matched name, so no AAAA is ever tried), then re-run
+    `tailscale up --reset`. If a node still never joins, the step now fails
+    with a cause — reachable over IPv4 (control-plane problem) vs unreachable
+    (provider egress filtering; relaunch elsewhere) — instead of a blind
+    "never joined the mesh". The durable operator-side fix is to disable IPv6
+    on the headscale Cloudflare record so AAAA is never advertised.
 18. `wire-tunnels` — the entrypoint creates socat tunnels **once at boot**
     from `TS_TUNNEL_n` env vars; there is no runtime re-read. Since tailnet
     IPs aren't known until now, the SDLs deploy with placeholder targets and
@@ -567,22 +656,43 @@ Per node, parallel where safe:
     (`keepidle=10,keepintvl=5,keepcnt=3`, mirroring the tmkms proxy) so a
     stalled flow dies in ~25s and redials instead of hanging.
 19. *(tmkms mode only)* `await-signer` — pause with a **guided signer
-    setup** panel, one tab per validator. The launcher generates everything
-    the local machine needs:
+    setup** panel that opens on its own at the pause, one section per
+    validator. The launcher generates everything the local machine needs:
     - a downloadable per-validator bundle: ready-to-run `tmkms.toml`
       (chain id, `addr = "tcp://<validator_tailnet_ip>:26659"`, protocol
       version, state file path) + the exported consensus key in tmkms
       import format;
-    - copy-paste commands with OS tabs: install tmkms (release binary or
+    - copy-paste commands: install tmkms (release binary or
       `cargo install tmkms --features=softsign`), join the mesh
       (`tailscale up --login-server=<headscale_url> --authkey=<spare
-      'home' preauth key>` — the key minted in step 10), `tmkms softsign
-      import`, `tmkms start`;
-    - a live status row per validator: mesh join detected (headscale
-      `nodes list`), privval port probe, "signer connected". Resume
-      auto-enables when all validators' probes pass; the same panel is
-      reachable later from the fleet dashboard for signer moves or
-      re-imports (relaunch regenerates the bundle with the new tailnet IP).
+      'home' preauth key> --hostname tmkms-<network>` — the key minted in
+      step 10), `tmkms softsign import`, `tmkms start`;
+    - live status lines (`GET /api/launches/:id/tmkms/status`, polled by
+      the panel): external machines seen on the mesh (headscale
+      `nodes list` minus fleet components), and per validator "signer
+      connected". The launch gate itself probes for an ESTABLISHED
+      privval session through the keepalive proxy (a session on the
+      backend port exists exactly while a signer holds it), never for an
+      open port: sparkdreamd binds the listener at boot, so a port check
+      passes with no signer anywhere and the launch sails into a chain
+      that can never sign. The same panel is reachable any time from the
+      launch header's "tmkms setup" button (signer moves, re-imports;
+      relaunch regenerates the bundle with the new tailnet IP).
+
+      With `topology.validators.consensusPubkeys` set (a hardware signer
+      that already holds its key), the panel changes shape: no key download
+      and no `softsign import`; the generated `tmkms.toml` carries a
+      commented provider skeleton (yubihsm/ledger examples) with the pinned
+      pubkey in a comment, and the commands walk through configuring the
+      device's own provider section. The status rows gain a live key check:
+      once a signer holds the privval session, the validator's own `/status`
+      reports that signer's pubkey (the bundle ships no local key file, so
+      the signer is the only possible source), and the panel and the
+      await-signer gate compare it against the spec's pin. A confirmed
+      mismatch pauses the launch with both keys named (the chain was built
+      with the pinned key and would reject every vote the connected device
+      produces); an unparseable answer logs a warning but never blocks the
+      gate.
 
 ### Phase F — CHAIN START
 
@@ -1066,18 +1176,26 @@ this launch.
 1. **Hard filters**: `isAudited` (if `auditedOnly`), `uptime7d ≥ minUptime7d`,
    `price ≤ maxPriceMultiplier × median(bid prices)`, provider ∉ chosen-set
    when `antiAffinity: strict` (headscale, every validator, every sentry on
-   distinct providers — DEPLOYMENT.md requires this), and **persistent
-   storage support**: when the role's resources declare a persistent volume
-   (sentries and validators by default), the provider must offer the
-   requested storage class (`beta3`) — checked via provider attributes
-   before bidding is even expected, and surfaced in the rejection table
-   ("no beta3 persistent storage").
+   distinct providers — DEPLOYMENT.md requires this), **spec exclusions**:
+   `providers.exclude` (fleet-wide) plus `providers.components.<group>.exclude`
+   reject any provider whose owner address equals an entry or whose `hostUri`
+   hostname contains an entry as a case-insensitive substring (client-side
+   only, SDL placement requirements stay empty; unlike anti-affinity these are
+   never relaxed, and the re-bid co-location fallback keeps them), and
+   **persistent storage support**: when the role's resources declare a
+   persistent volume (sentries and validators by default), the provider must
+   offer the requested storage class (`beta3`) — checked via provider
+   attributes before bidding is even expected, and surfaced in the rejection
+   table ("no beta3 persistent storage").
 2. **Preference list**: first bid whose provider appears in
    `providers.policy.preference` wins (list order beats price).
 3. **Tiebreak**: lowest `price.amount`.
 4. **Explainability**: every decision stored as
    `{chosen, rejected: [{provider, reason}]}` and shown in the UI ("cheapest
-   of 4 audited bids; 2 rejected: uptime, anti-affinity").
+   of 4 audited bids; 2 rejected: uptime, anti-affinity"). Spec exclusion
+   matches are also logged at selection time (so a hostname fragment can be
+   confirmed against the provider it actually matched) and appear in the
+   rejection table as `excluded by spec (<list>): <entry>`.
 5. **Escape hatch**: zero survivors → pause that deployment's row, render the
    rejection table, allow manual override or re-bid (close+recreate).
 

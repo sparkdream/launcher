@@ -3,6 +3,7 @@ import yaml from "js-yaml";
 import {
   chainId,
   deriveDreamDenom,
+  headscaleDomain,
   type ComponentKey,
   type ComponentRef,
   type LaunchSpec,
@@ -104,7 +105,7 @@ function explorerSdl(input: RenderComponentSdlInput) {
       ],
       env: [
         `SSH_PUBLIC_KEY=${input.sshPublicKey}`,
-        `HEADSCALE_URL=https://${spec.topology.headscale.domain}`,
+        `HEADSCALE_URL=https://${headscaleDomain(spec)}`,
         `TS_AUTHKEY=${input.placeholder.tsAuthkey(component.key)}`,
         `TS_HOSTNAME=${component.key}`,
         // on the persistent volume so the tailnet identity survives restarts

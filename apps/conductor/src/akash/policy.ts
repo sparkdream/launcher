@@ -60,9 +60,64 @@ export interface PolicyContext {
    * list, plus the provider a relaunch is moving off of.
    */
   avoidProviders?: ReadonlySet<string>;
+  /**
+   * Spec-declared exclusions (fleet-wide + this pick's component group):
+   * hard filter, matched on owner address or hostname fragment. Unlike
+   * anti-affinity these are never relaxed.
+   */
+  excludeMatchers?: ExclusionEntry[];
+  /** Selection-time log for exclusion matches; steps pass StepCtx.log. */
+  log?: (message: string) => void;
   /** Persistent storage class the deployment needs, if any. */
   requiredStorageClass?: string | undefined;
   providers: Map<string, ProviderInfo>;
+}
+
+/** A spec exclusion entry plus the list it came from (for logs/reasons). */
+export interface ExclusionEntry {
+  /** Raw spec entry: an akash1 owner address or a hostname fragment. */
+  entry: string;
+  /** "fleet" for providers.exclude, else the component group name. */
+  source: string;
+}
+
+/**
+ * Effective exclusions for a component key: the fleet-wide list plus the
+ * key's component group. val-N -> validators, sentry-N -> sentries, every
+ * other key (headscale, explorer, frontend, hub) maps to itself.
+ * Null-tolerant: resumed launches replay the stored spec JSON without a
+ * schema re-parse, so specs written before this feature arrive with
+ * providers.exclude / providers.components undefined at runtime.
+ */
+export function exclusionEntries(spec: LaunchSpec, key: string): ExclusionEntry[] {
+  const out: ExclusionEntry[] = (spec.providers.exclude ?? []).map((entry) => ({
+    entry,
+    source: "fleet",
+  }));
+  const group = /^val-\d+$/.test(key) ? "validators" : /^sentry-\d+$/.test(key) ? "sentries" : key;
+  const own = (
+    spec.providers.components as
+      | Record<string, { exclude?: string[] } | undefined>
+      | undefined
+  )?.[group];
+  for (const entry of own?.exclude ?? []) out.push({ entry, source: group });
+  return out;
+}
+
+/**
+ * Address entries (akash1...) match the provider owner exactly; anything
+ * else is a case-insensitive substring of the provider's hostname, parsed
+ * from hostUri (never the raw URI, whose scheme would false-match "https").
+ */
+export function matchesExclusion(entry: string, info: ProviderInfo): boolean {
+  if (entry.startsWith("akash1")) return info.owner === entry;
+  let host: string;
+  try {
+    host = new URL(info.hostUri).hostname;
+  } catch {
+    host = info.hostUri.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  }
+  return host.toLowerCase().includes(entry.toLowerCase());
 }
 
 /**
@@ -90,6 +145,14 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
     };
 
     if (!info) return reject("unknown provider (not in Console API list)");
+    const excluded = ctx.excludeMatchers?.find((m) => matchesExclusion(m.entry, info));
+    if (excluded) {
+      ctx.log?.(
+        `${provider} (${info.hostUri}) matched spec exclusion "${excluded.entry}" ` +
+          `(${excluded.source} list); not eligible for this pick`,
+      );
+      return reject(`excluded by spec (${excluded.source}): ${excluded.entry}`);
+    }
     if (ctx.avoidProviders?.has(provider)) return reject("on the avoid list");
     if (ctx.policy.auditedOnly && !info.isAudited) return reject("not audited");
     if (info.uptime7d < ctx.policy.minUptime7d) {

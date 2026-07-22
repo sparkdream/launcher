@@ -128,3 +128,31 @@ describe("runLaunch checkpointing", () => {
     db.close();
   });
 });
+
+describe("orphaned step cleanup", () => {
+  it("clears a step left 'running' by a dead driver so the UI stops spinning", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const spec = testnetSpec();
+    db.createLaunch("orphan", JSON.stringify(spec), "akash1owner");
+
+    // a previous driver died mid-"late" (restart/crash) while an EARLIER step
+    // had already failed — the state the UI renders as a spinning step that
+    // hides the real blocker
+    db.stepStarted("orphan", "early");
+    db.stepFailed("orphan", "early", "boom");
+    db.stepStarted("orphan", "late"); // never finished
+    expect(db.getStep("orphan", "late")?.status).toBe("running");
+
+    const steps: StepDef[] = [
+      { name: "early", async run() { return { ok: true }; } },
+      { name: "late", async run() { return { ok: true }; } },
+    ];
+    const result = await runLaunch(db, "orphan", spec, work, steps, fakeServices());
+
+    expect(result.status).toBe("completed");
+    // the orphan was cleared and then genuinely re-run, not left 'running'
+    expect(db.getStep("orphan", "late")?.status).toBe("done");
+    db.close();
+  });
+});

@@ -1,3 +1,5 @@
+import { sha256 } from "@cosmjs/crypto";
+import { toBech32 } from "@cosmjs/encoding";
 import { deriveDreamDenom, type LaunchSpec } from "@sparkdream/launch-spec";
 
 /**
@@ -141,10 +143,12 @@ export function applyReferenceGenesis(genesis: Json, reference: Json, spec: Laun
  * becomes an active x/rep member at the requested trust level (default
  * core), with dream balance and invitation credits defaulting to the
  * reference network's seed for a member of that level (personal history
- * zeroed), plus a blank x/season profile. Usernames are left empty to claim
- * on-chain: account names would collide with x/name blocked_names
- * ("treasury", "gov", ...). Runs after applyReferenceGenesis; idempotent
- * because that overlay resets the member lists.
+ * zeroed), plus an x/season profile. Profile cosmetics (username, display
+ * name, achievements) are seeded only when the spec spells them out —
+ * otherwise they stay blank to claim on-chain (account names would collide
+ * with x/name blocked_names: "treasury", "gov", ...). Runs after
+ * applyReferenceGenesis; idempotent because that overlay resets the member
+ * lists.
  */
 export function applyGenesisMembers(
   genesis: Json,
@@ -166,8 +170,13 @@ export function applyGenesisMembers(
   for (const acct of members) {
     const address = acct.address ?? accounts[`acct-${acct.name}`];
     if (!address) throw new Error(`no address for member account ${acct.name}`);
-    const opts: { trustLevel?: string | undefined; dreamBalance?: string | undefined } =
-      typeof acct.member === "object" ? acct.member : {};
+    const opts: {
+      trustLevel?: string | undefined;
+      dreamBalance?: string | undefined;
+      username?: string | undefined;
+      displayName?: string | undefined;
+      achievements?: string[] | undefined;
+    } = typeof acct.member === "object" ? acct.member : {};
     const level = `TRUST_LEVEL_${(opts.trustLevel ?? "core").toUpperCase()}`;
     // the reference seed for this level carries the network's convention for
     // starting dream balance and invitation credits; levels the reference
@@ -201,10 +210,10 @@ export function applyGenesisMembers(
     });
     app.season.member_profile_map.push({
       address,
-      username: "",
-      display_name: "",
+      username: opts.username ?? "",
+      display_name: opts.displayName ?? "",
       display_title: "",
-      achievements: [],
+      achievements: opts.achievements ?? [],
       unlocked_titles: [],
       season_xp: 0,
       season_level: 0,
@@ -216,6 +225,60 @@ export function applyGenesisMembers(
       invitations_successful: 0,
     });
   }
+  return genesis;
+}
+
+/**
+ * Seed the genesis community pool (accounts.communityPool): the
+ * distribution fee_pool entry must be backed by a matching balance on the
+ * distribution module account, which must itself exist in auth, and the
+ * bank supply must cover it — x/distribution's InitGenesis invariant
+ * rejects any of the four missing. The module address is the SDK
+ * derivation: sha256(module name) truncated to 20 bytes.
+ *
+ * Runs AFTER genesis accounts are added (it appends to auth.accounts and
+ * recomputes supply from balances) and idempotently: re-runs after gentx
+ * pauses must not double-seed.
+ */
+export function applyCommunityPool(genesis: Json, spec: LaunchSpec): Json {
+  const amount = spec.accounts.communityPool;
+  if (!amount) return genesis;
+  const denom = spec.token.bondDenom ?? spec.token.baseDenom;
+  const app = genesis.app_state as Json;
+  const address = toBech32(
+    spec.network.bech32Prefix,
+    sha256(new TextEncoder().encode("distribution")).slice(0, 20),
+  );
+
+  const balances = (app.bank.balances ?? []) as Json[];
+  if (!balances.some((b) => b.address === address)) {
+    balances.push({ address, coins: [{ denom, amount }] });
+    app.bank.balances = balances;
+
+    const accounts = (app.auth.accounts ?? []) as Json[];
+    accounts.push({
+      "@type": "/cosmos.auth.v1beta1.ModuleAccount",
+      base_account: {
+        // account numbers are reassigned contiguously by auth InitGenesis;
+        // this just has to be unique within the file
+        account_number: String(accounts.length),
+        address,
+        pub_key: null,
+        sequence: "0",
+      },
+      name: "distribution",
+      permissions: [],
+    });
+    app.auth.accounts = accounts;
+
+    const supply = (app.bank.supply ?? []) as Json[];
+    const entry = supply.find((s) => s.denom === denom);
+    if (entry) entry.amount = String(BigInt(entry.amount) + BigInt(amount));
+    else supply.push({ denom, amount });
+    app.bank.supply = supply;
+  }
+
+  app.distribution.fee_pool = { community_pool: [{ denom, amount }] };
   return genesis;
 }
 

@@ -13,6 +13,7 @@ export {
   withDefaults,
   validateSpec,
   checkSpec,
+  unknownKeyIssues,
   type SpecCheck,
   type ValidationIssue,
   type ValidationResult,
@@ -21,6 +22,7 @@ export { testnetSpec, testnetSpecInput, joinSpec, joinSpecInput } from "./fixtur
 export {
   chainId,
   deriveDreamDenom,
+  headscaleDomain,
   validatorMoniker,
   sentryMoniker,
   tunnelPort,

@@ -104,6 +104,11 @@ export async function runLaunch(
 ): Promise<RunResult> {
   const dirs = launchDirs(workRoot, launchId);
   fs.mkdirSync(dirs.root, { recursive: true });
+  // a previous driver may have died mid-step (restart/crash), leaving a row
+  // stuck at 'running' that the UI renders as a spinner forever — and which
+  // hides the earlier step actually holding the launch up
+  const orphaned = db.clearOrphanedRunningSteps(launchId);
+  if (orphaned > 0) log(`cleared ${orphaned} orphaned running step(s) from a previous driver`);
   db.setLaunchStatus(launchId, "running");
 
   const ctx: StepCtx = {

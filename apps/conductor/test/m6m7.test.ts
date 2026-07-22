@@ -242,8 +242,149 @@ describe("guided tmkms setup endpoint (M7)", () => {
     expect(setup.validators).toHaveLength(1);
     expect(setup.validators[0].tmkmsToml).toContain("sparkdream-1");
     expect(setup.validators[0].tmkmsToml).toContain(":26659");
+    // CometBFT v0.38 privval protocol with sign extensions (SDK 0.50 chains)
+    expect(setup.validators[0].tmkmsToml).toContain('protocol_version = "v0.38"');
+    expect(setup.validators[0].tmkmsToml).toContain("sign_extensions = true");
     expect(setup.validators[0].tailnetIp).toMatch(/^100\./);
     expect(setup.validators[0].consensusKey).toBeTruthy(); // key stays launcher-side (§3)
+    expect(setup.validators[0].commands.join("\n")).toContain("--hostname tmkms-sparkdream");
+    expect(setup.validators[0].commands.join("\n")).toContain("mkdir -p state secrets");
+    db.close();
+  }, 120_000);
+
+  it("reports live signer status: mesh join and per-validator connection", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({ security: { keyMode: "tmkms" } });
+    // one fake world shared by the launch and the server: the status
+    // endpoint's probes must see the same state the launch was driven with
+    const services = fakeServices();
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    db.createLaunch("tk", JSON.stringify(s), "akash1owner");
+    services.ssh.signerConnected = false;
+    await runWithSigner(db, "tk", s, work, allSteps(), services, new FakeSigner());
+
+    const before = await app.inject({ method: "GET", url: "/api/launches/tk/tmkms/status" });
+    expect(before.statusCode).toBe(200);
+    const s0 = before.json() as any;
+    expect(s0.externalNodes).toEqual([]);
+    expect(s0.validators).toHaveLength(1);
+    expect(s0.validators[0].key).toBe("val-0");
+    expect(s0.validators[0].tailnetIp).toMatch(/^100\./);
+    expect(s0.validators[0].signerConnected).toBe(false);
+
+    // the operator's laptop joins the mesh; tmkms connects to val-0
+    services.provider.externalMeshNodes = [
+      { name: "tmkms-sparkdream", ipAddresses: ["100.64.0.99"], online: true },
+    ];
+    services.ssh.signerConnected = true;
+
+    const after = await app.inject({ method: "GET", url: "/api/launches/tk/tmkms/status" });
+    const s1 = after.json() as any;
+    expect(s1.externalNodes).toEqual([
+      { name: "tmkms-sparkdream", ip: "100.64.0.99", online: true },
+    ]);
+    expect(s1.validators[0].signerConnected).toBe(true);
+    db.close();
+  }, 120_000);
+
+  // a hardware signer already holds its consensus key: the spec pins the
+  // pubkey, nothing is exported, and the panel checks the connected device
+  // holds the pinned key instead of just "a signer is there"
+  const PINNED = "OElT4VJpHCEW//d/q5FjCQ7i8EZURn49PSeB7MHp8ds=";
+  const pinnedSpec = () =>
+    spec({
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 1, consensusPubkeys: [PINNED] },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+
+  it("hardware signer (spec-pinned key): provider skeleton, no key export, live key match", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = pinnedSpec();
+    const services = fakeServices();
+    services.ssh.signerConnected = false;
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    db.createLaunch("hw", JSON.stringify(s), "akash1owner");
+    await runWithSigner(db, "hw", s, work, allSteps(), services, new FakeSigner());
+
+    const res = await app.inject({ method: "GET", url: "/api/launches/hw/tmkms" });
+    expect(res.statusCode).toBe(200);
+    const setup = res.json() as any;
+    const v0 = setup.validators[0];
+    // the init-generated placeholder must not be offered: importing it would
+    // sign with a key the chain never heard of
+    expect(v0.consensusKey).toBeNull();
+    expect(v0.expectedPubkey).toBe(PINNED);
+    expect(v0.tmkmsToml).not.toContain("[[providers.softsign]]");
+    expect(v0.tmkmsToml).toContain(PINNED);
+    expect(v0.tmkmsToml).toContain("[[validator]]");
+    const cmds = v0.commands.join("\n");
+    expect(cmds).not.toContain("softsign import");
+    expect(cmds).toContain(PINNED);
+    expect(cmds).toContain("tmkms start -c tmkms-val-0.toml");
+
+    // status: unknown until the signer connects (validator_info only exists
+    // once a signer holds the session)
+    let status = (await app.inject({ method: "GET", url: "/api/launches/hw/tmkms/status" })).json() as any;
+    expect(status.validators[0].expectedPubkey).toBe(PINNED);
+    expect(status.validators[0].pubkeyMatches).toBeNull();
+
+    // connected with the WRONG key: a positive mismatch, not just "connected"
+    services.ssh.signerConnected = true;
+    services.ssh.statusConsensusPubkey = Buffer.alloc(32, 9).toString("base64");
+    status = (await app.inject({ method: "GET", url: "/api/launches/hw/tmkms/status" })).json() as any;
+    expect(status.validators[0].signerConnected).toBe(true);
+    expect(status.validators[0].pubkeyMatches).toBe(false);
+
+    // connected with the pinned key
+    services.ssh.statusConsensusPubkey = PINNED;
+    status = (await app.inject({ method: "GET", url: "/api/launches/hw/tmkms/status" })).json() as any;
+    expect(status.validators[0].pubkeyMatches).toBe(true);
+    db.close();
+  }, 120_000);
+
+  it("await-signer pauses on a confirmed key mismatch, passes once the signer holds the pin", async () => {
+    const OTHER = Buffer.alloc(32, 9).toString("base64");
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = pinnedSpec();
+    const services = fakeServices();
+    services.ssh.signerConnected = true;
+    services.ssh.statusConsensusPubkey = OTHER;
+    db.createLaunch("gate", JSON.stringify(s), "akash1owner");
+
+    const paused = await runWithSigner(db, "gate", s, work, allSteps(), services, new FakeSigner());
+    expect(paused.status).toBe("awaiting-user");
+    expect(paused.failedStep).toBe("await-signer");
+    expect(paused.reason).toContain(PINNED);
+    expect(paused.reason).toContain(OTHER);
+
+    // the operator points the signer at the pinned key; resume completes
+    services.ssh.statusConsensusPubkey = PINNED;
+    const done = await runWithSigner(db, "gate", s, work, allSteps(), services, new FakeSigner());
+    expect(done.status).toBe("completed");
     db.close();
   }, 120_000);
 });

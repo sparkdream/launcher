@@ -10,6 +10,36 @@ import {
 } from "@sparkdream/launch-spec";
 import { templatePath } from "./vendor.js";
 
+/**
+ * config.toml's moniker is startup-validated by CometBFT ("valid non-empty
+ * ASCII text without tabs"), while the on-chain validator description
+ * (gentx) accepts unicode. The operator's chosen moniker stays untouched
+ * for the description (gentx.ts); what lands in config.toml is an ASCII
+ * form: fold common latin diacritics, drop everything else non-ASCII
+ * (emoji included), collapse whitespace. Falls back to the role default
+ * when nothing ASCII survives (a pure-emoji moniker).
+ */
+const DIACRITICS: Record<string, string> = {
+  ø: "o", Ø: "O", æ: "ae", Æ: "AE", å: "a", Å: "A", ä: "a", Ä: "A",
+  ö: "o", Ö: "O", ü: "u", Ü: "U", ß: "ss",
+  é: "e", è: "e", ê: "e", ë: "e",
+  á: "a", à: "a", â: "a", ã: "a",
+  í: "i", ì: "i", î: "i",
+  ó: "o", ò: "o", ô: "o", õ: "o",
+  ú: "u", ù: "u", û: "u",
+  ñ: "n", ç: "c",
+};
+
+export function configMoniker(raw: string, fallback: string): string {
+  const folded = [...raw].map((ch) => DIACRITICS[ch] ?? ch).join("");
+  const ascii = folded
+    .replace(/[^\x20-\x7e]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return ascii || fallback;
+}
+
+
 export interface RenderConfigsInput {
   spec: LaunchSpec;
   node: NodeRef;
@@ -105,7 +135,10 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
 
   // --- config.toml ---
   let config = substitute(fs.readFileSync(templatePath(`config.toml.${role}`), "utf8"), vars);
-  config = setTomlLine(config, "moniker", `moniker = "${node.moniker}"`);
+  // the spec moniker (unicode welcome) stays on-chain via the gentx
+  // description; config.toml gets the ASCII form CometBFT will boot with
+  const roleDefault = `${spec.network.name}-${role === "validator" ? "val" : "sentry"}-${node.index}`;
+  config = setTomlLine(config, "moniker", `moniker = "${configMoniker(node.moniker, roleDefault)}"`);
 
   if (role === "sentry") {
     const fronted = topology.sentryValidators[node.index] ?? [];

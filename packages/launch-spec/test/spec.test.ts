@@ -8,6 +8,7 @@ import {
   tunnelPort,
   validateSpec,
   withDefaults,
+  type LaunchSpec,
 } from "../src/index.js";
 import { joinSpec, joinSpecInput, testnetSpec, testnetSpecInput } from "../src/fixtures.js";
 
@@ -104,6 +105,171 @@ describe("validateSpec", () => {
     const res = validateSpec(spec);
     expect(res.errors.some((e) => e.path === "topology.headscale.backup")).toBe(true);
     expect(res.warnings.some((w) => w.path === "security.keyMode")).toBe(true);
+  });
+
+  it("network names allow inner hyphens, reject edge/consecutive ones", () => {
+    const named = (name: string) => checkSpec(testnetSpecInput({ network: { name, type: "testnet", bech32Prefix: "spark" } }));
+    expect(named("sparkdream-test").errors.some((e) => e.path === "network.name")).toBe(false);
+    expect(chainId(named("sparkdream-test").spec!)).toBe("sparkdream-test-1");
+    for (const bad of ["-sparkdream", "sparkdream-", "spark--dream", "Spark-Test"]) {
+      expect(named(bad).errors.some((e) => e.path === "network.name")).toBe(true);
+    }
+  });
+
+  it("validator monikers must match count; member usernames must be unique", () => {
+    const base = {
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: false },
+        frontend: { enabled: false },
+        hub: { enabled: false },
+      },
+      headscale: { domain: "headscale.sparkdream.io" },
+    };
+    const wrongCount = testnetSpec({
+      topology: { ...base, validators: { count: 2, monikers: ["🦢 Svanmøy-01 // ⚡"] } },
+    });
+    expect(validateSpec(wrongCount).errors.some((e) => e.path === "topology.validators.monikers")).toBe(true);
+    // non-ASCII monikers warn (config.toml is sanitized at render; the
+    // on-chain description keeps the original)
+    const nonAscii = testnetSpec({
+      topology: { ...base, validators: { count: 1, monikers: ["🦢 Svanmøy-01 // ⚡"] } },
+    });
+    const nonAsciiRes = validateSpec(nonAscii);
+    expect(nonAsciiRes.errors.some((e) => e.path.startsWith("topology.validators.monikers"))).toBe(
+      false,
+    );
+    expect(
+      nonAsciiRes.warnings.some((w) => w.path === "topology.validators.monikers[0]"),
+    ).toBe(true);
+    const ok = testnetSpec({
+      topology: { ...base, validators: { count: 1, monikers: ["Svanmoy-01"] } },
+    });
+    expect(validateSpec(ok).errors.some((e) => e.path.startsWith("topology.validators.monikers"))).toBe(false);
+
+    const dupes = testnetSpec({
+      accounts: {
+        initial: [
+          { name: "a", generate: true, amount: "10", member: { username: "valya" } },
+          { name: "b", generate: true, amount: "10", member: { username: "valya" } },
+        ],
+        validatorSelfDelegation: "1000000000000",
+      },
+    });
+    expect(validateSpec(dupes).errors.some((e) => e.message.includes("duplicate member usernames"))).toBe(true);
+  });
+
+  it("pre-existing consensus pubkeys: tmkms-only, one per validator, no duplicates", () => {
+    // from the manual testnet's gentx (a real 32-byte ed25519 pubkey)
+    const KEY0 = "OElT4VJpHCEW//d/q5FjCQ7i8EZURn49PSeB7MHp8ds=";
+    const KEY1 = Buffer.alloc(32, 1).toString("base64");
+    const topo = (validators: Record<string, unknown>) => ({
+      validators,
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: false },
+        frontend: { enabled: false },
+        hub: { enabled: false },
+      },
+      headscale: { domain: "headscale.sparkdream.io" },
+    });
+    const pinnedErr = (s: LaunchSpec) =>
+      validateSpec(s).errors.filter((e) => e.path.startsWith("topology.validators.consensusPubkeys"));
+
+    // tmkms + one key per validator: accepted (join mode too — the pin
+    // parameterizes your own validator, it does not shape genesis)
+    const ok = testnetSpec({
+      security: { keyMode: "tmkms" },
+      topology: topo({ count: 2, consensusPubkeys: [KEY0, KEY1] }),
+    });
+    expect(pinnedErr(ok)).toEqual([]);
+    const joined = joinSpec({
+      security: { keyMode: "tmkms" },
+      topology: topo({ count: 1, consensusPubkeys: [KEY0] }),
+    });
+    expect(pinnedErr(joined)).toEqual([]);
+
+    // softsign: the pinned key's private half never reaches the node
+    const soft = testnetSpec({ topology: topo({ count: 1, consensusPubkeys: [KEY0] }) });
+    expect(
+      pinnedErr(soft).some((e) => e.path === "topology.validators.consensusPubkeys"),
+    ).toBe(true);
+
+    // one key per validator, like monikers
+    const short = testnetSpec({
+      security: { keyMode: "tmkms" },
+      topology: topo({ count: 2, consensusPubkeys: [KEY0] }),
+    });
+    expect(
+      pinnedErr(short).some(
+        (e) => e.path === "topology.validators.consensusPubkeys" && e.message.includes("1 pubkeys for 2 validators"),
+      ),
+    ).toBe(true);
+
+    // two validators on one consensus key double-sign
+    const dupe = testnetSpec({
+      security: { keyMode: "tmkms" },
+      topology: topo({ count: 2, consensusPubkeys: [KEY0, KEY0] }),
+    });
+    expect(pinnedErr(dupe).some((e) => e.path === "topology.validators.consensusPubkeys[1]")).toBe(true);
+
+    // malformed keys fail the schema itself
+    const bad = checkSpec(
+      testnetSpecInput({
+        security: { keyMode: "tmkms" },
+        topology: topo({ count: 1, consensusPubkeys: ["not-a-key"] }),
+      }),
+    );
+    expect(bad.ok).toBe(false);
+    expect(bad.errors.some((e) => e.path === "topology.validators.consensusPubkeys[0]")).toBe(true);
+  });
+
+  it("communityPool is a genesis-shaping field: fine on new chains, rejected in join mode", () => {
+    const fresh = testnetSpec({ accounts: { initial: [], validatorSelfDelegation: "1", communityPool: "95000000000000" } });
+    expect(validateSpec(fresh).errors.some((e) => e.path === "accounts.communityPool")).toBe(false);
+    const joined = joinSpec({ accounts: { initial: [], validatorSelfDelegation: "1", communityPool: "95000000000000" } });
+    expect(validateSpec(joined).errors.some((e) => e.path === "accounts.communityPool")).toBe(true);
+  });
+
+  it("shared mesh (reuseFleet): domain becomes optional, backup forbidden", () => {
+    const topo = (headscale: Record<string, unknown>) => ({
+      validators: { count: 1 },
+      sentries: { count: 1 },
+      components: {
+        explorer: { enabled: false },
+        frontend: { enabled: false },
+        hub: { enabled: false },
+      },
+      headscale,
+    });
+    // reuseFleet alone is a valid mesh choice
+    expect(validateSpec(testnetSpec({ topology: topo({ reuseFleet: "abc-123" }) })).ok).toBe(true);
+    // neither domain nor reuseFleet is not
+    const neither = validateSpec(testnetSpec({ topology: topo({}) }));
+    expect(neither.errors.some((e) => e.path === "topology.headscale")).toBe(true);
+    // the owning fleet backs up the shared mesh, not this one
+    const withBackup = validateSpec(
+      testnetSpec({
+        topology: topo({
+          reuseFleet: "abc-123",
+          backup: {
+            s3: {
+              endpoint: "https://s3.example.com",
+              bucket: "b",
+              accessKeyId: "k",
+              secretRef: "env:S3_SECRET",
+            },
+          },
+        }),
+      }),
+    );
+    expect(withBackup.errors.some((e) => e.path === "topology.headscale.backup")).toBe(true);
+    // mainnet's backup requirement moves to the owning fleet too
+    const mainnet = testnetSpec({ network: { name: "sparkdream", type: "mainnet" } });
+    mainnet.topology.headscale = { reuseFleet: "abc-123" };
+    expect(
+      validateSpec(mainnet).errors.some((e) => e.path === "topology.headscale.backup"),
+    ).toBe(false);
   });
 
   it("rejects bad explicit mappings", () => {
@@ -658,5 +824,133 @@ describe("images.chainRepoCommit (§13 deploy-data pin)", () => {
 
   it("is optional", () => {
     expect(checkSpec(testnetSpecInput()).ok).toBe(true);
+  });
+});
+
+describe("provider exclusions", () => {
+  it("defaults to empty fleet-wide and per-component lists", () => {
+    const spec = testnetSpec();
+    expect(spec.providers.exclude).toEqual([]);
+    expect(spec.providers.components).toEqual({});
+    expect(validateSpec(spec).ok).toBe(true);
+  });
+
+  it("accepts a full exclusions block", () => {
+    const spec = testnetSpec({
+      providers: {
+        exclude: ["someprovider"],
+        components: {
+          headscale: { exclude: [AKASH_A] },
+          sentries: { exclude: ["frag"] },
+        },
+      },
+    });
+    expect(spec.providers.exclude).toEqual(["someprovider"]);
+    expect(spec.providers.components.headscale?.exclude).toEqual([AKASH_A]);
+    expect(validateSpec(spec).errors).toEqual([]);
+  });
+
+  it("rejects malformed akash addresses at the entry's path", () => {
+    const res = validateSpec(testnetSpec({ providers: { exclude: ["akash1bad"] } }));
+    expect(res.errors.some((e) => e.path === "providers.exclude[0]")).toBe(true);
+
+    const nested = validateSpec(
+      testnetSpec({
+        providers: { components: { sentries: { exclude: ["fine-fragment", "akash1xyz"] } } },
+      }),
+    );
+    expect(nested.errors.some((e) => e.path === "providers.components.sentries.exclude[1]")).toBe(
+      true,
+    );
+    expect(nested.errors.some((e) => e.path === "providers.components.sentries.exclude[0]")).toBe(
+      false,
+    );
+  });
+
+  it("rejects bech32 addresses with a non-akash prefix", () => {
+    const res = validateSpec(testnetSpec({ providers: { exclude: [COSMOS_A] } }));
+    expect(res.errors.some((e) => e.path === "providers.exclude[0]")).toBe(true);
+  });
+
+  it("rejects URL-shaped and whitespace fragments", () => {
+    for (const entry of ["https://provider.example.com", "has space", "a/b"]) {
+      const res = validateSpec(testnetSpec({ providers: { exclude: [entry] } }));
+      expect(res.errors.some((e) => e.path === "providers.exclude[0]")).toBe(true);
+    }
+  });
+
+  it("warns on very short fragments but still passes", () => {
+    const res = validateSpec(testnetSpec({ providers: { exclude: ["au"] } }));
+    expect(res.warnings.some((w) => w.path === "providers.exclude[0]")).toBe(true);
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects unknown component keys and misspelled inner keys", () => {
+    const typo = checkSpec(
+      testnetSpecInput({ providers: { components: { validator: { exclude: [] } } } }),
+    );
+    expect(typo.spec).toBeNull();
+    expect(typo.errors.some((e) => e.path === "providers.components")).toBe(true);
+
+    const inner = checkSpec(
+      testnetSpecInput({ providers: { components: { headscale: { exclud: [] } } } }),
+    );
+    expect(inner.spec).toBeNull();
+    expect(inner.errors.length).toBeGreaterThan(0);
+  });
+
+  it("rejects empty entries", () => {
+    const res = checkSpec(testnetSpecInput({ providers: { exclude: [""] } }));
+    expect(res.spec).toBeNull();
+    expect(res.errors.some((e) => e.path === "providers.exclude[0]")).toBe(true);
+  });
+});
+
+describe("unknown spec keys", () => {
+  it("a healthy spec produces no unknown-key warnings", () => {
+    const res = checkSpec(testnetSpecInput());
+    expect(res.warnings.filter((w) => w.message.includes("unrecognized key"))).toEqual([]);
+    expect(res.ok).toBe(true);
+  });
+
+  it("warns on a misspelled top-level key and still validates", () => {
+    const res = checkSpec(testnetSpecInput({ provideers: { exclude: ["x"] } }));
+    expect(res.ok).toBe(true);
+    expect(res.warnings.some((w) => w.path === "provideers")).toBe(true);
+  });
+
+  it("warns on a misplaced exclusion (nested under providers.policy)", () => {
+    const res = checkSpec(
+      testnetSpecInput({ providers: { policy: { exclude: ["someprovider"] } } }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.warnings.some((w) => w.path === "providers.policy.exclude")).toBe(true);
+    // and the parse stripped it: the policy engine would never see it
+    expect(res.spec!.providers.exclude).toEqual([]);
+  });
+
+  it("warns on blocks misplaced under topology", () => {
+    const res = checkSpec(
+      testnetSpecInput({
+        topology: { providers: { components: { headscale: { exclude: ["x"] } } } },
+      }),
+    );
+    expect(res.warnings.some((w) => w.path === "topology.providers")).toBe(true);
+  });
+
+  it("warns on unknown keys inside array items with an indexed path", () => {
+    const input = testnetSpecInput() as { accounts: { initial: Record<string, unknown>[] } };
+    input.accounts.initial[0]!.bogus = 1;
+    const res = checkSpec(input);
+    expect(res.warnings.some((w) => w.path === "accounts.initial[0].bogus")).toBe(true);
+  });
+
+  it("strict schema violations stay errors, without duplicate warnings", () => {
+    const res = checkSpec(
+      testnetSpecInput({ providers: { components: { validator: { exclude: [] } } } }),
+    );
+    expect(res.spec).toBeNull();
+    expect(res.errors.some((e) => e.path === "providers.components")).toBe(true);
+    expect(res.warnings).toEqual([]);
   });
 });

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { testnetSpec } from "@sparkdream/launch-spec";
-import { selectProvider, type Bid } from "../src/akash/policy.js";
+import { exclusionEntries, selectProvider, type Bid } from "../src/akash/policy.js";
 import { accountDepositMsg, createDeploymentMsg, createLeaseMsg, TypeUrl } from "../src/akash/messages.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../src/akash/sdl-groups.js";
 import { pollBids } from "../src/akash/client.js";
@@ -117,6 +117,124 @@ describe("policy engine (§6)", () => {
     );
     expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
     expect(decision.rejected[0]!.reason).toContain("above 2x median");
+  });
+
+  it("spec exclusion by hostname fragment rejects with a named reason", () => {
+    const decision = selectProvider(
+      [bid("akash1provider1", "100"), bid("akash1provider2", "200")],
+      {
+        policy: basePolicy,
+        chosenProviders: new Set(),
+        excludeMatchers: [{ entry: "provider1", source: "fleet" }],
+        providers: fakeProviders(),
+      },
+    );
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
+    expect(decision.rejected).toEqual([
+      { provider: "akash1provider1", reason: "excluded by spec (fleet): provider1" },
+    ]);
+  });
+
+  it("spec exclusion matching is case-insensitive", () => {
+    const decision = selectProvider([bid("akash1provider1", "100"), bid("akash1provider2", "200")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      excludeMatchers: [{ entry: "PROVIDER1.EXAMPLE", source: "headscale" }],
+      providers: fakeProviders(),
+    });
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
+    expect(decision.rejected[0]!.reason).toBe("excluded by spec (headscale): PROVIDER1.EXAMPLE");
+  });
+
+  it("spec exclusion by owner address matches exactly", () => {
+    const decision = selectProvider([bid("akash1provider1", "100"), bid("akash1provider2", "200")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      excludeMatchers: [{ entry: "akash1provider1", source: "validators" }],
+      providers: fakeProviders(),
+    });
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
+    expect(decision.rejected[0]!.reason).toBe("excluded by spec (validators): akash1provider1");
+  });
+
+  it("fragments match the hostUri hostname, not the owner string", () => {
+    const providers = fakeProviders();
+    providers.get("akash1provider1")!.hostUri = "https://unrelated.example.com:8443";
+    const decision = selectProvider([bid("akash1provider1", "100"), bid("akash1provider2", "200")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      excludeMatchers: [{ entry: "provider1", source: "fleet" }],
+      providers,
+    });
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
+  });
+
+  it("excluding every bid yields chosen null with exclusion reasons", () => {
+    const decision = selectProvider(
+      [bid("akash1provider1", "100"), bid("akash1provider2", "200")],
+      {
+        policy: basePolicy,
+        chosenProviders: new Set(),
+        excludeMatchers: [{ entry: "provider", source: "fleet" }],
+        providers: fakeProviders(),
+      },
+    );
+    expect(decision.chosen).toBeNull();
+    expect(decision.rejected).toHaveLength(2);
+    expect(decision.rejected.every((r) => r.reason.startsWith("excluded by spec"))).toBe(true);
+  });
+
+  it("logs which provider an exclusion matched", () => {
+    const lines: string[] = [];
+    selectProvider([bid("akash1provider1", "100"), bid("akash1provider2", "200")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      excludeMatchers: [{ entry: "provider1", source: "headscale" }],
+      log: (m) => lines.push(m),
+      providers: fakeProviders(),
+    });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("provider1");
+    expect(lines[0]).toContain("https://provider1.example.com:8443");
+    expect(lines[0]).toContain("headscale list");
+  });
+});
+
+describe("exclusionEntries", () => {
+  const spec = testnetSpec({
+    providers: {
+      exclude: ["fleetfrag"],
+      components: {
+        headscale: { exclude: ["hsfrag"] },
+        validators: { exclude: ["valfrag"] },
+        sentries: { exclude: ["senfrag"] },
+      },
+    },
+  });
+
+  it("maps component keys to their spec group", () => {
+    expect(exclusionEntries(spec, "val-0").map((e) => e.source)).toEqual(["fleet", "validators"]);
+    expect(exclusionEntries(spec, "sentry-12").map((e) => e.source)).toEqual(["fleet", "sentries"]);
+    for (const key of ["headscale", "explorer", "frontend", "hub"]) {
+      expect(exclusionEntries(spec, key).map((e) => e.source)).toEqual(
+        key === "headscale" ? ["fleet", "headscale"] : ["fleet"],
+      );
+    }
+  });
+
+  it("returns fleet-wide entries first, then the group's", () => {
+    expect(exclusionEntries(spec, "headscale")).toEqual([
+      { entry: "fleetfrag", source: "fleet" },
+      { entry: "hsfrag", source: "headscale" },
+    ]);
+  });
+
+  it("returns [] for specs without the new fields (pre-feature stored specs)", () => {
+    expect(exclusionEntries(testnetSpec(), "headscale")).toEqual([]);
+    const stale = JSON.parse(JSON.stringify(testnetSpec())) as Record<string, any>;
+    delete stale.providers.exclude;
+    delete stale.providers.components;
+    expect(exclusionEntries(stale as never, "val-0")).toEqual([]);
   });
 });
 

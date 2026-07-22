@@ -189,6 +189,72 @@ describe("fleet health monitor", () => {
   }, 120_000);
 });
 
+describe("relaunch adapts to the launch state", () => {
+  it("mid-launch it re-places through the launch; once completed it starts an op", async () => {
+    const { db, services, work } = await launched();
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    await app.inject({ method: "GET", url: "/api/fleet?owner=akash1owner" });
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+
+    // completed launch → the existing op path
+    const asOp = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "relaunch", confirm: true },
+    });
+    expect((asOp.json() as any).status).toBe("relaunch-started");
+    expect((asOp.json() as any).opId).toBeGreaterThan(0);
+
+    // now pretend the launch is still in flight: the SAME action must
+    // re-place through the launch instead, since an op could never run
+    db.setLaunchStatus("fl", "paused");
+    (services.api as any).leaseStates.set(sentry.dseq, "closed");
+    const midLaunch = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "relaunch", confirm: true },
+    });
+    // …re-placed through the launch, NOT queued as a second op (an op would
+    // never run while the launch is unfinished). The re-placement itself is
+    // covered end-to-end in full-launch.test.ts; here the point is that one
+    // action dispatches correctly on launch state.
+    expect((midLaunch.json() as any).status).toBe("replacing");
+    expect(db.listFleetOps("fl").filter((o) => o.kind === "relaunch")).toHaveLength(1);
+    db.close();
+  }, 120_000);
+});
+
+describe("headscale reachability", () => {
+  it("flags headscale unreachable even while its lease and escrow look fine", async () => {
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    for (const c of db.listFleetComponents("fl")) {
+      services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+    await fleet.tick("fl");
+    expect(db.listComponentHealth("fl").find((h) => h.component === "headscale")!.status).toBe(
+      "healthy",
+    );
+
+    // the public endpoint stops answering while the lease stays active and
+    // funded — previously this still read "healthy" and hid the fact that no
+    // node could join the mesh
+    services.rpc.darkUrls.add("headscale.sparkdream.io");
+    await fleet.tick("fl");
+    const hs = db.listComponentHealth("fl").find((h) => h.component === "headscale")!;
+    expect(hs.status).toBe("unreachable");
+    expect(hs.detail).toContain("cannot join the mesh");
+    db.close();
+  }, 120_000);
+});
+
 describe("fleet actions over HTTP", () => {
   it("guards a last-peer-path close, then closes through the signing loop", async () => {
     const { db, services, work, spec: s } = await launched();

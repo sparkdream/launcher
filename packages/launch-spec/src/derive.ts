@@ -21,8 +21,24 @@ export function deriveDreamDenom(token: LaunchSpec["token"]): string | undefined
   return dot > 0 ? `udream${bond.slice(dot)}` : undefined;
 }
 
+/**
+ * The mesh's public login URL host. A spec with reuseFleet gets its domain
+ * filled from the owning fleet when the launch is created, so by the time
+ * any step or renderer runs this is always set; throwing here catches a
+ * spec that skipped that resolution (e.g. handed to the engine directly).
+ */
+export function headscaleDomain(spec: LaunchSpec): string {
+  const d = spec.topology.headscale.domain;
+  if (!d) {
+    throw new Error(
+      "headscale domain not resolved — a reuseFleet spec must be resolved against its owning fleet before launch",
+    );
+  }
+  return d;
+}
+
 export function validatorMoniker(spec: LaunchSpec, v: number): string {
-  return `${spec.network.name}-val-${v}`;
+  return spec.topology.validators.monikers?.[v] ?? `${spec.network.name}-val-${v}`;
 }
 
 export function sentryMoniker(spec: LaunchSpec, s: number): string {

@@ -61,12 +61,33 @@ export interface TmkmsSetup {
     key: string;
     tailnetIp: string;
     tmkmsToml: string;
+    /** Exported priv_validator_key.json; null when the spec pins a
+     *  pre-existing pubkey (hardware signer holds the key). */
     consensusKey: unknown;
+    /** Spec-pinned consensus pubkey the signer must hold, or null. */
+    expectedPubkey: string | null;
     commands: string[];
   }>;
 }
 export async function getTmkmsSetup(id: string): Promise<TmkmsSetup> {
   return json(await afetch(`/api/launches/${id}/tmkms`));
+}
+
+export interface TmkmsStatus {
+  externalNodes: Array<{ name: string; ip: string; online: boolean }>;
+  validators: Array<{
+    key: string;
+    tailnetIp: string | null;
+    /** true: a signer holds a privval session now; false: none; null: probe failed. */
+    signerConnected: boolean | null;
+    /** Spec-pinned consensus pubkey (hardware signer), or null. */
+    expectedPubkey: string | null;
+    /** null: unknown/not pinned; otherwise the connected signer's key vs the pin. */
+    pubkeyMatches: boolean | null;
+  }>;
+}
+export async function getTmkmsStatus(id: string): Promise<TmkmsStatus> {
+  return json(await afetch(`/api/launches/${id}/tmkms/status`));
 }
 
 export interface StepView {
@@ -227,6 +248,10 @@ export interface PendingGentx {
   valIndex: number;
   address: string;
   signDoc: unknown;
+  /** The same doc as an unsigned tx file for airgapped `tx sign --offline`. */
+  unsignedTx?: unknown;
+  /** The exact offline signing command (chain id / account number / sequence filled in). */
+  signCommand?: string;
 }
 
 export async function getPendingGentx(id: string): Promise<PendingGentx | null> {
@@ -256,6 +281,8 @@ export interface FleetSummary {
     /** The spec's network name (distinguishes fleets sharing a chain id). */
     name: string;
     chainId: string;
+    /** softsign | tmkms — signer-related actions are gated on this. */
+    keyMode: string;
     components: ComponentView[];
     ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
   }>;
@@ -269,11 +296,16 @@ export async function getFleet(owner: string): Promise<FleetSummary> {
 export type FleetAction =
   | "close"
   | "restart"
+  /** Move to another provider: a fleet op once the launch has finished, or a
+   *  re-placement through the launch itself while it is still running. */
   | "relaunch"
   | "upgrade"
   | "halt-upgrade"
   | "topup"
-  | "unjail";
+  | "unjail"
+  /** tmkms validator whose signer stalled it: gate on the session, restart
+   *  the process in place, watch it sign again. */
+  | "resume-signing";
 
 export async function postFleetAction(
   launchId: string,
@@ -286,7 +318,7 @@ export async function postFleetAction(
     amount?: string;
     haltHeight?: number;
   } = {},
-): Promise<{ status?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
+): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -519,6 +551,38 @@ export async function postGentxResult(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ valIndex, response }),
+    }),
+  );
+}
+
+export interface SpecPrefill {
+  spec: unknown;
+  notes: string[];
+  issues: Array<{ path: string; message: string; warning?: boolean }>;
+}
+
+/** Reverse-map a genesis.json into a spec draft + caveat notes (editor helper). */
+export async function postSpecPrefill(genesis: unknown): Promise<SpecPrefill> {
+  return json(
+    await afetch(`/api/spec-prefill`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ genesis }),
+    }),
+  );
+}
+
+/** Offline path: submit a pasted `tx sign --offline` output instead of a wallet response. */
+export async function postSignedGentxTx(
+  id: string,
+  valIndex: number,
+  signedTx: unknown,
+): Promise<void> {
+  await json(
+    await afetch(`/api/launches/${id}/gentx-result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ valIndex, signedTx }),
     }),
   );
 }

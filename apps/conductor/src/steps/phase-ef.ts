@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chainId, nodes, resolveTopology, statelessComponents, tunnelPort } from "@sparkdream/launch-spec";
+import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
-import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
+import type { SshTarget } from "../services.js";
 import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "../node-ops.js";
+import { buildTmkmsSetup, SIGNER_CONNECTED_PROBE, VALIDATOR_STATUS_PROBE, probeSaysConnected, statusConsensusPubkey } from "../tmkms.js";
 import { phaseGSteps } from "./phase-g.js";
 import { resolveStateSyncTrust } from "./join.js";
 
@@ -49,26 +51,153 @@ export interface MeshTable {
   ips: Record<string, string>;
 }
 
+const MESH_SOCK = `${NODE_HOME}/tailscale/tailscaled.sock`;
+
+/** A node's assigned tailnet IPv4, or undefined if it has not joined yet.
+ *  An unreachable node is "not joined", not an error — the deployment check
+ *  below decides whether that is worth waiting out. */
+async function meshTailnetIp(ctx: StepCtx, target: SshTarget): Promise<string | undefined> {
+  const res = await ctx.services.ssh
+    .exec(target, `tailscale --socket=${MESH_SOCK} ip -4 2>/dev/null || true`)
+    .catch(() => ({ stdout: "" }));
+  const ip = res.stdout.trim().split("\n")[0];
+  return ip && /^100\./.test(ip) ? ip : undefined;
+}
+
+/**
+ * Bypass a black-holed IPv6 path to headscale (§ mesh join). Akash providers
+ * routinely give a container an IPv6 stack with no working IPv6 route;
+ * headscale sits behind Cloudflare, which advertises AAAA records, so the
+ * control client tries IPv6 first and the connection hangs on a dead route —
+ * `tailscale up` never completes and the node never joins. Pinning the
+ * headscale domain to its IPv4 in /etc/hosts makes the resolver return no
+ * AAAA at all (both musl and glibc consult /etc/hosts before DNS and use its
+ * entries exclusively for a matched name), so the control connection only
+ * ever tries IPv4. Then re-run `tailscale up` to retry the join. Best-effort:
+ * a failure here just falls through to the reachability diagnosis.
+ */
+async function pinHeadscaleIpv4AndRejoin(
+  ctx: StepCtx,
+  node: NodeRef,
+  target: SshTarget,
+  domain: string,
+  authkey: string | undefined,
+): Promise<string> {
+  const resolved = await ctx.services.ssh.exec(
+    target,
+    `nslookup ${domain} 2>/dev/null | awk '/^Address: [0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/{print $2; exit}'`,
+  );
+  const ipv4 = resolved.stdout.trim().split("\n")[0];
+  if (!ipv4 || !/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/.test(ipv4)) {
+    return `could not resolve an IPv4 address for ${domain} from this node`;
+  }
+  await ctx.services.ssh.exec(
+    target,
+    `grep -qF ' ${domain}' /etc/hosts || echo '${ipv4} ${domain}' >> /etc/hosts`,
+  );
+  if (authkey) {
+    // timeout-guarded: a pinned-IPv4 up completes in seconds, but never let a
+    // wedged up hang the launch
+    await ctx.services.ssh.exec(
+      target,
+      `timeout 90 tailscale --socket=${MESH_SOCK} up --auth-key=${authkey} ` +
+        `--login-server=https://${domain} --hostname=${node.key} --accept-dns=false --reset ` +
+        `>/dev/null 2>&1 || true`,
+    );
+  }
+  return `pinned ${domain}→${ipv4} in /etc/hosts and re-ran tailscale up (bypassing a likely IPv6 black hole)`;
+}
+
+/** Is headscale reachable from this node at all — the difference between an
+ *  IPv6 black hole (IPv4 works) and provider egress filtering (nothing works). */
+async function headscaleReachable(ctx: StepCtx, target: SshTarget, domain: string): Promise<boolean> {
+  const res = await ctx.services.ssh
+    .exec(
+      target,
+      `wget --no-check-certificate -q -O /dev/null -T 10 https://${domain}/health && echo REACH_OK || echo REACH_FAIL`,
+    )
+    .catch(() => ({ stdout: "REACH_FAIL" }));
+  return res.stdout.includes("REACH_OK");
+}
+
 export const awaitMeshStep: StepDef = {
   name: "await-mesh",
   async run(ctx): Promise<MeshTable> {
     const ips: Record<string, string> = {};
+    const domain = headscaleDomain(ctx.spec);
+    const preauth = ctx.output<PreauthKeys>("configure-headscale");
+    const plan = ctx.output<DeploymentPlan>("create-deployments");
+    const addr = ctx.db.getLaunch(ctx.launchId)?.owner ?? "";
     const maxAttempts = 30;
+    // ~20s of no-join before assuming the IPv6-black-hole path and pinning IPv4
+    const remediateAfter = 4;
     for (const node of nodes(ctx.spec)) {
       const target = nodeTarget(ctx, node.key);
-      for (let attempt = 1; ; attempt++) {
-        const res = await ctx.services.ssh.exec(
-          target,
-          `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`,
-        );
-        const ip = res.stdout.trim().split("\n")[0];
-        if (ip && /^100\./.test(ip)) {
-          ips[node.key] = ip;
-          break;
+      let remediated = false;
+      let ip: string | undefined;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        ip = await meshTailnetIp(ctx, target);
+        if (ip) break;
+        // A node whose deployment is closed can never join — polling it for
+        // the full budget wastes minutes and, worse, holds the launch driver
+        // so a relaunch the user just requested cannot start (drive() is a
+        // no-op while a run is in flight). Bail out immediately and say what
+        // to do. Only positive evidence counts; an LCD hiccup keeps waiting.
+        const dseq = plan?.perNode[node.key]?.dseq;
+        if (dseq && addr) {
+          const info = await ctx.services.api.deploymentInfo(addr, dseq).catch(() => undefined);
+          if (info && info.state !== "active") {
+            throw new AwaitUser(
+              "await-mesh",
+              `${node.key}'s deployment (dseq ${dseq}) is closed, so it can never join the mesh. ` +
+                `Use relaunch on ${node.key} to re-place it on another provider, then resume.`,
+            );
+          }
         }
-        if (attempt >= maxAttempts) throw new Error(`${node.key} never joined the mesh`);
+        if (!remediated && attempt >= remediateAfter) {
+          remediated = true;
+          const note = await pinHeadscaleIpv4AndRejoin(
+            ctx,
+            node,
+            target,
+            domain,
+            preauth?.perNode[node.key],
+          ).catch((e) => `IPv4 pin failed: ${String(e).slice(0, 120)}`);
+          ctx.log(`${node.key}: not on the mesh yet — ${note}`);
+        }
         await ctx.services.sleep(5000);
       }
+      if (!ip) {
+        // Name the culprit instead of timing out blindly. The decisive
+        // question is whether headscale is unreachable for EVERYONE or just
+        // for this node: probe it from the node AND from the launcher.
+        // Getting that backwards costs hours — a headscale whose public
+        // endpoint was down once sent us re-placing a blameless sentry
+        // across three providers.
+        const fromNode = await headscaleReachable(ctx, target, domain);
+        const fromLauncher = await ctx.services.rpc
+          .httpOk(`https://${domain}/health`)
+          .catch(() => false);
+        if (!fromLauncher) {
+          throw new AwaitUser(
+            "await-mesh",
+            `${node.key} cannot join the mesh because headscale at ${domain} is not answering ` +
+              `from anywhere — the launcher cannot reach it either. No node can register until ` +
+              `it does: check the domain's DNS/Cloudflare and that the headscale deployment is ` +
+              `serving, then resume. (This is not a problem with ${node.key} or its provider.)`,
+          );
+        }
+        throw new Error(
+          fromNode
+            ? `${node.key} never joined the mesh, though headscale at ${domain} answers from it — ` +
+              `check the node's tailscaled log; the control connection is failing for a reason ` +
+              `beyond the network path (which was already pinned to IPv4).`
+            : `${node.key} never joined the mesh: headscale at ${domain} answers for the launcher ` +
+              `but NOT from this node's Akash provider — an egress or path problem specific to ` +
+              `that provider. Relaunch ${node.key} to re-place it elsewhere.`,
+        );
+      }
+      ips[node.key] = ip;
     }
     return { ips };
   },
@@ -146,24 +275,69 @@ export const awaitSignerStep: StepDef = {
   async run(ctx) {
     if (ctx.spec.security.keyMode !== "tmkms") return { skipped: true };
     const mesh = ctx.output<MeshTable>("await-mesh")!;
+    // stanzas come from the guided-setup generator (single source for the
+    // protocol details; a hardcoded copy here drifted to the wrong protocol
+    // version once already)
+    const setup = buildTmkmsSetup({
+      spec: ctx.spec,
+      chainId: chainId(ctx.spec),
+      meshIps: mesh.ips,
+      nodeDir: (k) => ctx.dirs.node(k),
+    });
     const stanzas: Record<string, string> = {};
-    for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
-      stanzas[`val-${v}`] =
-        `[[validator]]\nchain_id = "${chainId(ctx.spec)}"\n` +
-        `addr = "tcp://${mesh.ips[`val-${v}`]}:26659"\nprotocol_version = "v0.34"\n`;
+    for (const v of setup.validators) {
+      stanzas[v.key] = v.tmkmsToml.slice(v.tmkmsToml.indexOf("[[validator]]"));
     }
-    // Probe the privval keepalive port on each validator; pause until all pass.
+    // Pause until a signer actually holds a privval session on each
+    // validator. Probing the port alone is vacuous: sparkdreamd binds the
+    // backend listener at boot, so nc -z passes with no signer anywhere in
+    // sight and the launch sails into a chain that can never sign. The
+    // established-session probe only goes green when tmkms dials in through
+    // the keepalive proxy. This runs right after start-chain, so poll for a
+    // minute first: the node needs a few seconds to bind the listener and a
+    // ready signer's reconnect has to land.
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
       const target = nodeTarget(ctx, `val-${v}`);
-      const probe = await ctx.services.ssh.exec(
-        target,
-        "nc -z 127.0.0.1 26660 && echo ok || echo no",
-      );
-      if (probe.stdout.trim() !== "ok") {
+      let connected = false;
+      for (let attempt = 0; attempt < 12 && !connected; attempt++) {
+        if (attempt > 0) await ctx.services.sleep(5000);
+        const probe = await ctx.services.ssh.exec(target, SIGNER_CONNECTED_PROBE);
+        connected = probeSaysConnected(probe.stdout);
+      }
+      if (!connected) {
         throw new AwaitUser(
           "await-signer",
-          `connect your tmkms signer(s), then resume.\n${Object.values(stanzas).join("\n")}`,
+          `connect your tmkms signer(s): the setup checklist below walks through it. ` +
+            `Resume once every validator reports its signer connected.\n` +
+            `${Object.values(stanzas).join("\n")}`,
         );
+      }
+      // spec-pinned key (hardware signer): a connected session is not enough,
+      // the device must hold the key the chain was built with. A confirmed
+      // mismatch means the chain rejects every vote this signer produces.
+      const pinned = ctx.spec.topology.validators.consensusPubkeys?.[v];
+      if (pinned) {
+        let signerKey: string | null = null;
+        for (let attempt = 0; attempt < 6 && !signerKey; attempt++) {
+          if (attempt > 0) await ctx.services.sleep(5000);
+          const status = await ctx.services.ssh.exec(target, VALIDATOR_STATUS_PROBE);
+          signerKey = statusConsensusPubkey(status.stdout);
+        }
+        if (signerKey && signerKey !== pinned) {
+          throw new AwaitUser(
+            "await-signer",
+            `the signer connected to val-${v} holds consensus pubkey ${signerKey}, but the spec ` +
+              `pins ${pinned}: the chain was built with the pinned key and rejects every vote ` +
+              `this signer produces. Point the signer at the pinned key (or relaunch with a ` +
+              `corrected consensusPubkeys list), then resume.`,
+          );
+        }
+        if (!signerKey) {
+          ctx.log(
+            `val-${v}: signer connected but /status did not report a pubkey; cannot verify it ` +
+              `against the spec's pinned key, proceeding anyway (the setup panel shows the live match state)`,
+          );
+        }
       }
     }
     return { stanzas };
@@ -544,8 +718,13 @@ export function phaseEFSteps(): StepDef[] {
     awaitMeshStep,
     wireTunnelsStep,
     patchValidatorPeersStep,
-    awaitSignerStep,
+    // start-chain before await-signer: containers boot with WAIT_FOR_CONFIG
+    // (no sparkdreamd), and the signer gate probes for an ESTABLISHED privval
+    // session, which can only exist once the node is up and has bound the
+    // backend listener. Gating earlier deadlocked the launch: no backend, no
+    // session, ever.
     startChainStep,
+    awaitSignerStep,
     persistStartStep,
     verifyChainStep,
     // Phase G (§5 "Join mode"): promote the joined pair to a bonded

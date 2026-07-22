@@ -117,6 +117,42 @@ describe("relaunch op", () => {
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 
+  it("relaunch honors the spec's per-component provider exclusions", async () => {
+    // 1x1 fleet: headscale/val-0/sentry-0 land on providers 1/2/3 (cheapest
+    // bids). provider4 is the bid a sentry-0 relaunch would win without the
+    // exclusion, so excluding it must push the relaunch to provider5.
+    const s = testnetSpec({
+      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+      providers: { components: { sentries: { exclude: ["provider4"] } } },
+    });
+    const w = await launched(s);
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(before.provider).toBe("akash1provider3");
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.state).toBe("active");
+    expect(after.provider).not.toBe(before.provider); // moved off the old provider
+    expect(after.provider).not.toBe("akash1provider4"); // spec exclusion held
+    expect(after.provider).toBe("akash1provider5");
+  }, 120_000);
+
   it("pauses on a genuine zombie container, proceeds past a mute closed-lease gateway", async () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
@@ -868,4 +904,137 @@ esac
     expect(doc.msgs[0].type).toBe("cosmos-sdk/MsgUnjail");
     expect(doc.msgs[0].value.address).toBe(tx.body.messages[0].validator_addr);
   }, 120_000);
+});
+
+describe("resume-signing op", () => {
+  function tmkmsSpec(): LaunchSpec {
+    return testnetSpec({
+      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 2 },
+        sentries: { count: 2 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+  }
+
+  /** CLI stub standing in for the chain: signing-info offset advances per
+   *  query while the `signing` file exists; `jailed` file flips the staking
+   *  answer (the post-stall downtime jail). */
+  function stubSparkdreamd(opts: { jailed?: boolean } = {}): { bin: string; dir: string } {
+    const dir = tmp();
+    if (opts.jailed) fs.writeFileSync(path.join(dir, "jailed"), "");
+    fs.writeFileSync(path.join(dir, "signing"), "");
+    const bin = path.join(dir, "sparkdreamd");
+    fs.writeFileSync(
+      bin,
+      `#!/bin/sh
+dir=$(dirname "$0")
+case "$1 $2" in
+  "query staking")
+    if [ -f "$dir/jailed" ]; then j=true; else j=false; fi
+    echo "{\\"validator\\":{\\"jailed\\":$j,\\"status\\":\\"BOND_STATUS_BONDED\\"}}"
+    ;;
+  "query slashing")
+    n=0; [ -f "$dir/offset" ] && n=$(cat "$dir/offset")
+    if [ -f "$dir/signing" ]; then n=$((n+1)); fi
+    echo "$n" > "$dir/offset"
+    echo "{\\"val_signing_info\\":{\\"index_offset\\":\\"$n\\",\\"missed_blocks_counter\\":\\"0\\"}}"
+    ;;
+  *)
+    echo '{}'
+    ;;
+esac
+`,
+    );
+    fs.chmodSync(bin, 0o755);
+    return { bin, dir };
+  }
+
+  async function withStub<T>(opts: { jailed?: boolean }, fn: () => Promise<T>): Promise<T> {
+    const stub = stubSparkdreamd(opts);
+    const prev = process.env.SPARKDREAMD_BIN;
+    process.env.SPARKDREAMD_BIN = stub.bin;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.SPARKDREAMD_BIN;
+      else process.env.SPARKDREAMD_BIN = prev;
+    }
+  }
+
+  it("gates on the signer session, restarts in place, verifies signing", async () => {
+    // the live shape: signer box down (session dropped) → user fixes it →
+    // one click gates, bounces the process, and proves blocks get signed —
+    // all without a manifest change (the out-of-band bounce this replaces
+    // drifted the on-chain hash and 422'd every later manifest send)
+    const w = await launched(tmkmsSpec());
+    w.services.ssh.signerConnected = false;
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sigsBefore = w.signer.signed.length;
+    const opId = w.fleet.requestResumeSigning(launch, val);
+
+    await withStub({}, async () => {
+      const parked = await driveOps(w);
+      expect(parked.status).toBe("awaiting-user");
+      expect(parked.failedStep).toBe(`op${opId}:await-signer`);
+      // no restart while the signer is down
+      expect(
+        w.services.ssh.execLog.some((e) => e.command.includes("pkill -x sparkdreamd")),
+      ).toBe(false);
+
+      // user brings the signer back, resumes
+      w.services.ssh.signerConnected = true;
+      const done = await driveOps(w);
+      expect(done.status).toBe("completed");
+    });
+
+    // the process was bounced in place, and NOT through a deployment change:
+    // the op signs no tx of any kind
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+    expect(w.services.ssh.started.has(valId)).toBe(true);
+    expect(
+      w.services.ssh.execLog.some(
+        (e) => e.target === valId && e.command.includes("pkill -x sparkdreamd"),
+      ),
+    ).toBe(true);
+    expect(w.signer.signed.length).toBe(sigsBefore);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.db.stepOutput<any>("fl", `op${opId}:verify`)!.signing).toBe(true);
+  }, 120_000);
+
+  it("completes with unjail guidance when the stall downtime-jailed the validator", async () => {
+    const w = await launched(tmkmsSpec());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const opId = w.fleet.requestResumeSigning(launch, val);
+
+    const result = await withStub({ jailed: true }, () => driveOps(w));
+    expect(result.status).toBe("completed");
+    // a jailed validator cannot be resumed by a restart: the op says so and
+    // finishes instead of failing (recovery is the unjail op's sync gate)
+    expect(w.db.stepOutput<any>("fl", `op${opId}:verify`)!.jailed).toBe(true);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+  }, 120_000);
+
+  it("refuses non-validators, softsign fleets, and doubled-up ops", async () => {
+    const w = await launched(tmkmsSpec());
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    expect(() => w.fleet.requestResumeSigning(launch, sentry)).toThrow(/validators/);
+    w.fleet.requestResumeSigning(launch, val);
+    expect(() => w.fleet.requestResumeSigning(launch, val)).toThrow(/already in progress/);
+
+    const soft = await launched(); // spec2x2 is softsign
+    const softVal = soft.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    expect(() => soft.fleet.requestResumeSigning(soft.db.getLaunch("fl")!, softVal)).toThrow(
+      /softsign/,
+    );
+    w.db.close();
+    soft.db.close();
+  }, 240_000);
 });

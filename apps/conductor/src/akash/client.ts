@@ -66,7 +66,11 @@ export class ProviderClient {
     private readonly creds: MtlsCredentials,
     opts: ProviderClientOpts = {},
   ) {
-    this.retries = opts.retries ?? 3;
+    // "no lease" right after MsgCreateLease is a propagation race: providers
+    // learn about leases by watching the chain, and the gateway can lag the
+    // confirmed tx by tens of seconds. 3×3s gave up after ~11s and stranded
+    // launches on a 404; 6 attempts with backoff waits ~50s instead.
+    this.retries = opts.retries ?? 6;
     this.preSendDelayMs = opts.preSendDelayMs ?? 5000;
     this.sleep = opts.sleep ?? defaultSleep;
   }
@@ -82,7 +86,7 @@ export class ProviderClient {
       } catch (e) {
         lastError = e as Error;
         if (!/no lease/i.test(lastError.message) || attempt === this.retries) throw lastError;
-        await this.sleep(3000);
+        await this.sleep(3000 * attempt); // 3s, 6s, 9s, 12s, 15s ≈ 45s + pre-send
       }
     }
     throw lastError;

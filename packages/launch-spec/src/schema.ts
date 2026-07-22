@@ -24,6 +24,18 @@ const memberOptions = z.object({
    * reference network's seed for a member of the same trust level.
    */
   dreamBalance: amount.optional(),
+  /**
+   * x/season profile username seeded at genesis. Defaults to empty
+   * (claimed on-chain later). Season rules: 3-20 chars, lowercase.
+   */
+  username: z.string().regex(/^[a-z0-9_]{3,20}$/).optional(),
+  /** x/season profile display name. Defaults to empty. */
+  displayName: z.string().min(1).max(50).optional(),
+  /**
+   * Achievement ids seeded on the season profile (e.g. "genesis_founder").
+   * Unknown ids are carried verbatim — the chain treats them as opaque.
+   */
+  achievements: z.array(z.string().regex(/^[a-z0-9_]{1,64}$/)).optional(),
 });
 
 const councilOptions = z.object({
@@ -88,6 +100,18 @@ const componentToggle = z.object({
   domain: domain.optional(),
 });
 
+/**
+ * Provider exclusions (§6): entries are either an akash1... provider owner
+ * address (exact match) or a case-insensitive substring of the provider's
+ * hostname (parsed from its hostUri). Matching is client-side only, in the
+ * conductor's policy engine; SDL placement requirements stay empty.
+ */
+const providerExclusions = z
+  .object({
+    exclude: z.array(z.string().min(1)).default([]),
+  })
+  .strict();
+
 const roleStorage = z.object({
   root: z.string().regex(/^[0-9]+[MGT]i$/),
   data: z.string().regex(/^[0-9]+[MGT]i$/),
@@ -144,7 +168,13 @@ export const launchSpecSchema = z.object({
   version: z.literal(1),
 
   network: z.object({
-    name: z.string().regex(/^[a-z][a-z0-9]{2,31}$/),
+    /** Lowercase alphanumeric with inner hyphens ("sparkdream-test" →
+     *  chain id "sparkdream-test-1"). */
+    name: z
+      .string()
+      .min(3)
+      .max(32)
+      .regex(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/, "lowercase alphanumeric, inner hyphens allowed"),
     type: networkType,
     chainIdSuffix: z.number().int().min(1).default(1),
     bech32Prefix: z.string().regex(/^[a-z]{2,16}$/),
@@ -178,6 +208,14 @@ export const launchSpecSchema = z.object({
   accounts: z.object({
     initial: z.array(initialAccount).default([]),
     validatorSelfDelegation: amount,
+    /**
+     * Genesis community pool, in the bond denom. Seeds the distribution
+     * module account (auth + bank balance + supply) and fee_pool
+     * consistently — the launcher owns all four, so the reference
+     * network's pool never carries over on its own. On SparkDream chains
+     * the pool is split across the three root councils at chain start.
+     */
+    communityPool: amount.optional(),
   }),
 
   topology: z.object({
@@ -189,6 +227,23 @@ export const launchSpecSchema = z.object({
        * (hardware-wallet capable), keys never leave the user's wallet.
        */
       operators: z.union([z.literal("generated"), z.array(z.string())]).default("generated"),
+      /**
+       * Per-validator monikers (staking description, ≤70 bytes each — any
+       * characters, emoji included). Defaults to "<name>-val-<index>".
+       * When set, the list length must match count (validateSpec).
+       */
+      monikers: z.array(z.string().min(1).max(70)).optional(),
+      /**
+       * Pre-existing consensus pubkeys (base64 ed25519, one per validator in
+       * val-0..N order) for signers that already hold their key — a hardware
+       * HSM running tmkms. The launcher pins these in the gentx instead of
+       * generating a key and exporting it for softsign import; no consensus
+       * private key ever exists launcher-side. Requires keyMode tmkms and a
+       * list matching count (validateSpec enforces both).
+       */
+      consensusPubkeys: z
+        .array(z.string().regex(/^[A-Za-z0-9+/]{43}=$/, "base64 ed25519 pubkey"))
+        .optional(),
     }),
     sentries: z.object({
       count: z.number().int().min(0).max(100),
@@ -226,7 +281,22 @@ export const launchSpecSchema = z.object({
       })
       .optional(),
     headscale: z.object({
-      domain,
+      /**
+       * Public DNS name of this fleet's own headscale. Omit when reuseFleet
+       * is set — the conductor fills it in from the owning fleet when the
+       * launch is created (validateSpec requires one of the two).
+       */
+      domain: domain.optional(),
+      /**
+       * Share another fleet's mesh instead of deploying a headscale of this
+       * fleet's own: the launch id (or unique network name) of a fleet on
+       * the same launcher instance and wallet. The launch then creates its
+       * own headscale user and preauth keys on that fleet's server and
+       * deploys no headscale itself — so one tailscale login on a signer
+       * machine reaches every fleet sharing the mesh. The owning fleet
+       * cannot shut down while a fleet sharing its mesh is live.
+       */
+      reuseFleet: z.string().min(1).optional(),
       backup: z.object({ s3: s3Backup }).optional(),
     }),
   }),
@@ -239,6 +309,20 @@ export const launchSpecSchema = z.object({
       preference: z.array(z.string()).default([]),
       antiAffinity: z.enum(["strict", "preferSpread"]),
     }),
+    /** Fleet-wide: providers on this list may host NO component. */
+    exclude: z.array(z.string().min(1)).default([]),
+    /** Per component group, merged over the fleet-wide list. */
+    components: z
+      .object({
+        headscale: providerExclusions.optional(),
+        validators: providerExclusions.optional(),
+        sentries: providerExclusions.optional(),
+        explorer: providerExclusions.optional(),
+        frontend: providerExclusions.optional(),
+        hub: providerExclusions.optional(),
+      })
+      .strict()
+      .default({}),
     escrow: z.object({
       targetRunwayDays: z.number().int().min(1),
     }),

@@ -123,7 +123,10 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
           },
         ]
       : []),
-    { role: "headscale", count: 1, workloads: headscaleWorkloads },
+    // a shared mesh (reuseFleet) is deployed and paid for by its owning fleet
+    ...(spec.topology.headscale.reuseFleet
+      ? []
+      : [{ role: "headscale", count: 1, workloads: headscaleWorkloads }]),
     ...statelessComponents(spec).map((c) => ({
       role: c.key,
       count: 1,

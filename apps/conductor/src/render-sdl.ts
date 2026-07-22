@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import yaml from "js-yaml";
 import {
+  headscaleDomain,
   tunnelPort,
   type LaunchSpec,
   type NodeRef,
@@ -49,7 +50,7 @@ export function renderNodeSdl(input: RenderSdlInput): void {
   svc.image = spec.images.sparkdreamd;
   const env: string[] = svc.env ?? [];
   setEnv(env, "SSH_PUBLIC_KEY", input.sshPublicKey);
-  setEnv(env, "HEADSCALE_URL", `https://${spec.topology.headscale.domain}`);
+  setEnv(env, "HEADSCALE_URL", `https://${headscaleDomain(spec)}`);
   setEnv(env, "TS_AUTHKEY", input.placeholder.tsAuthkey(node.key));
   setEnv(env, "TS_HOSTNAME", node.key);
   setEnv(env, "WAIT_FOR_CONFIG", "true");

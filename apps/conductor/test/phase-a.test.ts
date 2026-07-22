@@ -7,6 +7,7 @@ import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { launchDirs, runLaunch } from "../src/engine.js";
 import { phaseASteps } from "../src/steps/phase-a.js";
+import { configMoniker } from "../src/render-configs.js";
 import { fakeServices } from "./fakes.js";
 
 /**
@@ -262,6 +263,40 @@ describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
     expect(sentryListing).toContain("config/config.toml");
     db.close();
   }, 120_000);
+
+  it("spec-pinned consensus pubkeys (hardware signer) override the generated keys", async () => {
+    // a hardware tmkms signer already holds its key (§3): the launcher pins
+    // the device's pubkey and never generates or exports a consensus key
+    const KEY = "OElT4VJpHCEW//d/q5FjCQ7i8EZURn49PSeB7MHp8ds=";
+    const s = spec(1, 1, {
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 1, consensusPubkeys: [KEY] },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const { db, result, dirs } = await runPhaseA(s, "gp1");
+    if (result.status !== "completed") {
+      throw new Error(`paused at ${result.failedStep}: ${db.getStep("gp1", result.failedStep!)?.error}`);
+    }
+
+    // show-validator's answer (the init-generated placeholder) is ignored
+    const keys = db.stepOutput<{ consensusPubkeys: Record<string, string> }>("gp1", "generate-keys")!;
+    expect(keys.consensusPubkeys["val-0"]).toBe(KEY);
+
+    // and the gentx pins the device's key
+    const genesis = JSON.parse(
+      fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"), "utf8"),
+    );
+    expect(genesis.app_state.genutil.gen_txs[0].body.messages[0].pubkey.key).toBe(KEY);
+    db.close();
+  }, 120_000);
 });
 
 describe("Phase A golden run — explorer + frontend enabled", () => {
@@ -351,4 +386,22 @@ describe("Phase A re-run", () => {
     expect(db.listSteps("rerun").map((r) => r.finished_at)).toEqual(stamps);
     db.close();
   }, 120_000);
+});
+
+describe("configMoniker", () => {
+  it("folds diacritics and strips emoji for config.toml", () => {
+    expect(configMoniker("🦢 Svanmøy-01 // ⚡", "net-val-0")).toBe("Svanmoy-01 //");
+  });
+
+  it("passes ASCII through unchanged", () => {
+    expect(configMoniker("validator-one", "net-val-0")).toBe("validator-one");
+  });
+
+  it("falls back when nothing ASCII survives", () => {
+    expect(configMoniker("🦢⚡", "net-val-0")).toBe("net-val-0");
+  });
+
+  it("strips tabs and collapses whitespace", () => {
+    expect(configMoniker("a\tb  c", "x")).toBe("a b c");
+  });
 });

@@ -7,6 +7,7 @@ import {
   statelessComponents,
   tunnelPort,
   validateSpec,
+  validatorMoniker,
   type LaunchSpec,
   type NodeRef,
 } from "@sparkdream/launch-spec";
@@ -16,6 +17,7 @@ import { sparkdreamd, run } from "../exec.js";
 import { generateAgeKeypair, generateSshKeypair } from "../keys.js";
 import {
   applyChainParams,
+  applyCommunityPool,
   applyFoundingMembers,
   applyGenesisMembers,
   applyReferenceGenesis,
@@ -24,6 +26,8 @@ import {
 import {
   assembleGentxJson,
   buildGentxSignDoc,
+  gentxResponseFromSignedTx,
+  unsignedTxJsonFromSignDoc,
   verifySignedDoc,
   type GentxInputs,
   type GentxSignResponse,
@@ -55,7 +59,8 @@ export interface GenerateKeysOutput {
   /** name → address for operator + generated initial accounts. External
    *  operators appear here too (op-val-N → supplied address). */
   accounts: Record<string, string>;
-  /** val key → base64 ed25519 consensus pubkey (comet show-validator). */
+  /** val key → base64 ed25519 consensus pubkey (spec-pinned when
+   *  topology.validators.consensusPubkeys is set, else comet show-validator). */
   consensusPubkeys: Record<string, string>;
   sshPublicKey: string;
   ageRecipient: string;
@@ -198,6 +203,15 @@ export const generateKeysStep: StepDef = {
       const { stdout } = await sparkdreamd(["comet", "show-node-id", "--home", home]);
       nodeIds[node.key] = stdout.trim();
       if (node.role === "validator") {
+        // a spec-pinned pubkey (hardware tmkms signer, §3) wins over the
+        // init-generated key: the device holds the private key, and the
+        // binary derives every pubkey from priv_validator_key.json's
+        // private half, so the init file is a vestigial placeholder
+        const pinned = spec.topology.validators.consensusPubkeys?.[node.index];
+        if (pinned) {
+          consensusPubkeys[node.key] = pinned;
+          continue;
+        }
         const { stdout: pub } = await sparkdreamd(["comet", "show-validator", "--home", home]);
         consensusPubkeys[node.key] = (JSON.parse(pub) as { key: string }).key;
       }
@@ -335,6 +349,14 @@ export async function buildGenesisFiles(
     );
   }
 
+  // 2b. community pool — after accounts (it appends the distribution
+  //     module account and extends supply); idempotent across gentx pauses
+  if (spec.accounts.communityPool) {
+    const withPool = JSON.parse(fs.readFileSync(genesisPath, "utf8"));
+    applyCommunityPool(withPool, spec);
+    fs.writeFileSync(genesisPath, JSON.stringify(withPool, null, 2));
+  }
+
   // 3. one gentx per validator — locally signed (generated operators) or
   //    browser-signed with verification (external operators, §5 step 3b)
   const gentxDir = path.join(master, "config", "gentx");
@@ -370,6 +392,57 @@ export async function buildGenesisFiles(
     }
 
     const commission = commissionFlags(spec);
+    // spec-pinned consensus key (hardware signer, §3): the binary's `genesis
+    // gentx` derives the pubkey from priv_validator_key.json's PRIVATE half
+    // (show-validator ignores the file's pub_key field — verified against the
+    // binary), so it cannot pin a key whose private half lives in an HSM.
+    // Assemble the gentx like the external-operator path, but sign locally:
+    // `tx sign --offline` with the master keyring, the same amino fidelity,
+    // verified by the same verifySignedDoc before it may touch genesis.
+    const pinned = spec.topology.validators.consensusPubkeys?.[v];
+    if (pinned) {
+      const inputs: GentxInputs = {
+        spec,
+        valIndex: v,
+        operatorAddress: keys.accounts[`op-val-${v}`]!,
+        consensusPubkey: pinned,
+        nodeId: keys.nodeIds[`val-${v}`]!,
+        chainId: cid,
+      };
+      const signDoc = buildGentxSignDoc(inputs);
+      const unsignedPath = path.join(gentxDir, `unsigned-val-${v}.json`);
+      fs.writeFileSync(unsignedPath, unsignedTxJsonFromSignDoc(signDoc));
+      const { stdout: signedJson } = await sparkdreamd([
+        "tx",
+        "sign",
+        unsignedPath,
+        "--from",
+        `op-val-${v}`,
+        "--keyring-backend",
+        "test",
+        "--keyring-dir",
+        master,
+        "--home",
+        master,
+        "--offline",
+        "--chain-id",
+        cid,
+        "--account-number",
+        "0",
+        "--sequence",
+        "0",
+        "--sign-mode",
+        "amino-json",
+        "--yes",
+      ]);
+      const response = gentxResponseFromSignedTx(signedJson, signDoc);
+      const verdict = await verifySignedDoc(signDoc, response, keys.accounts[`op-val-${v}`]!);
+      if (!verdict.ok) {
+        throw new Error(`locally signed gentx for validator ${v} rejected: ${verdict.reason}`);
+      }
+      fs.writeFileSync(outputDocument, assembleGentxJson(inputs, response));
+      continue;
+    }
     await sparkdreamd([
       "genesis",
       "gentx",
@@ -378,7 +451,7 @@ export async function buildGenesisFiles(
       "--chain-id",
       cid,
       "--moniker",
-      `${spec.network.name}-val-${v}`,
+      validatorMoniker(spec, v),
       "--commission-rate",
       commission.rate,
       "--commission-max-rate",

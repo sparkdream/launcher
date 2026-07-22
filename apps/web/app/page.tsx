@@ -17,6 +17,7 @@ import {
   importLauncherBackup,
   postFleetAction,
   postGentxResult,
+  postSignedGentxTx,
   postTxResult,
   resumeLaunch,
   startLaunch,
@@ -93,10 +94,20 @@ accounts:
     - name: dave
       generate: true
       amount: "1000000000000"
-      member: { trustLevel: provisional, dreamBalance: "5000000000" }
+      # member cosmetics seed the season profile (otherwise claimed on-chain)
+      member: { trustLevel: provisional, dreamBalance: "5000000000", username: dave, displayName: Dave, achievements: [genesis_founder] }
   validatorSelfDelegation: "1000000000000"
+  # genesis community pool in the bond denom (split across the root councils
+  # at chain start); adds to total supply on top of the accounts above
+  # communityPool: "95000000000000"
 topology:
   validators: { count: 1 }
+  # per-validator staking monikers (default: <name>-val-<index>)
+  # validators: { count: 1, monikers: ["🦢 Svanmøy-01 // ⚡"] }
+  # tmkms with a pre-existing consensus key (hardware signer): pin each
+  # validator's ed25519 pubkey (base64, from comet show-validator or a gentx);
+  # the launcher then exports no key and the setup panel configures your device
+  # validators: { count: 1, consensusPubkeys: ["OElT4VJpHCEW//d/q5FjCQ7i8EZURn49PSeB7MHp8ds="] }
   sentries: { count: 1 }
   components:
     # route: the ping-pub path baked into the image, when it differs from network.name
@@ -109,6 +120,21 @@ topology:
   #   rpc: rpc.example.com
   headscale:
     domain: headscale.example.com
+    # or share an existing fleet's mesh instead of deploying a headscale
+    # (one tailscale login on a tmkms signer reaches every sharing fleet):
+    # reuseFleet: <launch id or network name of the owning fleet>
+# providers:
+#   # fleet-wide: providers on this list may host no component
+#   exclude: []
+#   components:
+#     # per-component exclusions, merged over the fleet-wide list. Entries are
+#     # an akash1... owner address (exact match) or a case-insensitive fragment
+#     # of the provider's hostname. Example: keep the coordination server off a
+#     # provider whose network drops traffic from other providers, while nodes
+#     # stay eligible for it:
+#     headscale: { exclude: ["provider-hostname-fragment"] }
+#     # validators: { exclude: [] }
+#     # sentries:   { exclude: [] }
 `;
 
 const LAST_LAUNCH_KEY = "launcher.lastLaunchId";
@@ -302,6 +328,32 @@ export default function Page() {
     localStorage.setItem(SPEC_KEY, text);
   };
 
+  // "Prefill from genesis.json": reverse-map an uploaded genesis into a
+  // spec draft; unmappable facts arrive as notes and lead the YAML as
+  // comments so they are read before Review
+  const prefillFromGenesisFile = async (file: File) => {
+    setBusy("prefilling spec from genesis…");
+    setError(null);
+    try {
+      const genesis = JSON.parse(await file.text());
+      const { postSpecPrefill } = await import("../lib/api");
+      const result = await postSpecPrefill(genesis);
+      const noteLines = [
+        `# Prefilled from ${file.name} — review before launching:`,
+        ...result.notes.map((n) => `#  - ${n}`),
+        ...result.issues.map(
+          (i) => `#  ${i.warning ? "warning" : "ERROR"} ${i.path}: ${i.message}`,
+        ),
+      ];
+      updateSpec(`${noteLines.join("\n")}\n${yaml.dump(result.spec, { lineWidth: 100 })}`);
+      setAdvOpen(true);
+    } catch (e) {
+      setError(`genesis prefill: ${String(e instanceof Error ? e.message : e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const updateChain = (patch: Partial<ChainConfig>) => {
     const next = { ...chain, ...patch };
     setChain(next);
@@ -460,15 +512,24 @@ export default function Page() {
   };
 
   const [tmkms, setTmkms] = useState<import("../lib/api").TmkmsSetup | null>(null);
+  const [tmkmsId, setTmkmsId] = useState<string | null>(null);
+  const [tmkmsStatus, setTmkmsStatus] = useState<import("../lib/api").TmkmsStatus | null>(null);
   const showTmkms = async (id: string) => {
     setError(null);
     try {
       const { getTmkmsSetup } = await import("../lib/api");
       setTmkms(await getTmkmsSetup(id));
+      setTmkmsId(id);
     } catch (e) {
       setError(String(e));
     }
   };
+  const closeTmkms = () => {
+    setTmkms(null);
+    setTmkmsId(null);
+    setTmkmsStatus(null);
+  };
+
 
   // wallet-scoped fleet view (§2): connect wallet → see your fleets
   useEffect(() => {
@@ -869,7 +930,10 @@ export default function Page() {
     if (spec.topology.sentries.count > 0) {
       rows.push({ role: "sentries", count: spec.topology.sentries.count, image: spec.images.sparkdreamd });
     }
-    rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
+    // a shared mesh (reuseFleet) is deployed and billed by its owning fleet
+    if (!spec.topology.headscale.reuseFleet) {
+      rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
+    }
     if (spec.topology.components.explorer.enabled && spec.images.explorer) {
       rows.push({ role: "explorer", count: 1, image: spec.images.explorer });
     }
@@ -958,7 +1022,7 @@ export default function Page() {
   const fleetAction = async (
     launchId: string,
     dseq: string,
-    action: "close" | "restart" | "relaunch" | "upgrade" | "topup" | "unjail",
+    action: "close" | "restart" | "relaunch" | "upgrade" | "topup" | "unjail" | "resume-signing",
     extra: { image?: string; components?: string[]; amount?: string; haltHeight?: number } = {},
   ) => {
     setError(null);
@@ -977,6 +1041,9 @@ export default function Page() {
       }
       // signature-bearing actions flow through the launch's signing loop —
       // open that launch's panel so the prompt is visible (and survives reload)
+      // a mid-launch re-placement may have to wait for the running step, so
+      // surface what the conductor said instead of looking like a no-op
+      if (first.note) showToast(first.note);
       if (action !== "restart") {
         localStorage.setItem(LAST_LAUNCH_KEY, launchId);
         setLaunchId(launchId);
@@ -1101,6 +1168,25 @@ export default function Page() {
     }
   }, [launchId, launch, pendingGentx]);
 
+  // offline signing (airgapped operator keys): pasted `tx sign --offline`
+  // output goes to the same endpoint; the conductor converts and verifies
+  const [offlineGentxText, setOfflineGentxText] = useState("");
+  const submitOfflineGentx = useCallback(async () => {
+    if (!launchId || !pendingGentx || !offlineGentxText.trim()) return;
+    setBusy(`verifying offline signature for validator ${pendingGentx.valIndex}…`);
+    setError(null);
+    try {
+      const parsed = JSON.parse(offlineGentxText);
+      await postSignedGentxTx(launchId, pendingGentx.valIndex, parsed);
+      setOfflineGentxText("");
+      setPendingGentx(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [launchId, pendingGentx, offlineGentxText]);
+
   // banner honesty: step messages persist across conductor restarts, so a
   // banner may describe a PREVIOUS attempt — show how old the report is
   const reportedAgo = (s: { started_at: string | null; finished_at: string | null }) => {
@@ -1123,6 +1209,36 @@ export default function Page() {
     [launch],
   );
   const failedStep = useMemo(() => launch?.steps.find((s) => s.status === "error"), [launch]);
+
+  const isTmkms = (launch?.spec as any)?.security?.keyMode === "tmkms";
+
+  // the launch's await-signer step and any op's *:await-signer gate both
+  // mean "the signer needs you" — the setup panel opens on its own (§5 step 19)
+  const awaitingSigner = (name?: string) => name === "await-signer" || name?.endsWith(":await-signer");
+  useEffect(() => {
+    if (awaitingSigner(waitingStep?.name) && launchId) void showTmkms(launchId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waitingStep?.name, launchId]);
+
+  // live status while the panel is open: mesh join + per-validator connection
+  useEffect(() => {
+    if (!tmkms || !tmkmsId) return;
+    let stop = false;
+    const tick = () =>
+      import("../lib/api").then(({ getTmkmsStatus }) =>
+        getTmkmsStatus(tmkmsId)
+          .then((s) => {
+            if (!stop) setTmkmsStatus(s);
+          })
+          .catch(() => {}),
+      );
+    void tick();
+    const t = setInterval(tick, 10_000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [tmkms, tmkmsId]);
 
   // ---- derived view state for the mission-control layout ----
   // a selected launch whose first poll hasn't answered yet: render a quiet
@@ -1665,6 +1781,51 @@ export default function Page() {
               <button onClick={signGentxNow} className="btn primary small" disabled={busy !== null}>
                 {isUnjail ? "Sign unjail with Keplr" : "Sign gentx with Keplr"}
               </button>
+              {pendingGentx.unsignedTx !== undefined && (
+                <details style={{ width: "100%", marginTop: 8 }}>
+                  <summary style={{ cursor: "pointer" }}>
+                    Sign offline instead (operator key on another machine)
+                  </summary>
+                  <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
+                    <span>
+                      1. Save this unsigned tx as <code>unsigned-tx.json</code> on the signing
+                      machine:{" "}
+                      <button
+                        className="btn small"
+                        onClick={() =>
+                          navigator.clipboard.writeText(
+                            JSON.stringify(pendingGentx.unsignedTx, null, 2),
+                          )
+                        }
+                      >
+                        copy unsigned tx
+                      </button>
+                    </span>
+                    <span>2. Sign it there with the operator key:</span>
+                    <pre style={{ overflowX: "auto", margin: 0 }}>
+                      <code>{pendingGentx.signCommand}</code>
+                    </pre>
+                    <span>
+                      3. Paste the contents of <code>signed-tx.json</code>:
+                    </span>
+                    <textarea
+                      rows={5}
+                      value={offlineGentxText}
+                      onChange={(e) => setOfflineGentxText(e.target.value)}
+                      placeholder='{"body": ..., "auth_info": ..., "signatures": [...]}'
+                      style={{ fontFamily: "monospace", width: "100%" }}
+                    />
+                    <button
+                      className="btn primary small"
+                      onClick={submitOfflineGentx}
+                      disabled={busy !== null || !offlineGentxText.trim()}
+                      style={{ justifySelf: "start" }}
+                    >
+                      Submit offline signature
+                    </button>
+                  </div>
+                </details>
+              )}
             </div>
           );
         })()}
@@ -1684,7 +1845,7 @@ export default function Page() {
             :
           </span>
           <pre>{waitingStep.error}</pre>
-          {waitingStep.name === "await-signer" && (
+          {awaitingSigner(waitingStep.name) && (
             <button className="btn" onClick={() => launchId && showTmkms(launchId)}>
               Show tmkms signer setup
             </button>
@@ -2119,6 +2280,15 @@ export default function Page() {
                 <span className="mono-dim" style={{ flex: "none", fontSize: 12 }}>
                   {launchPct}% · step {Math.min(totalSteps, doneSteps + 1)} of {totalSteps}
                 </span>
+                {isTmkms && (
+                  <button
+                    className="btn"
+                    title="Signer machine setup: mesh join command, consensus key, tmkms.toml"
+                    onClick={() => launchId && showTmkms(launchId)}
+                  >
+                    tmkms setup
+                  </button>
+                )}
               </>
             )}
             {launched && (
@@ -2135,6 +2305,18 @@ export default function Page() {
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, flex: "none" }}>
                   <span className="mono-dim">spec {launch!.id.slice(0, 8)}</span>
+                  {isTmkms && (
+                    <button
+                      className="btn"
+                      title="Signer machine setup: mesh join command, consensus key, tmkms.toml"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        launchId && showTmkms(launchId);
+                      }}
+                    >
+                      tmkms setup
+                    </button>
+                  )}
                   <button
                     className="btn"
                     title="Start a fresh launch from the spec editor (this chain keeps running)"
@@ -2305,12 +2487,25 @@ export default function Page() {
                       </button>
                     </div>
                   </div>
-                  <div style={{ marginTop: 18 }}>
+                  <div style={{ marginTop: 18, display: "flex", gap: 12, alignItems: "center" }}>
                     <button className="btn link" onClick={() => setAdvOpen((v) => !v)}>
                       {advOpen ? "▾" : "▸"} Advanced: edit the raw spec (YAML)
                     </button>
-                    {advOpen && <div style={{ marginTop: 10 }}>{specTextarea(220)}</div>}
+                    <label className="btn link" style={{ cursor: "pointer" }}>
+                      Prefill from genesis.json…
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        style={{ display: "none" }}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = "";
+                          if (file) void prefillFromGenesisFile(file);
+                        }}
+                      />
+                    </label>
                   </div>
+                  {advOpen && <div style={{ marginTop: 10 }}>{specTextarea(220)}</div>}
                   {specIssueList(!advOpen)}
                   <div className="wiz-nav">
                     <button className="btn" onClick={() => setWizStep(0)}>
@@ -2956,6 +3151,19 @@ export default function Page() {
                         {open && (
                           <div className="fleet-detail">
                             <div className="facts">
+                              {/* dseq first: it is what every provider/chain
+                                  lookup keys on when something goes wrong */}
+                              <span>
+                                dseq{" "}
+                                <span
+                                  className="v"
+                                  title="click to copy"
+                                  style={{ cursor: "pointer" }}
+                                  onClick={() => void navigator.clipboard.writeText(c.dseq)}
+                                >
+                                  {c.dseq}
+                                </span>
+                              </span>
                               {c.image && (
                                 <span>
                                   image <span className="v">{c.image}</span>
@@ -3009,6 +3217,15 @@ export default function Page() {
                                       onClick={() => fleetAction(f.launchId, c.dseq, "unjail")}
                                     >
                                       unjail
+                                    </button>
+                                  )}
+                                  {f.keyMode === "tmkms" && c.key.startsWith("val-") && (
+                                    <button
+                                      className="btn amber"
+                                      title="Signer stalled the chain? Bring the tmkms signer up first, then run this: it waits for the signer session, restarts the validator process in place (no redeploy, no manifest change), and watches it sign blocks again."
+                                      onClick={() => fleetAction(f.launchId, c.dseq, "resume-signing")}
+                                    >
+                                      resume signing
                                     </button>
                                   )}
                                   <button
@@ -3216,14 +3433,64 @@ export default function Page() {
               <span className="dim-note" style={{ fontSize: 12 }}>
                 run these on your signer machine, the launcher never touches it
               </span>
-              <button className="btn" style={{ marginLeft: "auto" }} onClick={() => setTmkms(null)}>
+              <button className="btn" style={{ marginLeft: "auto" }} onClick={closeTmkms}>
                 close
               </button>
             </div>
             <div className="card-body" style={{ paddingTop: 0 }}>
               <div className="dim-note">
-                Save each consensus key, join the mesh, import, start; then resume the launch.
+                Work the numbered steps on your signer machine, top to bottom. The status
+                lines below update on their own; when every validator reports its signer
+                connected, resume the launch.
               </div>
+              {tmkmsStatus && (
+                <div style={{ display: "grid", gap: 4, fontSize: 13, marginTop: 8 }}>
+                  <div>
+                    signer machine on the mesh:{" "}
+                    {tmkmsStatus.externalNodes.length === 0 ? (
+                      <span style={{ color: "var(--amber-text)" }}>none seen yet</span>
+                    ) : (
+                      tmkmsStatus.externalNodes.map((n, i) => (
+                        <span key={n.name}>
+                          {i > 0 && ", "}
+                          <span style={{ color: n.online ? "var(--ok)" : "var(--dim)" }}>
+                            {n.name}
+                            {n.ip ? ` (${n.ip})` : ""}
+                            {n.online ? "" : " (offline)"}
+                          </span>
+                        </span>
+                      ))
+                    )}
+                  </div>
+                  {tmkmsStatus.validators.map((v) => (
+                    <div key={v.key}>
+                      {v.key}:{" "}
+                      {v.signerConnected === null ? (
+                        <span style={{ color: "var(--dim)" }}>probe unreachable</span>
+                      ) : !v.signerConnected ? (
+                        <span style={{ color: "var(--amber-text)" }}>waiting for signer</span>
+                      ) : v.pubkeyMatches === false ? (
+                        <span style={{ color: "var(--red-text)" }}>
+                          connected, but the signer holds the wrong consensus key (expected{" "}
+                          {v.expectedPubkey})
+                        </span>
+                      ) : v.pubkeyMatches === true ? (
+                        <span style={{ color: "var(--ok)" }}>signer connected, key matches the spec</span>
+                      ) : (
+                        <span style={{ color: "var(--ok)" }}>signer connected</span>
+                      )}
+                    </div>
+                  ))}
+                  {tmkmsStatus.validators.length > 0 &&
+                    tmkmsStatus.validators.every(
+                      (v) => v.signerConnected === true && v.pubkeyMatches !== false,
+                    ) && (
+                      <div style={{ color: "var(--ok)", fontWeight: 600 }}>
+                        all signers connected: resume the launch
+                      </div>
+                    )}
+                </div>
+              )}
             </div>
             {tmkms.validators.map((v) => (
               <div key={v.key} className="tmkms-val">
@@ -3234,24 +3501,31 @@ export default function Page() {
                   <summary>tmkms-{v.key}.toml</summary>
                   <pre>{v.tmkmsToml}</pre>
                 </details>
-                <details>
-                  <summary>{v.key}-priv_validator_key.json (consensus key, handle offline)</summary>
-                  <pre>{JSON.stringify(v.consensusKey, null, 2)}</pre>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      const blob = new Blob([JSON.stringify(v.consensusKey, null, 2)], {
-                        type: "application/json",
-                      });
-                      const a = document.createElement("a");
-                      a.href = URL.createObjectURL(blob);
-                      a.download = `${v.key}-priv_validator_key.json`;
-                      a.click();
-                    }}
-                  >
-                    download key
-                  </button>
-                </details>
+                {v.expectedPubkey ? (
+                  <details open>
+                    <summary>consensus pubkey (must match the key in your hardware signer)</summary>
+                    <pre>{v.expectedPubkey}</pre>
+                  </details>
+                ) : (
+                  <details>
+                    <summary>{v.key}-priv_validator_key.json (consensus key, handle offline)</summary>
+                    <pre>{JSON.stringify(v.consensusKey, null, 2)}</pre>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        const blob = new Blob([JSON.stringify(v.consensusKey, null, 2)], {
+                          type: "application/json",
+                        });
+                        const a = document.createElement("a");
+                        a.href = URL.createObjectURL(blob);
+                        a.download = `${v.key}-priv_validator_key.json`;
+                        a.click();
+                      }}
+                    >
+                      download key
+                    </button>
+                  </details>
+                )}
                 <pre>{v.commands.join("\n")}</pre>
               </div>
             ))}

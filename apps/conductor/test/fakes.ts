@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { AkashApi, MtlsCredentials } from "../src/akash/client.js";
 import type { Bid, ProviderInfo } from "../src/akash/policy.js";
@@ -51,10 +52,15 @@ export class FakeAkashApi implements AkashApi {
    *  the "version already matches — skip update tx" reconciliation. */
   deploymentHashes = new Map<string, string>();
 
+  /** dseqs the chain has no record of (a deployment that never took effect,
+   *  or was pruned) — deploymentInfo answers undefined for them. */
+  missingDseqs = new Set<string>();
+
   async deploymentInfo(
     _owner: string,
     dseq: string,
   ): Promise<{ state: string; hash?: string } | undefined> {
+    if (this.missingDseqs.has(dseq)) return undefined;
     if (!this.knownDseqs.has(dseq)) return undefined;
     // a stale order still has an active deployment awaiting the close;
     // no hash (unless set above) → steps skip hash reconciliation in tests
@@ -66,9 +72,14 @@ export class FakeAkashApi implements AkashApi {
 
   /** dseqs whose bids have all expired (create-leases stale-bid recovery). */
   expiredBidDseqs = new Set<string>();
+  /** dseqs whose bids Akash has pruned (an order's bids disappear once it
+   *  closes — the lease still exists, so callers must not treat the empty
+   *  list as evidence of anything). */
+  prunedBidDseqs = new Set<string>();
 
   async listBids(_owner: string, dseq: string): Promise<Bid[]> {
     this.knownDseqs.add(dseq); // every launched dseq shows up on-chain
+    if (this.prunedBidDseqs.has(dseq)) return [];
     if (this.staleFirstOrder) this.firstDseq ??= dseq;
     const state =
       (this.staleFirstOrder && dseq === this.firstDseq) || this.expiredBidDseqs.has(dseq)
@@ -136,12 +147,47 @@ export class FakeProviderGateway {
    *  it, =true parks the container in wait mode. */
   onNodeManifest?: (sshId: string, waitMode: boolean) => void;
 
+  /** Provider hostUris whose DNS/gateway is dead: every manifest send to them
+   *  fails like a real unresolvable provider (send-manifests re-bids away). */
+  unreachableProviders = new Set<string>();
+  /** dseqs whose lease the provider already closed (manifest timeout): the
+   *  gateway answers, but 404s the manifest PUT. */
+  leaselessDseqs = new Set<string>();
+  /** dseqs the chain has no record of at all — the provider looks them up
+   *  and answers "Deployment not found". */
+  deploymentNotFoundDseqs = new Set<string>();
+  /** Wired by fakeServices to FakeAkashApi.deploymentHashes: emulate the
+   *  provider's manifest version check — the PUT 422s unless sha256 of the
+   *  manifest matches the deployment's on-chain hash. Inert for dseqs with
+   *  no recorded hash, so tests that don't track hashes are unaffected. */
+  onChainHash?: (dseq: string) => string | undefined;
+
   async sendManifest(
     _creds: MtlsCredentials,
     hostUri: string,
     dseq: string,
     manifestJson?: string,
   ): Promise<void> {
+    if (this.unreachableProviders.has(hostUri)) {
+      throw new Error(`getaddrinfo EAI_AGAIN ${new URL(hostUri).hostname}`);
+    }
+    if (this.leaselessDseqs.has(dseq)) {
+      throw new Error(`provider PUT /deployment/${dseq}/manifest: HTTP 404 no lease for deployment`);
+    }
+    if (this.deploymentNotFoundDseqs.has(dseq)) {
+      throw new Error(
+        `provider PUT /deployment/${dseq}/manifest: HTTP 500 rpc error: code = NotFound desc = Deployment not found: key not found`,
+      );
+    }
+    const wantHash = this.onChainHash?.(dseq);
+    if (wantHash && manifestJson) {
+      const got = crypto.createHash("sha256").update(manifestJson).digest("base64");
+      if (got !== wantHash) {
+        throw new Error(
+          `provider PUT /deployment/${dseq}/manifest: HTTP 422 manifest version validation failed`,
+        );
+      }
+    }
     this.manifests.push({ hostUri, dseq });
     if (manifestJson?.includes("WAIT_FOR_CONFIG=")) {
       const key = `${hostUri}/${dseq}`;
@@ -186,6 +232,12 @@ export class FakeProviderGateway {
 
   /** Lease-shell exec — the headscale image has no sshd (mirrors FakeSsh). */
   shellLog: Array<{ dseq: string; script: string }> = [];
+  /** headscale users created via lease-shell ("sparkdream" pre-seeded for
+   *  tests that mint keys without running configure-headscale first). */
+  private hsUsers: string[] = ["sparkdream"];
+  /** External (non-fleet) nodes reported by "headscale nodes list": the
+   *  tmkms host, operator laptops. Tests set this to simulate a mesh join. */
+  externalMeshNodes: { name: string; ipAddresses: string[]; online: boolean }[] = [];
   async shellExec(
     _creds: MtlsCredentials,
     _hostUri: string,
@@ -198,8 +250,19 @@ export class FakeProviderGateway {
     const script = cmd[cmd.length - 1] ?? "";
     this.shellLog.push({ dseq, script });
     if (script.includes("kill 1")) throw new Error("lease shell: connection closed before result");
+    if (script.includes("users create")) {
+      const name = /users create (\S+)/.exec(script)?.[1];
+      if (name && !this.hsUsers.includes(name)) this.hsUsers.push(name);
+      return { stdout: "", stderr: "" };
+    }
     if (script.includes("users list")) {
-      return { stdout: JSON.stringify([{ id: 1, name: "sparkdream" }]), stderr: "" };
+      return {
+        stdout: JSON.stringify(this.hsUsers.map((name, i) => ({ id: i + 1, name }))),
+        stderr: "",
+      };
+    }
+    if (script.includes("nodes list")) {
+      return { stdout: JSON.stringify(this.externalMeshNodes), stderr: "" };
     }
     if (script.includes("preauthkeys create")) {
       // mirrors the real CLI: --user must be the numeric id, not a name
@@ -227,6 +290,21 @@ export class FakeSsh {
   pingOutput = "pong from val-0 (100.64.0.10) via 10.0.0.1:41641 in 12ms";
   /** host:port whose old container still answers after close (zombie check). */
   zombieHosts = new Set<string>();
+  /** When true, every node reports "not on the mesh" until await-mesh's
+   *  IPv6-black-hole remediation re-runs `tailscale up` on it (models a dead
+   *  IPv6 route to headscale that the /etc/hosts IPv4 pin works around). */
+  ipv6BlackHole = false;
+  /** When false, the IPv4 pin + re-up does NOT clear the black hole (models a
+   *  genuinely dead path, so the node never joins and await-mesh must report). */
+  rejoinClearsBlackHole = true;
+  /** When true, the reachability probe reports headscale unreachable (models
+   *  provider egress filtering — distinct from the IPv6 black hole). */
+  unreachableHeadscale = false;
+  /** Consensus pubkey /status reports in validator_info (the tmkms key-match
+   *  check). Unset → the answer carries no validator_info (unknown, never a
+   *  mismatch). */
+  statusConsensusPubkey: string | null = null;
+  private rejoined = new Set<string>();
   execLog: Array<{ target: string; command: string }> = [];
   private ipCounter = 10;
   private ips = new Map<string, string>();
@@ -256,19 +334,41 @@ export class FakeSsh {
       return ok(this.pingOutput);
     }
     if (command.includes("tailscale") && command.includes("ip -4")) {
+      // black-holed until the IPv4 pin + re-up remediation runs on this node
+      if (this.ipv6BlackHole && !this.rejoined.has(id)) return ok("");
       if (!this.ips.has(id)) this.ips.set(id, `100.64.0.${this.ipCounter++}`);
       return ok(this.ips.get(id)!);
+    }
+    // await-mesh remediation: resolve headscale's IPv4 (the piped awk result)
+    if (command.includes("nslookup")) return ok("104.21.47.136");
+    // re-up after pinning IPv4 → this node can now join the mesh
+    if (command.includes("tailscale") && command.includes(" up ")) {
+      if (this.rejoinClearsBlackHole) this.rejoined.add(id);
+      return ok();
+    }
+    // reachability probe (await-mesh's descriptive failure) — reachable by default
+    if (command.includes("/health") && command.includes("REACH_OK")) {
+      return ok(this.unreachableHeadscale ? "REACH_FAIL" : "REACH_OK");
     }
     if (command.includes("preauthkeys create")) {
       return ok(JSON.stringify({ key: `hskey-${this.execLog.length}` }));
     }
     if (command.includes("SELECT count(*) FROM users")) return ok("1");
-    if (command.includes("nc -z 127.0.0.1 26660")) {
-      return ok(this.signerConnected ? "ok" : "no");
+    if (command.includes("netstat -tn") && command.includes("26660")) {
+      // signer-connected probe (await-signer, /tmkms/status): count of
+      // established privval sessions through the keepalive proxy
+      return ok(this.signerConnected ? "1" : "0");
     }
     if (command.includes("127.0.0.1:26657/status")) {
-      // sync gates (phase-g bond gate, unjail op) read the node's local RPC
-      return ok('{"result":{"sync_info":{"latest_block_height":"1000000","catching_up":false}}}');
+      // sync gates (phase-g bond gate, unjail op) read the node's local RPC;
+      // the tmkms key-match check reads validator_info (present only while a
+      // signer holds the privval session — modelled by the knob)
+      const validatorInfo = this.statusConsensusPubkey
+        ? `,"validator_info":{"pub_key":{"value":"${this.statusConsensusPubkey}"}}`
+        : "";
+      return ok(
+        `{"result":{"sync_info":{"latest_block_height":"1000000","catching_up":false}${validatorInfo}}}`,
+      );
     }
     if (command.includes("pgrep -x sparkdreamd")) {
       return ok(this.started.has(id) ? "yes" : "no");
@@ -345,12 +445,14 @@ export interface FakeWorld extends Services {
 export function fakeServices(): FakeWorld {
   const ssh = new FakeSsh();
   const provider = new FakeProviderGateway();
+  const api = new FakeAkashApi();
+  provider.onChainHash = (dseq) => api.deploymentHashes.get(dseq);
   provider.onNodeManifest = (sshId, waitMode) => {
     if (waitMode) ssh.started.delete(sshId);
     else ssh.started.add(sshId);
   };
   return {
-    api: new FakeAkashApi(),
+    api,
     provider,
     ssh,
     rpc: new FakeRpc(),

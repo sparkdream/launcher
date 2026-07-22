@@ -1,5 +1,5 @@
-import { ZodError } from "zod";
-import { fromBech32 } from "@cosmjs/encoding";
+import { z, ZodError } from "zod";
+import { fromBase64, fromBech32 } from "@cosmjs/encoding";
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
 import { deriveDreamDenom } from "./derive.js";
 import { profiles } from "./profiles.js";
@@ -58,6 +58,72 @@ function formatPath(path: (string | number)[]): string {
   );
 }
 
+/** Strip wrappers (optional/nullable/default/effects) to the meaningful node. */
+function unwrapZod(schema: z.ZodTypeAny): z.ZodTypeAny {
+  for (;;) {
+    if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) {
+      schema = schema.unwrap() as z.ZodTypeAny;
+    } else if (schema instanceof z.ZodDefault) {
+      schema = schema._def.innerType as z.ZodTypeAny;
+    } else if (schema instanceof z.ZodEffects) {
+      schema = schema._def.schema as z.ZodTypeAny;
+    } else {
+      return schema;
+    }
+  }
+}
+
+/**
+ * Non-strict zod objects STRIP unknown keys instead of complaining, so a
+ * misspelled or misplaced key (providers.policy.exclude, say) vanishes from
+ * the parsed spec without a trace and the launch runs with different
+ * settings than the user wrote. Walk the raw input against the schema's
+ * shape and warn on every key the parse will drop. Runs on raw user input
+ * only: after withDefaults the unknown keys are already gone.
+ */
+export function unknownKeyIssues(input: unknown): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const walk = (schema: z.ZodTypeAny, value: unknown, path: string): void => {
+    const node = unwrapZod(schema);
+    if (value === undefined || value === null) return;
+    if (node instanceof z.ZodObject) {
+      if (!isPlainObject(value)) return;
+      const shape = node.shape as Record<string, z.ZodTypeAny>;
+      for (const [k, v] of Object.entries(value)) {
+        const p = path ? `${path}.${k}` : k;
+        if (!shape[k]) {
+          issues.push({
+            path: p,
+            message: "unrecognized key; the schema strips it silently (check spelling and placement)",
+          });
+        } else {
+          walk(shape[k], v, p);
+        }
+      }
+      return;
+    }
+    if (node instanceof z.ZodArray) {
+      if (!Array.isArray(value)) return;
+      value.forEach((item, i) => walk(node.element as z.ZodTypeAny, item, `${path}[${i}]`));
+      return;
+    }
+    if (node instanceof z.ZodUnion) {
+      // route object/array input to the structurally matching option;
+      // scalar unions (e.g. literal enums) carry no keys to check
+      const options = node._def.options as z.ZodTypeAny[];
+      const match = options.find((o) => {
+        const u = unwrapZod(o);
+        return isPlainObject(value) ? u instanceof z.ZodObject : Array.isArray(value) && u instanceof z.ZodArray;
+      });
+      if (match) walk(match, value, path);
+      return;
+    }
+    // everything else (scalars, records, literals) has no fixed keys to check
+  };
+  walk(launchSpecSchema, input, "");
+  return issues;
+}
+
 /**
  * The one-call validation pipeline: profile defaults + schema parse (all
  * issues collected, not just the first) followed by the cross-field checks.
@@ -74,7 +140,8 @@ export function checkSpec(input: unknown): SpecCheck {
         : [{ path: "", message: String(e instanceof Error ? e.message : e) }];
     return { spec: null, errors, warnings: [], ok: false };
   }
-  return { spec, ...validateSpec(spec) };
+  const res = validateSpec(spec);
+  return { spec, errors: res.errors, warnings: [...unknownKeyIssues(input), ...res.warnings], ok: res.ok };
 }
 
 /**
@@ -126,6 +193,12 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         "accounts.initial",
         "join mode joins an existing chain: genesis accounts cannot be created; " +
           "fund the operator accounts on the live chain instead (§5 await-funds)",
+      );
+    }
+    if (spec.accounts.communityPool) {
+      err(
+        "accounts.communityPool",
+        "join mode joins an existing chain: its community pool already exists",
       );
     }
     for (const section of ["staking", "gov", "mint", "distribution", "slashing"] as const) {
@@ -343,6 +416,85 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     }
   }
 
+  // Validator monikers: one per validator when spelled out
+  const monikers = spec.topology.validators.monikers;
+  if (monikers && monikers.length !== V) {
+    err(
+      "topology.validators.monikers",
+      `${monikers.length} monikers for ${V} validators — provide one per validator or omit`,
+    );
+  }
+  // Pre-existing consensus pubkeys (hardware tmkms signers): one per
+  // validator, only in tmkms mode — softsign uploads the launcher-generated
+  // priv_validator_key.json to the node, so a pinned pubkey whose private
+  // key never reaches the node would produce a validator that can never
+  // sign. Duplicates are an equivocation hazard: two validators holding one
+  // consensus key double-sign the first conflicting block they both see.
+  const consensusPubkeys = spec.topology.validators.consensusPubkeys;
+  if (consensusPubkeys) {
+    if (consensusPubkeys.length !== V) {
+      err(
+        "topology.validators.consensusPubkeys",
+        `${consensusPubkeys.length} pubkeys for ${V} validators — provide one per validator or omit`,
+      );
+    }
+    if (spec.security.keyMode !== "tmkms") {
+      err(
+        "topology.validators.consensusPubkeys",
+        "pre-existing consensus keys require security.keyMode tmkms: in softsign mode the node " +
+          "signs with the launcher-generated key uploaded to it, and the pinned pubkey's private " +
+          "key never reaches the node",
+      );
+    }
+    const seenPubkeys = new Map<string, number>();
+    for (const [i, key] of consensusPubkeys.entries()) {
+      let bytes: Uint8Array | null = null;
+      try {
+        bytes = fromBase64(key);
+      } catch {
+        // falls through to the error below
+      }
+      if (!bytes || bytes.length !== 32) {
+        err(
+          `topology.validators.consensusPubkeys[${i}]`,
+          "not a base64 ed25519 pubkey (32 bytes — e.g. the \"key\" field of a gentx pubkey or `comet show-validator` output)",
+        );
+        continue;
+      }
+      const prev = seenPubkeys.get(key);
+      if (prev !== undefined) {
+        err(
+          `topology.validators.consensusPubkeys[${i}]`,
+          `duplicate pubkey (also consensusPubkeys[${prev}]): two validators on one consensus key will double-sign`,
+        );
+      } else {
+        seenPubkeys.set(key, i);
+      }
+    }
+  }
+
+  // CometBFT rejects non-ASCII monikers in config.toml at startup ("valid
+  // non-empty ASCII text without tabs"). The renderer writes an
+  // ASCII-sanitized form there while the on-chain validator description
+  // (gentx) keeps the original, so this is a warning, not an error.
+  for (const [i, m] of (monikers ?? []).entries()) {
+    if (!/^[\x20-\x7e]+$/.test(m)) {
+      warn(
+        `topology.validators.monikers[${i}]`,
+        "moniker is not ASCII: config.toml gets a sanitized form (CometBFT validates it at startup); the on-chain validator description keeps the original",
+      );
+    }
+  }
+
+  // Seeded season usernames must be unique — x/season enforces uniqueness
+  // and a duplicate fails InitGenesis after deposits are spent
+  const usernames = spec.accounts.initial
+    .map((a) => (typeof a.member === "object" ? a.member.username : undefined))
+    .filter((u): u is string => Boolean(u));
+  if (new Set(usernames).size !== usernames.length) {
+    err("accounts.initial", "duplicate member usernames");
+  }
+
   // Operator custody (§3)
   const operators = spec.topology.validators.operators;
   if (Array.isArray(operators)) {
@@ -410,6 +562,24 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     err("topology.publicEndpoints", "public endpoints are served by sentry-0 — add a sentry");
   }
 
+  // Mesh custody: a fleet either runs its own headscale (domain) or shares
+  // another fleet's (reuseFleet). The conductor resolves reuseFleet into the
+  // owning fleet's domain at launch creation, so both being set is normal
+  // for a stored spec; neither is never valid.
+  const hs = spec.topology.headscale;
+  if (!hs.domain && !hs.reuseFleet) {
+    err(
+      "topology.headscale",
+      "set domain (this fleet deploys its own headscale) or reuseFleet (share an existing fleet's mesh)",
+    );
+  }
+  if (hs.reuseFleet && hs.backup) {
+    err(
+      "topology.headscale.backup",
+      "a shared mesh is backed up by the fleet that owns it — remove backup when reuseFleet is set",
+    );
+  }
+
   // Every ingress hostname routes to a different service, so a domain can
   // appear only once across the fleet
   const domainUses: [string, string | undefined][] = [
@@ -470,6 +640,41 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     if (problem) err(`providers.policy.preference[${i}]`, problem);
   }
 
+  // Provider exclusion entries: akash1 owner addresses (exact match) or
+  // hostname fragments (case-insensitive substring). Anything address-shaped
+  // gets a hard check so a typo'd address fails loudly instead of silently
+  // never matching; fragment rules keep the substring matcher predictable.
+  const exclusionLists: [string, string[]][] = [
+    ["providers.exclude", spec.providers.exclude],
+    ...Object.entries(spec.providers.components).map(
+      ([group, c]): [string, string[]] => [
+        `providers.components.${group}.exclude`,
+        c?.exclude ?? [],
+      ],
+    ),
+  ];
+  for (const [path, entries] of exclusionLists) {
+    for (const [i, entry] of entries.entries()) {
+      const at = `${path}[${i}]`;
+      if (entry.startsWith("akash1")) {
+        const problem = addressProblem(entry, "akash");
+        if (problem) err(at, problem);
+      } else if (/^[a-z][a-z0-9]{1,15}1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{10,}$/i.test(entry)) {
+        err(
+          at,
+          "looks like a bech32 address with a non-akash prefix; exclusions take akash1 owner addresses or hostname fragments",
+        );
+      } else if (entry.includes("://") || entry.includes("/") || /\s/.test(entry)) {
+        err(
+          at,
+          "hostname fragments match against the provider's hostname only; give a plain fragment like \"jjozzietech\", not a URL",
+        );
+      } else if (entry.length < 4) {
+        warn(at, `fragment "${entry}" matches by substring and may exclude more providers than intended`);
+      }
+    }
+  }
+
   // SSH keys land verbatim in authorized_keys; a malformed one silently
   // locks the operator out of every node
   if (
@@ -483,7 +688,8 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
 
   // Mainnet hardening
   if (mainnet) {
-    if (!spec.topology.headscale.backup) {
+    // a shared mesh is backed up by its owning fleet, not this one
+    if (!spec.topology.headscale.backup && !spec.topology.headscale.reuseFleet) {
       err("topology.headscale.backup", "mainnet requires headscale S3 backup credentials");
     }
     if (spec.security.keyMode === "softsign") {

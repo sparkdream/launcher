@@ -3,7 +3,7 @@ import { fromBech32, toBech32 } from "@cosmjs/encoding";
 import { Decimal } from "@cosmjs/math";
 import { encodePubkey } from "@cosmjs/proto-signing";
 import { AminoTypes, createDefaultAminoConverters } from "@cosmjs/stargate";
-import type { LaunchSpec } from "@sparkdream/launch-spec";
+import { validatorMoniker, type LaunchSpec } from "@sparkdream/launch-spec";
 import { verifyAminoSignature } from "./amino-verify.js";
 import { commissionFlags } from "./genesis-params.js";
 
@@ -55,7 +55,7 @@ function createValidatorMsg(input: GentxInputs) {
     typeUrl: CREATE_VALIDATOR_TYPE_URL,
     value: {
       description: {
-        moniker: `${input.spec.network.name}-val-${input.valIndex}`,
+        moniker: validatorMoniker(input.spec, input.valIndex),
         identity: "",
         website: "",
         securityContact: "",
@@ -78,8 +78,31 @@ function createValidatorMsg(input: GentxInputs) {
   };
 }
 
+/**
+ * Match the SDK's amino-json rendering: fields without amino.dont_omitempty
+ * are omitted when empty, and cosmjs's converters keep empty strings
+ * (description.identity/website/..., the deprecated delegator_address). The
+ * chain regenerates sign bytes with the omit-empty form, so a doc that
+ * differs by even one "" fails signature verification — proven against the
+ * manual sparkdream-test-1 gentx, whose signature verifies only over the
+ * omit-empty rendering. `sparkdreamd tx sign` (the offline signing path)
+ * produces the same omit-empty bytes.
+ */
+function omitEmptyStrings<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(omitEmptyStrings) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === "") continue;
+      out[k] = omitEmptyStrings(v);
+    }
+    return out as T;
+  }
+  return value;
+}
+
 export function buildGentxSignDoc(input: GentxInputs): StdSignDoc {
-  const aminoMsg: AminoMsg = aminoTypes.toAmino(createValidatorMsg(input));
+  const aminoMsg: AminoMsg = omitEmptyStrings(aminoTypes.toAmino(createValidatorMsg(input)));
   const memo = `${input.nodeId}@127.0.0.1:26656`;
   // account number 0 / sequence 0 — see module doc, do not parameterize
   return makeSignDoc([aminoMsg], GENTX_FEE, input.chainId, memo, 0, 0);
@@ -99,7 +122,7 @@ export interface OnlineTxParams {
  * long past by the time the validator bonds).
  */
 export function buildCreateValidatorSignDoc(input: GentxInputs, online: OnlineTxParams): StdSignDoc {
-  const aminoMsg: AminoMsg = aminoTypes.toAmino(createValidatorMsg(input));
+  const aminoMsg: AminoMsg = omitEmptyStrings(aminoTypes.toAmino(createValidatorMsg(input)));
   return makeSignDoc([aminoMsg], online.fee, input.chainId, "", online.accountNumber, online.sequence);
 }
 
@@ -235,6 +258,111 @@ export function assembleGentxJson(input: GentxInputs, response: GentxSignRespons
     ],
     response,
   );
+}
+
+/**
+ * Offline signing (§5 step 3b variant): the operator key lives on an
+ * airgapped machine with sparkdreamd, not in a browser wallet. The
+ * conductor exports the sign doc as an UNSIGNED proto-JSON tx (`tx sign
+ * --offline --sign-mode amino-json` input), the machine signs it, and the
+ * pasted signed tx converts back into the amino sign-response shape the
+ * existing verification path consumes. Security is unchanged: the
+ * signature only verifies over the doc the conductor built, so a tx whose
+ * messages were tampered with fails verifySignedDoc like any bad browser
+ * signature.
+ */
+
+/** Amino msg → proto-JSON message (the tx-file encoding). */
+function aminoMsgToProtoJson(msg: AminoMsg): Record<string, unknown> {
+  if (msg.type === "cosmos-sdk/MsgCreateValidator") {
+    const v = msg.value as Record<string, any>;
+    return {
+      "@type": CREATE_VALIDATOR_TYPE_URL,
+      ...v,
+      pubkey: { "@type": "/cosmos.crypto.ed25519.PubKey", key: v.pubkey.value },
+    };
+  }
+  if (msg.type === "cosmos-sdk/MsgUnjail") {
+    // proto field name (validator_addr), not the amino field name (address)
+    return { "@type": UNJAIL_TYPE_URL, validator_addr: (msg.value as any).address };
+  }
+  throw new Error(`no proto-JSON conversion for amino msg type ${msg.type}`);
+}
+
+/** The unsigned tx file an airgapped `sparkdreamd tx sign --offline` takes. */
+export function unsignedTxJsonFromSignDoc(doc: StdSignDoc): string {
+  return JSON.stringify(
+    {
+      body: {
+        messages: doc.msgs.map(aminoMsgToProtoJson),
+        memo: doc.memo,
+        timeout_height: "0",
+        extension_options: [],
+        non_critical_extension_options: [],
+      },
+      auth_info: {
+        signer_infos: [],
+        fee: { amount: doc.fee.amount, gas_limit: doc.fee.gas, payer: "", granter: "" },
+        tip: null,
+      },
+      signatures: [],
+    },
+    null,
+    2,
+  );
+}
+
+/**
+ * Signed tx file → the amino sign-response shape verifySignedDoc consumes.
+ * The response's signed doc is reconstructed as "expected doc + the
+ * signer's fee/memo": if the signer changed anything else, the signature
+ * fails verification (drift in fee/memo is caught by verifySignedDoc's own
+ * rules). Throws with a user-facing reason on shape problems.
+ */
+export function gentxResponseFromSignedTx(
+  signedTx: unknown,
+  expected: StdSignDoc,
+): GentxSignResponse {
+  const tx = (typeof signedTx === "string" ? JSON.parse(signedTx) : signedTx) as Record<string, any>;
+  const body = tx?.body;
+  const authInfo = tx?.auth_info;
+  const signatures = tx?.signatures;
+  if (!body || !authInfo || !Array.isArray(signatures)) {
+    throw new Error("not a signed tx file: expected body / auth_info / signatures");
+  }
+  if (signatures.length !== 1 || typeof signatures[0] !== "string" || !signatures[0]) {
+    throw new Error("expected exactly one signature (run `tx sign`, not the unsigned file)");
+  }
+  const signers = authInfo.signer_infos;
+  if (!Array.isArray(signers) || signers.length !== 1) {
+    throw new Error("expected exactly one signer_info");
+  }
+  const signer = signers[0] as Record<string, any>;
+  const mode = signer.mode_info?.single?.mode;
+  if (mode !== "SIGN_MODE_LEGACY_AMINO_JSON") {
+    throw new Error(
+      `sign mode is ${mode ?? "unknown"} — re-sign with --sign-mode amino-json (gentx signatures are verified as amino)`,
+    );
+  }
+  if (String(signer.sequence ?? "") !== String(expected.sequence)) {
+    throw new Error(`signed with sequence ${signer.sequence}, expected ${expected.sequence}`);
+  }
+  const pubkeyB64 = signer.public_key?.key;
+  if (typeof pubkeyB64 !== "string" || !pubkeyB64) {
+    throw new Error("signer_info has no public key");
+  }
+  const fee = authInfo.fee ?? {};
+  return {
+    signed: {
+      ...expected,
+      fee: { amount: fee.amount ?? [], gas: String(fee.gas_limit ?? expected.fee.gas) },
+      memo: String(body.memo ?? ""),
+    },
+    signature: {
+      pub_key: { type: "tendermint/PubKeySecp256k1", value: pubkeyB64 },
+      signature: signatures[0],
+    },
+  };
 }
 
 const UNJAIL_TYPE_URL = "/cosmos.slashing.v1beta1.MsgUnjail";

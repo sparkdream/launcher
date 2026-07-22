@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { nodes, statelessComponents } from "@sparkdream/launch-spec";
+import { headscaleDomain, nodes, statelessComponents } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import {
@@ -16,13 +16,14 @@ import {
 import { feeCoin, feeConfig, launchFeeAmount } from "../fee.js";
 import { PRICING_DENOM } from "../render-sdl.js";
 import { pollBids } from "../akash/client.js";
-import { selectProvider, type PolicyDecision } from "../akash/policy.js";
+import { exclusionEntries, selectProvider, type Bid, type PolicyDecision } from "../akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../akash/sdl-groups.js";
 import { vendorDir } from "../vendor.js";
 import type { Certificate, SshTarget } from "../services.js";
 import { placeholder } from "./phase-a.js";
 import { readSecretFile, writeSecretFile } from "../secrets.js";
 import { toSsh2CompatiblePrivateKey } from "../keys.js";
+import { resolveSharedHeadscale } from "../headscale-reuse.js";
 
 /** Initial escrow deposit per pricing denom (M2 estimate-costs refines this). */
 const DEFAULT_DEPOSIT: Record<string, string> = { uakt: "5000000", uact: "5000000" };
@@ -89,6 +90,12 @@ export interface HeadscaleOutput {
   price: string;
   gseq: number;
   oseq: number;
+  /** Shared mesh (topology.headscale.reuseFleet): this fleet attached to an
+   *  existing fleet's headscale instead of deploying one. The lease belongs
+   *  to that fleet — never close it, pay it, or show it as ours. */
+  reused?: boolean;
+  /** Launch id of the owning fleet (set when reused). */
+  reusedFrom?: string;
 }
 
 /** Resolve a headscale user's numeric id — preauthkeys --user rejects names. */
@@ -138,7 +145,7 @@ export function templateHeadscaleSdl(
   deps: { ageRecipient?: string | undefined; ageIdentity?: string | undefined } = {},
 ): ReturnType<typeof loadSdl> {
   const sdl = loadSdl(path.join(vendorDir(), "mesh", "headscale.sdl.yaml"));
-  const domain = spec.topology.headscale.domain;
+  const domain = headscaleDomain(spec);
   const backup = spec.topology.headscale.backup;
   for (const svc of Object.values(sdl.services) as any[]) {
     for (const e of svc.expose ?? []) {
@@ -178,7 +185,43 @@ export const deployHeadscaleStep: StepDef = {
   name: "deploy-headscale",
   async run(ctx): Promise<HeadscaleOutput> {
     const addr = owner(ctx);
-    const domain = ctx.spec.topology.headscale.domain;
+
+    // Shared mesh (§5, topology.headscale.reuseFleet): attach to the owning
+    // fleet's live headscale instead of deploying one. price "0" keeps the
+    // borrowed lease out of this launch's fee math; reused: true keeps it
+    // out of the fleet's component rows (it is not ours to close or bill).
+    const shared = resolveSharedHeadscale(ctx.db, ctx.spec, addr);
+    if (shared) {
+      // only positive evidence blocks (an LCD hiccup must not wedge a launch)
+      const info = await ctx.services.api.deploymentInfo(addr, shared.dseq).catch(() => undefined);
+      if (info && info.state !== "active") {
+        throw new AwaitUser(
+          "deploy-headscale",
+          `the shared headscale (fleet "${shared.name}", dseq ${shared.dseq}) is closed ` +
+            "on-chain — this launch cannot join its mesh. Remove topology.headscale.reuseFleet " +
+            "(or relaunch the owning fleet), then start a new launch.",
+        );
+      }
+      const url = `https://${shared.domain}/health`;
+      if (!(await ctx.services.rpc.httpOk(url))) {
+        throw new AwaitUser(
+          "deploy-headscale",
+          `shared headscale not reachable at ${url} — check fleet "${shared.name}", then resume.`,
+        );
+      }
+      return {
+        dseq: shared.dseq,
+        provider: shared.provider,
+        hostUri: shared.hostUri,
+        price: "0",
+        gseq: shared.gseq,
+        oseq: shared.oseq,
+        reused: true,
+        reusedFrom: shared.launchId,
+      };
+    }
+
+    const domain = headscaleDomain(ctx.spec);
     const backup = ctx.spec.topology.headscale.backup;
     const sdl = templateHeadscaleSdl(ctx.spec, {
       ageRecipient: backup
@@ -296,6 +339,8 @@ export const deployHeadscaleStep: StepDef = {
         },
         chosenProviders: new Set(),
         avoidProviders: new Set(prefs.avoid),
+        excludeMatchers: exclusionEntries(ctx.spec, "headscale"),
+        log: ctx.log,
         requiredStorageClass: artifacts.requiredStorageClass,
         providers,
       });
@@ -370,29 +415,33 @@ export const configureHeadscaleStep: StepDef = {
   async run(ctx): Promise<PreauthKeys> {
     const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
     if (!hs) throw new Error("deploy-headscale output missing");
-    const domain = ctx.spec.topology.headscale.domain;
 
-    await headscaleShell(
-      ctx,
-      hs,
-      `sed -i 's|^server_url:.*|server_url: https://${domain}|' /etc/headscale/config.yaml`,
-    );
-    // kill 1 restarts the container — the shell connection dies with it, so
-    // tolerate the drop, then wait for the pod to actually accept commands
-    // again. (The lease-status `available` counter is NOT a readiness
-    // signal — it reads 1 even mid-crash-loop; the shell itself is.)
-    await headscaleShell(ctx, hs, "kill 1").catch(() => {});
-    let up = false;
-    for (let i = 0; i < 20 && !up; i++) {
-      await ctx.services.sleep(4000);
-      try {
-        await headscaleShell(ctx, hs, "true");
-        up = true;
-      } catch {
-        // "no active replica" / connection refused while the pod restarts
+    // a shared mesh is already configured by its owning fleet — and the
+    // restart below would briefly sever every fleet riding it
+    if (!hs.reused) {
+      const domain = headscaleDomain(ctx.spec);
+      await headscaleShell(
+        ctx,
+        hs,
+        `sed -i 's|^server_url:.*|server_url: https://${domain}|' /etc/headscale/config.yaml`,
+      );
+      // kill 1 restarts the container — the shell connection dies with it, so
+      // tolerate the drop, then wait for the pod to actually accept commands
+      // again. (The lease-status `available` counter is NOT a readiness
+      // signal — it reads 1 even mid-crash-loop; the shell itself is.)
+      await headscaleShell(ctx, hs, "kill 1").catch(() => {});
+      let up = false;
+      for (let i = 0; i < 20 && !up; i++) {
+        await ctx.services.sleep(4000);
+        try {
+          await headscaleShell(ctx, hs, "true");
+          up = true;
+        } catch {
+          // "no active replica" / connection refused while the pod restarts
+        }
       }
+      if (!up) throw new Error("headscale did not come back after server_url restart");
     }
-    if (!up) throw new Error("headscale did not come back after server_url restart");
     await headscaleShell(
       ctx,
       hs,
@@ -430,6 +479,9 @@ export const seedHeadscaleBackupStep: StepDef = {
     const backup = ctx.spec.topology.headscale.backup;
     if (!backup || ctx.spec.network.type === "devnet") return { skipped: true };
     const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
+    // a shared mesh is backed up by its owning fleet (validateSpec also
+    // rejects backup + reuseFleet, so this is belt-and-suspenders)
+    if (hs.reused) return { skipped: true };
     const stage = path.join(ctx.dirs.root, "headscale-backup");
     fs.mkdirSync(stage, { recursive: true });
     // Port of seed-replica.sh: db + noise/DERP keys, validated before upload.
@@ -477,9 +529,13 @@ export const createDeploymentsStep: StepDef = {
       if (info && info.state !== "active") {
         throw new AwaitUser(
           "create-deployments",
-          `headscale deployment ${hs.dseq} is closed on-chain (fleet shut down?) — ` +
-            "this launch cannot continue without its mesh coordinator. " +
-            "Shut down the fleet and start a new launch from the same spec.",
+          hs.reused
+            ? `the shared headscale ${hs.dseq} (owned by fleet ${hs.reusedFrom}) is closed ` +
+              "on-chain — this launch cannot continue without its mesh coordinator. " +
+              "Bring the owning fleet back, or start a new launch with its own headscale domain."
+            : `headscale deployment ${hs.dseq} is closed on-chain (fleet shut down?) — ` +
+              "this launch cannot continue without its mesh coordinator. " +
+              "Shut down the fleet and start a new launch from the same spec.",
         );
       }
     }
@@ -577,6 +633,8 @@ export const collectBidsStep: StepDef = {
         policy,
         chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
         avoidProviders,
+        excludeMatchers: exclusionEntries(ctx.spec, key),
+        log: ctx.log,
         requiredStorageClass: entry.requiredStorageClass,
         providers,
       });
@@ -712,6 +770,286 @@ export interface SshEndpoints {
   p2p?: Record<string, { host: string; port: number }>;
 }
 
+/**
+ * A provider whose gateway we cannot reach at all: DNS failure (the provider's
+ * domain is down — seen live with a provider whose zone went SERVFAIL while
+ * the deployment itself was healthy on-chain) or a dead TCP path. Distinct
+ * from an HTTP error FROM the provider, which means it is up and talking.
+ */
+function providerUnreachable(e: unknown): boolean {
+  const s = String((e as { message?: string })?.message ?? e);
+  return /EAI_AGAIN|EAI_NONAME|ENOTFOUND|SERVFAIL|getaddrinfo|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ECONNRESET|socket hang up/i.test(
+    s,
+  );
+}
+
+/**
+ * Send a manifest, retrying an unreachable provider a few times: a momentary
+ * DNS hiccup or connection reset must not fail a launch, while a provider
+ * that is genuinely down still surfaces quickly enough to re-bid.
+ */
+async function sendManifestWithRetry(
+  ctx: StepCtx,
+  cert: Certificate,
+  hostUri: string,
+  dseq: string,
+  manifestJson: string,
+): Promise<void> {
+  const attempts = 3;
+  for (let i = 1; ; i++) {
+    try {
+      await ctx.services.provider.sendManifest(cert, hostUri, dseq, manifestJson);
+      return;
+    } catch (e) {
+      if (i >= attempts || !providerUnreachable(e)) throw e;
+      ctx.log(`manifest send to ${hostUri} failed (${String(e).slice(0, 80)}) — retry ${i}/${attempts - 1}`);
+      await ctx.services.sleep(3000 * i);
+    }
+  }
+}
+
+/**
+ * The provider is up and answering, but has no lease for this deployment —
+ * after the client's own "no lease" retries, that means the lease is gone,
+ * not late. The usual cause is a provider-side **manifest timeout**: a
+ * provider closes a lease whose manifest never arrives within its window, so
+ * a launch that sat paused for a long time (waiting on a signature, or stuck
+ * on an unrelated failure) comes back to find the lease closed. Seen live:
+ * the frontend's lease was closed this way while the launch was blocked on a
+ * DNS outage affecting a different component.
+ */
+function leaseGone(e: unknown): boolean {
+  const s = String((e as { message?: string })?.message ?? e);
+  // "no lease for deployment" — the lease was closed (manifest timeout).
+  // "Deployment not found: key not found" — the provider looked the
+  // deployment up on-chain and it is not there at all (closed, or a
+  // deployment tx that never took effect). Both mean: this placement can
+  // never serve, re-place it.
+  return /no lease/i.test(s) || /deployment not found/i.test(s);
+}
+
+/**
+ * Re-place one component whose current deployment cannot serve it: close the
+ * deployment (escrow refunds — the close is a chain tx, so it works even when
+ * the provider's gateway is unreachable), re-deploy and re-bid, and rewrite
+ * the create-deployments / collect-bids outputs so every later step
+ * (await-mesh, persist-start, the fleet view) sees the new placement.
+ *
+ * `blameProvider` separates the two triggers, and getting it wrong is costly:
+ * an unreachable provider is at fault and must go on the wallet's avoid list
+ * so nothing picks it again, but a lease closed by a manifest timeout says
+ * nothing bad about the provider — it may well be hosting the rest of the
+ * fleet happily, and avoiding it would needlessly shrink the bid pool.
+ *
+ * Re-entrant: the dseq is pinned and every tx goes through requireTx, so the
+ * signature pauses this needs resume mid-recovery instead of starting over.
+ */
+async function rebidComponent(
+  ctx: StepCtx,
+  key: string,
+  plan: DeploymentPlan,
+  assignments: Assignments,
+  opts: { blameProvider: boolean; reason: string },
+): Promise<void> {
+  const addr = owner(ctx);
+  const dead = assignments.perNode[key]!;
+  const entry = plan.perNode[key]!;
+  let deadName = dead.provider;
+  try {
+    deadName = new URL(dead.hostUri).hostname;
+  } catch {
+    // malformed hostUri — fall back to the address
+  }
+
+  // 1. blame the provider only when it is actually at fault
+  if (opts.blameProvider) {
+    ctx.db.setProviderPref(addr, dead.provider, "avoid", deadName);
+    ctx.log(`${key}: ${opts.reason} — ${deadName} added to the avoid list, re-bidding`);
+  } else {
+    ctx.log(`${key}: ${opts.reason} — re-deploying (${deadName} stays eligible)`);
+  }
+
+  // 2. close the unusable deployment so its escrow comes back — but only if
+  //    it actually exists and is active. Closing a deployment the chain has
+  //    never heard of produces a tx that fails on-chain and wedges the
+  //    signing queue behind it.
+  const closeStep = `send-manifests:close:${entry.dseq}`;
+  const info = await ctx.services.api.deploymentInfo(addr, entry.dseq).catch(() => undefined);
+  if (info?.state === "active") {
+    await ctx.requireTx(closeStep, [closeDeploymentMsg(addr, entry.dseq)]);
+  } else {
+    // already closed, or never existed: drop any close a prior pass enqueued
+    ctx.db.deletePendingTx(ctx.launchId, closeStep);
+  }
+
+  // 3. redeploy the same manifest under a fresh dseq. Every tx of an attempt
+  //    is keyed by that attempt's dseq: a second re-place of the same
+  //    component would otherwise find the FIRST attempt's confirmed rows
+  //    under the same step name and "succeed" without deploying anything.
+  const artifacts = sdlArtifacts(loadSdl(path.join(ctx.dirs.sdl, `${key}.yaml`)));
+  const dseq = await pinnedValue(ctx, `rebid-${key}-dseq`, async () =>
+    String(await ctx.services.api.latestBlockHeight()),
+  );
+  const redeployStep = `send-manifests:redeploy:${key}:${dseq}`;
+  await ctx.requireTx(redeployStep, [
+    createDeploymentMsg({
+      owner: addr,
+      dseq,
+      groups: artifacts.groups,
+      hash: artifacts.hash,
+      deposit: {
+        denom: artifacts.pricingDenom,
+        amount: DEFAULT_DEPOSIT[artifacts.pricingDenom] ?? "5000000",
+      },
+    }),
+  ]);
+
+  // 4. pick a replacement, honoring anti-affinity against the components that
+  //    are staying put
+  const providers = await ctx.services.api.listProviders();
+  const leaseStep = `send-manifests:release:${key}:${dseq}`;
+  const leaseRow = ctx.db.getPendingTx(ctx.launchId, leaseStep);
+  let decision: PolicyDecision;
+  /** provider/gseq/oseq of the placement we end up with, plus its price. */
+  let placement: { provider: string; gseq: number; oseq: number; price: string };
+  if (leaseRow && (leaseRow.status === "signed" || leaseRow.status === "confirmed")) {
+    // A lease signed on a prior pass IS the choice: leasing flips the winner
+    // to "active" and closes every other bid, so re-polling would see no open
+    // bids and misread a healthy order as "no replacement available" (same
+    // short-circuit as deploy-headscale and the relaunch op).
+    const bidId = JSON.parse(leaseRow.msgs_json)[0].value.bidId;
+    // The LEASE is the authority here, never the bid list: Akash prunes bids
+    // once an order closes, so "no bid on-chain" says nothing about whether
+    // we hold a lease — treating it as fatal stranded a launch whose lease
+    // was perfectly good.
+    const leaseState = await ctx.services.api
+      .leaseState(addr, dseq, bidId.provider)
+      .catch(() => undefined);
+    if (leaseState && leaseState !== "active") {
+      // the replacement placement itself died — forget this attempt so the
+      // next pass mints a fresh dseq instead of re-confirming a dead lease
+      ctx.db.deletePendingTx(ctx.launchId, leaseStep);
+      ctx.db.deletePendingTx(ctx.launchId, redeployStep);
+      clearPin(ctx, `rebid-${key}-dseq`);
+      throw new Error(
+        `${key}: the replacement lease on dseq ${dseq} is ${leaseState} — retry to re-bid on a fresh deployment`,
+      );
+    }
+    await ctx.requireTx(leaseStep, [createLeaseMsg(bidId)]);
+    // price is display/fee metadata only; if the bid was pruned, keep the
+    // previous figure rather than inventing one or failing
+    const all = await ctx.services.api.listBids(addr, dseq).catch(() => [] as Bid[]);
+    const won = all.find(
+      (b) =>
+        b.bid.id.provider === bidId.provider &&
+        b.bid.id.gseq === bidId.gseq &&
+        b.bid.id.oseq === bidId.oseq,
+    );
+    placement = {
+      provider: bidId.provider,
+      gseq: bidId.gseq,
+      oseq: bidId.oseq,
+      price: won?.bid.price.amount ?? dead.price,
+    };
+    decision = { chosen: won ?? null, rejected: [] };
+  } else {
+    const prefs = ctx.db.providerPrefs(addr);
+    const stateless = new Set<string>(statelessComponents(ctx.spec).map((c) => c.key));
+    // Anti-affinity covers headscale/validators/sentries (§6) — headscale
+    // included, exactly as collect-bids seeds it. Omitting it here let a
+    // re-bid co-locate a node with the mesh coordinator: one provider outage
+    // would then take out both, and the node has to reach headscale's public
+    // domain from inside its own provider (a hairpin path that frequently
+    // fails where an external one works).
+    const chosen = new Set(
+      Object.entries(assignments.perNode)
+        .filter(([k]) => k !== key && !stateless.has(k))
+        .map(([, a]) => a.provider),
+    );
+    const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
+    if (hs) chosen.add(hs.provider);
+    const bids = await pollBids(ctx.services.api, addr, dseq, {
+      sleep: ctx.services.sleep,
+      minBids: 1,
+      settleRounds: 2,
+    });
+    decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+      policy: {
+        ...ctx.spec.providers.policy,
+        preference: [...new Set([...prefs.prefer, ...ctx.spec.providers.policy.preference])],
+      },
+      chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
+      // a blameless re-deploy (manifest timeout) may land on the same provider
+      avoidProviders: new Set([...(opts.blameProvider ? [dead.provider] : []), ...prefs.avoid]),
+      excludeMatchers: exclusionEntries(ctx.spec, key),
+      log: ctx.log,
+      requiredStorageClass: entry.requiredStorageClass,
+      providers,
+    });
+    if (!decision.chosen && chosen.size > 0 && !stateless.has(key)) {
+      // Anti-affinity is a resilience preference, not a correctness rule. A
+      // fleet whose other components already hold every acceptable provider
+      // has nowhere spread-out left to go, and refusing to place the
+      // component leaves the launch dead instead of merely less spread.
+      // Co-locate, loudly, rather than dead-ending.
+      ctx.log(
+        `${key}: no acceptable provider left that satisfies anti-affinity — re-bidding WITH ` +
+          `co-location allowed (this component will share a provider with another; a single ` +
+          `provider outage now takes out both)`,
+      );
+      decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+        policy: {
+          ...ctx.spec.providers.policy,
+          preference: [...new Set([...prefs.prefer, ...ctx.spec.providers.policy.preference])],
+        },
+        chosenProviders: new Set<string>(),
+        avoidProviders: new Set([...(opts.blameProvider ? [dead.provider] : []), ...prefs.avoid]),
+        // anti-affinity is relaxed here; spec exclusions are not (they exist
+        // for providers that break the component, e.g. a network that
+        // black-holes the component's inbound traffic)
+        excludeMatchers: exclusionEntries(ctx.spec, key),
+        log: ctx.log,
+        requiredStorageClass: entry.requiredStorageClass,
+        providers,
+      });
+    }
+    if (!decision.chosen) {
+      throw new AwaitUser(
+        "send-manifests",
+        `${key}: ${opts.reason}, and no acceptable replacement bid was found even with ` +
+          `co-location allowed (${JSON.stringify(decision.rejected)}). Relax providers.policy ` +
+          `(auditedOnly, maxPriceMultiplier), trim providers.exclude / providers.components ` +
+          `exclusions, or wait for more bids, then resume.`,
+      );
+    }
+    const won = decision.chosen;
+    placement = {
+      provider: won.bid.id.provider,
+      gseq: won.bid.id.gseq,
+      oseq: won.bid.id.oseq,
+      price: won.bid.price.amount,
+    };
+    await ctx.requireTx(leaseStep, [createLeaseMsg(won.bid.id)]);
+  }
+
+  // 5. rewrite the recorded placement so downstream steps follow the move
+  const hostUri = providers.get(placement.provider)?.hostUri;
+  if (!hostUri) throw new Error(`${key}: provider ${placement.provider} has no known hostUri`);
+  plan.perNode[key] = { ...entry, dseq };
+  assignments.perNode[key] = {
+    provider: placement.provider,
+    hostUri,
+    price: placement.price,
+    gseq: placement.gseq,
+    oseq: placement.oseq,
+    decision,
+  };
+  ctx.db.stepDone(ctx.launchId, "create-deployments", plan);
+  ctx.db.stepDone(ctx.launchId, "collect-bids", assignments);
+  clearPin(ctx, `rebid-${key}-dseq`);
+  ctx.log(`${key}: moved to ${new URL(assignments.perNode[key]!.hostUri).hostname} (dseq ${dseq})`);
+}
+
 export const sendManifestsStep: StepDef = {
   name: "send-manifests",
   async run(ctx): Promise<SshEndpoints> {
@@ -727,10 +1065,103 @@ export const sendManifestsStep: StepDef = {
     );
     const perNode: SshEndpoints["perNode"] = {};
     const p2p: NonNullable<SshEndpoints["p2p"]> = {};
-    for (const [key, entry] of Object.entries(plan.perNode)) {
+    const addr = owner(ctx);
+    for (const key of Object.keys(plan.perNode)) {
+      // Ask the CHAIN whether this placement is still usable before pushing a
+      // manifest at it. Providers report a dead placement differently every
+      // time — 404 "no lease", 500 "Deployment not found", 422 "manifest
+      // version validation failed" have all appeared for the same underlying
+      // cause — so classifying their error text is a losing game. Deployment
+      // state is authoritative and costs one query. (Absence of an answer is
+      // NOT evidence: an LCD hiccup must not trigger a re-place.)
+      const onChain = await ctx.services.api
+        .deploymentInfo(addr, plan.perNode[key]!.dseq)
+        .catch(() => undefined);
+      let rePlaced = false;
+      if (onChain && onChain.state !== "active") {
+        await rebidComponent(ctx, key, plan, assignments, {
+          blameProvider: false,
+          reason: `deployment ${plan.perNode[key]!.dseq} is ${onChain.state}`,
+        });
+        rePlaced = true;
+      }
+      // Derive the manifest from the CURRENT SDL, never the create-deployments
+      // snapshot at manifestPath: persist-start rewrites the SDLs
+      // (WAIT_FOR_CONFIG, baked tunnel IPs) and updates the on-chain hash to
+      // match, so a re-run after it (requestReplace, retry) that PUT the
+      // snapshot gets 422'd by the provider ("manifest version validation
+      // failed"), wedging the step before the component being re-placed is
+      // even reached. rebidComponent signs from the same SDL, so a
+      // just-re-placed component matches its fresh deployment too.
+      const artifacts = sdlArtifacts(loadSdl(path.join(ctx.dirs.sdl, `${key}.yaml`)));
+      // Reconcile on-chain hash drift before the PUT: the provider recomputes
+      // the manifest version and 422s any mismatch, and the record can drift
+      // from this SDL with no launcher involvement at all — an update signed
+      // through another tool with the same wallet leaves no trace in
+      // pending_txs (seen live: a validator 422ing every send with an
+      // on-chain hash matching no manifest the launcher ever produced). Same
+      // guard as deploy-headscale and the relaunch op. A just-re-placed
+      // deployment was signed from this very SDL: it matches by construction.
+      if (!rePlaced && onChain?.hash) {
+        const wantHash = Buffer.from(artifacts.hash).toString("base64");
+        if (onChain.hash !== wantHash) {
+          ctx.log(
+            `${key} manifest hash drifted from deployment ${plan.perNode[key]!.dseq} — updating on-chain`,
+          );
+          await ctx.requireTx(`send-manifests:update:${key}:${wantHash.slice(0, 8)}`, [
+            {
+              typeUrl: TypeUrl.UpdateDeployment,
+              value: { id: { owner: addr, dseq: plan.perNode[key]!.dseq }, hash: wantHash },
+            },
+          ]);
+        }
+      }
+      try {
+        await sendManifestWithRetry(
+          ctx, cert, assignments.perNode[key]!.hostUri, plan.perNode[key]!.dseq, artifacts.manifestJson,
+        );
+      } catch (e) {
+        // Two placements that retrying can never rescue, with different
+        // culprits: a provider we cannot reach at all (its fault — avoid it),
+        // and a lease the provider already closed, typically a manifest
+        // timeout while the launch was blocked elsewhere (not its fault).
+        // Either way the component is re-deployed and re-bid, and
+        // rebidComponent rewrites plan + assignments.
+        const host = (() => {
+          try {
+            return new URL(assignments.perNode[key]!.hostUri).hostname;
+          } catch {
+            return assignments.perNode[key]!.provider;
+          }
+        })();
+        if (providerUnreachable(e)) {
+          await rebidComponent(ctx, key, plan, assignments, {
+            blameProvider: true,
+            reason: `provider ${host} is unreachable`,
+          });
+        } else if (leaseGone(e)) {
+          const ghost = /deployment not found/i.test(String(e));
+          // NOTE: do not clear the attempt's pinned dseq here. This error is
+          // about the placement currently RECORDED, which during a re-place
+          // that is awaiting a signature is still the old one — voiding the
+          // pin on it cancels the in-flight attempt, and the next pass mints
+          // yet another dseq, forever. A completed re-place clears its own
+          // pin, so a genuine ghost always gets a fresh dseq anyway.
+          await rebidComponent(ctx, key, plan, assignments, {
+            blameProvider: false,
+            reason: ghost
+              ? `deployment ${plan.perNode[key]!.dseq} is not on-chain`
+              : `the lease on ${host} is gone (closed by the provider — manifest timeout)`,
+          });
+        } else {
+          throw e;
+        }
+        await sendManifestWithRetry(
+          ctx, cert, assignments.perNode[key]!.hostUri, plan.perNode[key]!.dseq, artifacts.manifestJson,
+        );
+      }
+      const entry = plan.perNode[key]!;
       const a = assignments.perNode[key]!;
-      const manifest = fs.readFileSync(entry.manifestPath, "utf8");
-      await ctx.services.provider.sendManifest(cert, a.hostUri, entry.dseq, manifest);
       let status = await waitLeaseStatus(ctx, cert, a.hostUri, entry.dseq, a.gseq, a.oseq, {
         ...(noSsh.has(key) ? {} : { forwardedPort: 2222 }),
       });

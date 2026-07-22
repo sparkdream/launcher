@@ -2,12 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import yaml from "js-yaml";
-import { validateSpec, withDefaults } from "@sparkdream/launch-spec";
+import { unknownKeyIssues, validateSpec, withDefaults } from "@sparkdream/launch-spec";
 import { ConductorDb } from "./db.js";
 import { runWithSigner } from "./engine.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
 import { CliSigner } from "./signer.js";
+import { resolveSharedHeadscale } from "./headscale-reuse.js";
 
 /**
  * M2 headless launch driver (§11): run a full launch from a spec file with
@@ -31,7 +32,10 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const spec = withDefaults(yaml.load(fs.readFileSync(specPath, "utf8")));
+  const rawSpec = yaml.load(fs.readFileSync(specPath, "utf8"));
+  // unknown keys are stripped by the schema parse; surface them before that
+  for (const w of unknownKeyIssues(rawSpec)) console.warn(`warning: ${w.path}: ${w.message}`);
+  const spec = withDefaults(rawSpec);
   const validation = validateSpec(spec);
   for (const w of validation.warnings) console.warn(`warning: ${w.path}: ${w.message}`);
   if (!validation.ok) {
@@ -55,6 +59,15 @@ async function main(): Promise<void> {
     lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
     consoleApi: process.env.CONSOLE_API ?? "https://console-api.akash.network",
   });
+
+  // shared mesh: resolve reuseFleet against this instance's fleets so the
+  // stored spec carries the owning launch id + domain (same as the server)
+  if (spec.topology.headscale.reuseFleet) {
+    const shared = resolveSharedHeadscale(db, spec, owner)!;
+    spec.topology.headscale.reuseFleet = shared.launchId;
+    spec.topology.headscale.domain = shared.domain;
+    console.log(`sharing fleet "${shared.name}" mesh at https://${shared.domain}`);
+  }
 
   let launchId = process.env.LAUNCH_ID;
   if (!launchId) {

@@ -17,6 +17,7 @@ import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./se
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
+import { dependentFleets } from "./headscale-reuse.js";
 import type { ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
@@ -62,6 +63,8 @@ export interface FleetView {
    *  (e.g. an origin fleet and a joiner on the same chain). */
   name: string;
   chainId: string;
+  /** softsign | tmkms — the UI gates signer-related actions on this. */
+  keyMode: string;
   components: ComponentView[];
   ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
 }
@@ -100,7 +103,7 @@ export class FleetService {
     const assignments = this.db.stepOutput<Assignments>(launchId, "collect-bids");
     const ssh = this.db.stepOutput<SshEndpoints>(launchId, "send-manifests");
     const mesh = this.db.stepOutput<{ ips: Record<string, string> }>(launchId, "await-mesh");
-    if (hs) {
+    if (hs && !hs.reused) {
       // adopt a redeployed headscale the same way as the node batch below
       const hsRow = this.db.listFleetComponents(launchId).find((c) => c.key === "headscale");
       if (hsRow && hsRow.generation === 0 && hsRow.dseq !== hs.dseq) {
@@ -371,6 +374,7 @@ export class FleetService {
         name: spec.network.name,
         // join-aware: a joined fleet runs the LIVE chain, not name-suffix
         chainId: chainId(spec),
+        keyMode: spec.security.keyMode,
         components,
         ops: this.db.listFleetOps(launch.id).map((o) => ({
           id: o.id,
@@ -471,6 +475,30 @@ export class FleetService {
               );
               return;
             }
+          } else if (c.key === "headscale") {
+            // The mesh's front door. An active lease and healthy escrow say
+            // nothing about whether nodes can actually reach the control
+            // endpoint — and every join depends on it, so a headscale that
+            // is up but unreachable reads "healthy" while no node can
+            // register (seen live: Cloudflare answered TLS but never
+            // responded, and the fleet showed green throughout while a
+            // sentry failed to join for hours).
+            const domain = spec.topology.headscale.domain;
+            if (domain) {
+              const url = `https://${domain}/health`;
+              if (!(await this.services.rpc.httpOk(url))) {
+                this.db.setComponentHealth(
+                  launchId,
+                  c.key,
+                  "unreachable",
+                  `${url} not answering — nodes cannot join the mesh. headscale's HTTP ` +
+                    `listener can wedge while the process still runs (the CLI uses a local ` +
+                    `socket, so "nodes list" keeps working): try restarting it, then check ` +
+                    `the domain's DNS`,
+                );
+                return;
+              }
+            }
           } else if (componentDomains.has(c.key)) {
             // stateless components: HTTP 200 on the public domain (§5 step 21)
             const url = `https://${componentDomains.get(c.key)}/`;
@@ -524,6 +552,14 @@ export class FleetService {
     const warnings = this.sentryIsolationWarnings(spec, component, "while it is closed");
     if (component.key === "headscale") {
       warnings.push("closing headscale severs the mesh: nodes keep running but cannot re-wire");
+      const dependents = dependentFleets(this.db, launch.id);
+      if (dependents.length > 0) {
+        warnings.push(
+          `this mesh is shared: fleet(s) ${dependents
+            .map((d) => this.spec(d).network.name)
+            .join(", ")} ride it via reuseFleet and would be severed too`,
+        );
+      }
     }
     if (component.key.startsWith("val-")) {
       warnings.push(
@@ -559,8 +595,23 @@ export class FleetService {
     return warnings;
   }
 
+  /** Fleets riding this launch's mesh — refuse to sever them (§ shared mesh). */
+  private assertNoDependentFleets(launch: LaunchRow, closing: string): void {
+    const dependents = dependentFleets(this.db, launch.id);
+    if (dependents.length > 0) {
+      throw new Error(
+        `${closing} would sever the shared mesh: fleet(s) ` +
+          dependents.map((d) => `"${this.spec(d).network.name}" (${d.id})`).join(", ") +
+          " share this fleet's headscale via reuseFleet — shut those fleets down first",
+      );
+    }
+  }
+
   /** Enqueue MsgCloseDeployment into the launch's signing loop. */
   requestClose(launch: LaunchRow, component: FleetComponentRow): { step: string } {
+    if (component.key === "headscale") {
+      this.assertNoDependentFleets(launch, "closing headscale");
+    }
     const step = `fleet:close:${component.dseq}`;
     this.db.enqueuePendingTx(
       launch.id,
@@ -575,6 +626,7 @@ export class FleetService {
    * component in a single tx through the signing loop.
    */
   async requestShutdown(launch: LaunchRow): Promise<{ step: string; closing: string[] }> {
+    this.assertNoDependentFleets(launch, "shutting this fleet down");
     this.materialize(launch.id);
     // shutting down abandons whatever the launch was waiting on — drop any
     // unsigned engine tx (e.g. create-leases with expired bids) so it can't
@@ -788,20 +840,77 @@ export class FleetService {
     return { step };
   }
 
+  /**
+   * Re-place a component while its launch is still running (§5
+   * send-manifests recovery). A relaunch op cannot help here: op steps are
+   * appended AFTER the launch steps, so nothing runs while the launch is
+   * paused — a node that dies mid-launch would otherwise deadlock the whole
+   * thing (seen live: a sentry whose deployment was closed after
+   * send-manifests had already checkpointed `done`, leaving await-mesh
+   * waiting forever for a container that no longer existed).
+   *
+   * Instead, undo the node-bootstrap steps for everyone and let the launch
+   * redo them. That is safe because each is idempotent for the healthy
+   * components — manifests re-PUT unchanged, node data skips on its marker
+   * file — while the dead component falls into send-manifests' own
+   * "lease is gone" recovery, which re-deploys and re-bids it honoring
+   * anti-affinity and the avoid list.
+   */
+  async requestReplace(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+  ): Promise<{ step?: string; closing: boolean }> {
+    if (launch.status === "completed") {
+      throw new Error(
+        `${component.key}: this launch has finished — use relaunch, which moves the component through a proper op`,
+      );
+    }
+    if (component.key === "headscale") {
+      throw new Error("headscale cannot be re-placed mid-launch (it re-keys the whole mesh)");
+    }
+    // close it first when it is still leased, so the re-place is a genuine
+    // move and the escrow comes back; an already-closed deployment (the
+    // usual case here) skips straight to the step reset
+    let step: string | undefined;
+    const info = await this.services.api
+      .deploymentInfo(launch.owner, component.dseq)
+      .catch(() => undefined);
+    if (info?.state === "active") {
+      step = `fleet:close:${component.dseq}`;
+      this.db.enqueuePendingTx(
+        launch.id,
+        step,
+        JSON.stringify([closeDeploymentMsg(launch.owner, component.dseq)]),
+      );
+    }
+    // re-run the steps that place and bootstrap nodes. await-mesh and
+    // everything after it re-run anyway (they have not completed).
+    for (const name of ["send-manifests", "upload-node-data"]) {
+      this.db.resetStep(launch.id, name);
+    }
+    return { ...(step ? { step } : {}), closing: info?.state === "active" };
+  }
+
   /** Relaunch / rolling upgrade → fleet_ops rows; steps composed by buildOpSteps. */
   requestRelaunch(launch: LaunchRow, component: FleetComponentRow): number {
     if (component.key === "headscale") {
       throw new Error("headscale relaunch is not supported (it re-keys the whole mesh)");
     }
     // everything except the frontend joins the mesh, and a relaunch mints its
-    // preauth key via headscale — impossible once the fleet is shut down
+    // preauth key via headscale — impossible once the mesh is gone. A shared
+    // mesh (reuseFleet) has no headscale row here; check the owning fleet's.
     if (component.key !== "frontend") {
+      const reuse = this.spec(launch).topology.headscale.reuseFleet;
       const hs = this.db
-        .listFleetComponents(launch.id)
+        .listFleetComponents(reuse ?? launch.id)
         .find((c) => c.key === "headscale");
-      if (hs?.state === "closed") {
+      if (hs?.state === "closed" || (reuse && !hs)) {
         throw new Error(
-          `${component.key} cannot relaunch: headscale is closed (fleet shut down) — a relaunch needs the mesh to mint a preauth key`,
+          `${component.key} cannot relaunch: ` +
+            (reuse
+              ? `the shared headscale (fleet ${reuse}) is closed or gone`
+              : "headscale is closed (fleet shut down)") +
+            " — a relaunch needs the mesh to mint a preauth key",
         );
       }
     }
@@ -890,6 +999,36 @@ export class FleetService {
       .find((o) => o.kind === "unjail" && o.status === "active");
     if (running) throw new Error(`an unjail op (#${running.id}) is already in progress`);
     return this.db.createFleetOp(launch.id, "unjail", { key: component.key });
+  }
+
+  /**
+   * "The signer is ready — get the validator signing again" (§5, tmkms
+   * fleets): gate on the privval session, restart the process in place,
+   * prove signing resumes. No tx and no manifest change, so nothing can
+   * drift the on-chain hash (the out-of-band manifest bounce this replaces
+   * did exactly that, and 422'd every later manifest send).
+   */
+  requestResumeSigning(launch: LaunchRow, component: FleetComponentRow): number {
+    if (!component.key.startsWith("val-")) {
+      throw new Error(`resume-signing applies to validators, not ${component.key}`);
+    }
+    if (this.spec(launch).security.keyMode !== "tmkms") {
+      throw new Error(
+        `${component.key} signs locally (softsign): use restart; there is no signer session to gate on`,
+      );
+    }
+    const running = this.db
+      .listFleetOps(launch.id)
+      .find(
+        (o) =>
+          o.kind === "resume-signing" &&
+          o.status === "active" &&
+          JSON.parse(o.params_json).key === component.key,
+      );
+    if (running) {
+      throw new Error(`a resume-signing op (#${running.id}) is already in progress for ${component.key}`);
+    }
+    return this.db.createFleetOp(launch.id, "resume-signing", { key: component.key });
   }
 
   /**

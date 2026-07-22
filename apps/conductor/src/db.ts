@@ -343,6 +343,23 @@ export class ConductorDb {
       .run(launchId, name);
   }
 
+  /**
+   * Clear step rows left at 'running' by a driver that died mid-step (a
+   * conductor restart, a crash). Only one driver runs per launch, so at the
+   * start of a drive every 'running' row is by definition orphaned. Without
+   * this the UI shows a forever-spinning step that is not executing —
+   * genuinely misleading when the launch is actually paused on an error in
+   * an EARLIER step, which is the one the user needs to see.
+   */
+  clearOrphanedRunningSteps(launchId: string): number {
+    return this.db
+      .prepare(
+        `UPDATE launch_steps SET status = 'pending', started_at = NULL
+         WHERE launch_id = ? AND status = 'running'`,
+      )
+      .run(launchId).changes;
+  }
+
   stepDone(launchId: string, name: string, output: unknown): void {
     this.db
       .prepare(
