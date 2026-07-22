@@ -24,19 +24,21 @@ describe("launch cost estimate", () => {
       { role: "validators", count: 2, unitLowUsd: 5.05, unitHighUsd: 10.1 },
       // 2cpu + 8Gi + 5Gi eph + 8Gi beta3 = 3.2 + 6.4 + 0.1 + 0.32
       { role: "sentries", count: 2, unitLowUsd: 5.01, unitHighUsd: 10.02 },
-      // vendored SDL: 0.5cpu + 512Mi + 512Mi eph + 2×512Mi beta3
-      { role: "headscale", count: 1, unitLowUsd: 0.63, unitHighUsd: 1.25 },
+      // vendored SDL: 1cpu + 1Gi + 512Mi eph + 2×512Mi beta3 (bumped
+      // 2026-07-22: the embedded DERP relay hairpins all mesh traffic
+      // through this box, 0.5cpu/512Mi was control-plane sizing)
+      { role: "headscale", count: 1, unitLowUsd: 1.23, unitHighUsd: 2.45 },
       // 0.5cpu + 512Mi + 512Mi eph + 1Gi beta3
       { role: "explorer", count: 1, unitLowUsd: 0.63, unitHighUsd: 1.25 },
       // 0.5cpu + 512Mi + 1Gi eph
       { role: "frontend", count: 1, unitLowUsd: 0.61, unitHighUsd: 1.22 },
     ]);
-    expect(est.totalHighUsd).toBe(43.96);
-    expect(est.totalLowUsd).toBe(21.98);
+    expect(est.totalHighUsd).toBe(45.16);
+    expect(est.totalLowUsd).toBe(22.58);
     // one-time launch fee: 10% of the monthly range
     expect(est.feeBps).toBe(1000);
-    expect(est.feeLowUsd).toBe(2.2);
-    expect(est.feeHighUsd).toBe(4.4);
+    expect(est.feeLowUsd).toBe(2.26);
+    expect(est.feeHighUsd).toBe(4.52);
   });
 
   it("LAUNCH_FEE_BPS=0 disables the fee", () => {
@@ -52,7 +54,10 @@ describe("launch cost estimate", () => {
   });
 
   it("the observed mainnet fleet prices fall inside the range", () => {
-    // first real launch (2026-07): val $5.51/mo, sentry $5.28, headscale $0.71
+    // first real launch (2026-07): val $5.51/mo, sentry $5.28, headscale $0.71.
+    // The headscale bid was for the pre-bump 0.5cpu/512Mi size; after the
+    // relay-host bump the range sits above it, so only the high side is
+    // anchored on that observation.
     const est = estimateLaunchCost(
       testnetSpec({
         topology: {
@@ -74,7 +79,6 @@ describe("launch cost estimate", () => {
     expect(val.unitHighUsd).toBeGreaterThanOrEqual(5.51);
     expect(sentry.unitLowUsd).toBeLessThanOrEqual(5.28);
     expect(sentry.unitHighUsd).toBeGreaterThanOrEqual(5.28);
-    expect(hs.unitLowUsd).toBeLessThanOrEqual(0.71);
     expect(hs.unitHighUsd).toBeGreaterThanOrEqual(0.71);
   });
 

@@ -582,7 +582,18 @@ export class FleetService {
   relaunchWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
     const spec = this.spec(launch);
     const warnings = this.sentryIsolationWarnings(spec, component, "while it relaunches");
-    if (component.key.startsWith("val-")) {
+    if (component.key === "headscale") {
+      warnings.push(
+        spec.topology.headscale.backup
+          ? "relaunching headscale redeploys it on a different provider and restores the mesh " +
+              "from its S3 backup, so every client reconnects as-is. You will be asked to point " +
+              "the domain's DNS record at the new provider."
+          : "relaunching headscale RE-KEYS the whole mesh (no backup is configured): every " +
+              "component re-registers with a fresh preauth key, tailnet IPs can change, and a " +
+              "tmkms signer must re-join with the new key the op shows at the end. The chain " +
+              "signs nothing between the DNS flip and the signer repoint.",
+      );
+    } else if (component.key.startsWith("val-")) {
       warnings.push(
         `relaunching ${component.key} closes its current deployment and redeploys it on a ` +
           "different provider. The node is offline until the replacement syncs; its keys and " +
@@ -893,13 +904,20 @@ export class FleetService {
 
   /** Relaunch / rolling upgrade → fleet_ops rows; steps composed by buildOpSteps. */
   requestRelaunch(launch: LaunchRow, component: FleetComponentRow): number {
+    // headscale relaunches through a dedicated flow (headscaleRelaunchSteps):
+    // a naive redeploy re-keys the whole mesh. A shared-mesh fleet has no
+    // headscale of its own to relaunch; the owning fleet runs the op.
     if (component.key === "headscale") {
-      throw new Error("headscale relaunch is not supported (it re-keys the whole mesh)");
-    }
-    // everything except the frontend joins the mesh, and a relaunch mints its
-    // preauth key via headscale — impossible once the mesh is gone. A shared
-    // mesh (reuseFleet) has no headscale row here; check the owning fleet's.
-    if (component.key !== "frontend") {
+      const reuse = this.spec(launch).topology.headscale.reuseFleet;
+      if (reuse) {
+        throw new Error(
+          `this fleet rides fleet ${reuse}'s mesh — relaunch the headscale from that fleet's panel`,
+        );
+      }
+    } else if (component.key !== "frontend") {
+      // everything except the frontend joins the mesh, and a relaunch mints its
+      // preauth key via headscale — impossible once the mesh is gone. A shared
+      // mesh (reuseFleet) has no headscale row here; check the owning fleet's.
       const reuse = this.spec(launch).topology.headscale.reuseFleet;
       const hs = this.db
         .listFleetComponents(reuse ?? launch.id)

@@ -1055,3 +1055,122 @@ esac
     soft.db.close();
   }, 240_000);
 });
+
+describe("headscale relaunch op", () => {
+  function tmkmsSpec1(): LaunchSpec {
+    return testnetSpec({
+      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+  }
+
+  it("re-keys the mesh: new placement, fresh preauth keys pushed, trackers refreshed", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "headscale")!;
+    const launchKeys = w.db.stepOutput<{ perNode: Record<string, string>; home: string }>(
+      "fl",
+      "configure-headscale",
+    )!;
+    const launchMesh = w.db.stepOutput<{ ips: Record<string, string> }>("fl", "await-mesh")!;
+
+    const opId = w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    // the fresh mesh allocates fresh IPs, and validators still reference the old
+    w.services.ssh.remapTailnetIps();
+    w.services.ssh.configHasStaleIp = true;
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // headscale moved to a new provider + dseq, avoiding the old one
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "headscale")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+    expect(after.provider).not.toBe(before.provider);
+    expect(after.generation).toBe(before.generation + 1);
+
+    // fresh preauth keys minted on the new server; trackers refreshed
+    const keys = w.db.stepOutput<{ perNode: Record<string, string>; home: string }>(
+      "fl",
+      "configure-headscale",
+    )!;
+    expect(keys.home).not.toBe(launchKeys.home);
+    for (const k of ["val-0", "sentry-0", "explorer"]) {
+      expect(keys.perNode[k]).toBeDefined();
+      expect(keys.perNode[k]).not.toBe(launchKeys.perNode[k]);
+      const sdl = fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", `${k}.yaml`), "utf8");
+      expect(sdl).toContain(`TS_AUTHKEY=${keys.perNode[k]}`);
+    }
+
+    // deploy-headscale output points at the new lease
+    const hs = w.db.stepOutput<{ dseq: string; hostUri: string }>("fl", "deploy-headscale")!;
+    expect(hs.dseq).toBe(after.dseq);
+    expect(hs.hostUri).toBe(after.host_uri);
+
+    // fresh mesh IPs in rows + await-mesh output, env references rewritten
+    const mesh = w.db.stepOutput<{ ips: Record<string, string> }>("fl", "await-mesh")!;
+    for (const k of ["val-0", "sentry-0", "explorer"]) {
+      expect(mesh.ips[k]).toBeDefined();
+      expect(mesh.ips[k]).not.toBe(launchMesh.ips[k]);
+      expect(w.db.listFleetComponents("fl").find((c) => c.key === k)!.tailnet_ip).toBe(mesh.ips[k]);
+    }
+    const explorerSdl = fs.readFileSync(
+      path.join(w.work, "launches", "fl", "sdl", "explorer.yaml"),
+      "utf8",
+    );
+    expect(explorerSdl).not.toContain(launchMesh.ips["sentry-0"]!);
+    expect(explorerSdl).toContain(mesh.ips["sentry-0"]!);
+
+    // validator config re-patched (sed old→new sentry IP over SSH)
+    expect(
+      w.services.ssh.execLog.some(
+        (e) =>
+          e.command.includes("sed -i") &&
+          e.command.includes(launchMesh.ips["sentry-0"]!) &&
+          e.command.includes(mesh.ips["sentry-0"]!),
+      ),
+    ).toBe(true);
+
+    // frontend is not meshed: untouched by the re-key
+    const frontendSdl = fs.readFileSync(
+      path.join(w.work, "launches", "fl", "sdl", "frontend.yaml"),
+      "utf8",
+    );
+    expect(frontendSdl).not.toContain("TS_AUTHKEY=");
+
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 240_000);
+
+  it("tmkms fleets park at the signer gate with the new home key and validator addrs", async () => {
+    const w = await launched(tmkmsSpec1());
+    const launch = w.db.getLaunch("fl")!;
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "headscale")!;
+    const opId = w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.remapTailnetIps();
+    w.services.ssh.signerConnected = false;
+
+    const paused = await driveOps(w);
+    expect(paused.status).toBe("awaiting-user");
+    const waiting = w.db.getStep("fl", `op${opId}:signer`)!;
+    expect(waiting.status).toBe("waiting");
+    expect(waiting.error).toContain("re-join your tmkms signer machine");
+    expect(waiting.error).toContain("--authkey=hskey-");
+    expect(waiting.error).toContain(":26659");
+
+    // signer returns: the op completes
+    w.services.ssh.signerConnected = true;
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 240_000);
+});

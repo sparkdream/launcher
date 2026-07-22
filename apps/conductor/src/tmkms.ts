@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { headscaleDomain, type LaunchSpec } from "@sparkdream/launch-spec";
+import { NODE_HOME } from "./node-ops.js";
 
 /**
  * Guided tmkms signer setup (M7, §5 step 19): everything the local signer
@@ -42,6 +43,115 @@ export const SIGNER_CONNECTED_PROBE =
 export function probeSaysConnected(stdout: string): boolean {
   const last = stdout.trim().split("\n").pop() ?? "";
   return Number(last) >= 1;
+}
+
+/**
+ * Signer-path probes, run on the validator over SSH. Both read LOCAL
+ * tailscaled state and measure the relay host only: a firewall on the signer
+ * machine blocks everything aimed AT it (the validator cannot ping the tmkms
+ * node — the signer only ever dials out), but the session state and the
+ * relay's latency are visible from this side. Socket path matches the
+ * sentry-link probes in fleet.ts (unjail guard).
+ */
+export const TAILSCALE_STATUS_PROBE =
+  `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock status --json 2>/dev/null || true`;
+
+export const TAILSCALE_NETCHECK_PROBE =
+  `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock netcheck 2>/dev/null || true`;
+
+export interface SignerPeerInfo {
+  name: string;
+  ip: string | null;
+  online: boolean;
+  /** the peer's session to this validator moved traffic recently */
+  active: boolean;
+  /** DERP region the session relays through, null when direct */
+  relay: string | null;
+  txBytes: number;
+  rxBytes: number;
+  lastHandshake: string | null;
+}
+
+/**
+ * The signer machines visible from a validator's own tailscaled, parsed out
+ * of `tailscale status --json` (local daemon state, no traffic toward the
+ * signer). Matches the hostname the guided setup joins with (--hostname
+ * tmkms-<network>, buildTmkmsSetup below): any tmkms-* peer counts since
+ * headscale rewrites names to DNS-safe form, and the exact network match
+ * sorts first.
+ */
+export function parseSignerPeers(stdout: string, networkName: string): SignerPeerInfo[] {
+  let doc: any;
+  try {
+    doc = JSON.parse(stdout.trim());
+  } catch {
+    return [];
+  }
+  const want = `tmkms-${networkName}`.toLowerCase();
+  const out: SignerPeerInfo[] = [];
+  for (const p of Object.values(doc?.Peer ?? {}) as any[]) {
+    const host = String(p?.HostName ?? "");
+    const dns = String(p?.DNSName ?? "").split(".")[0]!;
+    if (!host.toLowerCase().startsWith("tmkms-") && !dns.toLowerCase().startsWith("tmkms-")) {
+      continue;
+    }
+    out.push({
+      name: host || dns,
+      ip: Array.isArray(p?.TailscaleIPs) ? String(p.TailscaleIPs[0] ?? "") || null : null,
+      online: Boolean(p?.Online),
+      active: Boolean(p?.Active),
+      relay: p?.Relay ? String(p.Relay) : null,
+      txBytes: Number(p?.TxBytes ?? 0),
+      rxBytes: Number(p?.RxBytes ?? 0),
+      lastHandshake: typeof p?.LastHandshake === "string" ? p.LastHandshake : null,
+    });
+  }
+  out.sort(
+    (a, b) =>
+      Number(b.name.toLowerCase() === want) - Number(a.name.toLowerCase() === want) ||
+      a.name.localeCompare(b.name),
+  );
+  return out;
+}
+
+export interface DerpRegionLatency {
+  /** region code ("sparkdream"), the same string tailscale status reports in
+   *  a peer's Relay field */
+  code: string;
+  /** display name ("SparkDream DERP"), null when the output carries none */
+  name: string | null;
+  ms: number;
+}
+
+export interface NetcheckInfo {
+  nearest: string | null;
+  regions: DerpRegionLatency[];
+}
+
+/**
+ * The validator's own latency to each DERP region, from `tailscale netcheck`
+ * text output (netcheck has no --json). This is the validator↔relay leg of
+ * the signer path; the signer machine's leg is unreachable behind its
+ * firewall, so the panel pairs this with the signer's own once-measured leg.
+ */
+export function parseNetcheck(stdout: string): NetcheckInfo {
+  const nearest = /^\s*\* Nearest DERP:\s*(.+?)\s*$/m.exec(stdout)?.[1] ?? null;
+  const regions: DerpRegionLatency[] = [];
+  // "  - sparkdream: 71.9ms  (SparkDream DERP)"
+  for (const m of stdout.matchAll(/^\s*-\s*([a-z0-9-]+):\s*([\d.]+)ms(?:\s+\(([^)]+)\))?\s*$/gim)) {
+    regions.push({ code: m[1]!, name: m[3] ?? null, ms: Number(m[2]) });
+  }
+  return { nearest, regions };
+}
+
+/** Latency to the relay a signer session uses, when netcheck measured it. */
+export function relayLatencyMs(netcheck: NetcheckInfo | null, relay: string | null): number | null {
+  if (!netcheck) return null;
+  if (relay) {
+    const hit = netcheck.regions.find((r) => r.code === relay || r.name === relay);
+    if (hit) return hit.ms;
+  }
+  return netcheck.regions[0]?.ms ?? null;
 }
 
 /**

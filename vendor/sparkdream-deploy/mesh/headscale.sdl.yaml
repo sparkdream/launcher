@@ -70,11 +70,14 @@ services:
 profiles:
   compute:
     headscale:
+      # The embedded DERP relay hairpins every mesh flow (votes, privval
+      # signing, RPC tunnels) through this container: size it for the mesh's
+      # single point of failure, not for a control-plane-only box.
       resources:
         cpu:
-          units: 0.5
+          units: 1
         memory:
-          size: 512Mi
+          size: 1Gi
         storage:
           - size: 512Mi
           - name: headscale-data

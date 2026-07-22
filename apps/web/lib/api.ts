@@ -84,6 +84,26 @@ export interface TmkmsStatus {
     expectedPubkey: string | null;
     /** null: unknown/not pinned; otherwise the connected signer's key vs the pin. */
     pubkeyMatches: boolean | null;
+    /** Signer machines the validator's own tailscaled sees (read from local
+     *  daemon state; nothing probes the signer machine through its firewall). */
+    signerPeers: Array<{
+      name: string;
+      ip: string | null;
+      online: boolean;
+      /** the session to this validator moved traffic recently. */
+      active: boolean;
+      /** DERP region the session relays through; null when direct. */
+      relay: string | null;
+      txBytes: number;
+      rxBytes: number;
+      lastHandshake: string | null;
+    }> | null;
+    /** Validator↔relay latency in ms (netcheck, ~60s cache), null when unknown. */
+    signerRelayMs: number | null;
+    /** Slashing counters read from the chain; null when unknown. The panel
+     *  diffs them between polls: 0 new blocks while connected = stalled signer. */
+    missedBlocks: number | null;
+    indexOffset: number | null;
   }>;
 }
 export async function getTmkmsStatus(id: string): Promise<TmkmsStatus> {

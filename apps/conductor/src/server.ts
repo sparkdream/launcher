@@ -27,12 +27,28 @@ import {
   lsRemoteTag,
   setChainAssetMode,
 } from "./chain-assets/index.js";
-import type { ConductorDb } from "./db.js";
+import type { ConductorDb, FleetComponentRow } from "./db.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
-import { buildTmkmsSetup, probeSaysConnected, statusConsensusPubkey, SIGNER_CONNECTED_PROBE, VALIDATOR_STATUS_PROBE } from "./tmkms.js";
+import {
+  buildTmkmsSetup,
+  parseNetcheck,
+  parseSignerPeers,
+  probeSaysConnected,
+  relayLatencyMs,
+  statusConsensusPubkey,
+  SIGNER_CONNECTED_PROBE,
+  TAILSCALE_NETCHECK_PROBE,
+  TAILSCALE_STATUS_PROBE,
+  VALIDATOR_STATUS_PROBE,
+  type NetcheckInfo,
+  type SignerPeerInfo,
+} from "./tmkms.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { readSecretFile } from "./secrets.js";
+import { extractForwardedPort } from "./steps/phase-bcd.js";
+import { queryJson } from "./steps/phase-g.js";
+import type { GenerateKeysOutput } from "./steps/phase-a.js";
 import type {
   Assignments,
   DeploymentPlan,
@@ -73,6 +89,15 @@ export interface ServerDeps {
  * allowlist) lands with M4/M6 — routes are factored so it drops in as a
  * fastify preHandler.
  */
+
+/** Slow signer-path probes behind the polled tmkms status route. netcheck
+ *  takes seconds and the RPC URL comes from a provider lease-status call, so
+ *  both ride a 60s cache; the fast probes (SSH reads of local state) run
+ *  every poll. */
+const SLOW_PROBE_CACHE_MS = 60_000;
+const netcheckCache = new Map<string, { at: number; info: NetcheckInfo | null }>();
+const chainRpcCache = new Map<string, { at: number; url: string | null }>();
+
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify();
   app.addContentTypeParser(
@@ -871,17 +896,47 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const sshEps = deps.db.stepOutput<SshEndpoints>(id, "send-manifests");
     const plan = deps.db.stepOutput<DeploymentPlan>(id, "create-deployments");
     const assigns = deps.db.stepOutput<Assignments>(id, "collect-bids");
+    const keys = deps.db.stepOutput<GenerateKeysOutput>(id, "generate-keys");
+    // RPC for the slashing reads below, via any active sentry. Cached: the
+    // lease-status lookup is a provider round trip per poll otherwise.
+    const chainRpc = async (): Promise<string | null> => {
+      const hit = chainRpcCache.get(id);
+      if (hit && Date.now() - hit.at < SLOW_PROBE_CACHE_MS) return hit.url;
+      let url: string | null = null;
+      try {
+        const sentry = (deps.db.listFleetComponents(id) as FleetComponentRow[]).find(
+          (c) => c.key.startsWith("sentry-") && c.state === "active",
+        );
+        if (sentry) {
+          const status = await deps.services.provider.leaseStatus(mtls, sentry.host_uri, sentry.dseq, 1, 1);
+          const rpcEp = extractForwardedPort(status, 26657);
+          url = `http://${rpcEp.host}:${rpcEp.port}`;
+        }
+      } catch {
+        url = null;
+      }
+      chainRpcCache.set(id, { at: Date.now(), url });
+      return url;
+    };
     const validators: {
       key: string;
       tailnetIp: string | null;
       signerConnected: boolean | null;
       expectedPubkey: string | null;
       pubkeyMatches: boolean | null;
+      signerPeers: SignerPeerInfo[] | null;
+      signerRelayMs: number | null;
+      missedBlocks: number | null;
+      indexOffset: number | null;
     }[] = [];
     for (let v = 0; v < spec.topology.validators.count; v++) {
       const key = `val-${v}`;
       let connected: boolean | null = null;
       let pubkeyMatches: boolean | null = null;
+      let signerPeers: SignerPeerInfo[] | null = null;
+      let signerRelayMs: number | null = null;
+      let missedBlocks: number | null = null;
+      let indexOffset: number | null = null;
       const expectedPubkey = spec.topology.validators.consensusPubkeys?.[v] ?? null;
       const ep = sshEps?.perNode[key];
       if (ep) {
@@ -918,8 +973,56 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             const signerKey = statusConsensusPubkey(status.stdout);
             pubkeyMatches = signerKey === null ? null : signerKey === expectedPubkey;
           }
+          // signer path, read from the validator's side only: its tailscaled
+          // knows the session (relayed? traffic?) and netcheck measures the
+          // validator↔relay leg. Nothing probes the signer machine, whose
+          // firewall drops inbound by design (the validator cannot ping it).
+          const tsStatus = await deps.services.ssh.exec(target, TAILSCALE_STATUS_PROBE);
+          signerPeers = parseSignerPeers(tsStatus.stdout, spec.network.name);
+          const ncKey = `${id}:${key}`;
+          const ncHit = netcheckCache.get(ncKey);
+          let netcheck: NetcheckInfo | null;
+          if (ncHit && Date.now() - ncHit.at < SLOW_PROBE_CACHE_MS) {
+            netcheck = ncHit.info;
+          } else {
+            try {
+              const res = await deps.services.ssh.exec(target, TAILSCALE_NETCHECK_PROBE);
+              const info = parseNetcheck(res.stdout);
+              netcheck = info.regions.length > 0 ? info : null;
+            } catch {
+              netcheck = null;
+            }
+            netcheckCache.set(ncKey, { at: Date.now(), info: netcheck });
+          }
+          signerRelayMs = relayLatencyMs(netcheck, signerPeers?.[0]?.relay ?? null);
         } catch {
           connected = null; // node unreachable: report unknown, not false
+        }
+      }
+      // signing truth from the chain (slashing counters): needs nothing from
+      // the signer machine or the validator, and for a stalled signer it is
+      // the difference between "connected" and "connected but signing nothing"
+      const signingPubkey = expectedPubkey ?? keys?.consensusPubkeys?.[key] ?? null;
+      if (signingPubkey) {
+        try {
+          const rpc = await chainRpc();
+          if (rpc) {
+            const out = await queryJson(
+              [
+                "query",
+                "slashing",
+                "signing-info",
+                JSON.stringify({ "@type": "/cosmos.crypto.ed25519.PubKey", key: signingPubkey }),
+              ],
+              rpc,
+            );
+            const info = out.val_signing_info ?? out;
+            missedBlocks = Number(info.missed_blocks_counter ?? 0);
+            indexOffset = Number(info.index_offset ?? 0);
+          }
+        } catch {
+          missedBlocks = null; // chain not queryable: unknown, not zero
+          indexOffset = null;
         }
       }
       validators.push({
@@ -928,6 +1031,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         signerConnected: connected,
         expectedPubkey,
         pubkeyMatches,
+        signerPeers,
+        signerRelayMs,
+        missedBlocks,
+        indexOffset,
       });
     }
     return { externalNodes, validators };

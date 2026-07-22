@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { chainId, resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -12,7 +12,7 @@ import { PRICING_DENOM } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
 import { exclusionEntries, selectProvider } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
-import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
+import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
   createNamedAccounts,
@@ -34,6 +34,7 @@ import {
 } from "./gentx.js";
 import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
+import { readSecretFile } from "./secrets.js";
 import type { SshTarget } from "./services.js";
 
 /**
@@ -752,6 +753,532 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       if (!back) throw new Error(`${key} did not come back after the persist restart`);
       ctx.db.setFleetOpStatus(opId, "done");
       return { persisted: targets };
+    },
+  });
+
+  return steps;
+}
+
+/**
+ * Headscale relaunch: the one component relaunchSteps cannot do, because a
+ * naive redeploy re-keys the whole mesh (noise key, DERP key, preauth keys,
+ * node registrations all live in the container, and this fleet may have no
+ * S3 backup). Two paths:
+ *
+ *  - backup configured: the fresh container restores db + static keys from
+ *    S3 at boot, the mesh identity survives, and clients reconnect as-is.
+ *    Only the DNS record and the launcher's tracking need updating.
+ *  - no backup: the mesh re-keys. The op mints fresh preauth keys on the new
+ *    server, pushes them into every mesh component's env (manifest update +
+ *    restart), re-collects tailnet IPs (sequential allocation means they can
+ *    shuffle), rewrites env IP references, re-patches validators' peers, and
+ *    ends gated on the tmkms signer re-joining, since the chain signs
+ *    nothing until it does.
+ *
+ * Either way the launch-time step outputs everything downstream reads
+ * (deploy-headscale, configure-headscale, await-mesh) are refreshed, so the
+ * tmkms panel, future relaunches, and shared-mesh fleets keep working.
+ */
+export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const key = "headscale";
+  const domain = headscaleDomain(spec);
+  const backup = spec.topology.headscale.backup;
+  const meshKeys = [
+    ...nodes(spec).map((n) => n.key),
+    ...statelessComponents(spec).filter((c) => c.mesh).map((c) => c.key),
+  ];
+  const valKeys = nodes(spec).filter((n) => n.key.startsWith("val-")).map((n) => n.key);
+
+  const hsShell = (ctx: StepCtx, hs: { hostUri: string; dseq: string; gseq: number; oseq: number }, script: string) =>
+    ctx.services.provider.shellExec(loadCert(ctx), hs.hostUri, hs.dseq, hs.gseq, hs.oseq, "headscale", ["sh", "-c", script]);
+
+  /** A node's assigned tailnet IPv4, or undefined while it has not joined. */
+  const tailnetIp = async (ctx: StepCtx, target: SshTarget): Promise<string | undefined> => {
+    const res = await ctx.services.ssh
+      .exec(target, `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`)
+      .catch(() => ({ stdout: "" }));
+    const ip = res.stdout.trim().split("\n")[0]!;
+    return ip && ip.startsWith("100.") ? ip : undefined;
+  };
+
+  /** Wait out a manifest-push container restart, then for mesh (re)join. */
+  const collectIp = async (ctx: StepCtx, row: FleetComponentRow): Promise<string> => {
+    const target = rowTarget(ctx, row);
+    let sshUp = false;
+    for (let i = 0; i < 40 && !sshUp; i++) {
+      if (i > 0) await ctx.services.sleep(5000);
+      sshUp = await ctx.services.ssh
+        .exec(target, "true", { quick: true })
+        .then(() => true)
+        .catch(() => false);
+    }
+    if (!sshUp) throw new Error(`${row.key}: container never came back after its manifest update`);
+    let ip: string | undefined;
+    for (let i = 0; i < 30 && !ip; i++) {
+      if (i > 0) await ctx.services.sleep(5000);
+      ip = await tailnetIp(ctx, target);
+    }
+    if (!ip) {
+      throw new Error(
+        `${row.key} never joined the new mesh: headscale answers at ${domain} (the op verified it), ` +
+          "so check the node's tailscaled log and that its provider can reach the new headscale host",
+      );
+    }
+    return ip;
+  };
+
+  const steps: StepDef[] = [];
+
+  steps.push({
+    name: p("close"),
+    async run(ctx) {
+      const row = componentRow(ctx, key);
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+      const lease = await ctx.services.api.leaseState(owner, row.dseq, row.provider);
+      if (lease === "active") {
+        await ctx.requireTx(p("close"), [
+          { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq: row.dseq } } },
+        ]);
+      }
+      // no zombie check: the headscale image has no sshd to probe, and a
+      // second headscale answering the domain briefly is harmless (clients
+      // only switch at the DNS flip below)
+      ctx.db.setComponentState(ctx.launchId, key, "relaunching");
+      return { closedDseq: row.dseq };
+    },
+  });
+
+  steps.push({
+    name: p("deploy"),
+    async run(ctx) {
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+      // same render as deploy-headscale, backup env included when configured
+      const sdl = templateHeadscaleSdl(spec, {
+        ageRecipient: backup
+          ? ctx.output<{ ageRecipient: string }>("generate-keys")!.ageRecipient
+          : undefined,
+        ageIdentity: backup
+          ? readSecretFile(path.join(ctx.dirs.secrets, "age.txt"))
+              .split("\n")
+              .find((l) => l.startsWith("AGE-SECRET-KEY-"))
+          : undefined,
+      });
+      const sdlPath = sdlPathFor(ctx, key);
+      fs.writeFileSync(sdlPath, yaml.dump(sdl, { lineWidth: 120 }));
+      const artifacts = sdlArtifacts(loadSdl(sdlPath));
+      const dseq = await pinnedValue(ctx, `op${opId}-dseq`, async () =>
+        String(await ctx.services.api.latestBlockHeight()),
+      );
+      fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+      await ctx.requireTx(p("deploy"), [
+        createDeploymentMsg({
+          owner,
+          dseq,
+          groups: artifacts.groups,
+          hash: artifacts.hash,
+          deposit: {
+            denom: artifacts.pricingDenom,
+            amount: DEPOSIT[artifacts.pricingDenom] ?? "5000000",
+          },
+        }),
+      ]);
+      return { dseq, requiredStorageClass: artifacts.requiredStorageClass };
+    },
+  });
+
+  steps.push({
+    name: p("lease"),
+    async run(ctx) {
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+      const deploy = ctx.output<{ dseq: string; requiredStorageClass?: string }>(p("deploy"))!;
+      const providers = await ctx.services.api.listProviders();
+
+      // a lease signed on a prior run IS the choice (same short-circuit as
+      // the component relaunch: re-polling bids misreads the leased order)
+      const leaseRow = ctx.db.getPendingTx(ctx.launchId, p("lease"));
+      if (leaseRow && (leaseRow.status === "signed" || leaseRow.status === "confirmed")) {
+        const bidId = JSON.parse(leaseRow.msgs_json)[0].value.bidId;
+        await ctx.requireTx(p("lease"), [createLeaseMsg(bidId)]);
+        const all = await ctx.services.api.listBids(owner, deploy.dseq);
+        return {
+          provider: bidId.provider,
+          gseq: bidId.gseq,
+          oseq: bidId.oseq,
+          hostUri: providers.get(bidId.provider)!.hostUri,
+          price: all.find((b) => b.bid.id.provider === bidId.provider)?.bid.price.amount ?? "0",
+        };
+      }
+
+      // headscale placement is price-driven like at launch (no anti-affinity
+      // against the fleet); the avoid list (old provider + wallet's) and the
+      // spec's headscale exclusions constrain it
+      const avoidProviders = new Set<string>(params.avoidProviders ?? []);
+      const bids = await pollBids(ctx.services.api, owner, deploy.dseq, {
+        sleep: ctx.services.sleep,
+        minBids: 1,
+        settleRounds: 2,
+      });
+      const preference = [
+        ...new Set([...(params.preferProviders ?? []), ...spec.providers.policy.preference]),
+      ];
+      const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+        policy: { ...spec.providers.policy, preference },
+        chosenProviders: new Set<string>(),
+        avoidProviders,
+        excludeMatchers: exclusionEntries(spec, key),
+        log: ctx.log,
+        requiredStorageClass: deploy.requiredStorageClass,
+        providers,
+      });
+      if (!decision.chosen) {
+        const expired = bids.length > 0 && bids.every((b) => b.bid.state !== "open");
+        throw new AwaitUser(
+          p("lease"),
+          expired
+            ? `the bids for the headscale relaunch deployment have expired (a lease must be signed ` +
+                "within a few minutes of the bids arriving). Resuming cannot recover this: " +
+                "use Abandon on this operation to close the deployment and refund its escrow, " +
+                "then relaunch headscale again and sign the lease promptly"
+            : `no acceptable bids for the headscale relaunch avoiding ${avoidProviders.size} provider(s): ${JSON.stringify(decision.rejected)}`,
+        );
+      }
+      const bidId = decision.chosen.bid.id;
+      await ctx.requireTx(p("lease"), [createLeaseMsg(bidId)]);
+      return {
+        provider: bidId.provider,
+        gseq: bidId.gseq,
+        oseq: bidId.oseq,
+        hostUri: providers.get(bidId.provider)!.hostUri,
+        price: decision.chosen.bid.price.amount,
+      };
+    },
+  });
+
+  steps.push({
+    name: p("manifest"),
+    async run(ctx) {
+      const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+      const lease = ctx.output<{
+        provider: string;
+        gseq: number;
+        oseq: number;
+        hostUri: string;
+        price: string;
+      }>(p("lease"))!;
+      const cert = loadCert(ctx);
+      const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8");
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+      const wantHash = crypto.createHash("sha256").update(manifest).digest("base64");
+      const onChain = await ctx.services.api.deploymentInfo(owner, deploy.dseq);
+      if (onChain?.hash && onChain.hash !== wantHash) {
+        ctx.log(`headscale manifest hash drifted from deployment ${deploy.dseq} — updating on-chain`);
+        await ctx.requireTx(`${p("update")}:${wantHash.slice(0, 8)}`, [
+          { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner, dseq: deploy.dseq }, hash: wantHash } },
+        ]);
+      }
+      await ctx.services.provider.sendManifest(cert, lease.hostUri, deploy.dseq, manifest);
+      // no sshd and no forwarded SSH port: the lease itself is the readiness
+      // signal; the configure step's shell loop takes it from there
+      await waitLeaseStatus(ctx, cert, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, {});
+      ctx.db.updateComponentPlacement(ctx.launchId, key, {
+        dseq: deploy.dseq,
+        provider: lease.provider,
+        host_uri: lease.hostUri,
+        price: lease.price,
+        generation: params.generation,
+      });
+      return { placed: true };
+    },
+  });
+
+  steps.push({
+    name: p("configure"),
+    async run(ctx) {
+      const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+      const lease = ctx.output<{ provider: string; hostUri: string; price: string; gseq: number; oseq: number }>(
+        p("lease"),
+      )!;
+      const hs = { hostUri: lease.hostUri, dseq: deploy.dseq, gseq: lease.gseq, oseq: lease.oseq };
+      // the shell itself is the readiness signal (lease-status counters read
+      // ready mid-crash-loop) — mirrors configure-headscale at launch
+      let up = false;
+      for (let i = 0; i < 30 && !up; i++) {
+        if (i > 0) await ctx.services.sleep(4000);
+        try {
+          await hsShell(ctx, hs, "true");
+          up = true;
+        } catch {
+          // pod still starting
+        }
+      }
+      if (!up) throw new Error("headscale never accepted lease-shell commands after the manifest push");
+      await hsShell(ctx, hs, `sed -i 's|^server_url:.*|server_url: https://${domain}|' /etc/headscale/config.yaml`);
+      // kill 1 restarts the container and drops the shell connection with it
+      await hsShell(ctx, hs, "kill 1").catch(() => {});
+      up = false;
+      for (let i = 0; i < 30 && !up; i++) {
+        await ctx.services.sleep(4000);
+        try {
+          await hsShell(ctx, hs, "true");
+          up = true;
+        } catch {
+          // restarting
+        }
+      }
+      if (!up) throw new Error("headscale did not come back after the server_url restart");
+      // the tracker update is path-independent: everything downstream reads
+      // the deploy-headscale output (tmkms panel, shared-mesh fleets, mints)
+      ctx.db.stepDone(ctx.launchId, "deploy-headscale", {
+        dseq: deploy.dseq,
+        provider: lease.provider,
+        hostUri: lease.hostUri,
+        price: lease.price,
+        gseq: lease.gseq,
+        oseq: lease.oseq,
+      } satisfies HeadscaleOutput);
+
+      if (backup) {
+        // restore path: the entrypoint pulled db + static keys from S3 at
+        // boot. Prove it actually restored before skipping the re-key: an
+        // empty db here means the mesh identity is GONE and silently
+        // continuing would strand every client on stale keys
+        const users = await hsShell(ctx, hs, "headscale users list --output json");
+        const list = JSON.parse(users.stdout.trim() || "[]");
+        if (!Array.isArray(list) || list.length === 0) {
+          throw new Error(
+            "headscale relaunched with backup configured, but the restored db has no users: " +
+              "the S3 restore did not take (check the headscale container logs for the litestream " +
+              "restore and the age identity). The mesh identity did not come back; fix the backup " +
+              "and resume, or relaunch again after removing topology.headscale.backup to re-key.",
+          );
+        }
+        return { restored: true };
+      }
+
+      // re-key path: fresh user + per-component preauth keys, mirroring
+      // configure-headscale at launch. The new keys replace the launch-time
+      // step output so the tmkms panel and later ops see them.
+      await hsShell(ctx, hs, `headscale users create ${spec.network.name} 2>/dev/null || true`);
+      const userId = await headscaleUserId(ctx, hs, spec.network.name);
+      const mint = async (label: string) => {
+        const res = await hsShell(
+          ctx,
+          hs,
+          `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
+        );
+        const parsed = JSON.parse(res.stdout.trim());
+        const k: string = typeof parsed === "string" ? parsed : parsed.key;
+        if (!k) throw new Error(`no preauth key in mint output for ${label}`);
+        return k;
+      };
+      const perNode: Record<string, string> = {};
+      for (const k of meshKeys) perNode[k] = await mint(k);
+      const home = await mint("home");
+      ctx.db.stepDone(ctx.launchId, "configure-headscale", { perNode, home });
+      return { restored: false, keys: { perNode, home } };
+    },
+  });
+
+  steps.push({
+    name: p("dns"),
+    async run(ctx) {
+      const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+      const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+      const ingress = await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain);
+      // poll briefly first (the record may already be right, e.g. a wildcard
+      // or a fast flip), then gate unconditionally: the relaunch moved
+      // providers, so the domain points at the OLD headscale until the user
+      // flips it, and a health pass against the old server would split the
+      // mesh (keys minted on the new one, clients registering on the old)
+      for (let i = 0; i < 6; i++) {
+        if (await ctx.services.rpc.httpOk(`https://${domain}/health`)) return { dns: true };
+        await ctx.services.sleep(5000);
+      }
+      throw new AwaitUser(
+        p("dns"),
+        `headscale moved to a new provider: update the DNS record for ${domain} → CNAME ${ingress}, ` +
+          "then resume. Every mesh client dials this domain, so nothing re-registers until it " +
+          "points at the new deployment.",
+      );
+    },
+  });
+
+  steps.push({
+    name: p("rekey"),
+    async run(ctx) {
+      const configure = ctx.output<{ restored: boolean; keys?: { perNode: Record<string, string>; home: string } }>(
+        p("configure"),
+      )!;
+      if (configure.restored) return { skipped: true, reason: "mesh identity restored from backup" };
+      const keys = configure.keys!;
+      const cert = loadCert(ctx);
+      const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+
+      // phase A: fresh preauth key into every mesh component's env. The
+      // manifest push restarts the container, whose entrypoint re-runs
+      // tailscale up with the new key against the new mesh.
+      const updateMsgs: Msg[] = [];
+      const planned: { row: FleetComponentRow; text: string }[] = [];
+      for (const k of meshKeys) {
+        const row = componentRow(ctx, k);
+        const sdlPath = sdlPathFor(ctx, k);
+        let text = fs.readFileSync(sdlPath, "utf8");
+        if (!text.includes("TS_AUTHKEY=")) continue;
+        text = text.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${keys.perNode[k]}`);
+        planned.push({ row, text });
+      }
+      for (const { row, text } of planned) {
+        const sdlPath = sdlPathFor(ctx, row.key);
+        fs.writeFileSync(sdlPath, text);
+        // hashes go on-chain in ONE tx (one signature) before any PUT;
+        // providers 422 a manifest whose hash drifted from the deployment
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), artifacts.manifestJson);
+        updateMsgs.push({
+          typeUrl: TypeUrl.UpdateDeployment,
+          value: { id: { owner, dseq: row.dseq }, hash: artifacts.hash },
+        });
+      }
+      if (updateMsgs.length > 0) await ctx.requireTx(p("rekey"), updateMsgs);
+      for (const { row } of planned) {
+        const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), "utf8");
+        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifest);
+      }
+
+      // collect: every component re-registers and reports its new tailnet IP
+      // (sequential allocation on a fresh db — IPs can shuffle)
+      const newIps: Record<string, string> = {};
+      for (const { row } of planned) newIps[row.key] = await collectIp(ctx, row);
+
+      // phase B: env references to the OLD IPs (sentry tunnels to validators,
+      // explorer tunnels to sentries) point nowhere now; rewrite and push
+      // once more where they occur. Skipped for components whose env names
+      // no stale IP (validators, fresh-from-launch placeholders).
+      const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(ctx.launchId, "await-mesh");
+      const ipMap = new Map<string, string>();
+      for (const k of meshKeys) {
+        const oldIp = componentRow(ctx, k).tailnet_ip ?? launchMesh?.ips[k];
+        if (oldIp && newIps[k] && oldIp !== newIps[k]) ipMap.set(oldIp, newIps[k]);
+      }
+      const ipMsgs: Msg[] = [];
+      const changedRows: FleetComponentRow[] = [];
+      for (const { row } of planned) {
+        const sdlPath = sdlPathFor(ctx, row.key);
+        let text = fs.readFileSync(sdlPath, "utf8");
+        let changed = false;
+        for (const [o, n] of ipMap) {
+          if (!text.includes(o)) continue;
+          text = text.replace(new RegExp(`(?<![\\d.])${o.replace(/\./g, "\\.")}(?![\\d.])`, "g"), n);
+          changed = true;
+        }
+        if (!changed) continue;
+        fs.writeFileSync(sdlPath, text);
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), artifacts.manifestJson);
+        ipMsgs.push({
+          typeUrl: TypeUrl.UpdateDeployment,
+          value: { id: { owner, dseq: row.dseq }, hash: artifacts.hash },
+        });
+        changedRows.push(row);
+      }
+      if (ipMsgs.length > 0) await ctx.requireTx(p("rekey-ips"), ipMsgs);
+      for (const row of changedRows) {
+        const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), "utf8");
+        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifest);
+      }
+      // the second push restarts them again; wait for the mesh to settle
+      for (const row of changedRows) await collectIp(ctx, row);
+      return { newIps, ipMap: Object.fromEntries(ipMap) };
+    },
+  });
+
+  steps.push({
+    name: p("rewire"),
+    async run(ctx) {
+      const rekey = ctx.output<{ skipped?: boolean; newIps?: Record<string, string>; ipMap?: Record<string, string> }>(
+        p("rekey"),
+      )!;
+      if (rekey.skipped) return { skipped: true };
+      const newIps = rekey.newIps!;
+      const pairs = Object.entries(rekey.ipMap ?? {});
+      // trackers: component rows + the launch's await-mesh output
+      for (const [k, ip] of Object.entries(newIps)) {
+        ctx.db.updateComponentRuntime(ctx.launchId, k, { tailnet_ip: ip });
+      }
+      const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(ctx.launchId, "await-mesh");
+      ctx.db.stepDone(ctx.launchId, "await-mesh", { ips: { ...(launchMesh?.ips ?? {}), ...newIps } });
+      // validators' persistent_peers live in config.toml on the volume (not
+      // the env): sed stale IPs and restart. Fleets peered over the sentry's
+      // PUBLIC endpoint match nothing and skip the restart.
+      for (const vk of valKeys) {
+        const row = componentRow(ctx, vk);
+        const target = rowTarget(ctx, row);
+        let touched = false;
+        for (const [o, n] of pairs) {
+          const has = await ctx.services.ssh.exec(
+            target,
+            `grep -c '${o.replace(/\./g, "\\.")}' ${NODE_HOME}/config/config.toml || true`,
+          );
+          if (has.stdout.trim() === "0" || has.stdout.trim() === "") continue;
+          await ctx.services.ssh.exec(target, `sed -i 's|${o}|${n}|g' ${NODE_HOME}/config/config.toml`);
+          touched = true;
+        }
+        if (touched) await restartNode(ctx.services.ssh, target);
+      }
+      return { rewired: true };
+    },
+  });
+
+  steps.push({
+    name: p("signer"),
+    async run(ctx) {
+      const rekey = ctx.output<{ skipped?: boolean }>(p("rekey"))!;
+      if (rekey.skipped || spec.security.keyMode !== "tmkms") return { skipped: true };
+      const configure = ctx.output<{ keys?: { home: string } }>(p("configure"))!;
+      const rekeyOut = ctx.output<{ newIps?: Record<string, string> }>(p("rekey"))!;
+      const home = configure.keys!.home;
+      const newIps = rekeyOut.newIps ?? {};
+      // a ready signer's reconnect lands within seconds: poll a minute before
+      // parking (same cushion as resume-signing's await-signer)
+      const poll = async (): Promise<string[]> => {
+        const missing: string[] = [];
+        for (const vk of valKeys) {
+          const row = componentRow(ctx, vk);
+          const probe = await ctx.services.ssh
+            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE)
+            .catch(() => ({ stdout: "" }));
+          if (!probeSaysConnected(probe.stdout)) missing.push(vk);
+        }
+        return missing;
+      };
+      for (let attempt = 0; attempt < 12; attempt++) {
+        if (attempt > 0) await ctx.services.sleep(5000);
+        if ((await poll()).length === 0) return { connected: true };
+      }
+      const addrs = valKeys
+        .map((vk) => `  ${vk}: addr = "tcp://${newIps[vk] ?? "<see tmkms panel>"}:26659"`)
+        .join("\n");
+      throw new AwaitUser(
+        p("signer"),
+        "the mesh re-keyed: re-join your tmkms signer machine to the new mesh and repoint it " +
+          "at the validator(s), then restart tmkms:\n" +
+          `  sudo tailscale up --login-server=https://${domain} --authkey=${home} --hostname tmkms-${spec.network.name}\n` +
+          `${addrs}\n` +
+          "Resume once the tmkms panel reports the signer connected.",
+      );
+    },
+  });
+
+  steps.push({
+    name: p("verify"),
+    async run(ctx) {
+      if (!(await ctx.services.rpc.httpOk(`https://${domain}/health`))) {
+        throw new Error(`headscale health check failed at ${domain} at the end of the op`);
+      }
+      ctx.db.setComponentState(ctx.launchId, key, "active");
+      ctx.db.setFleetOpStatus(opId, "done");
+      return { ok: true };
     },
   });
 
@@ -1979,7 +2506,13 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {  co
     if (op.status !== "active" && op.status !== "done") continue;
     // done ops keep their steps in the list — checkpointed rows skip instantly
     const params = JSON.parse(op.params_json);
-    if (op.kind === "relaunch") steps.push(...relaunchSteps(op.id, params, spec));
+    if (op.kind === "relaunch") {
+      steps.push(
+        ...(params.key === "headscale"
+          ? headscaleRelaunchSteps(op.id, params, spec)
+          : relaunchSteps(op.id, params, spec)),
+      );
+    }
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));

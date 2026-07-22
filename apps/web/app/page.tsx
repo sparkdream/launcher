@@ -514,6 +514,10 @@ export default function Page() {
   const [tmkms, setTmkms] = useState<import("../lib/api").TmkmsSetup | null>(null);
   const [tmkmsId, setTmkmsId] = useState<string | null>(null);
   const [tmkmsStatus, setTmkmsStatus] = useState<import("../lib/api").TmkmsStatus | null>(null);
+  // per-validator signing deltas, diffed between status polls: the stall
+  // signal (0 new blocks while connected) lives in the delta, not the counters
+  const [tmkmsSignDeltas, setTmkmsSignDeltas] = useState<Record<string, { seen: number; missed: number } | null>>({});
+  const tmkmsPrevCounters = useRef<Record<string, { missed: number; offset: number }>>({});
   const showTmkms = async (id: string) => {
     setError(null);
     try {
@@ -528,6 +532,8 @@ export default function Page() {
     setTmkms(null);
     setTmkmsId(null);
     setTmkmsStatus(null);
+    setTmkmsSignDeltas({});
+    tmkmsPrevCounters.current = {};
   };
 
 
@@ -1228,7 +1234,24 @@ export default function Page() {
       import("../lib/api").then(({ getTmkmsStatus }) =>
         getTmkmsStatus(tmkmsId)
           .then((s) => {
-            if (!stop) setTmkmsStatus(s);
+            if (stop) return;
+            setTmkmsStatus(s);
+            // diff the slashing counters against the previous sample: "no new
+            // blocks while connected" is the live stall signal; a backward
+            // jump (state re-sync) hides the row rather than lying
+            const prev = tmkmsPrevCounters.current;
+            const deltas: Record<string, { seen: number; missed: number } | null> = {};
+            for (const v of s.validators) {
+              if (v.indexOffset === null || v.missedBlocks === null) continue;
+              const p = prev[v.key];
+              if (p) {
+                const seen = v.indexOffset - p.offset;
+                deltas[v.key] =
+                  seen >= 0 ? { seen, missed: Math.max(0, v.missedBlocks - p.missed) } : null;
+              }
+              prev[v.key] = { missed: v.missedBlocks, offset: v.indexOffset };
+            }
+            setTmkmsSignDeltas(deltas);
           })
           .catch(() => {}),
       );
@@ -3300,14 +3323,12 @@ export default function Page() {
                                       upgrade…
                                     </button>
                                   )}
-                                  {c.key !== "headscale" && (
-                                    <button
-                                      className="btn amber"
-                                      onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}
-                                    >
-                                      relaunch
-                                    </button>
-                                  )}
+                                  <button
+                                    className="btn amber"
+                                    onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}
+                                  >
+                                    relaunch
+                                  </button>
                                   <button
                                     className="btn red"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "close")}
@@ -3318,7 +3339,7 @@ export default function Page() {
                               )}
                               {/* a closed/relaunching node can still be relaunched
                                   (redeploy fresh) — the only action that applies */}
-                              {c.state !== "active" && c.key !== "headscale" && !shutDown && (
+                              {c.state !== "active" && !shutDown && (
                                 <button
                                   className="btn amber"
                                   onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}
@@ -3470,25 +3491,63 @@ export default function Page() {
                       ))
                     )}
                   </div>
-                  {tmkmsStatus.validators.map((v) => (
-                    <div key={v.key}>
-                      {v.key}:{" "}
-                      {v.signerConnected === null ? (
-                        <span style={{ color: "var(--dim)" }}>probe unreachable</span>
-                      ) : !v.signerConnected ? (
-                        <span style={{ color: "var(--amber-text)" }}>waiting for signer</span>
-                      ) : v.pubkeyMatches === false ? (
-                        <span style={{ color: "var(--red-text)" }}>
-                          connected, but the signer holds the wrong consensus key (expected{" "}
-                          {v.expectedPubkey})
-                        </span>
-                      ) : v.pubkeyMatches === true ? (
-                        <span style={{ color: "var(--ok)" }}>signer connected, key matches the spec</span>
-                      ) : (
-                        <span style={{ color: "var(--ok)" }}>signer connected</span>
-                      )}
-                    </div>
-                  ))}
+                  {tmkmsStatus.validators.map((v) => {
+                    const delta = tmkmsSignDeltas[v.key];
+                    const peer = v.signerPeers?.[0];
+                    return (
+                      <div key={v.key}>
+                        {v.key}:{" "}
+                        {v.signerConnected === null ? (
+                          <span style={{ color: "var(--dim)" }}>probe unreachable</span>
+                        ) : !v.signerConnected ? (
+                          <span style={{ color: "var(--amber-text)" }}>waiting for signer</span>
+                        ) : v.pubkeyMatches === false ? (
+                          <span style={{ color: "var(--red-text)" }}>
+                            connected, but the signer holds the wrong consensus key (expected{" "}
+                            {v.expectedPubkey})
+                          </span>
+                        ) : v.pubkeyMatches === true ? (
+                          <span style={{ color: "var(--ok)" }}>signer connected, key matches the spec</span>
+                        ) : (
+                          <span style={{ color: "var(--ok)" }}>signer connected</span>
+                        )}
+                        {peer && (
+                          <span className="dim-note">
+                            {" · "}
+                            {peer.relay ? `path relayed via ${peer.relay}` : "path direct"}
+                          </span>
+                        )}
+                        {v.signerRelayMs !== null && (
+                          <span className="dim-note">
+                            {" · "}
+                            {Math.round(v.signerRelayMs)}ms to the relay
+                          </span>
+                        )}
+                        {v.signerRelayMs !== null && v.signerRelayMs > 1000 && (
+                          <span style={{ color: "var(--amber-text)" }}>
+                            {" "}
+                            (high: a stall over 5s interrupts signing)
+                          </span>
+                        )}
+                        {delta && delta.seen > 0 && delta.missed === 0 && (
+                          <span className="dim-note">
+                            {" · "}signed the last {delta.seen} block{delta.seen === 1 ? "" : "s"}
+                          </span>
+                        )}
+                        {delta && delta.seen > 0 && delta.missed > 0 && (
+                          <span style={{ color: "var(--amber-text)" }}>
+                            {" · "}missed {delta.missed} of the last {delta.seen} blocks
+                          </span>
+                        )}
+                        {delta && delta.seen === 0 && v.signerConnected === true && (
+                          <span style={{ color: "var(--amber-text)" }}>
+                            {" · "}no new blocks since the last check: the signer path may be
+                            stalling
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
                   {tmkmsStatus.validators.length > 0 &&
                     tmkmsStatus.validators.every(
                       (v) => v.signerConnected === true && v.pubkeyMatches !== false,

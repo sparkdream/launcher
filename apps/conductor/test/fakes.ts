@@ -304,10 +304,19 @@ export class FakeSsh {
    *  check). Unset → the answer carries no validator_info (unknown, never a
    *  mismatch). */
   statusConsensusPubkey: string | null = null;
+  /** When true, validators' config.toml still references the pre-rekey IPs
+   *  (headscale relaunch's rewire probe). */
+  configHasStaleIp = false;
   private rejoined = new Set<string>();
   execLog: Array<{ target: string; command: string }> = [];
   private ipCounter = 10;
   private ips = new Map<string, string>();
+
+  /** Simulate a mesh re-key: previously assigned tailnet IPs are forgotten,
+   *  so the next `ip -4` per target hands out fresh ones. */
+  remapTailnetIps(): void {
+    this.ips.clear();
+  }
 
   private id(target: SshTarget): string {
     return `${target.host}:${target.port}`;
@@ -338,6 +347,10 @@ export class FakeSsh {
       if (this.ipv6BlackHole && !this.rejoined.has(id)) return ok("");
       if (!this.ips.has(id)) this.ips.set(id, `100.64.0.${this.ipCounter++}`);
       return ok(this.ips.get(id)!);
+    }
+    // mesh re-key (headscale relaunch): config.toml peer-IP presence probe
+    if (command.includes("grep -c") && command.includes("config.toml")) {
+      return ok(this.configHasStaleIp ? "1" : "0");
     }
     // await-mesh remediation: resolve headscale's IPv4 (the piped awk result)
     if (command.includes("nslookup")) return ok("104.21.47.136");
