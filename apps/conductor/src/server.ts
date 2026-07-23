@@ -56,7 +56,7 @@ import type {
   SshEndpoints,
 } from "./steps/phase-bcd.js";
 import type { SshTarget } from "./services.js";
-import { FleetService } from "./fleet.js";
+import { describePendingTx, FleetService } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
@@ -436,7 +436,39 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (denyForeign(req, reply, launch)) return;
     const pending = deps.db.nextPendingTx(id);
     if (!pending) return reply.status(204).send();
-    return { step: pending.step, msgs: JSON.parse(pending.msgs_json) };
+    return {
+      step: pending.step,
+      msgs: JSON.parse(pending.msgs_json),
+      ...describePendingTx(deps.db, id, pending.step),
+    };
+  });
+
+  // dismiss the queued request instead of signing it: nothing is broadcast,
+  // and the queue is oldest-first, so an unwanted head would otherwise
+  // shadow every later fleet action until it was signed
+  app.delete("/api/launches/:id/pending-tx", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const { step } = req.query as { step?: string };
+    const launch = deps.db.getLaunch(id);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const pending = deps.db.nextPendingTx(id);
+    if (!pending) return reply.status(409).send({ error: "nothing is waiting for a signature" });
+    // the caller names the step it displayed: the queue head can advance
+    // between the poll and the click, and dismissing a request the user
+    // never saw is exactly the surprise this endpoint exists to prevent
+    if (step && step !== pending.step) {
+      return reply.status(409).send({
+        error: `the signing queue has moved on to ${pending.step}: reload and dismiss that one if you meant to`,
+      });
+    }
+    const described = describePendingTx(deps.db, id, pending.step);
+    if (!deps.db.discardUnsignedPendingTx(id, pending.step)) {
+      return reply
+        .status(409)
+        .send({ error: `${pending.step} was signed already: it cannot be recalled` });
+    }
+    return { status: "dismissed", step: pending.step, ...described };
   });
 
   app.post("/api/launches/:id/tx-result", async (req, reply) => {

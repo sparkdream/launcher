@@ -75,6 +75,65 @@ export interface FleetSummary {
   unmanaged: Array<{ dseq: string; state: string }>;
 }
 
+export interface PendingTxOrigin {
+  /**
+   * Plain-language account of what put this signature request in the queue.
+   * The step name alone ("fleet:close:27846438") does not tell a user which
+   * button produced it, and the banner is often read long after the click.
+   */
+  origin: string;
+  /**
+   * fleet-action — a standalone request (close, shutdown, top-up); dismissing
+   * it cancels the action outright.
+   * launch-step — the launch engine is blocked on it; dismissing clears the
+   * banner, but the step re-enqueues an equivalent tx on the next resume,
+   * so the way to stop it for good is aborting the op or the launch.
+   */
+  kind: "fleet-action" | "launch-step";
+}
+
+/** Explain a queued signature request so it can be dismissed knowingly. */
+export function describePendingTx(
+  db: ConductorDb,
+  launchId: string,
+  step: string,
+): PendingTxOrigin {
+  if (step === "fleet:shutdown") {
+    return { kind: "fleet-action", origin: "the fleet shutdown you requested" };
+  }
+  const fleetAction = /^fleet:(close|topup):(.+)$/.exec(step);
+  if (fleetAction) {
+    const action = fleetAction[1]!;
+    const dseq = fleetAction[2]!;
+    const component = db.getFleetComponentByDseq(launchId, dseq);
+    const what = component ? `${component.key} (dseq ${dseq})` : `deployment ${dseq}`;
+    return {
+      kind: "fleet-action",
+      origin:
+        action === "topup"
+          ? `a deposit top-up for ${what}`
+          : component
+            ? `closing ${what}, from its close or re-place action`
+            : // no component row owns this dseq: an abandoned op's deployment,
+              // whose close requestAbortOp enqueues to refund the escrow
+              `closing ${what}, the deployment left behind by an abandoned operation`,
+    };
+  }
+  const opStep = /^op(\d+):(.+)$/.exec(step);
+  if (opStep) {
+    const opId = opStep[1]!;
+    const name = opStep[2]!;
+    const op = db.listFleetOps(launchId).find((o) => o.id === Number(opId));
+    return {
+      kind: "launch-step",
+      origin: op
+        ? `the ${op.kind} operation (#${opId}), at its ${name} step`
+        : `operation #${opId}, at its ${name} step`,
+    };
+  }
+  return { kind: "launch-step", origin: `the launch's ${step} step` };
+}
+
 export class FleetService {
   constructor(
     private readonly db: ConductorDb,

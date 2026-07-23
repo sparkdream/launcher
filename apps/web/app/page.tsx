@@ -1154,6 +1154,27 @@ export default function Page() {
     }
   }, [wallet, launchId, pending, chain]);
 
+  // the signing queue serves oldest-first, so an unwanted head blocks every
+  // later fleet action — dismissing it is the only way out short of signing
+  const dismissPendingTx = useCallback(async () => {
+    if (!launchId || !pending) return;
+    const ok = window.confirm(
+      pending.kind === "fleet-action"
+        ? `Cancel ${pending.origin}? Nothing is signed or broadcast, so the action simply does not happen.`
+        : `Clear the signature request from ${pending.origin}? Nothing is broadcast, but the step re-creates this transaction the next time the launch resumes, so abort the operation itself to stop it for good.`,
+    );
+    if (!ok) return;
+    setError(null);
+    try {
+      const { discardPendingTx } = await import("../lib/api");
+      await discardPendingTx(launchId, pending.step);
+      setPending(null);
+      setSignFailedStep(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [launchId, pending]);
+
   const signingGentxRef = useRef(false);
   const signGentxNow = useCallback(async () => {
     if (!launchId || !launch || !pendingGentx || signingGentxRef.current) return;
@@ -1761,9 +1782,24 @@ export default function Page() {
                 of their own flow */}
             ({[...new Set(pending.msgs.map((m) => m.typeUrl.split(".").pop() ?? m.typeUrl))].join(", ")}
             {pending.msgs.length > 1 ? ` × ${pending.msgs.length}` : ""})
+            {/* a request read minutes after the click needs to say what it
+                came from, or the only safe move looks like signing it */}
+            {pending.origin && <span className="dim-note"> · {pending.origin}</span>}
           </span>
           <button onClick={sign} className="btn primary small" disabled={busy !== null}>
             Sign with Keplr
+          </button>
+          <button
+            className="btn"
+            title={
+              pending.kind === "fleet-action"
+                ? "Cancel this request without signing. Nothing is broadcast and the action does not happen."
+                : "Clear this request without signing. The step re-creates it the next time the launch resumes."
+            }
+            onClick={() => dismissPendingTx()}
+            disabled={busy !== null}
+          >
+            {pending.kind === "fleet-action" ? "cancel request" : "dismiss"}
           </button>
           {signFailedStep === pending.step && (
             <button

@@ -462,6 +462,22 @@ export class ConductorDb {
       .run(launchId);
   }
 
+  /**
+   * Drop one unsigned tx: the user dismissed the signature request. Signed
+   * rows are deliberately out of reach — those are already broadcast, and
+   * hiding the row would not recall the tx. Returns false when the step is
+   * gone or already signed, so the caller can say so instead of claiming a
+   * cancel that did not happen.
+   */
+  discardUnsignedPendingTx(launchId: string, step: string): boolean {
+    const info = this.db
+      .prepare(
+        "DELETE FROM pending_txs WHERE launch_id = ? AND step = ? AND status IN ('pending', 'failed')",
+      )
+      .run(launchId, step);
+    return info.changes > 0;
+  }
+
   /** Signed rows whose step matches a LIKE pattern — already broadcast, so
    *  they cannot be recalled; callers can only warn about them. */
   listSignedPendingTxsLike(launchId: string, pattern: string): PendingTxRow[] {

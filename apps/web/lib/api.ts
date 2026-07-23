@@ -128,6 +128,12 @@ export interface LaunchView {
 export interface PendingTx {
   step: string;
   msgs: Msg[];
+  /** What enqueued this request, in plain language (the step name alone
+   *  does not say which button produced it). */
+  origin: string;
+  /** fleet-action: dismissing cancels it. launch-step: the step re-enqueues
+   *  an equivalent tx on the next resume. */
+  kind: "fleet-action" | "launch-step";
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -252,6 +258,19 @@ export async function getPendingTx(id: string): Promise<PendingTx | null> {
   const res = await afetch(`/api/launches/${id}/pending-tx`);
   if (res.status === 204) return null;
   return json(res);
+}
+
+/** Drop the queued signature request without signing it. `step` is the one
+ *  the banner displayed: the server refuses if the queue has moved on. */
+export async function discardPendingTx(
+  id: string,
+  step: string,
+): Promise<{ status: string; step: string; kind: PendingTx["kind"] }> {
+  return json(
+    await afetch(`/api/launches/${id}/pending-tx?step=${encodeURIComponent(step)}`, {
+      method: "DELETE",
+    }),
+  );
 }
 
 export async function postTxResult(id: string, txHash: string): Promise<void> {

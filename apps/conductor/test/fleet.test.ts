@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
-import { FleetService } from "../src/fleet.js";
+import { describePendingTx, FleetService } from "../src/fleet.js";
 import { allSteps, buildServer } from "../src/index.js";
 import { fakeServices, FakeSigner, type FakeWorld } from "./fakes.js";
 
@@ -612,6 +612,121 @@ describe("fleet bundle", () => {
     expect(db2.getLaunch("fl")).toBeTruthy();
     expect(fs.existsSync(path.join(work2, "launches/fl/nodes"))).toBe(false);
     db2.close();
+    db.close();
+  }, 120_000);
+});
+
+describe("dismissing a queued signature request", () => {
+  it("names what enqueued a close and cancels it without closing anything", async () => {
+    const { db, services, work } = await launched();
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    await app.inject({ method: "GET", url: "/api/fleet?owner=akash1owner" }); // materialize
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "close", confirm: true },
+    });
+
+    // the banner must say which action produced the request: the step name
+    // alone ("fleet:close:<dseq>") is unreadable minutes after the click
+    const pending = (
+      await app.inject({ method: "GET", url: "/api/launches/fl/pending-tx" })
+    ).json() as any;
+    expect(pending.kind).toBe("fleet-action");
+    expect(pending.origin).toContain("sentry-0");
+    expect(pending.origin).toContain(sentry.dseq);
+
+    const dismissed = await app.inject({
+      method: "DELETE",
+      url: `/api/launches/fl/pending-tx?step=${encodeURIComponent(pending.step)}`,
+    });
+    expect(dismissed.statusCode).toBe(200);
+    expect((dismissed.json() as any).status).toBe("dismissed");
+
+    // queue empty, and the deployment was never closed — nothing was signed
+    const after = await app.inject({ method: "GET", url: "/api/launches/fl/pending-tx" });
+    expect(after.statusCode).toBe(204);
+    expect(db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.state).not.toBe(
+      "closed",
+    );
+    db.close();
+  }, 120_000);
+
+  it("refuses to dismiss a request the caller did not see", async () => {
+    const { db, services, work } = await launched();
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    await app.inject({ method: "GET", url: "/api/fleet?owner=akash1owner" });
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "close", confirm: true },
+    });
+
+    // the queue head advanced between the UI's poll and its click
+    const stale = await app.inject({
+      method: "DELETE",
+      url: "/api/launches/fl/pending-tx?step=fleet:close:99999",
+    });
+    expect(stale.statusCode).toBe(409);
+    expect((stale.json() as any).error).toContain("moved on");
+    expect(db.nextPendingTx("fl")!.step).toBe(`fleet:close:${sentry.dseq}`);
+
+    // an empty queue has nothing to dismiss
+    db.discardUnsignedPendingTx("fl", `fleet:close:${sentry.dseq}`);
+    const empty = await app.inject({ method: "DELETE", url: "/api/launches/fl/pending-tx" });
+    expect(empty.statusCode).toBe(409);
+    db.close();
+  }, 120_000);
+
+  it("leaves a signed tx alone — it is already broadcast", async () => {
+    const { db, services, work } = await launched();
+    const app = buildServer({
+      db,
+      services,
+      workRoot: work,
+      steps: allSteps(),
+      monitorIntervalMs: 0,
+    });
+    await app.inject({ method: "GET", url: "/api/fleet?owner=akash1owner" });
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "close", confirm: true },
+    });
+    const step = `fleet:close:${sentry.dseq}`;
+    db.setPendingTxSigned("fl", step, "AB".repeat(32));
+    expect(db.discardUnsignedPendingTx("fl", step)).toBe(false);
+    expect(db.getPendingTx("fl", step)!.status).toBe("signed");
+    db.close();
+  }, 120_000);
+
+  it("describes a launch step as one the engine re-creates on resume", async () => {
+    const { db, services, work } = await launched();
+    const opId = db.createFleetOp("fl", "relaunch", { key: "sentry-0" });
+    db.enqueuePendingTx("fl", `op${opId}:close`, JSON.stringify([]));
+    expect(describePendingTx(db, "fl", `op${opId}:close`)).toEqual({
+      kind: "launch-step",
+      origin: `the relaunch operation (#${opId}), at its close step`,
+    });
+    expect(describePendingTx(db, "fl", "create-leases")).toEqual({
+      kind: "launch-step",
+      origin: "the launch's create-leases step",
+    });
     db.close();
   }, 120_000);
 });
