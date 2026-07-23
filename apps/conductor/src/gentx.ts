@@ -141,6 +141,63 @@ export interface GentxVerifyResult {
 }
 
 /**
+ * Keplr's background sign handler returns the signed doc after a recursive
+ * alphabetical key sort (keyring-cosmos/service.ts → common/json/sort.ts),
+ * so raw key order in the wallet's doc is never the conductor's. Amino sign
+ * bytes are themselves sorted JSON — order carries no consensus meaning —
+ * which is why the signature still verifies. Drift checks compare the
+ * canonical (sorted) form; any value-level tampering still fails here or
+ * under verifyAminoSignature.
+ */
+function sortKeysDeep<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(sortKeysDeep) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      out[k] = sortKeysDeep((value as Record<string, unknown>)[k]);
+    }
+    return out as T;
+  }
+  return value;
+}
+
+/**
+ * Where two JSON-shaped values first differ, for a drift reason the
+ * operator can act on ("msgs[0].value.commission.rate") — "msgs differ"
+ * alone sent operators hunting blind. Inputs must be key-sorted already
+ * (sortKeysDeep) so ordering doesn't read as a difference.
+ */
+function firstDiffPath(expected: unknown, actual: unknown, at: string): string {
+  if (JSON.stringify(expected) === JSON.stringify(actual)) return at;
+  if (Array.isArray(expected) && Array.isArray(actual)) {
+    if (expected.length !== actual.length) {
+      return `${at} (signed ${actual.length}, expected ${expected.length})`;
+    }
+    for (let i = 0; i < expected.length; i++) {
+      if (JSON.stringify(expected[i]) !== JSON.stringify(actual[i])) {
+        return firstDiffPath(expected[i], actual[i], `${at}[${i}]`);
+      }
+    }
+    return at;
+  }
+  if (expected && actual && typeof expected === "object" && typeof actual === "object") {
+    const e = expected as Record<string, unknown>;
+    const a = actual as Record<string, unknown>;
+    for (const k of Object.keys(e)) {
+      if (!(k in a)) return `${at}.${k} (missing from the signed doc)`;
+      if (JSON.stringify(e[k]) !== JSON.stringify(a[k])) {
+        return firstDiffPath(e[k], a[k], `${at}.${k}`);
+      }
+    }
+    for (const k of Object.keys(a)) {
+      if (!(k in e)) return `${at}.${k} (not in the conductor's doc)`;
+    }
+    return at;
+  }
+  return at;
+}
+
+/**
  * Verify a wallet's amino sign response against the doc the conductor
  * built, before the tx is assembled (§5 step 3b, and Phase G's
  * promote-validator): the signature must be valid over the doc the wallet
@@ -154,6 +211,11 @@ export interface GentxVerifyResult {
  * are copied from the signed doc into the assembled tx, where a changed
  * fee fails at InitChain / broadcast (too low) or spends past the balance
  * the conductor verified (too high), with a far less useful error.
+ *
+ * Drift is compared on canonical (key-sorted) forms: Keplr's background
+ * returns the signed doc with every object's keys re-sorted alphabetically,
+ * so a key-order-naive comparison rejects every genuine Keplr signature
+ * (the 2026-07-22 sparkdream-dev gentx rejection).
  */
 export async function verifySignedDoc(
   expected: StdSignDoc,
@@ -168,14 +230,27 @@ export async function verifySignedDoc(
   if (signed.sequence !== expected.sequence) {
     return { ok: false, reason: `sequence must be ${expected.sequence}` };
   }
-  if (JSON.stringify(signed.msgs) !== JSON.stringify(expected.msgs)) {
-    return { ok: false, reason: "msgs differ from the conductor-built sign doc" };
+  // msgs and fee.amount compare canonical (key-sorted) forms — Keplr
+  // returns the doc with keys recursively sorted, so a raw JSON.stringify
+  // rejects every genuine Keplr signature (see sortKeysDeep)
+  const expectedMsgs = sortKeysDeep(expected.msgs);
+  const signedMsgs = sortKeysDeep(signed.msgs);
+  if (JSON.stringify(signedMsgs) !== JSON.stringify(expectedMsgs)) {
+    return {
+      ok: false,
+      reason: `msgs differ from the conductor-built sign doc (${firstDiffPath(expectedMsgs, signedMsgs, "msgs")})`,
+    };
   }
   if (signed.memo !== expected.memo) {
     return { ok: false, reason: "memo differs from the conductor-built sign doc" };
   }
-  if (JSON.stringify(signed.fee.amount) !== JSON.stringify(expected.fee.amount)) {
-    return { ok: false, reason: "fee amount differs from the conductor-built sign doc" };
+  const expectedAmount = sortKeysDeep(expected.fee.amount);
+  const signedAmount = sortKeysDeep(signed.fee.amount);
+  if (JSON.stringify(signedAmount) !== JSON.stringify(expectedAmount)) {
+    return {
+      ok: false,
+      reason: `fee amount differs from the conductor-built sign doc (${firstDiffPath(expectedAmount, signedAmount, "fee.amount")})`,
+    };
   }
   return verifyAminoSignature(signed, operatorAddress, signature);
 }

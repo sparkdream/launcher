@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
-import { Secp256k1HdWallet, type StdSignDoc } from "@cosmjs/amino";
+import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { toEncodeObject } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
@@ -11,7 +11,7 @@ import { runWithSigner, type GentxSigner } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
 import { buildOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
-import { fakeServices, FakeSigner, type FakeWorld } from "./fakes.js";
+import { fakeServices, FakeSigner, keplrSignAmino, type FakeWorld } from "./fakes.js";
 
 const tmpDirs: string[] = [];
 function tmp(): string {
@@ -863,7 +863,8 @@ esac
   }, 120_000);
 
   it("external operator: wallet signs MsgUnjail through the gentx loop, tx assembled and broadcast", async () => {
-    // the "wallet" is cosmjs amino signing — byte-identical to Keplr's path
+    // the "wallet" signs with cosmjs but answers in Keplr's response shape
+    // (key-sorted signed doc — see keplrSignAmino in fakes)
     const wallet = await Secp256k1HdWallet.fromMnemonic(
       "surround miss nominee dream gap cross assault thank captain prosper drop duty group candy wealth weather scale put",
       { prefix: "sprkdrm" },
@@ -872,7 +873,7 @@ esac
     const address = account!.address;
     const gentxSigner: GentxSigner = {
       async signGentx(signDocJson: string): Promise<string> {
-        return JSON.stringify(await wallet.signAmino(address, JSON.parse(signDocJson) as StdSignDoc));
+        return keplrSignAmino(wallet, address, signDocJson);
       },
     };
     const s = testnetSpec({

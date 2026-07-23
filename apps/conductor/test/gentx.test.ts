@@ -12,14 +12,21 @@ import { AminoTypes, createDefaultAminoConverters } from "@cosmjs/stargate";
 import { verifyAminoSignature } from "../src/amino-verify.js";
 import { ConductorDb } from "../src/db.js";
 import { launchDirs, runWithSigner, type GentxSigner } from "../src/engine.js";
-import { buildGentxSignDoc, gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "../src/gentx.js";
+import {
+  buildGentxSignDoc,
+  gentxResponseFromSignedTx,
+  unsignedTxJsonFromSignDoc,
+  verifySignedDoc,
+  type GentxInputs,
+} from "../src/gentx.js";
 import { allSteps } from "../src/index.js";
-import { fakeServices, FakeSigner } from "./fakes.js";
+import { fakeServices, FakeSigner, keplrSignAmino, keplrSortObjectByKey } from "./fakes.js";
 
 /**
- * External-operator gentx flow (§5 step 3b), end to end: the "wallet" here
- * is cosmjs amino signing — byte-identical to what Keplr does for
- * Ledger-backed accounts — and genesis is validated by the real sparkdreamd.
+ * External-operator gentx flow (§5 step 3b), end to end: the "wallet" signs
+ * with cosmjs but answers in Keplr's response shape (key-sorted signed doc —
+ * see keplrSignAmino in fakes), and genesis is validated by the real
+ * sparkdreamd.
  */
 
 // throwaway test vector — never funded
@@ -62,12 +69,54 @@ function externalSpec(operatorAddress: string): LaunchSpec {
 function walletGentxSigner(wallet: Secp256k1HdWallet, signAs: string): GentxSigner {
   return {
     async signGentx(signDocJson: string): Promise<string> {
-      const signDoc = JSON.parse(signDocJson) as StdSignDoc;
-      const response = await wallet.signAmino(signAs, signDoc);
-      return JSON.stringify(response);
+      return keplrSignAmino(wallet, signAs, signDocJson);
     },
   };
 }
+
+describe("verifySignedDoc vs the wallet's returned doc", () => {
+  const inputs = (address: string): GentxInputs => ({
+    spec: externalSpec(address),
+    valIndex: 0,
+    operatorAddress: address,
+    consensusPubkey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", // 32 zero bytes
+    nodeId: "d765bd2f17896c96646d2dfa82e80b0b60702522",
+    chainId: "sparkdream-1",
+  });
+
+  it("accepts Keplr's key-sorted signed doc (the 2026-07-22 false rejection)", async () => {
+    const { wallet, address } = await operatorWallet();
+    const doc = buildGentxSignDoc(inputs(address));
+    // the premise of the incident: Keplr's sort really does reorder the msgs
+    const keplrSigned = keplrSortObjectByKey(doc);
+    expect(JSON.stringify(keplrSigned.msgs)).not.toBe(JSON.stringify(doc.msgs));
+    const { signature } = await wallet.signAmino(address, doc);
+    const verdict = await verifySignedDoc(doc, { signed: keplrSigned, signature }, address);
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("rejects a tampered msg value and names the differing field", async () => {
+    const { wallet, address } = await operatorWallet();
+    const doc = buildGentxSignDoc(inputs(address));
+    const { signature } = await wallet.signAmino(address, doc);
+    const tampered = keplrSortObjectByKey(doc);
+    tampered.msgs[0].value.commission.rate = "0.990000000000000000";
+    const verdict = await verifySignedDoc(doc, { signed: tampered, signature }, address);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("msgs[0].value.commission.rate");
+  });
+
+  it("rejects a fee amount drift and names the coin", async () => {
+    const { wallet, address } = await operatorWallet();
+    const doc = buildGentxSignDoc(inputs(address));
+    const { signature } = await wallet.signAmino(address, doc);
+    const drifted = keplrSortObjectByKey(doc);
+    drifted.fee.amount = [{ denom: "uspark.sparkdreamtest", amount: "5" }];
+    const verdict = await verifySignedDoc(doc, { signed: drifted, signature }, address);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("fee.amount");
+  });
+});
 
 describe("sign-doc rendering matches the chain's amino encoding", () => {
   // The chain regenerates gentx sign bytes with the SDK's amino-json

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { Secp256k1HdWallet, type StdSignDoc } from "@cosmjs/amino";
 import type { AkashApi, MtlsCredentials } from "../src/akash/client.js";
 import type { Bid, ProviderInfo } from "../src/akash/policy.js";
 import type { Msg } from "../src/akash/messages.js";
@@ -485,4 +486,39 @@ export class FakeSigner implements Signer {
     this.signed.push(msgs);
     return `FAKETX${this.signed.length.toString().padStart(4, "0")}`;
   }
+}
+
+/**
+ * Keplr's response shape, verbatim from its source: the background keyring
+ * returns the signed doc after this recursive alphabetical key sort
+ * (keplr-wallet packages/common/src/json/sort.ts, applied in
+ * keyring-cosmos/service.ts). Amino sign bytes are sorted JSON either way,
+ * so a signature cosmjs produced over the original doc is valid over the
+ * sorted one — exactly as with Keplr.
+ */
+export function keplrSortObjectByKey(obj: any): any {
+  if (typeof obj !== "object" || obj === null) return obj;
+  if (Array.isArray(obj)) return obj.map(keplrSortObjectByKey);
+  const sortedKeys = Object.keys(obj).sort();
+  const result: Record<string, any> = {};
+  sortedKeys.forEach((key) => {
+    result[key] = keplrSortObjectByKey(obj[key]);
+  });
+  return result;
+}
+
+/**
+ * Keplr-faithful signAmino for tests: cosmjs produces the signature, and
+ * the response carries the key-sorted doc exactly as the real extension
+ * returns it — a plain cosmjs response would not exercise the conductor's
+ * drift check the way Keplr does.
+ */
+export async function keplrSignAmino(
+  wallet: Secp256k1HdWallet,
+  address: string,
+  signDocJson: string,
+): Promise<string> {
+  const signDoc = JSON.parse(signDocJson) as StdSignDoc;
+  const { signature } = await wallet.signAmino(address, signDoc);
+  return JSON.stringify({ signed: keplrSortObjectByKey(signDoc), signature });
 }
