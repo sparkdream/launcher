@@ -333,6 +333,41 @@ describe("rolling upgrade op", () => {
     );
   }, 120_000);
 
+  it("gates a validator on its in-container RPC, not the SSH port the restart kills", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    // the upgrade restarts the container, so the provider reassigns the
+    // forwarded SSH port and the old pgrep-over-SSH probe would hang on the
+    // dead port. Model that by failing the validator's recorded SSH endpoint:
+    // verify must still pass by reading the node's localhost RPC in-container.
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.failHosts.add(`${val.ssh_host}:${val.ssh_port}`);
+    w.fleet.requestUpgrade(launch, ["val-0"], "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!.image).toBe(
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28",
+    );
+  }, 120_000);
+
+  it("fails a validator whose in-container height is stalled after upgrade", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.provider.stalledDseqs.add(val.dseq);
+    const opId = w.fleet.requestUpgrade(
+      launch,
+      ["val-0"],
+      "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28",
+    );
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("paused");
+    expect(result.failedStep).toBe(`op${opId}:val-0:verify`);
+    expect(w.db.getStep("fl", `op${opId}:val-0:verify`)!.error).toContain("height is stalled");
+  }, 120_000);
+
   it("retried op skips components already updated on-chain; fee rides the next tx", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
@@ -359,6 +394,23 @@ describe("rolling upgrade op", () => {
     expect(retryTxs[0]![1]!.typeUrl).toBe("/cosmos.bank.v1beta1.MsgSend");
     // manifests still re-sent for all four, skipped component included
     expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
+  }, 120_000);
+
+  it("moves on when the provider already runs the target manifest (identical-PUT 422)", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28";
+    // the target manifest already landed on sentry-0's provider on an earlier
+    // run: on-chain version matches, and the provider refuses the identical
+    // re-PUT with HTTP 422 "manifest version validation failed"
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    w.services.provider.manifestUnchangedDseqs.add(sentry.dseq);
+
+    w.fleet.requestUpgrade(launch, ["sentry-0"], image);
+    // the 422 must not wedge the rollout: the step reads it as "already
+    // deployed" and records the image, moving on to verify
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(image);
   }, 120_000);
 
   it("fails a sentry whose height stalls, reporting the last probe result", async () => {

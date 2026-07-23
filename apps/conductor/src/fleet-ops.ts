@@ -1285,6 +1285,19 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
   return steps;
 }
 
+/**
+ * A provider's PUT rejection for a manifest identical to the one it already
+ * runs. Akash surfaces "no change to apply" as HTTP 422 "manifest version
+ * validation failed" — the same text a genuine hash mismatch produces, so
+ * callers must only read it as "already deployed" once they've confirmed the
+ * on-chain deployment version equals this manifest's hash (a mismatch there
+ * is a real fault to raise, not swallow).
+ */
+function isManifestAlreadyDeployed(e: unknown): boolean {
+  const msg = String(e);
+  return /HTTP 422/.test(msg) && /manifest version validation failed/i.test(msg);
+}
+
 /** Rolling upgrade (§5 "Node upgrades"): serial per component, health-gated. */
 export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSpec): StepDef[] {
   const steps: StepDef[] = [];
@@ -1361,12 +1374,24 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           await ctx.requireTx(p("update"), msgs);
         }
         const cert = loadCert(ctx);
-        await ctx.services.provider.sendManifest(
-          cert,
-          row.host_uri,
-          row.dseq,
-          fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
-        );
+        try {
+          await ctx.services.provider.sendManifest(
+            cert,
+            row.host_uri,
+            row.dseq,
+            fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
+          );
+        } catch (e) {
+          // A provider refuses (HTTP 422 "manifest version validation failed")
+          // a PUT whose manifest matches the one it already runs — there is
+          // nothing to redeploy. By this point the on-chain version already
+          // equals this manifest's hash (skipped or just updated above), so
+          // the 422 can only mean the component is already on the target
+          // manifest: treat it as done and move on rather than wedging the
+          // rollout on a re-run of an upgrade that already landed.
+          if (!isManifestAlreadyDeployed(e)) throw e;
+          ctx.log(`${key}: already running the target manifest — provider reports no change`);
+        }
         ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
         return { image: params.image, txSkipped: onChain?.hash === wantHash };
       },
@@ -1414,17 +1439,33 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
               note(`rpc not up yet: ${cause(e)}`);
             }
           } else {
-            // validators expose no public RPC — the supervised process
-            // being back is the best signal available over SSH
+            // validators expose no public RPC, and this upgrade just restarted
+            // the container, so its forwarded SSH port has been reassigned:
+            // probing over the SSH runner burns the full ~20s dead-port
+            // timeout every iteration before falling back (and the old pgrep
+            // gate needs procps the node image does not carry). Read the
+            // node's own localhost RPC in-container via lease-shell — the
+            // port-independent, progress-based check the health monitor
+            // already relies on (fleet.ts) — and gate on the height advancing.
             try {
-              const running = await ctx.services.ssh.exec(
-                rowTarget(ctx, row),
-                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+              const inContainerHeight = async () => {
+                const r = await ctx.services.provider.shellExec(
+                  loadCert(ctx), row.host_uri, row.dseq, 1, 1, "sparkdreamd",
+                  ["sh", "-c", "wget -qO- http://127.0.0.1:26657/status 2>/dev/null"],
+                );
+                return Number(/latest_block_height."?:?"?(\d+)/.exec(r.stdout)?.[1]);
+              };
+              const a = await inContainerHeight();
+              await ctx.services.sleep(3000);
+              const b = await inContainerHeight();
+              if (Number.isFinite(b) && b > a) return { healthy: true };
+              note(
+                Number.isFinite(b)
+                  ? `in-container rpc answers but height is stalled at ${b}`
+                  : "in-container rpc not up yet",
               );
-              if (running.stdout.trim() === "yes") return { healthy: true };
-              note("ssh reachable, sparkdreamd not running yet");
             } catch (e) {
-              note(`ssh probe failed: ${cause(e)}`);
+              note(`in-container rpc probe failed: ${cause(e)}`);
             }
           }
           await ctx.services.sleep(5000);

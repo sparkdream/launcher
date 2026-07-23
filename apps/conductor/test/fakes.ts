@@ -162,6 +162,17 @@ export class FakeProviderGateway {
    *  manifest matches the deployment's on-chain hash. Inert for dseqs with
    *  no recorded hash, so tests that don't track hashes are unaffected. */
   onChainHash?: (dseq: string) => string | undefined;
+  /** dseqs already running the manifest being PUT: a real provider refuses a
+   *  PUT identical to what it runs ("nothing to redeploy") with the same
+   *  HTTP 422 "manifest version validation failed" as a hash mismatch. Lets
+   *  a test drive an upgrade re-run that already landed on the provider. */
+  manifestUnchangedDseqs = new Set<string>();
+  /** In-container localhost-RPC height for validator reads (upgrade verify,
+   *  health monitor): advances on each /status read so a progress-based gate
+   *  passes. dseqs in stalledDseqs report a frozen height, modelling a node
+   *  that answers but is not making blocks. */
+  private statusHeight = 1_000_000;
+  stalledDseqs = new Set<string>();
 
   async sendManifest(
     _creds: MtlsCredentials,
@@ -178,6 +189,11 @@ export class FakeProviderGateway {
     if (this.deploymentNotFoundDseqs.has(dseq)) {
       throw new Error(
         `provider PUT /deployment/${dseq}/manifest: HTTP 500 rpc error: code = NotFound desc = Deployment not found: key not found`,
+      );
+    }
+    if (this.manifestUnchangedDseqs.has(dseq)) {
+      throw new Error(
+        `provider PUT /deployment/${dseq}/manifest: HTTP 422 manifest version validation failed`,
       );
     }
     const wantHash = this.onChainHash?.(dseq);
@@ -273,6 +289,13 @@ export class FakeProviderGateway {
       return { stdout: JSON.stringify({ key: `hskey-${this.shellLog.length}` }), stderr: "" };
     }
     if (script.includes("SELECT count(*) FROM users")) return { stdout: "1", stderr: "" };
+    if (script.includes("127.0.0.1:26657/status")) {
+      const height = this.stalledDseqs.has(dseq) ? this.statusHeight : ++this.statusHeight;
+      return {
+        stdout: `{"result":{"sync_info":{"latest_block_height":"${height}","catching_up":false}}}`,
+        stderr: "",
+      };
+    }
     if (script.startsWith("base64 ")) {
       return { stdout: Buffer.from("FAKE").toString("base64"), stderr: "" };
     }
