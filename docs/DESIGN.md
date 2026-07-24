@@ -469,10 +469,20 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
    not** (assigned by headscale in Phase E), so peer wiring renders in two
    stages:
    - sentry `persistent_peers` = `<validator_node_id>@127.0.0.1:<tunnelPort>`
-     — fully renderable now (local tunnel address, no IP needed)
+     for each fronted validator (fully renderable now — local tunnel address,
+     no IP needed) **plus every other sentry** at
+     `<sentry_node_id>@<SENTRY_TAILNET_IP>:26656` (placeholder, resolved in
+     Phase E step 18). The sentry layer is a full mesh: validators run
+     `pex = false` and peer only through their own sentries, so without the
+     sentry mesh any mapping with disjoint sentry sets (round-robin with
+     more than one validator) splits the network into islands that can
+     never reach consensus. `private_peer_ids` lists **every** validator's
+     node ID; `unconditional_peer_ids` pins the whole fleet (validators +
+     fellow sentries) against peer-slot eviction
    - validator `persistent_peers` = `<sentry_node_id>@<SENTRY_TAILNET_IP>:26656`
      — rendered with a placeholder here, resolved in Phase E step 18b
-     (public sentry endpoint when reachable, tailnet IP otherwise; see 18b)
+     (public sentry endpoint when reachable, tailnet IP otherwise; see 18b);
+     `unconditional_peer_ids` pins its sentries
    - tunnel port allocation: sentry *s* → validator *v* uses `16656 + v`
      (`TS_TUNNEL_n=<port>:<validator_tailnet_ip>:26656`, IP patched in Phase E)
    - validator quirks baked in: `priv_validator_laddr = tcp://127.0.0.1:26660`
@@ -633,7 +643,11 @@ Per node, parallel where safe:
     `nc -zv 127.0.0.1 <port>`. These ad-hoc tunnels die on container restart
     — step 20b persists the real targets into the SDL env (the durable
     long-term fix is the entrypoint reading tunnel specs from a file;
-    chain-repo image change, see §12.2).
+    chain-repo image change, see §12.2). The step also substitutes the
+    other sentries' tailnet IPs into each sentry's `persistent_peers`
+    placeholders (the sentry full mesh from step 4) — tailnet only; PEX
+    plus the advertised public `external_address` lets CometBFT find
+    direct public routes between sentries on its own.
 18b. `patch-validator-peers` — resolve each validator's `persistent_peers`
     placeholders, **public endpoint first**: for every assigned sentry, the
     step probes the sentry's provider-forwarded public p2p port FROM INSIDE
@@ -890,8 +904,8 @@ survive.
 
 The sentry layer is designed to be the chain's public edge: the sentry SDL
 exposes P2P 26656 `global: true` ("so other nodes can join the network"),
-sentries run `pex = true`, and `private_peer_ids` keeps their validators
-out of gossip. As launched today the port is nevertheless unusable by
+sentries run `pex = true`, and `private_peer_ids` (every validator's node
+ID, on every sentry) keeps the validators out of gossip. As launched today the port is nevertheless unusable by
 strangers: Akash forwards 26656 to a provider-assigned random port while
 `external_address` stays `""` (so the sentry advertises a
 container-internal address, which also poisons PEX gossip), nothing

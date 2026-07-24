@@ -954,3 +954,70 @@ describe("unknown spec keys", () => {
     expect(res.warnings).toEqual([]);
   });
 });
+
+describe("topology connectivity", () => {
+  const topoErrors = (spec: LaunchSpec) =>
+    validateSpec(spec).errors.filter((e) => e.path === "topology");
+
+  it("round-robin 2x2 is connected (the sentry mesh bridges the pairs)", () => {
+    expect(topoErrors(testnetSpec())).toEqual([]);
+  });
+
+  it("rejects multiple validators with no sentries: no peer path at all", () => {
+    const spec = testnetSpec({ topology: { sentries: { count: 0 } } });
+    const errs = topoErrors(spec);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]!.message).toContain("disconnected");
+    expect(errs[0]!.message).toContain("val-1");
+  });
+
+  it("a single validator with no sentries is fine (it runs alone)", () => {
+    const spec = testnetSpec({
+      topology: { validators: { count: 1 }, sentries: { count: 0 } },
+    });
+    expect(topoErrors(spec)).toEqual([]);
+  });
+
+  it("round-robin with fewer sentries than validators strands the tail", () => {
+    const spec = testnetSpec({
+      topology: { validators: { count: 3 }, sentries: { count: 2 } },
+    });
+    const errs = topoErrors(spec);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]!.message).toContain("val-2");
+    expect(errs[0]!.message).not.toContain("val-1");
+  });
+
+  it("disjoint explicit mappings are connected via the sentry mesh", () => {
+    const spec = testnetSpec({
+      topology: { sentries: { count: 2, mapping: [[0], [1]] } },
+    });
+    expect(topoErrors(spec)).toEqual([]);
+  });
+
+  it("explicit mapping leaving a validator uncovered is disconnected", () => {
+    const spec = testnetSpec({
+      topology: { sentries: { count: 1, mapping: [[0]] } },
+    });
+    const errs = topoErrors(spec);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]!.message).toContain("val-1");
+    // the coverage check fires too, on its own path
+    expect(
+      validateSpec(spec).errors.some((e) => e.path === "topology.sentries.mapping"),
+    ).toBe(true);
+  });
+
+  it("join mode: every validator needs its own sentry (public peers only reach sentries)", () => {
+    const uncovered = joinSpec({
+      topology: { validators: { count: 2 }, sentries: { count: 1, mapping: [[0]] } },
+    });
+    const errs = topoErrors(uncovered);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]!.message).toContain("validator 1");
+    const covered = joinSpec({
+      topology: { validators: { count: 2 }, sentries: { count: 1, mapping: [[0, 1]] } },
+    });
+    expect(topoErrors(covered)).toEqual([]);
+  });
+});

@@ -416,6 +416,61 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     }
   }
 
+  // Connectivity: the renderer emits exactly these p2p edges — the sentry
+  // layer as a full mesh, plus each sentry's fronted validators (validators
+  // run pex=false and peer only through their own sentries). A disconnected
+  // graph can never gossip votes across its islands, so a fresh chain never
+  // reaches block 1. Join mode instead requires every validator to have a
+  // sentry: the public network bridges the sentries, but a sentry-less join
+  // validator would boot with an empty peer list.
+  const frontsOf = (s: number): number[] =>
+    mapping === "round-robin"
+      ? V > 0 ? [s % V] : []
+      : (mapping[s] ?? []).filter((v) => v >= 0 && v < V);
+  if (spec.join) {
+    for (let v = 0; v < V; v++) {
+      const covered = Array.from({ length: S }, (_, s) => frontsOf(s)).some((f) => f.includes(v));
+      if (!covered) {
+        err(
+          "topology",
+          `validator ${v} has no sentry: join validators peer only through their own sentries, ` +
+            `so it would boot with no peers at all`,
+        );
+      }
+    }
+  } else if (V + S > 1) {
+    // nodes 0..V-1 are validators, V..V+S-1 are sentries
+    const adjacent: number[][] = Array.from({ length: V + S }, () => []);
+    for (let s = 0; s < S; s++) {
+      for (let s2 = 0; s2 < S; s2++) if (s2 !== s) adjacent[V + s]!.push(V + s2);
+      for (const v of frontsOf(s)) {
+        adjacent[V + s]!.push(v);
+        adjacent[v]!.push(V + s);
+      }
+    }
+    const reached = new Set([0]);
+    const queue = [0];
+    while (queue.length > 0) {
+      for (const m of adjacent[queue.shift()!]!) {
+        if (!reached.has(m)) {
+          reached.add(m);
+          queue.push(m);
+        }
+      }
+    }
+    if (reached.size < V + S) {
+      const stranded = Array.from({ length: V + S }, (_, n) => n)
+        .filter((n) => !reached.has(n))
+        .map((n) => (n < V ? `val-${n}` : `sentry-${n - V}`));
+      err(
+        "topology",
+        `the p2p graph is disconnected: ${stranded.join(", ")} cannot reach the rest of the ` +
+          `fleet, so the chain could never produce a block. Give every validator at least one ` +
+          `sentry (sentries interconnect automatically).`,
+      );
+    }
+  }
+
   // Validator monikers: one per validator when spelled out
   const monikers = spec.topology.validators.monikers;
   if (monikers && monikers.length !== V) {

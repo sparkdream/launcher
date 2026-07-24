@@ -188,6 +188,8 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     expect(val0).toContain(
       `persistent_peers = "${keys.nodeIds["sentry-0"]}@{{TAILNET_IP:sentry-0}}:26656"`,
     );
+    // fleet links survive peer-slot pressure
+    expect(val0).toContain(`unconditional_peer_ids = "${keys.nodeIds["sentry-0"]}"`);
     expect(val0).toContain('moniker = "sparkdream-val-0"');
     expect(val0).toContain('timeout_commit = "3s"');
     // softsign: file-based privval — the template's tmkms socket is cleared
@@ -196,10 +198,20 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     expect(val0).toContain("allow_duplicate_ip = true");
 
     const sentry1 = fs.readFileSync(path.join(dirs.node("sentry-1"), "config", "config.toml"), "utf8");
+    // sentry mesh: fronted validator via local tunnel, plus the other sentry
+    // over the tailnet — the bridge that connects the two validator islands
     expect(sentry1).toContain(
-      `persistent_peers = "${keys.nodeIds["val-1"]}@127.0.0.1:16657"`,
+      `persistent_peers = "${keys.nodeIds["val-1"]}@127.0.0.1:16657,` +
+        `${keys.nodeIds["sentry-0"]}@{{TAILNET_IP:sentry-0}}:26656"`,
     );
-    expect(sentry1).toContain(`private_peer_ids = "${keys.nodeIds["val-1"]}"`);
+    // EVERY validator is gossip-hidden, not just the fronted one
+    expect(sentry1).toContain(
+      `private_peer_ids = "${keys.nodeIds["val-0"]},${keys.nodeIds["val-1"]}"`,
+    );
+    expect(sentry1).toContain(
+      `unconditional_peer_ids = "${keys.nodeIds["val-0"]},${keys.nodeIds["val-1"]},` +
+        `${keys.nodeIds["sentry-0"]}"`,
+    );
 
     const app = fs.readFileSync(path.join(dirs.node("sentry-0"), "config", "app.toml"), "utf8");
     expect(app).toContain('minimum-gas-prices = "25000uspark.sparkdreamtest"');

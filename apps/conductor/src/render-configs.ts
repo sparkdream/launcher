@@ -111,6 +111,8 @@ function replaceOnce(content: string, from: string, to: string): string {
  * Render config.toml / app.toml / client.toml for one node from the
  * vendored role templates (§5 step 4). Peer wiring:
  *  - sentry → validator via local socat tunnel (127.0.0.1:16656+v)
+ *  - sentry → every other sentry at its tailnet IP (placeholder until
+ *    Phase E; wire-tunnels substitutes the real IPs)
  *  - validator → sentry at its tailnet IP (placeholder until Phase E)
  */
 export function renderNodeConfigs(input: RenderConfigsInput): void {
@@ -140,17 +142,50 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
   const roleDefault = `${spec.network.name}-${role === "validator" ? "val" : "sentry"}-${node.index}`;
   config = setTomlLine(config, "moniker", `moniker = "${configMoniker(node.moniker, roleDefault)}"`);
 
+  // The sentry layer is a full mesh: every sentry peers with every other
+  // sentry over the tailnet, so any coverage-complete sentry→validator
+  // mapping yields ONE connected gossip graph. Without this, mappings whose
+  // sentry sets don't overlap (round-robin with V>1) partition the network
+  // into per-validator islands that can never reach consensus — validators
+  // run pex=false and peer only through their own sentries by design.
+  const allValidatorIds = Array.from(
+    { length: spec.topology.validators.count },
+    (_, v) => nodeIds[`val-${v}`],
+  ).join(",");
   if (role === "sentry") {
     const fronted = topology.sentryValidators[node.index] ?? [];
+    const otherSentries = Array.from(
+      { length: spec.topology.sentries.count },
+      (_, s) => s,
+    ).filter((s) => s !== node.index);
     const peers = fronted
       .map((v) => `${nodeIds[`val-${v}`]}@127.0.0.1:${tunnelPort(v)}`)
+      .concat(
+        otherSentries.map(
+          (s) => `${nodeIds[`sentry-${s}`]}@${input.tailnetIpPlaceholder(`sentry-${s}`)}:26656`,
+        ),
+      )
       .concat(input.join?.peers ?? [])
       .join(",");
-    const privateIds = fronted.map((v) => nodeIds[`val-${v}`]).join(",");
+    // private_peer_ids carries EVERY validator, not just the fronted ones:
+    // with the sentry mesh a sentry now hears about other pairs' validators
+    // and must never gossip any of their addresses.
     config = setTomlLine(config, "persistent_peers", `persistent_peers = "${peers}"`);
-    config = setTomlLine(config, "private_peer_ids", `private_peer_ids = "${privateIds}"`);
+    config = setTomlLine(config, "private_peer_ids", `private_peer_ids = "${allValidatorIds}"`);
+    // Fleet links must survive peer-slot pressure (join-mode sentries run
+    // public pex, and eviction of the one bridge link partitions the graph).
+    const unconditional = [
+      allValidatorIds,
+      otherSentries.map((s) => nodeIds[`sentry-${s}`]).join(","),
+    ]
+      .filter(Boolean)
+      .join(",");
+    config = setTomlLine(
+      config, "unconditional_peer_ids", `unconditional_peer_ids = "${unconditional}"`,
+    );
   } else {
     const sentries = topology.validatorSentries[node.index] ?? [];
+    const sentryIds = sentries.map((s) => nodeIds[`sentry-${s}`]).join(",");
     const peers = sentries
       .map(
         (s) =>
@@ -158,6 +193,9 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
       )
       .join(",");
     config = setTomlLine(config, "persistent_peers", `persistent_peers = "${peers}"`);
+    config = setTomlLine(
+      config, "unconditional_peer_ids", `unconditional_peer_ids = "${sentryIds}"`,
+    );
   }
 
   if (input.join) {

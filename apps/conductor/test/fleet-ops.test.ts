@@ -114,6 +114,23 @@ describe("relaunch op", () => {
         (e) => e.command.includes("sed -i") && e.command.includes(before.tailnet_ip!),
       ),
     ).toBe(true);
+    // sentry mesh: the fellow sentry's peer entry is repaired to the new IP...
+    const sentry1 = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    expect(
+      w.services.ssh.execLog.some(
+        (e) =>
+          e.target === `${sentry1.ssh_host}:${sentry1.ssh_port}` &&
+          e.command.includes("sed -i") &&
+          e.command.includes(before.tailnet_ip!),
+      ),
+    ).toBe(true);
+    // ...and the relaunched sentry resolves its own re-uploaded placeholder
+    // for the fellow sentry's current IP
+    expect(
+      w.services.ssh.execLog.some((e) =>
+        e.command.includes(`{{TAILNET_IP:sentry-1}}|${sentry1.tailnet_ip}`),
+      ),
+    ).toBe(true);
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 

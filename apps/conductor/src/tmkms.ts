@@ -203,7 +203,14 @@ export function buildTmkmsSetup(args: {
       // CometBFT v0.38 (SDK 0.50): sign extensions carry the vote
       // extension data; without them the signature is rejected
       `key_format = { type = "cometbft", sign_extensions = true }`,
-      `state_file = "state/${chainId}-consensus.json"`,
+      // per-validator state file when there are several: each validator
+      // needs its own tmkms process (softsign maps one key per chain id),
+      // and two processes sharing one double-sign watermark file either
+      // refuse each other's heights (permanent missed blocks) or corrupt it
+      // under concurrent writes. Single-validator fleets keep the legacy
+      // un-keyed path so a re-fetched checklist never points a live signer
+      // at a fresh (empty) watermark.
+      `state_file = "state/${chainId}${spec.topology.validators.count > 1 ? `-${key}` : ""}-consensus.json"`,
     ];
     // keep [[validator]] LAST: await-signer slices its stanza from it onward
     const validatorSection = [
@@ -239,13 +246,24 @@ export function buildTmkmsSetup(args: {
           `key_type = "consensus"`,
           `path = "secrets/${key}-consensus.key"`,
         ];
+    const multiVal = spec.topology.validators.count > 1;
     const meshJoinNote = spec.topology.headscale.reuseFleet
       ? [`# 2. join the mesh with the spare 'home' preauth key: skip if this`,
          `#    machine is already logged into the shared mesh (reuseFleet)`]
-      : [`# 2. join the mesh with the spare 'home' preauth key`];
+      : multiVal
+        ? [`# 2. join the mesh with the spare 'home' preauth key. One join per`,
+           `#    machine: if this machine already runs another validator's`,
+           `#    signer, skip this step (the existing login serves both)`]
+        : [`# 2. join the mesh with the spare 'home' preauth key`];
+    // per-validator hostname when there are several: distinct signer
+    // machines must not collide on one mesh name (headscale would rename
+    // the second, and the checklist could not tell the signers apart)
+    const hostname = multiVal
+      ? `tmkms-${spec.network.name}-${key}`
+      : `tmkms-${spec.network.name}`;
     const meshJoin =
       `sudo tailscale up --login-server=https://${headscaleDomain(spec)} ` +
-      `--authkey=${args.homePreauthKey ?? "<pending>"} --hostname tmkms-${spec.network.name}`;
+      `--authkey=${args.homePreauthKey ?? "<pending>"} --hostname ${hostname}`;
     const commands = pinned
       ? [
           `# 1. install tmkms with the feature for your signer, e.g.:`,

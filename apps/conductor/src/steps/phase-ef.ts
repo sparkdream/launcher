@@ -220,6 +220,23 @@ export const wireTunnelsStep: StepDef = {
         if (!ip) throw new Error(`no tailnet IP for val-${v}`);
         await ctx.services.ssh.exec(target, socatTunnelCmd(port, ip));
       }
+      // sentry mesh (render-configs): substitute the other sentries' tailnet
+      // IPs into this sentry's persistent_peers placeholders. Tailnet only —
+      // sentries advertise their public external_address and run pex, so
+      // CometBFT can still find direct public routes on its own.
+      const seds: string[] = [];
+      for (let s2 = 0; s2 < ctx.spec.topology.sentries.count; s2++) {
+        if (s2 === s) continue;
+        const ip = mesh.ips[`sentry-${s2}`];
+        if (!ip) throw new Error(`no tailnet IP for sentry-${s2}`);
+        seds.push(`s|${placeholder.tailnetIp(`sentry-${s2}`)}|${ip}|g`);
+      }
+      if (seds.length > 0) {
+        await ctx.services.ssh.exec(
+          target,
+          `sed -i '${seds.join("; ")}' ${NODE_HOME}/config/config.toml`,
+        );
+      }
     }
     return { wired: true };
   },

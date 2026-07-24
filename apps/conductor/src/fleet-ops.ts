@@ -551,18 +551,43 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           const port = tunnelPort(v);
           await ctx.services.ssh.exec(target, socatTunnelCmd(port, valIp));
         }
-        // §5: relaunching a sentry re-patches its validators' persistent_peers
+        // sentry mesh: the re-uploaded bundle's config still carries tailnet
+        // placeholders for the OTHER sentries — substitute their current IPs
+        // (same wiring wire-tunnels does on first launch). A fellow sentry
+        // with no recorded IP (e.g. mid-relaunch itself) is skipped: its own
+        // relaunch re-patches this side when it comes back.
+        for (let s2 = 0; s2 < spec.topology.sentries.count; s2++) {
+          if (s2 === sIndex) continue;
+          const otherIp = componentRow(ctx, `sentry-${s2}`).tailnet_ip;
+          if (!otherIp) {
+            ctx.log(`${key}: sentry-${s2} has no recorded tailnet IP yet; leaving its peer entry for its own relaunch to fix`);
+            continue;
+          }
+          await ctx.services.ssh.exec(
+            target,
+            `sed -i 's|${placeholder.tailnetIp(`sentry-${s2}`)}|${otherIp}|g' ${NODE_HOME}/config/config.toml`,
+          );
+        }
+        // §5: relaunching a sentry re-patches its validators' AND fellow
+        // sentries' persistent_peers — the old tailnet IP is dead, and the
+        // sentry mesh link is the only bridge between validator islands.
         const close = ctx.output<{ oldTailnetIp: string | null }>(p("close"))!;
-        for (const v of topo.sentryValidators[sIndex] ?? []) {
-          const valRow = componentRow(ctx, `val-${v}`);
+        const dependents = [
+          ...(topo.sentryValidators[sIndex] ?? []).map((v) => `val-${v}`),
+          ...Array.from({ length: spec.topology.sentries.count }, (_, s2) => `sentry-${s2}`)
+            .filter((k) => k !== key),
+        ];
+        for (const depKey of dependents) {
+          const row = componentRow(ctx, depKey);
+          if (!row.tailnet_ip) continue; // not reachable/placed right now
           if (close.oldTailnetIp) {
             await ctx.services.ssh.exec(
-              rowTarget(ctx, valRow),
+              rowTarget(ctx, row),
               `sed -i 's|${close.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
             );
           }
           // peer change requires a process restart (documented in the dialog)
-          await restartNode(ctx.services.ssh, rowTarget(ctx, valRow));
+          await restartNode(ctx.services.ssh, rowTarget(ctx, row));
         }
       }
       return { tailnetIp: ip };

@@ -388,3 +388,57 @@ describe("guided tmkms setup endpoint (M7)", () => {
     db.close();
   }, 120_000);
 });
+
+describe("multi-validator tmkms setup", () => {
+  it("gives each validator its own state file and mesh hostname", async () => {
+    const { buildTmkmsSetup } = await import("../src/tmkms.js");
+    const s = spec({
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 2 },
+        sentries: { count: 2 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+        },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+    const setup = buildTmkmsSetup({
+      spec: s,
+      chainId: "sparkdream-1",
+      meshIps: { "val-0": "100.64.0.1", "val-1": "100.64.0.2" },
+      nodeDir: () => "/nonexistent",
+    });
+    expect(setup.validators).toHaveLength(2);
+    // each validator runs its own tmkms process; a shared double-sign
+    // watermark file makes the signers refuse each other's heights
+    const stateFiles = setup.validators.map(
+      (v) => v.tmkmsToml.match(/^state_file = "(.+)"$/m)?.[1],
+    );
+    expect(stateFiles[0]).toBe("state/sparkdream-1-val-0-consensus.json");
+    expect(stateFiles[1]).toBe("state/sparkdream-1-val-1-consensus.json");
+    // distinct signer machines must not collide on one mesh hostname
+    expect(setup.validators[0]!.commands.join("\n")).toContain(
+      "--hostname tmkms-sparkdream-val-0",
+    );
+    expect(setup.validators[1]!.commands.join("\n")).toContain(
+      "--hostname tmkms-sparkdream-val-1",
+    );
+    // single-validator fleets keep the legacy hostname and state path (no
+    // churn for signers already running against a live launch)
+    const single = buildTmkmsSetup({
+      spec: spec({ security: { keyMode: "tmkms" } }),
+      chainId: "sparkdream-1",
+      meshIps: { "val-0": "100.64.0.1" },
+      nodeDir: () => "/nonexistent",
+    });
+    expect(single.validators[0]!.commands.join("\n")).toContain(
+      "--hostname tmkms-sparkdream\n",
+    );
+    expect(single.validators[0]!.tmkmsToml).toContain(
+      'state_file = "state/sparkdream-1-consensus.json"',
+    );
+  });
+});
