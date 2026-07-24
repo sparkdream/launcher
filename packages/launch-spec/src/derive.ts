@@ -9,10 +9,11 @@ export function chainId(spec: LaunchSpec): string {
 }
 
 /**
- * The chain's second token. The identity module hardcodes its prefix
- * (`^udream\.<suffix>$`), so the default is "udream." + the bond denom's
- * suffix. Returns undefined when the bond denom has no suffix to borrow —
- * validateSpec turns that into an error unless token.dreamDenom is set.
+ * The chain's second token. The identity module accepts any bond-denom-shaped
+ * value (`u<2-5 letters>.<suffix>`); "udream." + the bond denom's suffix is
+ * the conventional default when token.dreamDenom doesn't pick a name. Returns
+ * undefined when the bond denom has no suffix to borrow — validateSpec turns
+ * that into an error unless token.dreamDenom is set.
  */
 export function deriveDreamDenom(token: LaunchSpec["token"]): string | undefined {
   if (token.dreamDenom) return token.dreamDenom;

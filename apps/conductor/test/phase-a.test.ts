@@ -245,7 +245,12 @@ describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
   it("completes and never packages the consensus key", async () => {
     const s = spec(1, 1, {
       security: { keyMode: "tmkms" },
-      token: { baseDenom: "uspark.sparkdreamtest", displayDenom: "SPARK", dreamDisplayDenom: "GLOW" },
+      token: {
+        baseDenom: "uspark.sparkdreamtest",
+        displayDenom: "SPARK",
+        dreamDenom: "uglow.sparkdreamtest",
+        dreamDisplayDenom: "GLOW",
+      },
     });
     const { db, result, dirs } = await runPhaseA(s, "g11");
     if (result.status !== "completed") {
@@ -254,17 +259,22 @@ describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
 
     expect(db.stepOutput<{ gentxCount: number }>("g11", "build-genesis")!.gentxCount).toBe(1);
 
-    // dream token renamed via spec: metadata display + identity symbol/name
+    // dream token fully renamed via spec: base denom (custom prefix, no
+    // "udream."), metadata display, and identity symbol/name all follow
     const genesis = JSON.parse(
       fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"), "utf8"),
     );
     const dreamMeta = genesis.app_state.bank.denom_metadata.find(
-      (m: any) => m.base === "udream.sparkdreamtest",
+      (m: any) => m.base === "uglow.sparkdreamtest",
     );
     expect(dreamMeta.display).toBe("glow");
     expect(dreamMeta.denom_units[1]).toMatchObject({ denom: "glow", exponent: 6 });
+    expect(genesis.app_state.identity.identity.dream_denom).toBe("uglow.sparkdreamtest");
     expect(genesis.app_state.identity.identity.dream_display_symbol).toBe("GLOW");
     expect(genesis.app_state.identity.identity.dream_display_name).toBe("Glow");
+    // the reference's dream denom is substituted everywhere, not just in
+    // the identity record (module params price things in the dream denom)
+    expect(JSON.stringify(genesis)).not.toContain("udream.");
 
     const listing = execFileSync("tar", ["tzf", path.join(dirs.bundles, "val-0.tgz")]).toString();
     expect(listing).not.toContain("priv_validator_key.json");

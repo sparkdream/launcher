@@ -60,7 +60,7 @@ network:
   type: devnet
   bech32Prefix: sprkdrm
 token:
-  # chain rules: baseDenom u<2-5 letters>.<suffix>; dream prefix is fixed "udream."
+  # chain rule for both denoms: u<2-5 letters>.<suffix>
   baseDenom: uspark.sparkdreamdev
   displayDenom: SPARK
   # dreamDenom: udream.sparkdreamdev  # udream. + baseDenom's suffix unless set
@@ -870,9 +870,8 @@ export default function Page() {
       const m = typeof base === "string" ? base.match(/^(u[a-z]{2,5})\.(.+)$/) : null;
       if (m && v) doc.token.baseDenom = `${m[1]}.${v}`;
       const dream: string | undefined = doc.token?.dreamDenom;
-      if (typeof dream === "string" && /^udream\./.test(dream) && v) {
-        doc.token.dreamDenom = `udream.${v}`;
-      }
+      const dm = typeof dream === "string" ? dream.match(/^(u[a-z]{2,5})\.(.+)$/) : null;
+      if (dm && v) doc.token.dreamDenom = `${dm[1]}.${v}`;
     });
   const setSpecType = (v: string) =>
     patchSpec((doc) => {
@@ -888,6 +887,11 @@ export default function Page() {
   const setSpecDream = (v: string) =>
     patchSpec((doc) => {
       doc.token = { ...(doc.token ?? {}), dreamDisplayDenom: v };
+      // like setSpecSym: a renamed dream token also renames its base denom
+      // (u<symbol>.<suffix>), keeping whichever suffix is already in play
+      const current: string | undefined = doc.token.dreamDenom ?? doc.token.baseDenom;
+      const m = typeof current === "string" ? current.match(/^u[a-z]{2,5}\.(.+)$/) : null;
+      if (m && /^[A-Za-z]{2,5}$/.test(v)) doc.token.dreamDenom = `u${v.toLowerCase()}.${m[1]}`;
     });
   const setSpecCount = (kind: "validators" | "sentries", delta: number) =>
     patchSpec((doc) => {

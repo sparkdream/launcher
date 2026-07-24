@@ -70,7 +70,7 @@ describe("validateSpec", () => {
     // "usparkz" has six letters after the u — the chain caps it at five
     const badBond = testnetSpec({ token: { baseDenom: "usparkz.sparkdreamdev", displayDenom: "SPARKZ" } });
     expect(validateSpec(badBond).errors.some((e) => e.path === "token.baseDenom")).toBe(true);
-    // the dream denom prefix is hardcoded "udream." by x/identity
+    // the dream denom follows the same shape rule: "udreamz" is six letters
     const badDream = testnetSpec({
       token: {
         baseDenom: "uspark.sparkdreamdev",
@@ -79,6 +79,34 @@ describe("validateSpec", () => {
       },
     });
     expect(validateSpec(badDream).errors.some((e) => e.path === "token.dreamDenom")).toBe(true);
+    // the "udream" prefix itself is a convention, not a rule: a custom
+    // dream token name passes as long as it keeps the bond denom shape
+    const renamedDream = testnetSpec({
+      token: {
+        baseDenom: "uspark.sparkdreamdev",
+        displayDenom: "SPARK",
+        dreamDenom: "uwish.sparkdreamdev",
+        dreamDisplayDenom: "WISH",
+      },
+    });
+    expect(validateSpec(renamedDream).errors).toEqual([]);
+    // x/identity rejects bond/dream collisions at genesis; validate catches them first
+    const collidingDenom = testnetSpec({
+      token: {
+        baseDenom: "uspark.sparkdreamdev",
+        displayDenom: "SPARK",
+        dreamDenom: "uspark.sparkdreamdev",
+      },
+    });
+    expect(validateSpec(collidingDenom).errors.some((e) => e.path === "token.dreamDenom")).toBe(true);
+    const collidingSymbol = testnetSpec({
+      token: {
+        baseDenom: "uspark.sparkdreamdev",
+        displayDenom: "SPARK",
+        dreamDisplayDenom: "SPARK",
+      },
+    });
+    expect(validateSpec(collidingSymbol).errors.some((e) => e.path === "token.dreamDisplayDenom")).toBe(true);
     // display symbols are 3-8 chars on-chain (schema alone allows more)
     const badSymbol = testnetSpec({
       token: { baseDenom: "uspark.sparkdreamdev", displayDenom: "SPARKLETONS" },

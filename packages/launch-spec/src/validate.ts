@@ -261,11 +261,16 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     );
   }
   const dreamDenom = deriveDreamDenom(spec.token);
-  if (!dreamDenom || !/^udream\.[a-z][a-z0-9-]{2,15}$/.test(dreamDenom)) {
+  if (!dreamDenom || !/^u[a-z]{2,5}\.[a-z][a-z0-9-]{2,15}$/.test(dreamDenom)) {
     err(
       "token.dreamDenom",
-      `"${dreamDenom ?? "<underivable>"}" violates the chain's dream denom rule — the prefix ` +
-        'is fixed: it must be "udream.<3-16 char suffix>" (x/identity)',
+      `"${dreamDenom ?? "<underivable>"}" violates the chain's dream denom rule ` +
+        "u<2-5 letters>.<3-16 char suffix>, e.g. udream.sparkdreamdev (x/identity)",
+    );
+  } else if (dreamDenom === bondDenom) {
+    err(
+      "token.dreamDenom",
+      `"${dreamDenom}" equals the bond denom: x/identity rejects the collision at genesis`,
     );
   }
   for (const [field, symbol] of [
@@ -275,6 +280,12 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     if (!/^[A-Z][A-Z0-9]{2,7}$/.test(symbol)) {
       err(field, `"${symbol}" violates the chain's display symbol rule: 3-8 chars, [A-Z][A-Z0-9]+ (x/identity)`);
     }
+  }
+  if (spec.token.dreamDisplayDenom === spec.token.displayDenom) {
+    err(
+      "token.dreamDisplayDenom",
+      `"${spec.token.dreamDisplayDenom}" equals the bond display symbol: x/identity rejects the collision at genesis`,
+    );
   }
   const seenNames = new Map<string, number>();
   const seenAddrs = new Map<string, number>();

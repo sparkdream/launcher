@@ -193,9 +193,9 @@ export const launchSpecSchema = z.object({
     /** Defaults to baseDenom. */
     bondDenom: denom.optional(),
     /**
-     * The chain's internal coordination token. The chain's identity module
-     * hardcodes the prefix — this must be "udream.<suffix>" — so it defaults
-     * to "udream." + the bond denom's suffix (validateSpec enforces both).
+     * The chain's internal coordination token. Same shape rule as the bond
+     * denom, "u<2-5 letters>.<suffix>" (validateSpec enforces it); defaults
+     * to "udream." + the bond denom's suffix.
      */
     dreamDenom: denom.optional(),
     /** Display name for the dream token, like displayDenom for the bond token. */
