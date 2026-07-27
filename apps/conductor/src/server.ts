@@ -583,7 +583,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
           });
         }
-        const opId = fleet.requestRelaunch(launch, component);
+        const opId = await fleet.requestRelaunch(launch, component);
         drive(launchId, spec);
         return { status: "relaunch-started", opId };
       }
@@ -642,6 +642,44 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return reply.status(400).send({ error: "unknown action" });
     }
   });
+
+  // Push a file into a component's container. Body is the raw file bytes
+  // (octet-stream); the destination filename rides in x-filename. The file is
+  // written verbatim to /root/<filename> — no unpacking; the user moves or
+  // extracts it from the Akash shell. Like restart, this carries no signature:
+  // the session must own the fleet (§2 scoping rule).
+  app.post(
+    "/api/fleet/:launchId/components/:key/upload",
+    { bodyLimit: 256 * 1024 * 1024 },
+    async (req, reply) => {
+      const { launchId, key } = req.params as { launchId: string; key: string };
+      const launch = deps.db.getLaunch(launchId);
+      if (!launch) return reply.status(404).send({ error: "launch not found" });
+      if (denyForeign(req, reply, launch)) return;
+      const component = deps.db.listFleetComponents(launchId).find((c) => c.key === key);
+      if (!component) return reply.status(404).send({ error: "component not found" });
+
+      // sanitize: basename only, restricted charset, length-capped
+      const raw = String(req.headers["x-filename"] ?? "upload.bin");
+      const safe =
+        path.basename(raw).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128) || "upload.bin";
+      const remotePath = `/root/${safe}`;
+
+      const tmp = fs.mkdtempSync(`${deps.workRoot}/upload-`);
+      try {
+        const local = path.join(tmp, safe);
+        fs.writeFileSync(local, req.body as Buffer);
+        await fleet.uploadToNode(launch, component, local, remotePath);
+        return { ok: true, remotePath };
+      } catch (e) {
+        return reply
+          .status(500)
+          .send({ error: String(e instanceof Error ? e.message : e) });
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+  );
 
   app.get("/api/fleet/:launchId/:dseq/logs", async (req, reply) => {
     const { launchId, dseq } = req.params as { launchId: string; dseq: string };

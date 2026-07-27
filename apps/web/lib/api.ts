@@ -310,6 +310,9 @@ export interface ComponentView {
   state: string;
   /** Deployed image reference (upgrades update it). */
   image?: string | null;
+  /** True when the component runs sshd with a recorded endpoint — eligible
+   *  for the upload-file action (nodes + explorer). */
+  ssh?: boolean;
   health?: { status: string; detail: string | null; checked_at: string };
 }
 
@@ -576,6 +579,24 @@ export async function importLauncherBackup(
   });
   if (!res.ok) {
     throw new Error((await res.json().catch(() => ({})))?.error ?? `restore: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Push a file into a component's container. The bytes are written verbatim to
+ *  /root/<filename>; returns the remote path. */
+export async function uploadToComponent(
+  launchId: string,
+  key: string,
+  file: File,
+): Promise<{ remotePath: string }> {
+  const res = await afetch(`/api/fleet/${launchId}/components/${encodeURIComponent(key)}/upload`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream", "x-filename": file.name },
+    body: file,
+  });
+  if (!res.ok) {
+    throw new Error((await res.json().catch(() => ({})))?.error ?? `upload: HTTP ${res.status}`);
   }
   return res.json();
 }

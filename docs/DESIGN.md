@@ -775,7 +775,27 @@ dashboard as mini state machines reusing the launch steps:
   chain process from then on, current tunnel targets baked into the
   `TS_TUNNEL_*` env, and the counterparts' env re-aimed at the new tailnet
   IP — after which container restarts self-heal, same as a launch after
-  step 20b.
+  step 20b. **tmkms fleets gate on the signer AFTER that push, never
+  before**: the privval listener belongs to `sparkdreamd`, which the
+  relaunch deliberately does not start until persist, so a pre-boot probe of
+  that port reports "no signer" no matter how the signer is configured — a
+  gate there could never be satisfied and wedged the op permanently
+  (observed live). The start step only announces the new
+  `addr = "tcp://<new_tailnet_ip>:26659"`; an `await-signer` step after
+  persist runs the same ESTABLISHED-session probe as step 19 and pauses
+  there if the signer has not been repointed. The same rule applies to the
+  chain reset's signer step, which runs while the fleet is halted in wait
+  mode: it announces the new chain-id once and lets the resume through,
+  leaving verification to the block-production check. A relaunched node's
+  *mesh clients* are repointed too, in a
+  follow-up step: the explorer tunnels into a sentry's LCD and RPC over the
+  tailnet, so a sentry relaunch rewrites the explorer's `TS_TUNNEL_*` env,
+  batches its `MsgUpdateDeployment` (1 sig) and re-pushes the manifest.
+  Symmetrically, relaunching any mesh component re-aims its own tunnel env at
+  the *current* tailnet IPs of the components it dials before the deployment
+  is created: an address baked at launch is only valid until that peer's own
+  relaunch or a headscale re-key (observed live: an explorer relaunch
+  redeployed with the sentry's pre-relaunch IP and served nothing).
 
 **Validator relaunch: double-sign safety (mandatory, softsign mode).**
 Relaunch re-uploads the *same consensus key* to a new container, and

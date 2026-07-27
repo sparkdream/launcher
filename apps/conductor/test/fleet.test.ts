@@ -90,7 +90,7 @@ describe("fleet read-model + reconciliation", () => {
       db.setComponentState("fl", c.key, "closed");
     }
     const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
-    expect(() => fleet.requestRelaunch(launch, sentry)).toThrow(/headscale is closed/);
+    await expect(fleet.requestRelaunch(launch, sentry)).rejects.toThrow(/headscale is closed/);
   }, 120_000);
 });
 

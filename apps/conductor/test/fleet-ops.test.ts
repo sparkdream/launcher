@@ -89,7 +89,7 @@ describe("relaunch op", () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     // the old container stops answering once the provider tears it down
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
@@ -134,6 +134,30 @@ describe("relaunch op", () => {
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 
+  it("a stacked relaunch on the same component supersedes the prior op (no deploy→lease→deploy loop)", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const launch = w.db.getLaunch("fl")!;
+    // two clicks → two requestRelaunch calls. Without supersede both stay
+    // active and buildOpSteps runs them together: each op's close step reads
+    // the component row that the other's manifest step just rewrote to its own
+    // new dseq, so each closes what the other deployed — a loop.
+    await w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
+    const ops = w.db.listFleetOps("fl").filter((o) => o.kind === "relaunch");
+    expect(ops.length).toBe(2);
+    expect(ops.filter((o) => o.status === "active")).toHaveLength(1);
+    expect(ops.some((o) => o.status === "aborted")).toBe(true);
+    // the lone surviving op drives to completion cleanly
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+  }, 120_000);
+
   it("relaunch honors the spec's per-component provider exclusions", async () => {
     // 1x1 fleet: headscale/val-0/sentry-0 land on providers 1/2/3 (cheapest
     // bids). provider4 is the bid a sentry-0 relaunch would win without the
@@ -156,7 +180,7 @@ describe("relaunch op", () => {
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
     expect(before.provider).toBe("akash1provider3");
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
 
@@ -174,7 +198,7 @@ describe("relaunch op", () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
 
     // container really still answering → pause for the provider teardown
@@ -193,7 +217,7 @@ describe("relaunch op", () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
 
@@ -225,12 +249,76 @@ describe("relaunch op", () => {
   }, 120_000);
 });
 
+describe("tmkms validator relaunch", () => {
+  function tmkms1x1(): LaunchSpec {
+    return testnetSpec({
+      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+      security: { keyMode: "tmkms" },
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+        headscale: { domain: "headscale.sparkdream.io" },
+      },
+    });
+  }
+
+  it("gates on the signer AFTER the node boots, with the new address", async () => {
+    // The gate used to run before persist, probing the privval port on a
+    // container that had not started sparkdreamd yet — unsatisfiable, so
+    // resume failed forever however correctly the signer was repointed.
+    const w = await launched(tmkms1x1());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.signerConnected = false; // signer still on the old address
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:await-signer`);
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    // the pause names the address the signer must now dial...
+    expect(parked.reason).toContain(`tcp://${after.tailnet_ip}:26659`);
+    expect(parked.reason).not.toContain(before.tailnet_ip!);
+    // ...and it comes after the boot, so a repointed signer can actually
+    // connect: the deployment left wait mode and the node is running
+    expect(
+      fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "val-0.yaml"), "utf8"),
+    ).toContain("WAIT_FOR_CONFIG=false");
+    expect(w.services.ssh.started.has(`${after.ssh_host}:${after.ssh_port}`)).toBe(true);
+
+    // signer repointed and restarted → resume clears the gate
+    w.services.ssh.signerConnected = true;
+    const done = await driveOps(w);
+    expect(done.status).toBe("completed");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("publishes the new signer address to the tmkms checklist", async () => {
+    // the checklist renders from the launch's await-mesh table, so a
+    // relaunch that left it stale sent the operator to a dead endpoint
+    const w = await launched(tmkms1x1());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const mesh = w.db.stepOutput<{ ips: Record<string, string> }>("fl", "await-mesh")!;
+    expect(mesh.ips["val-0"]).toBe(after.tailnet_ip);
+  }, 120_000);
+});
+
 describe("stateless component relaunch", () => {
   it("relaunches the explorer without rewiring or start guards", async () => {
     const w = await launched(specWithComponents());
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
     const startsBefore = w.services.ssh.started.size;
@@ -252,7 +340,7 @@ describe("stateless component relaunch", () => {
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!;
     expect(before.ssh_host).toBeNull(); // never had an SSH endpoint
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     const mintsBefore = w.services.provider.shellLog.filter((e) =>
       e.script.includes("preauthkeys create"),
@@ -273,11 +361,51 @@ describe("stateless component relaunch", () => {
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 
+  it("follows the sentry's tailnet IP: repointed on the sentry's relaunch, re-aimed on its own", async () => {
+    const w = await launched(specWithComponents());
+    const explorerSdl = () =>
+      fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "explorer.yaml"), "utf8");
+    const sentryBefore = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(explorerSdl()).toContain(`TS_TUNNEL_1=11317:${sentryBefore.tailnet_ip}:1317`);
+
+    // the sentry moves: its tailnet IP changes, and the explorer's env must
+    // follow it (it was tunnelling to the old address)
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, sentryBefore);
+    w.services.api.leaseStates.set(sentryBefore.dseq, "closed");
+    w.services.ssh.failHosts.add(`${sentryBefore.ssh_host}:${sentryBefore.ssh_port}`);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const sentryAfter = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(sentryAfter.tailnet_ip).not.toBe(sentryBefore.tailnet_ip);
+    expect(explorerSdl()).toContain(`TS_TUNNEL_1=11317:${sentryAfter.tailnet_ip}:1317`);
+    expect(explorerSdl()).toContain(`TS_TUNNEL_2=26657:${sentryAfter.tailnet_ip}:26657`);
+    expect(explorerSdl()).not.toContain(sentryBefore.tailnet_ip!);
+
+    // and a relaunch never redeploys a stale address: even with the env
+    // wound back to a dead IP, the fresh deployment names the current one
+    fs.writeFileSync(
+      path.join(w.work, "launches", "fl", "sdl", "explorer.yaml"),
+      explorerSdl().replaceAll(sentryAfter.tailnet_ip!, "100.64.0.99"),
+    );
+    const explorerBefore = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, explorerBefore);
+    w.services.api.leaseStates.set(explorerBefore.dseq, "closed");
+    w.services.ssh.failHosts.add(`${explorerBefore.ssh_host}:${explorerBefore.ssh_port}`);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    expect(explorerSdl()).toContain(`TS_TUNNEL_1=11317:${sentryAfter.tailnet_ip}:1317`);
+    expect(explorerSdl()).not.toContain("100.64.0.99");
+    // the deployed manifest carries it too, not just the on-disk SDL
+    expect(
+      fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "explorer.manifest.json"), "utf8"),
+    ).toContain(`11317:${sentryAfter.tailnet_ip}:1317`);
+  }, 120_000);
+
   it("pauses with a DNS pointer when the relaunched component stays dark", async () => {
     const w = await launched(specWithComponents());
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
     const launch = w.db.getLaunch("fl")!;
-    w.fleet.requestRelaunch(launch, before);
+    await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
     w.services.rpc.darkUrls.add("explorer.sparkdream.io");
@@ -1150,7 +1278,7 @@ describe("headscale relaunch op", () => {
     )!;
     const launchMesh = w.db.stepOutput<{ ips: Record<string, string> }>("fl", "await-mesh")!;
 
-    const opId = w.fleet.requestRelaunch(launch, before);
+    const opId = await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     // the fresh mesh allocates fresh IPs, and validators still reference the old
     w.services.ssh.remapTailnetIps();
@@ -1223,7 +1351,7 @@ describe("headscale relaunch op", () => {
     const w = await launched(tmkmsSpec1());
     const launch = w.db.getLaunch("fl")!;
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "headscale")!;
-    const opId = w.fleet.requestRelaunch(launch, before);
+    const opId = await w.fleet.requestRelaunch(launch, before);
     w.services.api.leaseStates.set(before.dseq, "closed");
     w.services.ssh.remapTailnetIps();
     w.services.ssh.signerConnected = false;

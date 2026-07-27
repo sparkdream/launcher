@@ -49,6 +49,18 @@ export function componentResources(key: ComponentKey) {
       };
 }
 
+/**
+ * The explorer's mesh tunnels: local port → the port it dials on its sentry.
+ * The sentry it dials is EXPLORER_SENTRY. Fleet ops read these to re-aim the
+ * env at the sentry's current tailnet IP, so keep the SDL below built from
+ * them rather than from repeated literals.
+ */
+export const EXPLORER_SENTRY = "sentry-0";
+export const EXPLORER_TUNNELS: Array<{ local: number; remote: number }> = [
+  { local: 11317, remote: 1317 },
+  { local: 26657, remote: 26657 },
+];
+
 export interface RenderComponentSdlInput {
   spec: LaunchSpec;
   component: ComponentRef;
@@ -110,8 +122,10 @@ function explorerSdl(input: RenderComponentSdlInput) {
         `TS_HOSTNAME=${component.key}`,
         // on the persistent volume so the tailnet identity survives restarts
         "TS_STATE_DIR=/data/tailscale",
-        `TS_TUNNEL_1=11317:${input.placeholder.tailnetIp("sentry-0")}:1317`,
-        `TS_TUNNEL_2=26657:${input.placeholder.tailnetIp("sentry-0")}:26657`,
+        ...EXPLORER_TUNNELS.map(
+          (t, i) =>
+            `TS_TUNNEL_${i + 1}=${t.local}:${input.placeholder.tailnetIp(EXPLORER_SENTRY)}:${t.remote}`,
+        ),
         // entrypoint seds these over the baked chain config; relative paths
         // hit the nginx proxies above
         "NODE_API_ENDPOINT=/api",

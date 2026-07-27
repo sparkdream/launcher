@@ -985,6 +985,8 @@ export default function Page() {
   }, []);
 
   const [logsView, setLogsView] = useState<{ key: string; text: string } | null>(null);
+  // file in flight to a component's container (key → original filename)
+  const [uploading, setUploading] = useState<Record<string, string>>({});
   // shut-down fleets (every component closed) collapse to one line; the
   // record stays for bundle export / genesis download behind this toggle
   const [showClosedFleet, setShowClosedFleet] = usePersistedState<Record<string, boolean>>(
@@ -3311,6 +3313,52 @@ export default function Page() {
                                   >
                                     logs
                                   </button>
+                                  {c.ssh && (
+                                    <label
+                                      className="btn"
+                                      title={
+                                        uploading[c.key]
+                                          ? undefined
+                                          : "Push a file into this container. It lands in /root/<filename> as-is; move or extract it from the shell afterwards."
+                                      }
+                                      style={
+                                        uploading[c.key]
+                                          ? { opacity: 0.5, pointerEvents: "none" }
+                                          : { cursor: "pointer" }
+                                      }
+                                    >
+                                      {uploading[c.key]
+                                        ? `uploading ${uploading[c.key]}…`
+                                        : "upload"}
+                                      <input
+                                        type="file"
+                                        hidden
+                                        onChange={async (e) => {
+                                          const file = e.target.files?.[0];
+                                          e.target.value = "";
+                                          if (!file) return;
+                                          setUploading((u) => ({ ...u, [c.key]: file.name }));
+                                          try {
+                                            const { uploadToComponent } = await import("../lib/api");
+                                            const { remotePath } = await uploadToComponent(
+                                              f.launchId,
+                                              c.key,
+                                              file,
+                                            );
+                                            showToast(`uploaded to ${c.key}:${remotePath}`);
+                                          } catch (err) {
+                                            setError(String(err));
+                                          } finally {
+                                            setUploading((u) => {
+                                              const next = { ...u };
+                                              delete next[c.key];
+                                              return next;
+                                            });
+                                          }
+                                        }}
+                                      />
+                                    </label>
+                                  )}
                                   <button
                                     className="btn"
                                     title="Download the rendered SDL this component was deployed with"

@@ -37,6 +37,14 @@ function blocksPerDay(spec: LaunchSpec): number {
   return Math.round(86_400 / blockSeconds);
 }
 
+/** Lease-shell service name for a component: chain nodes run the `sparkdreamd`
+ *  service, while the stateless components run a service named after their key
+ *  (the SDL is built as `services: { [key]: ... }`). Node keys look like
+ *  `val-0` / `sentry-0`; everything else is a stateless key. */
+function leaseServiceName(key: string): string {
+  return key.startsWith("val-") || key.startsWith("sentry-") ? "sparkdreamd" : key;
+}
+
 export interface ComponentView {
   key: string;
   dseq: string;
@@ -53,6 +61,10 @@ export interface ComponentView {
   state: string;
   /** Deployed image reference (upgrades update it). */
   image: string | null;
+  /** True when the component runs sshd and has a recorded forwarded endpoint —
+   *  i.e. the user can push files to it (nodes + explorer; headscale and the
+   *  frontend image run no sshd). */
+  ssh: boolean;
   health?: { status: string; detail: string | null; checked_at: string } | undefined;
 }
 
@@ -421,6 +433,7 @@ export class FleetService {
             escrow,
             state: c.state,
             image: c.image,
+            ssh: c.ssh_host != null && c.ssh_port != null,
             health: h
               ? { status: h.status, detail: h.detail, checked_at: h.checked_at }
               : undefined,
@@ -884,9 +897,27 @@ export class FleetService {
         dseq: component.dseq,
         gseq: 1,
         oseq: 1,
-        service: "sparkdreamd",
+        service: leaseServiceName(component.key),
       },
     };
+  }
+
+  /** Push a file into a component's container over SSH (with lease-shell
+   *  fallback). Generic: the bytes are written verbatim to remotePath — no
+   *  unpacking is done on the node; move or extract the file from the Akash
+   *  shell afterwards. Only components that run sshd (nodes + explorer) are
+   *  valid targets; headscale and the frontend image have no sshd. */
+  async uploadToNode(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    localPath: string,
+    remotePath: string,
+  ): Promise<void> {
+    if (component.key === "headscale" || component.key === "frontend") {
+      throw new Error(`${component.key} runs no sshd; cannot accept file uploads`);
+    }
+    const target = this.sshTargetFor(launch, component);
+    await this.services.ssh.upload(target, localPath, remotePath);
   }
 
   /** Escrow top-up: unsigned deposit into the launch's signing loop, plus
@@ -962,7 +993,7 @@ export class FleetService {
   }
 
   /** Relaunch / rolling upgrade → fleet_ops rows; steps composed by buildOpSteps. */
-  requestRelaunch(launch: LaunchRow, component: FleetComponentRow): number {
+  async requestRelaunch(launch: LaunchRow, component: FleetComponentRow): Promise<number> {
     // headscale relaunches through a dedicated flow (headscaleRelaunchSteps):
     // a naive redeploy re-keys the whole mesh. A shared-mesh fleet has no
     // headscale of its own to relaunch; the owning fleet runs the op.
@@ -995,12 +1026,56 @@ export class FleetService {
     // always move OFF the current provider (that's the point of a relaunch),
     // plus the wallet's global avoid list
     const avoidProviders = [...new Set([component.provider, ...prefs.avoid])];
+    // a previous relaunch on this component may still be active (the user
+    // clicked again, or aborted and re-clicked). Two concurrent relaunch ops on
+    // one component ping-pong: each op's close step reads the component row,
+    // which the other op's manifest step just rewrote to its own new dseq, so
+    // each closes what the other deployed — a deploy→lease→deploy loop. Supersede any stacked op first.
+    await this.supersedeRelaunchOps(launch, component.key);
     return this.db.createFleetOp(launch.id, "relaunch", {
       key: component.key,
       generation: component.generation + 1,
       avoidProviders,
       preferProviders: prefs.prefer,
     });
+  }
+
+  /** Abort every still-active relaunch op targeting `key` so a fresh request
+   *  starts from one op. Mirrors requestAbortOp's cleanup — drop the op's
+   *  steps and unsigned txs so they stop driving the component — but leaves
+   *  the deployment the component row currently points to alone: the new op's
+   *  own close step tears that one down. Any OTHER dseq a superseded op leased
+   *  is orphaned, so close it (best-effort) to refund escrow. */
+  private async supersedeRelaunchOps(launch: LaunchRow, key: string): Promise<void> {
+    const currentDseq = this.db
+      .listFleetComponents(launch.id)
+      .find((c) => c.key === key)?.dseq;
+    const prior = this.db.listFleetOps(launch.id).filter((o) => {
+      if (o.status !== "active" || o.kind !== "relaunch") return false;
+      try {
+        return JSON.parse(o.params_json).key === key;
+      } catch {
+        return false;
+      }
+    });
+    for (const op of prior) {
+      this.db.setFleetOpStatus(op.id, "aborted");
+      this.db.deleteOpSteps(launch.id, op.id);
+      this.db.deleteUnsignedPendingTxsLike(launch.id, `op${op.id}:%`);
+      const deploy = this.db.stepOutput<{ dseq: string }>(launch.id, `op${op.id}:deploy`);
+      if (deploy?.dseq && deploy.dseq !== currentDseq) {
+        const info = await this.services.api
+          .deploymentInfo(launch.owner, deploy.dseq)
+          .catch(() => undefined);
+        if (info?.state === "active") {
+          this.db.enqueuePendingTx(
+            launch.id,
+            `fleet:close:${deploy.dseq}`,
+            JSON.stringify([closeDeploymentMsg(launch.owner, deploy.dseq)]),
+          );
+        }
+      }
+    }
   }
 
   /**

@@ -21,7 +21,7 @@ import {
   type GenerateKeysOutput,
 } from "./steps/phase-a.js";
 import { sparkdreamd } from "./exec.js";
-import { explorerChainEnv, renderComponentSdl } from "./render-component-sdl.js";
+import { explorerChainEnv, renderComponentSdl, EXPLORER_SENTRY, EXPLORER_TUNNELS } from "./render-component-sdl.js";
 import { ingressHost } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
@@ -90,6 +90,78 @@ function headscaleRef(ctx: StepCtx): { hostUri: string; dseq: string; gseq: numb
   return { hostUri: hs.hostUri, dseq: hs.dseq, gseq: hs.gseq, oseq: hs.oseq };
 }
 
+/**
+ * Which mesh component each of `key`'s TS_TUNNEL_* entries dials, keyed by
+ * the tunnel's local port (the port is what identifies the peer: the
+ * renderers derive it from the peer's index, or from a fixed constant).
+ * Everything that re-aims a tunnel env reads this map, so a component's
+ * mesh dependencies are stated once.
+ */
+function tunnelPeers(spec: LaunchSpec, key: string): Map<number, string> {
+  const topo = resolveTopology(spec);
+  const peers = new Map<number, string>();
+  if (key.startsWith("val-")) {
+    // join mode bakes an own-sentry witness + peer tunnel (see the persist
+    // step); a fresh-launch validator has neither, and an absent entry
+    // simply matches nothing.
+    const s = topo.validatorSentries[Number(key.split("-")[1])]?.[0];
+    if (s !== undefined) {
+      peers.set(WITNESS_RPC_PORT, `sentry-${s}`);
+      peers.set(VAL_PEER_TUNNEL_PORT, `sentry-${s}`);
+    }
+  } else if (key.startsWith("sentry-")) {
+    for (const v of topo.sentryValidators[Number(key.split("-")[1])] ?? []) {
+      peers.set(tunnelPort(v), `val-${v}`);
+    }
+  } else if (key === "explorer") {
+    for (const t of EXPLORER_TUNNELS) peers.set(t.local, EXPLORER_SENTRY);
+  }
+  return peers;
+}
+
+/**
+ * Re-aim every TS_TUNNEL_* target in an SDL at the CURRENT tailnet IP of the
+ * component it dials. Tailnet IPs are not stable across a peer's lifetime: a
+ * peer relaunch or a headscale re-key hands out a different address, and the
+ * env baked at launch (or at this component's last persist) then names a dead
+ * one. Observed live: an explorer relaunched after its sentry had moved came
+ * back tunnelling to the sentry's pre-relaunch IP and served nothing until the
+ * env was edited by hand.
+ *
+ * Placeholder targets are resolved the same way, so an SDL that never reached
+ * persist-start is also handled. A peer with no recorded IP is left as-is.
+ */
+function retargetTunnelEnv(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  key: string,
+  text: string,
+): { text: string; changes: string[] } {
+  const peers = tunnelPeers(spec, key);
+  if (peers.size === 0) return { text, changes: [] };
+  const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+  const changes: string[] = [];
+  const out = text.replace(
+    /TS_TUNNEL_([A-Za-z0-9_]+)=(\d+):(.+?):(\d+)(?=["'\s]|$)/g,
+    (whole, name: string, local: string, target: string, remote: string) => {
+      const peerKey = peers.get(Number(local));
+      if (!peerKey) return whole;
+      const ip = rows.find((c) => c.key === peerKey)?.tailnet_ip;
+      if (!ip || ip === target) return whole;
+      changes.push(`${peerKey} ${target} → ${ip}`);
+      return `TS_TUNNEL_${name}=${local}:${ip}:${remote}`;
+    },
+  );
+  return { text: out, changes };
+}
+
+/** Mesh components whose tunnel env dials `key` (the explorer, for a sentry). */
+function meshDependents(spec: LaunchSpec, key: string): string[] {
+  return statelessComponents(spec)
+    .filter((c) => c.mesh && [...tunnelPeers(spec, c.key).values()].includes(key))
+    .map((c) => c.key);
+}
+
 function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
   if (!row.ssh_host || !row.ssh_port) throw new Error(`${row.key}: no SSH endpoint recorded`);
   return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq));
@@ -117,6 +189,17 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
   const isValidator = key.startsWith("val-");
   const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
   const stateless = statelessComponents(spec).find((c) => c.key === key);
+  // Trailing steps are conditional (a tmkms validator gets a signer gate, a
+  // node the explorer dials gets a mesh-client repoint), so which one closes
+  // the op out varies — name it once instead of guessing in each step.
+  const signerGate = isValidator && spec.security.keyMode === "tmkms";
+  const lastStep = p(
+    meshDependents(spec, key).length > 0
+      ? "mesh-clients"
+      : signerGate
+        ? "await-signer"
+        : "persist",
+  );
 
   const steps: StepDef[] = [];
 
@@ -196,7 +279,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         sdl = sdl.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${authkey}`);
         // fresh volume must wait for node-data again (no-op for components)
         sdl = sdl.replace(/WAIT_FOR_CONFIG=false/g, "WAIT_FOR_CONFIG=true");
-        fs.writeFileSync(sdlPath, sdl);
+        // the peers this component tunnels to may have moved since its env
+        // was last written (their own relaunch, a headscale re-key) — deploy
+        // with their CURRENT addresses so the fresh container comes up
+        // dialing something alive. Nodes get re-wired again at persist; for a
+        // stateless component this is the only pass there is.
+        const retarget = retargetTunnelEnv(ctx, spec, key, sdl);
+        for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
+        fs.writeFileSync(sdlPath, retarget.text);
       }
       const sdlPath = sdlPathFor(ctx, key);
 
@@ -368,9 +458,9 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
 
   if (stateless) {
     // §5: stateless components skip the node rewiring and guarded start —
-    // the container is live once it answers on its domain. The explorer's
-    // SDL env already carries the real sentry tailnet IP (baked by
-    // persist-start), so its tunnels come up correct at boot.
+    // the container is live once it answers on its domain. Its tunnels come
+    // up correct at boot because the deploy step re-aimed the env at the
+    // peers' current tailnet IPs.
     steps.push({
       name: p("verify"),
       async run(ctx) {
@@ -479,6 +569,15 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         await ctx.services.sleep(5000);
       }
       ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
+      // The tmkms setup checklist and the signer panel render addresses from
+      // the launch's await-mesh table, not from the component rows, so a
+      // relaunch that only updated the row left them printing the address
+      // this node just moved off — the operator then repoints the signer at
+      // a dead endpoint. Refresh it here, same as the headscale relaunch.
+      const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(ctx.launchId, "await-mesh");
+      if (launchMesh) {
+        ctx.db.stepDone(ctx.launchId, "await-mesh", { ips: { ...launchMesh.ips, [key]: ip } });
+      }
 
       const topo = resolveTopology(spec);
       const publicPeered = new Set<number>();
@@ -597,21 +696,22 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
   steps.push({
     name: p("start"),
     async run(ctx) {
-      const row = componentRow(ctx, key);
-      const target = rowTarget(ctx, row);
       const close = ctx.output<{ baselineHeight?: number }>(p("close"))!;
       const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
 
       if (isValidator && spec.security.keyMode === "tmkms") {
-        // §5 tmkms fleets: new IP → signer must be repointed before start
-        const probe = await ctx.services.ssh.exec(target, "nc -z 127.0.0.1 26660 && echo ok || echo no");
-        if (probe.stdout.trim() !== "ok") {
-          throw new AwaitUser(
-            p("start"),
-            `repoint your tmkms signer to the relaunched ${key}:\n` +
-              `addr = "tcp://${cfg.tailnetIp}:26659"\nthen resume`,
-          );
-        }
+        // §5 tmkms fleets: the relaunch moved the validator, so the signer
+        // has to be repointed. This step can only ANNOUNCE the new address,
+        // never verify it: sparkdreamd owns the privval listener (26660,
+        // fronted by the entrypoint's keepalive proxy on 26659) and it has
+        // not booted yet — the persist step below is its first and only
+        // start. A gate here on that port could therefore never pass, and a
+        // resume with a perfectly repointed signer failed forever (observed
+        // live). The real check runs after the boot, in await-signer.
+        ctx.log(
+          `${key}: repoint your tmkms signer while this finishes — ` +
+            `addr = "tcp://${cfg.tailnetIp}:26659"`,
+        );
       }
       if (isValidator && spec.security.keyMode === "softsign" && close.baselineHeight !== undefined) {
         // §5 double-sign safety window: wait N blocks past the pre-close height
@@ -776,10 +876,91 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         }
       }
       if (!back) throw new Error(`${key} did not come back after the persist restart`);
-      ctx.db.setFleetOpStatus(opId, "done");
+      if (lastStep === p("persist")) ctx.db.setFleetOpStatus(opId, "done");
       return { persisted: targets };
     },
   });
+
+  if (signerGate) {
+    steps.push({
+      name: p("await-signer"),
+      async run(ctx) {
+        // The node is running now (persist booted it), so the privval
+        // listener exists and a signer's session is finally observable —
+        // this is the earliest point where "is the signer repointed?" is a
+        // real question. Same established-session probe as the launch gate:
+        // a port check would pass on sparkdreamd's own listener with no
+        // signer anywhere, and the chain signs nothing until tmkms dials in.
+        const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
+        const row = componentRow(ctx, key);
+        let connected = false;
+        for (let attempt = 0; attempt < 12 && !connected; attempt++) {
+          if (attempt > 0) await ctx.services.sleep(5000);
+          const probe = await ctx.services.ssh
+            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE)
+            .catch(() => ({ stdout: "" }));
+          connected = probeSaysConnected(probe.stdout);
+        }
+        if (!connected) {
+          throw new AwaitUser(
+            p("await-signer"),
+            `repoint your tmkms signer at the relaunched ${key} — the relaunch moved it to a ` +
+              `new mesh address:\n  addr = "tcp://${cfg.tailnetIp}:26659"\n` +
+              "in the [[validator]] block of tmkms.toml, then restart the signer and resume. " +
+              "Keep the existing state file: its watermark is what stops a double-sign.",
+          );
+        }
+        ctx.log(`${key}: signer connected`);
+        if (lastStep === p("await-signer")) ctx.db.setFleetOpStatus(opId, "done");
+        return { signerConnected: true };
+      },
+    });
+  }
+
+  if (meshDependents(spec, key).length > 0) {
+    steps.push({
+      name: p("mesh-clients"),
+      async run(ctx) {
+        // Mesh components dial this node over the tailnet too (the explorer
+        // tunnels into sentry-0's LCD and RPC), and the relaunch changed the
+        // address their env names. Same treatment as the counterpart
+        // sentries: rewrite the env, one update tx, re-push the manifest —
+        // which restarts them onto the live address. Left alone, they keep
+        // dialing a dead IP until their own next relaunch.
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const cert = loadCert(ctx);
+        const msgs: Msg[] = [];
+        const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
+        for (const depKey of meshDependents(spec, key)) {
+          const row = componentRow(ctx, depKey);
+          const sdlPath = sdlPathFor(ctx, depKey);
+          const retarget = retargetTunnelEnv(ctx, spec, depKey, fs.readFileSync(sdlPath, "utf8"));
+          if (retarget.changes.length === 0) continue;
+          for (const c of retarget.changes) ctx.log(`${depKey}: tunnel re-aimed at ${c}`);
+          fs.writeFileSync(sdlPath, retarget.text);
+          const artifacts = sdlArtifacts(loadSdl(sdlPath));
+          fs.writeFileSync(path.join(ctx.dirs.sdl, `${depKey}.manifest.json`), artifacts.manifestJson);
+          pushes.push({ row, json: artifacts.manifestJson });
+          // convergent like retarget: a re-run finds the version already on
+          // chain and only re-sends the manifest
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash === wantHash) continue;
+          msgs.push({
+            typeUrl: TypeUrl.UpdateDeployment,
+            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+          });
+        }
+        if (msgs.length > 0) await ctx.requireTx(p("mesh-clients"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("mesh-clients"));
+        for (const { row, json } of pushes) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { repointed: pushes.map((p2) => p2.row.key) };
+      },
+    });
+  }
 
   return steps;
 }
@@ -2048,19 +2229,27 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
       name: p("signer"),
       async run(ctx) {
         // new chain-id → the signer needs [chain] id updated BEFORE the
-        // nodes resume (tmkms state is per-chain-id, so it starts fresh)
-        for (const row of nodeRows(ctx).filter((r) => r.key.startsWith("val-"))) {
-          const probe = await ctx.services.ssh.exec(
-            rowTarget(ctx, row),
-            "nc -z 127.0.0.1 26660 && echo ok || echo no",
+        // nodes resume (tmkms state is per-chain-id, so it starts fresh).
+        //
+        // Announce-once, not probe: op:halt left every node in wait mode, so
+        // sparkdreamd — the process that owns the privval listener — is not
+        // running, and any port check here reports "no signer" no matter how
+        // correctly the signer is configured. Gating on that wedged the op
+        // permanently (the same defect the relaunch had). The signer is
+        // verifiable only after the nodes boot, which op:verify covers: no
+        // signer means no blocks, and its failure says so.
+        const notice = `op${opId}-signer-notice`;
+        const alreadyAsked = fs.existsSync(path.join(ctx.dirs.root, `${notice}.pin`));
+        await pinnedValue(ctx, notice, async () => "asked");
+        if (!alreadyAsked) {
+          const vals = nodeRows(ctx).filter((r) => r.key.startsWith("val-")).map((r) => r.key);
+          throw new AwaitUser(
+            p("signer"),
+            `update your tmkms config for ${vals.join(", ")}: set chain_id = "${cid}" in ` +
+              "tmkms.toml (both [[chain]] and [[validator]]), restart the signer, then resume. " +
+              "The reset's new chain-id also means a fresh state file, which is correct here: " +
+              "the old watermark belongs to the chain being discarded.",
           );
-          if (probe.stdout.trim() !== "ok") {
-            throw new AwaitUser(
-              p("signer"),
-              `update your tmkms config for ${row.key}: set chain_id = "${cid}" in tmkms.toml ` +
-                "(both [[chain]] and [[validator]]), restart the signer, then resume",
-            );
-          }
         }
         return { signersReady: true };
       },
@@ -2189,7 +2378,13 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
           }
         }
         if (height === undefined) {
-          throw new Error("chain did not start producing blocks after the reset");
+          throw new Error(
+            "chain did not start producing blocks after the reset" +
+              (spec.security.keyMode === "tmkms"
+                ? ` — check the signer: with the new chain-id "${cid}" tmkms must have chain_id ` +
+                  "updated in both [[chain]] and [[validator]], and no votes are signed until it reconnects"
+                : ""),
+          );
         }
         // the frontend and explorer restarted with the new chain env — gate
         // on both answering again

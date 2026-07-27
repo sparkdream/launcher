@@ -407,6 +407,13 @@ export class FakeSsh {
         `{"result":{"sync_info":{"latest_block_height":"1000000","catching_up":false}${validatorInfo}}}`,
       );
     }
+    if (command.includes("nc -z 127.0.0.1 26660")) {
+      // the privval backend listener belongs to sparkdreamd (the entrypoint's
+      // keepalive proxy on 26659 only forwards to it), so the port is closed
+      // whenever the node is not running — a container in wait mode answers
+      // "no" no matter how the signer is configured
+      return ok(this.started.has(id) ? "ok" : "no");
+    }
     if (command.includes("pgrep -x sparkdreamd")) {
       return ok(this.started.has(id) ? "yes" : "no");
     }
