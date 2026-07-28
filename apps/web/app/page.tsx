@@ -30,6 +30,7 @@ import {
   type FeeInfo,
   type FleetSummary,
   type LaunchView,
+  type OpProgress,
   type PendingGentx,
   type PendingTx,
 } from "../lib/api";
@@ -124,6 +125,11 @@ topology:
     # (one tailscale login on a tmkms signer reaches every sharing fleet):
     # reuseFleet: <launch id or network name of the owning fleet>
 # providers:
+#   policy:
+#     # pause every deployment with its bids listed and lease the one you pick
+#     # (the guided "provider selection" toggle writes this); per component
+#     # group, set providers.components.<group>.manualBid instead
+#     manualBid: true
 #   # fleet-wide: providers on this list may host no component
 #   exclude: []
 #   components:
@@ -158,6 +164,35 @@ const ROLE_LABELS: Array<[RegExp, string]> = [
 ];
 const roleLabel = (key: string) =>
   ROLE_LABELS.find(([re]) => re.test(key))?.[1] ?? "Service";
+
+/** "418,320 / 1,204,885 · 34.7% · ~2h 10m left" — the caption beside the bar. */
+const progressText = (p: OpProgress): string =>
+  [
+    p.current === undefined
+      ? null
+      : p.current.toLocaleString() + (p.target ? ` / ${p.target.toLocaleString()}` : ""),
+    p.percent === undefined ? null : `${p.percent}%`,
+    p.etaSeconds === undefined ? null : `~${duration(p.etaSeconds)} left`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+/** The rest of it, on hover: what is running, how fast, and how fresh. */
+const progressTitle = (p: OpProgress): string =>
+  p.label +
+  (p.rate ? `, ${p.rate} blocks/s` : "") +
+  (p.elapsedSeconds === undefined ? "" : `, running ${duration(p.elapsedSeconds)}`) +
+  `. Updated ${new Date(p.updatedAt).toLocaleTimeString()}. ` +
+  "The work runs on the node itself: closing this page does not stop it.";
+
+/** "3h 12m" / "12m" / "45s" — coarse on purpose, these are estimates. */
+const duration = (seconds: number): string => {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+};
 
 // Nebula background ported from sparkdream-ui's Imaginarium (NebulaField):
 // drifting cosmic blobs, cold palette, screen-blended over the black canvas.
@@ -858,6 +893,7 @@ export default function Page() {
   const specDream: string = specDoc?.token?.dreamDisplayDenom ?? "DREAM";
   const specVals: number = specDoc?.topology?.validators?.count ?? 1;
   const specSents: number = specDoc?.topology?.sentries?.count ?? 0;
+  const specManualBid: boolean = specDoc?.providers?.policy?.manualBid === true;
   const specAccounts: string[] = Array.isArray(specDoc?.accounts?.initial)
     ? specDoc.accounts.initial.map((a: any) => String(a?.name ?? "?"))
     : [];
@@ -892,6 +928,21 @@ export default function Page() {
       const current: string | undefined = doc.token.dreamDenom ?? doc.token.baseDenom;
       const m = typeof current === "string" ? current.match(/^u[a-z]{2,5}\.(.+)$/) : null;
       if (m && /^[A-Za-z]{2,5}$/.test(v)) doc.token.dreamDenom = `u${v.toLowerCase()}.${m[1]}`;
+    });
+  // providers.policy.manualBid (§6.6): off means the selection policy leases
+  // the bid it picks; on means every deployment of the launch parks with its
+  // bids listed and waits to be chosen
+  const setSpecManualBid = (v: boolean) =>
+    patchSpec((doc) => {
+      const providers = { ...(doc.providers ?? {}) };
+      const policy = { ...(providers.policy ?? {}) };
+      if (v) policy.manualBid = true;
+      else delete policy.manualBid;
+      // leave no empty scaffolding behind when the toggle goes back off
+      if (Object.keys(policy).length > 0) providers.policy = policy;
+      else delete providers.policy;
+      if (Object.keys(providers).length > 0) doc.providers = providers;
+      else delete doc.providers;
     });
   const setSpecCount = (kind: "validators" | "sentries", delta: number) =>
     patchSpec((doc) => {
@@ -1034,8 +1085,25 @@ export default function Page() {
   const fleetAction = async (
     launchId: string,
     dseq: string,
-    action: "close" | "restart" | "relaunch" | "upgrade" | "topup" | "unjail" | "resume-signing",
-    extra: { image?: string; components?: string[]; amount?: string; haltHeight?: number } = {},
+    action:
+      | "close"
+      | "restart"
+      | "relaunch"
+      | "upgrade"
+      | "topup"
+      | "unjail"
+      | "resume-signing"
+      | "restore-archive"
+      | "repair"
+      | "clear-halt-height"
+      | "reset-data",
+    extra: {
+      image?: string;
+      components?: string[];
+      amount?: string;
+      haltHeight?: number;
+      manualBid?: boolean;
+    } = {},
   ) => {
     setError(null);
     try {
@@ -1044,24 +1112,54 @@ export default function Page() {
         setError(first.error);
         return;
       }
+      let result = first;
       if (first.warnings?.length) {
         const ok = window.confirm(
-          `${first.warnings.join("\n")}\n\n${first.confirmPrompt ?? "Proceed anyway?"}`,
+          `${first.warnings.join("\n\n")}\n\n${first.confirmPrompt ?? "Proceed anyway?"}`,
         );
         if (!ok) return;
-        await postFleetAction(launchId, dseq, action, { ...extra, confirm: true });
+        // the confirmed call is the one that acts, so it carries what
+        // happened — a refusal here would otherwise pass silently
+        result = await postFleetAction(launchId, dseq, action, { ...extra, confirm: true });
+        if (result.error) {
+          setError(result.error);
+          return;
+        }
       }
       // signature-bearing actions flow through the launch's signing loop —
       // open that launch's panel so the prompt is visible (and survives reload)
       // a mid-launch re-placement may have to wait for the running step, so
       // surface what the conductor said instead of looking like a no-op
-      if (first.note) showToast(first.note);
-      if (action !== "restart") {
+      if (result.note) showToast(result.note);
+      if (action === "restart") {
+        showToast(`restart requested (${dseq})`);
+      } else if (action !== "reset-data") {
+        // reset-data acts over SSH and is already done: its note says so
         localStorage.setItem(LAST_LAUNCH_KEY, launchId);
         setLaunchId(launchId);
-      } else {
-        showToast(`restart requested (${dseq})`);
       }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** Name the bid a parked placement should lease. An op-made placement is
+   *  answered on the op, a launch-made one on the launch's component key. */
+  const chooseBid = async (
+    launchId: string,
+    target: { opId: number } | { key: string },
+    provider: string,
+  ) => {
+    setError(null);
+    try {
+      const api = await import("../lib/api");
+      const { key } =
+        "opId" in target
+          ? await api.postChooseBid(launchId, target.opId, provider)
+          : await api.postChooseLaunchBid(launchId, target.key, provider);
+      showToast(`${key}: leasing the picked bid — sign the lease when prompted`);
+      localStorage.setItem(LAST_LAUNCH_KEY, launchId);
+      setLaunchId(launchId);
     } catch (e) {
       setError(String(e));
     }
@@ -1300,7 +1398,17 @@ export default function Page() {
   const idle = !launching && !launched && !loadingLaunch;
   const doneSteps = launch?.steps.filter((s) => s.status === "done").length ?? 0;
   const totalSteps = launch?.steps.length ?? 0;
-  const launchPct = totalSteps > 0 ? Math.round((doneSteps / totalSteps) * 100) : 0;
+  // Progress is WHERE the run is, not how many steps are done. The two agree
+  // on a launch that only moves forward, but a re-opened one (a component
+  // re-placed after the launch finished) has a long done tail — every later
+  // step plus every past op's — behind the step actually running. Counting
+  // those read "92% · step 97 of 104" while the work sat at await-mesh, a
+  // third of the way down. The engine walks the list in order, so the first
+  // step that is not done IS the position.
+  const openIdx = launch?.steps.findIndex((s) => s.status !== "done") ?? -1;
+  const stepPos = openIdx < 0 ? totalSteps : openIdx + 1;
+  const launchPct =
+    totalSteps > 0 ? Math.round(((openIdx < 0 ? totalSteps : openIdx) / totalSteps) * 100) : 0;
   const launchSpec = launch?.spec as any;
   const launchName: string = launchSpec?.network?.name ?? specName ?? "chain";
 
@@ -1311,8 +1419,13 @@ export default function Page() {
     .filter((f) => f.launchId === launchId)
     .flatMap((f) => f.ops.filter((o) => o.status === "active").map((o) => o.kind));
 
-  // the step list accumulates every past op's steps; collapse the leading
-  // run of already-done steps so the current work stays in view
+  // the step list accumulates every past op's steps, so what matters is not a
+  // leading run: a step that failed early keeps its place while later ops append
+  // hundreds of finished ones behind it, and collapsing only the run in front of
+  // it left the whole rest of the log on screen with no way to fold it. Hide the
+  // done steps instead, wherever they sit: every step that is not done stays (the
+  // failure, the running one, the work still ahead), as does the tail, and each
+  // stretch of done steps folds into one summary row that opens the full log.
   const [stepsExpanded, setStepsExpanded] = useState(false);
   // completed launch: clicking the "is live" header shows/hides the step log
   // (remembered per launch)
@@ -1324,14 +1437,27 @@ export default function Page() {
   const toggleLog = () => {
     if (launchId) setLogOpenMap((m) => ({ ...m, [launchId]: !logOpen }));
   };
-  const firstOpenStep = launch?.steps.findIndex((s) => s.status !== "done") ?? -1;
-  // when everything is done (status still running between polls), keep the tail
-  const collapseCount = Math.max(
-    0,
-    (firstOpenStep < 0 ? totalSteps - 1 : firstOpenStep) - 1,
-  );
-  const collapseSteps = !stepsExpanded && collapseCount > 2;
-  const visibleSteps = collapseSteps ? launch?.steps.slice(collapseCount) ?? [] : launch?.steps ?? [];
+  const allSteps = launch?.steps ?? [];
+  const STEP_TAIL = 2;
+  const keepStep = (s: LaunchView["steps"][number], i: number) =>
+    i >= allSteps.length - STEP_TAIL || s.status !== "done";
+  type StepGroup =
+    | { kind: "step"; step: LaunchView["steps"][number] }
+    | { kind: "gap"; steps: LaunchView["steps"][number][] };
+  const stepGroups: StepGroup[] = [];
+  allSteps.forEach((s, i) => {
+    if (keepStep(s, i)) {
+      stepGroups.push({ kind: "step", step: s });
+      return;
+    }
+    const last = stepGroups[stepGroups.length - 1];
+    if (last?.kind === "gap") last.steps.push(s);
+    else stepGroups.push({ kind: "gap", steps: [s] });
+  });
+  // every stretch folds, however short: the collapsed pane keeps one height
+  const stepPlan: StepGroup[] = stepGroups;
+  const hiddenSteps = stepPlan.reduce((n, g) => (g.kind === "gap" ? n + g.steps.length : n), 0);
+  const stepCount = (n: number) => `${n} completed step${n === 1 ? "" : "s"}`;
 
   // headline fleet for the status pill: the open launch's fleet, else the
   // most recent fleet that still has live components
@@ -1729,6 +1855,17 @@ export default function Page() {
     </div>
   );
 
+  const bidSeg = (
+    <div className="seg fill">
+      <button className={specManualBid ? "" : "on"} onClick={() => setSpecManualBid(false)}>
+        automatic
+      </button>
+      <button className={specManualBid ? "on" : ""} onClick={() => setSpecManualBid(true)}>
+        pick each bid
+      </button>
+    </div>
+  );
+
   const counter = (value: number, kind: "validators" | "sentries") => (
     <div className="counter">
       <button onClick={() => setSpecCount(kind, -1)}>−</button>
@@ -1748,8 +1885,22 @@ export default function Page() {
     />
   );
 
+  // Live position of this launch's long ops, by op id. The step list is where
+  // an operator actually watches a restore (a replay runs for hours inside one
+  // step row), so the bar belongs here and not only on the fleet panel's chip.
+  const opProgress = new Map<number, OpProgress>(
+    (fleet?.fleets ?? [])
+      .filter((f) => f.launchId === launchId)
+      .flatMap((f) =>
+        f.ops.flatMap((o) => (o.progress ? [[o.id, o.progress] as [number, OpProgress]] : [])),
+      ),
+  );
+
   // step rows for the launching view, mapped from the conductor's real steps
   const stepRow = (s: LaunchView["steps"][number]) => {
+    // op steps are named op<id>:<step>; only the running one has a position
+    const opId = Number(/^op(\d+):/.exec(s.name)?.[1]);
+    const progress = s.status === "running" ? opProgress.get(opId) : undefined;
     const cls =
       s.status === "done"
         ? "done"
@@ -1770,6 +1921,18 @@ export default function Page() {
           </span>
         )}
         <span className="lbl">{s.name}</span>
+        {progress && (
+          <span className="step-progress" title={progressTitle(progress)}>
+            {/* no target (archives that do not name their range): the caption
+                carries the height and the bar is left out rather than faked */}
+            {progress.percent !== undefined && (
+              <span className="op-bar step-bar">
+                <span className="op-bar-fill" style={{ width: `${progress.percent}%` }} />
+              </span>
+            )}
+            <span className="mono">{progressText(progress)}</span>
+          </span>
+        )}
         <span className="op">{s.status}</span>
       </div>
     );
@@ -2343,7 +2506,7 @@ export default function Page() {
                   </div>
                 </div>
                 <span className="mono-dim" style={{ flex: "none", fontSize: 12 }}>
-                  {launchPct}% · step {Math.min(totalSteps, doneSteps + 1)} of {totalSteps}
+                  {launchPct}% · step {stepPos} of {totalSteps}
                 </span>
                 {isTmkms && (
                   <button
@@ -2536,7 +2699,20 @@ export default function Page() {
                       </div>
                       {counter(specSents, "sentries")}
                     </div>
+                    <div>
+                      <div className="f-label">
+                        Provider selection <span className="hint">· who picks the bids</span>
+                      </div>
+                      {bidSeg}
+                    </div>
                   </div>
+                  {specManualBid && (
+                    <div className="dim-note" style={{ marginTop: 10 }}>
+                      Every deployment will pause with its bids listed for you to choose from,
+                      starting with the VPN mesh and then the whole node batch at once. The launch
+                      waits at each pause until you pick.
+                    </div>
+                  )}
                   <div style={{ marginTop: 18 }}>
                     <div className="f-label" style={{ marginBottom: 9 }}>
                       Genesis accounts
@@ -2595,6 +2771,7 @@ export default function Page() {
                       {specVals} validator{specVals === 1 ? "" : "s"} · {specSents}{" "}
                       {specSents === 1 ? "sentry" : "sentries"} · {specAccounts.length} accounts
                     </span>
+                    {specManualBid && <span className="chip plain">you pick every bid</span>}
                   </div>
                   <div className="sub-card" style={{ marginTop: 16, padding: "18px 20px" }}>
                     <div className="cost-head">
@@ -2676,6 +2853,10 @@ export default function Page() {
                           <div className="f-label">Sentries</div>
                           {counter(specSents, "sentries")}
                         </div>
+                        <div>
+                          <div className="f-label">Provider selection</div>
+                          {bidSeg}
+                        </div>
                       </div>
                       <div className="dim-note" style={{ marginTop: 12 }}>
                         Tokens, accounts and service images keep the spec's current values.
@@ -2732,29 +2913,34 @@ export default function Page() {
                 </div>
               )}
               <div className="launch-rows">
-                {collapseSteps && (
+                {stepsExpanded && hiddenSteps > 0 && (
                   <button
                     className="launch-row done summary"
-                    title="Show the completed steps"
-                    onClick={() => setStepsExpanded(true)}
-                  >
-                    <span className="mark">✓</span>
-                    <span className="lbl">{collapseCount} completed steps</span>
-                    <span className="op">show ▾</span>
-                  </button>
-                )}
-                {stepsExpanded && collapseCount > 2 && (
-                  <button
-                    className="launch-row done summary"
-                    title="Collapse the completed steps"
+                    title="Collapse the earlier steps"
                     onClick={() => setStepsExpanded(false)}
                   >
                     <span className="mark">✓</span>
-                    <span className="lbl">hide completed steps</span>
+                    <span className="lbl">hide {stepCount(hiddenSteps)}</span>
                     <span className="op">hide ▴</span>
                   </button>
                 )}
-                {visibleSteps.map(stepRow)}
+                {stepsExpanded
+                  ? allSteps.map(stepRow)
+                  : stepPlan.map((g, i) => {
+                      if (g.kind === "step") return stepRow(g.step);
+                      return (
+                        <button
+                          key={`gap-${i}`}
+                          className="launch-row done summary"
+                          title="Show these steps"
+                          onClick={() => setStepsExpanded(true)}
+                        >
+                          <span className="mark">✓</span>
+                          <span className="lbl">{stepCount(g.steps.length)}</span>
+                          <span className="op">show ▾</span>
+                        </button>
+                      );
+                    })}
               </div>
             </div>
           )}
@@ -3044,6 +3230,24 @@ export default function Page() {
                     >
                       join bundle
                     </button>
+                    {!shutDown && active.length > 0 && (
+                      <button
+                        className="btn"
+                        title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
+                        onClick={() => fleetAction(f.launchId, active[0]!.dseq, "repair")}
+                      >
+                        repair fleet
+                      </button>
+                    )}
+                    {!shutDown && active.length > 0 && (
+                      <button
+                        className="btn"
+                        title="Set halt-height back to 0 on every chain node. Recovery for a halt-height upgrade abandoned before it cleared the setting itself: until it is cleared, a node that stopped at the halt height halts again on every restart, and nothing else in the launcher edits it. Nothing is started — restart a halted node to resume on its current image, or run an upgrade to bring it back on a new one."
+                        onClick={() => fleetAction(f.launchId, active[0]!.dseq, "clear-halt-height")}
+                      >
+                        clear halt height
+                      </button>
+                    )}
                     {!shutDown && (
                       <>
                         <button
@@ -3103,8 +3307,27 @@ export default function Page() {
                     {f.ops
                       .filter((o) => o.status === "active")
                       .map((o) => (
-                        <span key={o.id} className="op-active">
-                          {o.kind} in progress…
+                        <span key={o.id} className={o.progress ? "op-active measured" : "op-active"}>
+                          {o.progress ? (
+                            <span className="op-progress" title={progressTitle(o.progress)}>
+                              <span className="op-progress-text">
+                                {o.progress.label} <span className="mono">{progressText(o.progress)}</span>
+                              </span>
+                              {/* no target height (archives that do not name
+                                  their range): the bar would be a lie, so the
+                                  height alone stands in for it */}
+                              {o.progress.percent !== undefined && (
+                                <span className="op-bar">
+                                  <span
+                                    className="op-bar-fill"
+                                    style={{ width: `${o.progress.percent}%` }}
+                                  />
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <>{o.kind} in progress…</>
+                          )}
                           <button
                             className="btn"
                             title="Abandon this operation (e.g. if it's stuck on a broken provider). Closes its new deployment; the component can then be relaunched."
@@ -3168,6 +3391,91 @@ export default function Page() {
                     )}
                   </div>
                 )}
+
+                {/* manual bid selection: a placement parked for a pick offers
+                    every bid it drew; the pick is leased as-is, so bids the
+                    policy rejected stay choosable (that is the point —
+                    reaching a provider auto-selection passes over). A
+                    relaunch op carries its offers on the op, a re-place made
+                    by the launch itself on the launch. */}
+                {!collapsed &&
+                  [
+                    ...f.ops
+                      .filter(
+                        (o) => o.status === "active" && o.params.offeredBids && !o.params.bidChoice,
+                      )
+                      .map((o) => ({
+                        id: `op-${o.id}`,
+                        key: o.params.key ?? "component",
+                        dseq: o.params.offeredBids!.dseq,
+                        bids: o.params.offeredBids!.bids,
+                        target: { opId: o.id } as { opId: number } | { key: string },
+                        retry: "abandon the operation and relaunch for a fresh set",
+                      })),
+                    ...f.bidPicks.map((p) => ({
+                      id: `launch-${p.key}`,
+                      key: p.key,
+                      dseq: p.dseq,
+                      bids: p.bids,
+                      target: { key: p.key } as { opId: number } | { key: string },
+                      retry: "resume the launch to draw a fresh set",
+                    })),
+                  ].map((o) => (
+                      <div key={`bid-pick-${o.id}`} className="bid-pick">
+                        <div className="bid-pick-head">
+                          <b>{o.key}</b>: pick the bid to lease (deployment {o.dseq})
+                          <span className="dim-note">
+                            {" "}
+                            Bids close a few minutes after they arrive. If the lease then fails,{" "}
+                            {o.retry}.
+                          </span>
+                        </div>
+                        {o.bids.length === 0 && (
+                          <div className="dim-note">
+                            No usable bids (bidders missing from the provider list cannot be
+                            leased). Try again for a fresh set.
+                          </div>
+                        )}
+                        {o.bids.map((b) => (
+                          <div key={b.provider} className="bid-row">
+                            <span className="bid-host" title={b.provider}>
+                              {b.hostUri.replace(/^https?:\/\//, "")}
+                            </span>
+                            <span className="bid-price" title={`${b.price} ${b.priceDenom}/block`}>
+                              {priceMonthly(b.price, b.priceDenom)}
+                            </span>
+                            <span className="bid-meta">
+                              {b.audited ? "audited" : "unaudited"} · uptime{" "}
+                              {(b.uptime7d * 100).toFixed(1)}%
+                            </span>
+                            <span className={`bid-verdict${b.rejected ? " off" : ""}`}>
+                              {b.autoPick
+                                ? "auto-selection would lease this"
+                                : (b.rejected ?? "passes the policy")}
+                            </span>
+                            <button
+                              className="btn amber"
+                              onClick={() => {
+                                // a rejected bid is leased as asked, but the
+                                // reason can be a real blocker (no persistent
+                                // storage class) rather than a preference
+                                if (
+                                  b.rejected &&
+                                  !window.confirm(
+                                    `The selection policy rejected this bid: ${b.rejected}\n\n` +
+                                      "Lease it anyway?",
+                                  )
+                                )
+                                  return;
+                                void chooseBid(f.launchId, o.target, b.provider);
+                              }}
+                            >
+                              lease this
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
 
                 {!collapsed &&
                   bodyOpen &&
@@ -3242,6 +3550,21 @@ export default function Page() {
                                   image <span className="v">{c.image}</span>
                                 </span>
                               )}
+                              {c.tailnetIp && (
+                                <span>
+                                  mesh ip{" "}
+                                  <span
+                                    className="v"
+                                    title="Address on the headscale mesh (click to copy). Peers reach this component here."
+                                    style={{ cursor: "pointer" }}
+                                    onClick={() =>
+                                      void navigator.clipboard.writeText(c.tailnetIp!)
+                                    }
+                                  >
+                                    {c.tailnetIp}
+                                  </span>
+                                </span>
+                              )}
                               {c.escrow != null && (
                                 <span>
                                   escrow left{" "}
@@ -3307,6 +3630,26 @@ export default function Page() {
                                   >
                                     restart
                                   </button>
+                                  {/^(val|sentry)-/.test(c.key) && (
+                                    <>
+                                      <button
+                                        className="btn"
+                                        title="Rebuild block history from archive files uploaded to this node: stops sparkdreamd, runs replay-from-archive in the background (its output stays on the node, so nothing floods the log viewer), then starts the node on the restored state. Upload the blocks_*.jsonl.gz files, or one .tar.gz of them, first."
+                                        onClick={() =>
+                                          fleetAction(f.launchId, c.dseq, "restore-archive")
+                                        }
+                                      >
+                                        restore
+                                      </button>
+                                      <button
+                                        className="btn red"
+                                        title="Erase this node's chain data (comet unsafe-reset-all) and leave it stopped. Keys are kept. Only needed to rebuild history BELOW the node's current height: restore replays forward from where the node is, so a full rebuild from block 1 starts from an empty database."
+                                        onClick={() => fleetAction(f.launchId, c.dseq, "reset-data")}
+                                      >
+                                        reset data…
+                                      </button>
+                                    </>
+                                  )}
                                   <button
                                     className="btn"
                                     onClick={() => showLogs(f.launchId, c.dseq, c.key)}
@@ -3319,7 +3662,9 @@ export default function Page() {
                                       title={
                                         uploading[c.key]
                                           ? undefined
-                                          : "Push a file into this container. It lands in /root/<filename> as-is; move or extract it from the shell afterwards."
+                                          : c.key === "explorer"
+                                            ? "Push a file into this container. It lands in /data as-is; move or extract it from the shell afterwards."
+                                            : "Push a file into this container. It lands in /root/.sparkdream (the chain home) as-is; move or extract it from the shell afterwards."
                                       }
                                       style={
                                         uploading[c.key]
@@ -3418,6 +3763,17 @@ export default function Page() {
                                     relaunch
                                   </button>
                                   <button
+                                    className="btn amber"
+                                    title="Relaunch, but stop at the lease and list every bid so you can pick one. Your pick is leased whatever the selection policy says about it (price, uptime, avoid list)."
+                                    onClick={() =>
+                                      fleetAction(f.launchId, c.dseq, "relaunch", {
+                                        manualBid: true,
+                                      })
+                                    }
+                                  >
+                                    relaunch: pick bid…
+                                  </button>
+                                  <button
                                     className="btn red"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "close")}
                                   >
@@ -3428,12 +3784,25 @@ export default function Page() {
                               {/* a closed/relaunching node can still be relaunched
                                   (redeploy fresh) — the only action that applies */}
                               {c.state !== "active" && !shutDown && (
-                                <button
-                                  className="btn amber"
-                                  onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}
-                                >
-                                  relaunch
-                                </button>
+                                <>
+                                  <button
+                                    className="btn amber"
+                                    onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}
+                                  >
+                                    relaunch
+                                  </button>
+                                  <button
+                                    className="btn amber"
+                                    title="Relaunch, but stop at the lease and list every bid so you can pick one. Your pick is leased whatever the selection policy says about it (price, uptime, avoid list)."
+                                    onClick={() =>
+                                      fleetAction(f.launchId, c.dseq, "relaunch", {
+                                        manualBid: true,
+                                      })
+                                    }
+                                  >
+                                    relaunch: pick bid…
+                                  </button>
+                                </>
                               )}
                             </div>
                             {logsView?.key === c.key && (

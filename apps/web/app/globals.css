@@ -493,6 +493,14 @@ input.mint-amt {
 .launch-row .op {
   font-family: var(--font-mono); font-size: 11px; color: var(--faint); margin-left: auto;
 }
+/* a long op's live position, on the running step row that owns it */
+.launch-row .step-progress {
+  margin-left: auto; display: flex; align-items: center; gap: 10px;
+  font-size: 11px; color: var(--dim2);
+}
+/* accent, not the fleet chip's amber: this bar sits in the launch step list */
+.launch-row .step-bar { width: 150px; flex: none; background: rgba(109, 106, 248, 0.18); }
+.launch-row .step-bar .op-bar-fill { background: var(--accent); }
 button.launch-row.summary {
   background: transparent; border: none; width: 100%; cursor: pointer;
   text-align: left; font: inherit;
@@ -529,6 +537,34 @@ button.launch-row.summary .lbl { color: var(--dim2); font-style: italic; }
 /* ---------- fleet ---------- */
 .fleet-acts { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 22px 14px; align-items: center; }
 .op-active { color: var(--amber-text); font-size: 12px; animation: dvpulse 1.4s infinite; display: inline-flex; gap: 8px; align-items: center; }
+/* an op that reports a real position says so with the bar; pulsing the text
+   as well (the way an unmeasured op does) just makes the number hard to read */
+.op-active.measured { animation: none; }
+.op-progress { display: inline-flex; flex-direction: column; gap: 4px; min-width: 260px; }
+.op-progress-text { white-space: nowrap; }
+.op-bar {
+  display: block; height: 4px; border-radius: 2px; overflow: hidden;
+  background: rgba(255, 176, 46, 0.16);
+}
+.op-bar-fill {
+  display: block; height: 100%; border-radius: 2px;
+  background: var(--amber-text); transition: width 600ms linear;
+}
+/* manual bid selection panel (relaunch parked at its lease step) */
+.bid-pick {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 14px 22px; display: flex; flex-direction: column; gap: 8px;
+  background: rgba(255, 176, 46, 0.04);
+}
+.bid-pick-head { font-size: 12.5px; color: var(--amber-text); }
+.bid-row {
+  display: grid; grid-template-columns: 1fr 100px 190px 1fr auto;
+  align-items: center; gap: 14px; font-size: 12px;
+}
+.bid-host { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.bid-price { text-align: right; }
+.bid-meta, .bid-verdict { color: var(--dim); }
+.bid-verdict.off { color: var(--red); }
 .fleet-comp { border-top: 1px solid rgba(255, 255, 255, 0.06); }
 .fleet-row {
   display: grid; grid-template-columns: 14px 175px 1fr 190px 90px 18px;

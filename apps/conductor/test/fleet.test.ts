@@ -22,6 +22,9 @@ afterAll(() => {
 function spec(validators = 1, sentries = 1): LaunchSpec {
   return testnetSpec({
     network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    // relaunches here must land somewhere new to be observable, which is
+    // anti-affinity's job — no profile turns it on by default
+    providers: { policy: { antiAffinity: "strict" } },
     topology: {
       validators: { count: validators },
       sentries: { count: sentries },
@@ -315,6 +318,57 @@ describe("fleet actions over HTTP", () => {
     expect(
       services.ssh.execLog.some((e) => e.command.includes("pkill -x sparkdreamd")),
     ).toBe(true);
+  }, 120_000);
+
+  it("reset-data warns about what it destroys, then wipes and leaves the node stopped", async () => {
+    const { db, services, work } = await launched(1, 1);
+    const app = buildServer({ db, services, workRoot: work, steps: allSteps(), monitorIntervalMs: 0 });
+    await app.inject({ method: "GET", url: "/api/fleet?owner=akash1owner" });
+    const val = db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+
+    const guarded = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${val.dseq}/actions`,
+      payload: { action: "reset-data" },
+    });
+    expect(guarded.statusCode).toBe(409);
+    const warnings = (guarded.json() as any).warnings as string[];
+    expect(warnings[0]).toContain("erases");
+    // the fleet's only validator: stopping it stops the chain
+    expect(warnings.some((w) => w.includes("only active validator"))).toBe(true);
+    // softsign keeps the double-sign watermark in the dir this wipes
+    expect(warnings.some((w) => w.includes("double sign"))).toBe(true);
+    // nothing touched before the confirm
+    expect(services.ssh.execLog.some((e) => e.command.includes("unsafe-reset-all"))).toBe(false);
+
+    const done = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${val.dseq}/actions`,
+      payload: { action: "reset-data", confirm: true },
+    });
+    expect((done.json() as any).status).toBe("reset");
+    const log = services.ssh.execLog.filter((e) => e.target === valId).map((e) => e.command);
+    const stopAt = log.findLastIndex((c) => c.includes("pkill -x sparkdreamd"));
+    const resetAt = log.findLastIndex((c) => c.includes("unsafe-reset-all"));
+    // the reset opens the databases the node holds: it runs only once stopped
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(resetAt).toBeGreaterThan(stopAt);
+    expect(log[resetAt]).toContain("--keep-addr-book");
+    // left stopped on purpose — a restart would re-sync and take the height
+    // with it, which is what a from-genesis restore needs it not to do
+    expect(services.ssh.started.has(valId)).toBe(false);
+
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sentryGuard = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "reset-data" },
+    });
+    // sentries reset too, with only the data warning — they sign nothing
+    const sentryWarnings = (sentryGuard.json() as any).warnings as string[];
+    expect(sentryWarnings).toHaveLength(1);
+    db.close();
   }, 120_000);
 });
 

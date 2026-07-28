@@ -761,8 +761,11 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     if (spec.security.keyMode === "softsign") {
       warn("security.keyMode", "softsign on mainnet: consensus keys live on provider disk");
     }
-    if (spec.providers.policy.antiAffinity !== "strict") {
-      warn("providers.policy.antiAffinity", "mainnet should use strict anti-affinity");
+    if (spec.providers.policy.antiAffinity === "off") {
+      warn(
+        "providers.policy.antiAffinity",
+        "anti-affinity off: nothing stops the whole fleet landing on one provider",
+      );
     }
   }
 

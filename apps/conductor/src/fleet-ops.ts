@@ -10,7 +10,7 @@ import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/
 import { feeCoin, feeConfig } from "./fee.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
-import { exclusionEntries, selectProvider } from "./akash/policy.js";
+import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
@@ -32,7 +32,7 @@ import {
   verifySignedDoc,
   type GentxSignResponse,
 } from "./gentx.js";
-import { NODE_HOME, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
+import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import { readSecretFile } from "./secrets.js";
 import type { SshTarget } from "./services.js";
@@ -57,6 +57,14 @@ export interface RelaunchParams {
   avoidProviders?: string[];
   /** Provider addresses to try first (promoted in the preference order). */
   preferProviders?: string[];
+  /** Operator picks the bid by hand: the lease step parks with the bid list
+   *  on this op row instead of applying the selection policy. */
+  manualBid?: boolean;
+  /** The pick, once made. Scoped to the deployment the bids belong to — a
+   *  later attempt (new dseq) draws new bids, so an old pick never applies. */
+  bidChoice?: { dseq: string; provider: string };
+  /** Bids on offer for the pick, refreshed each time the step parks. */
+  offeredBids?: { dseq: string; bids: OfferedBid[] };
 }
 
 export interface UpgradeParams {
@@ -178,6 +186,143 @@ async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<numbe
   if (!sentry) return undefined;
   const url = await nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
   return (await ctx.services.rpc.status(url)).latestBlockHeight;
+}
+
+/** The line cosmos prints on its way down when `halt-height` fires. */
+export function haltLogLine(haltHeight: number): string {
+  return `halt per configuration height ${haltHeight}`;
+}
+
+/** Log tail pulled when looking for the halt line: a boot prints a lot. */
+const HALT_LOG_TAIL = 500;
+
+/**
+ * Swap the version tag on a recorded image reference.
+ *
+ * Only ever rewrites a tag that already looks like a version (`v1.2.3` or
+ * `1.2.3`), preserving the `v` prefix if it had one: a node reports a version,
+ * not an image name, so re-tagging anything else — a floating tag, a
+ * digest pin, a custom build — would be a guess. Returns undefined when it
+ * cannot tell, so the caller keeps the recorded reference rather than
+ * inventing one.
+ */
+export function retagImage(image: string | null, version: string): string | undefined {
+  if (!image) return undefined;
+  const at = image.lastIndexOf(":");
+  if (at <= image.lastIndexOf("/")) return undefined; // no tag at all
+  const prefix = /^(v?)\d+\.\d+\.\d+/.exec(image.slice(at + 1))?.[1];
+  if (prefix === undefined) return undefined;
+  return `${image.slice(0, at)}:${prefix}${version.replace(/^v/, "")}`;
+}
+
+/**
+ * Has this node hit its configured halt height?
+ *
+ * Read from the container's own log stream, and deliberately neither an RPC
+ * probe nor an SSH one — both fail for the same reason. sparkdreamd is PID 1
+ * (deploy/docker/entrypoint_ssh.sh `exec "$@"`), so refusing the halt-height
+ * block exits the container and Akash restarts it, which boots straight back
+ * into the same halt: a halted node is a CRASH LOOP, not a stopped process.
+ * There is no window where the container is up and the node is down, so
+ * "sparkdreamd is gone" is never observable; RPC is dead throughout (and
+ * cosmos refuses the halt block inside FinalizeBlock, so the head stops at
+ * H-1 and never reaches H anyway); and SSH only answers during each boot
+ * attempt, disappearing entirely into the provider's restart backoff
+ * ("no active replicas for service"). The log stream is the one source that
+ * outlives the restarts, and the halt line is reprinted on every lap.
+ */
+async function haltObserved(
+  ctx: StepCtx,
+  row: FleetComponentRow,
+  haltHeight: number,
+): Promise<boolean> {
+  const logs = await ctx.services.provider.leaseLogs(
+    loadCert(ctx),
+    row.host_uri,
+    row.dseq,
+    1,
+    1,
+    HALT_LOG_TAIL,
+  );
+  return logs.includes(haltLogLine(haltHeight));
+}
+
+/**
+ * Run a command on a node that may be halting.
+ *
+ * The crash loop means SSH answers only inside each boot window (sshd comes
+ * up before the entrypoint execs sparkdreamd) and refuses connections for the
+ * whole of the provider's restart backoff between them. A single attempt is a
+ * coin flip, so retry until one lands.
+ */
+async function execOnHaltingNode(
+  ctx: StepCtx,
+  row: FleetComponentRow,
+  command: string,
+  attempts = 120,
+): Promise<string> {
+  let last = "";
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await ctx.services.ssh.exec(rowTarget(ctx, row), command, { quick: true });
+      return res.stdout;
+    } catch (e) {
+      last = (e instanceof Error ? e.message : String(e)).slice(0, 200);
+      if (i === 0 || i % 12 === 0) ctx.log(`${row.key}: waiting for a boot window — ${last}`);
+    }
+    await ctx.services.sleep(5000);
+  }
+  throw new Error(`${row.key}: command never landed after ${attempts} attempts (last: ${last})`);
+}
+
+/**
+ * Manual bid selection (the relaunch option): instead of letting the policy
+ * pick, park the op with every bid on the order recorded on its row, and
+ * lease exactly the one the operator names — policy filters, the avoid list
+ * and anti-affinity included. The whole point is to reach a provider the
+ * automatic selection keeps passing over (a cheap host the price-median or
+ * uptime floor rejects), so a rejected bid stays choosable; the reason is
+ * carried through to the picker and logged when the pick is honored.
+ *
+ * The choice is scoped to `dseq`: bids belong to one order, so a pick made
+ * for an earlier attempt (abandoned op, re-deploy) never carries over.
+ */
+async function manualBidChoice(
+  ctx: StepCtx,
+  opId: number,
+  stepName: string,
+  key: string,
+  dseq: string,
+  open: Bid[],
+  providers: Map<string, ProviderInfo>,
+  decision: PolicyDecision,
+): Promise<Bid> {
+  const op = ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId);
+  const params = JSON.parse(op?.params_json ?? "{}") as RelaunchParams;
+  const choice = params.bidChoice;
+  if (choice && choice.dseq === dseq) {
+    const hit = open.find((b) => b.bid.id.provider === choice.provider);
+    if (hit) {
+      const why = decision.rejected.find((r) => r.provider === choice.provider)?.reason;
+      ctx.log(
+        `${key}: leasing hand-picked bid from ${choice.provider} ` +
+          `(${providers.get(choice.provider)?.hostUri ?? "unknown host"})` +
+          (why ? ` — overriding the policy, which rejected it: ${why}` : ""),
+      );
+      return hit;
+    }
+    ctx.log(`${key}: the picked bid (${choice.provider}) is no longer on offer — pick again`);
+  }
+  const offers = describeBids(open, providers, decision);
+  const { bidChoice: _dropped, ...rest } = params;
+  ctx.db.updateFleetOpParams(opId, { ...rest, offeredBids: { dseq, bids: offers } });
+  ctx.log(`${key}: ${offers.length} bid(s) on offer, waiting for a manual pick`);
+  throw new AwaitUser(
+    stepName,
+    `${key}: pick which bid to lease — the fleet panel lists the ${offers.length} bid(s) on ` +
+      "this deployment. Bids close a few minutes after they arrive, so if the lease then " +
+      "fails, abandon this operation and relaunch to draw a fresh set.",
+  );
 }
 
 /** Relaunch: close → fresh deploy on a new provider → rewire → guarded start.
@@ -363,7 +508,8 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       const preference = [
         ...new Set([...(params.preferProviders ?? []), ...spec.providers.policy.preference]),
       ];
-      const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+      const open = bids.filter((b) => b.bid.state === "open");
+      const decision = selectProvider(open, {
         policy: { ...spec.providers.policy, preference },
         chosenProviders: exclude,
         avoidProviders,
@@ -372,7 +518,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         requiredStorageClass: deploy.requiredStorageClass,
         providers,
       });
-      if (!decision.chosen) {
+      // hand-picked: the operator's bid wins over everything above. The
+      // relaunch may ask for a pick; the spec may also require one for this
+      // component, in which case every placement of it is the operator's.
+      const chosen =
+        (params.manualBid ?? manualBidRequired(spec, key)) && open.length > 0
+          ? await manualBidChoice(ctx, opId, p("lease"), key, deploy.dseq, open, providers, decision)
+          : decision.chosen;
+      if (!chosen) {
         // distinguish "market had nothing" from "the bids expired": a bid
         // not leased within a few minutes closes, and providers do not
         // re-bid on an old order — resuming here can never succeed, so
@@ -388,14 +541,14 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
             : `no acceptable bids for ${key} relaunch avoiding ${avoidProviders.size + exclude.size} provider(s): ${JSON.stringify(decision.rejected)}`,
         );
       }
-      const bidId = decision.chosen.bid.id;
+      const bidId = chosen.bid.id;
       await ctx.requireTx(p("lease"), [createLeaseMsg(bidId)]);
       return {
         provider: bidId.provider,
         gseq: bidId.gseq,
         oseq: bidId.oseq,
         hostUri: providers.get(bidId.provider)!.hostUri,
-        price: decision.chosen.bid.price.amount,
+        price: chosen.bid.price.amount,
       };
     },
   });
@@ -1128,7 +1281,8 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       const preference = [
         ...new Set([...(params.preferProviders ?? []), ...spec.providers.policy.preference]),
       ];
-      const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+      const open = bids.filter((b) => b.bid.state === "open");
+      const decision = selectProvider(open, {
         policy: { ...spec.providers.policy, preference },
         chosenProviders: new Set<string>(),
         avoidProviders,
@@ -1137,7 +1291,11 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         requiredStorageClass: deploy.requiredStorageClass,
         providers,
       });
-      if (!decision.chosen) {
+      const chosen =
+        (params.manualBid ?? manualBidRequired(spec, key)) && open.length > 0
+          ? await manualBidChoice(ctx, opId, p("lease"), key, deploy.dseq, open, providers, decision)
+          : decision.chosen;
+      if (!chosen) {
         const expired = bids.length > 0 && bids.every((b) => b.bid.state !== "open");
         throw new AwaitUser(
           p("lease"),
@@ -1149,14 +1307,14 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
             : `no acceptable bids for the headscale relaunch avoiding ${avoidProviders.size} provider(s): ${JSON.stringify(decision.rejected)}`,
         );
       }
-      const bidId = decision.chosen.bid.id;
+      const bidId = chosen.bid.id;
       await ctx.requireTx(p("lease"), [createLeaseMsg(bidId)]);
       return {
         provider: bidId.provider,
         gseq: bidId.gseq,
         oseq: bidId.oseq,
         hostUri: providers.get(bidId.provider)!.hostUri,
-        price: decision.chosen.bid.price.amount,
+        price: chosen.bid.price.amount,
       };
     },
   });
@@ -1735,22 +1893,59 @@ export function haltUpgradeSteps(
     {
       name: p("halt-wait"),
       async run(ctx) {
+        // every node carries the same halt-height, so they all stop within a
+        // block of each other — the gate is ALL of them halted, since the next
+        // step clears the setting and the one after restarts containers.
+        // Sticky: a node in its restart backoff serves no logs at all, so an
+        // unreadable stream is missing information, never evidence that a node
+        // already seen halting has somehow resumed.
+        const halted = new Set<string>();
+        let lastNote = "";
+        let note = "no probe ran";
         for (let i = 0; i < 720; i++) {
-          const height = await sentryRpcHeight(ctx);
-          if (height !== undefined && height >= params.haltHeight) return { haltedAt: height };
+          const problems: string[] = [];
+          for (const row of nodeRows(ctx)) {
+            if (halted.has(row.key)) continue;
+            try {
+              if (await haltObserved(ctx, row, params.haltHeight)) halted.add(row.key);
+              else problems.push(`${row.key} still running`);
+            } catch (e) {
+              // no logs to read: mid-restart, or the provider is unhappy.
+              // Either way this round learned nothing — keep polling.
+              problems.push(
+                `${row.key} unreadable (${(e instanceof Error ? e.message : String(e)).slice(0, 80)})`,
+              );
+            }
+          }
+          const keys = nodeRows(ctx).map((r) => r.key);
+          if (keys.length > 0 && keys.every((k) => halted.has(k))) {
+            // FinalizeBlock refuses the halt-height block, so the committed
+            // head is the one below it
+            return { haltedAt: params.haltHeight - 1, nodes: keys };
+          }
+          note = problems.join(", ") || "no chain nodes to halt";
+          if (note !== lastNote) {
+            ctx.log(`halt-wait: waiting for ${params.haltHeight} — ${note}`);
+            lastNote = note;
+          }
           await ctx.services.sleep(5000);
         }
-        throw new Error(`chain never reached halt height ${params.haltHeight}`);
+        throw new Error(
+          `nodes never halted at ${params.haltHeight} (last: ${note})`,
+        );
       },
     },
     {
       name: p("halt-clear"),
       async run(ctx) {
         // clear BEFORE the image swap restarts containers, or the new
-        // binary comes up and halts again immediately
+        // binary comes up and halts again immediately. Every node is crash
+        // looping by now, so this has to wait for a boot window rather than
+        // assume SSH answers on the first try.
         for (const row of nodeRows(ctx)) {
-          await ctx.services.ssh.exec(
-            rowTarget(ctx, row),
+          await execOnHaltingNode(
+            ctx,
+            row,
             `sed -i 's|^halt-height =.*|halt-height = 0|' ${NODE_HOME}/config/app.toml`,
           );
         }
@@ -1807,10 +2002,16 @@ export function haltUpgradeSteps(
         // providers restart containers on the new image; WAIT_FOR_CONFIG=false
         // (step 20b) auto-starts them — chain resumes once >2/3 are back
         for (let i = 0; i < 240; i++) {
-          const height = await sentryRpcHeight(ctx);
-          if (height !== undefined && height > params.haltHeight) {
-            ctx.db.setFleetOpStatus(opId, "done");
-            return { resumedAt: height };
+          try {
+            const height = await sentryRpcHeight(ctx);
+            if (height !== undefined && height > params.haltHeight) {
+              ctx.db.setFleetOpStatus(opId, "done");
+              return { resumedAt: height };
+            }
+          } catch {
+            // the sentry halted with everything else and its RPC comes back
+            // only once the provider has restarted it on the new image — the
+            // loop is the retry, not a reason to fail the op
           }
           await ctx.services.sleep(5000);
         }
@@ -2758,13 +2959,692 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
   ];
 }
 
+export interface RestoreArchiveParams {
+  /** Node component key (validator or sentry), e.g. "val-0". */
+  key: string;
+  /** Directory holding blocks_*.jsonl.gz; resolved on the node when absent. */
+  archiveDir?: string;
+  /** --validate: verify the app hash after every block (default true). */
+  validate?: boolean;
+  /** --end-height: stop the replay here (0/absent = every archived block). */
+  endHeight?: number;
+}
+
+/** Where the replay writes its output and its exit code on the node. The log
+ *  is deliberately NOT mirrored to the container's stdout (unlike the node
+ *  log): the replay prints a progress line every 5s for hours, which is what
+ *  crashes log viewers watching the provider stream. */
+const REPLAY_LOG = `${NODE_HOME}/replay-archive.log`;
+const REPLAY_EXIT = `${NODE_HOME}/replay-archive.exit`;
+/** Bracketed so the poll command's own shell (whose cmdline contains this
+ *  pattern) is not what the pgrep matches. */
+const REPLAY_PGREP = 'pgrep -f "replay[-]from-archive" >/dev/null';
+/** Dir the op unpacks an uploaded archive tarball into, and the first place
+ *  it looks for loose archive files. */
+const ARCHIVE_DIR = `${NODE_HOME}/archives`;
+/** Poll cadence while the replay runs, and how long the step watches before
+ *  giving up on it (the process keeps running; re-running the op re-attaches). */
+const REPLAY_POLL_MS = 15_000;
+const REPLAY_MAX_HOURS = 12;
+
+/**
+ * Restore block history into a node from archive files (§5): run
+ * `sparkdreamd replay-from-archive` against the node's own databases, then
+ * start the node back up on the rebuilt state.
+ *
+ * The replay opens the blockstore/state/application LevelDBs directly, so
+ * sparkdreamd has to be stopped for it — and it runs for hours, printing a
+ * progress line every 5 seconds. Driving it by hand through a lease shell
+ * means the console has to survive both (Akash Console does not: the output
+ * volume kills it, and the disconnect takes the replay with it). So the op
+ * detaches the process, keeps its output in a file on the node, and polls,
+ * logging only the height it has reached. A dropped launcher connection,
+ * a restarted conductor, or a re-run of the op re-attaches to the same
+ * running replay instead of starting a second one.
+ */
+export function restoreArchiveSteps(opId: number, params: RestoreArchiveParams): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const validate = params.validate !== false;
+  const target = (ctx: StepCtx) => rowTarget(ctx, componentRow(ctx, params.key));
+
+  /**
+   * The block range the archives on the node cover, read off their names:
+   * `target` is the height the replay is working towards and `floor` the
+   * block before the first one on offer, so a set starting at 500 001 does
+   * not read as 0% when it is nearly done. Archives named some other way
+   * yield nothing, and the op then reports a height with no percentage.
+   */
+  const archiveRange = async (
+    ctx: StepCtx,
+    dir: string,
+  ): Promise<{ target?: number; floor?: number }> => {
+    const names = await ctx.services.ssh.exec(target(ctx), `ls ${dir}/blocks_*_to_*.jsonl.gz`, {
+      quick: true,
+    });
+    const ranges = [...names.stdout.matchAll(/blocks_(\d+)_to_(\d+)\.jsonl\.gz/g)].map((m) => ({
+      from: Number(m[1]),
+      to: Number(m[2]),
+    }));
+    if (ranges.length === 0) return {};
+    return {
+      target: Math.max(...ranges.map((r) => r.to)),
+      floor: Math.min(...ranges.map((r) => r.from)) - 1,
+    };
+  };
+
+  /** Last few log lines, for an error message or a park reason. */
+  const tail = async (ctx: StepCtx, lines = 5): Promise<string> => {
+    const out = await ctx.services.ssh.exec(target(ctx), `tail -n ${lines} ${REPLAY_LOG} 2>/dev/null || true`, {
+      quick: true,
+    });
+    return out.stdout.trim();
+  };
+
+  return [
+    {
+      name: p("find-archive"),
+      async run(ctx) {
+        // The upload action writes files verbatim into the chain home and
+        // the operator never gets the SSH key, so unpacking an uploaded
+        // tarball has to happen here — otherwise a .tar.gz of archives is
+        // stranded on the node with no way to open it.
+        const candidates = [params.archiveDir, ARCHIVE_DIR, `${NODE_HOME}/archive`, NODE_HOME].filter(
+          (d): d is string => Boolean(d),
+        );
+        const find =
+          candidates
+            .map((d) => `if ls ${d}/blocks_*_to_*.jsonl.gz >/dev/null 2>&1; then ` +
+              `echo "DIR ${d} $(ls ${d}/blocks_*_to_*.jsonl.gz | wc -l)"; exit 0; fi`)
+            .join("; ") + "; echo NONE";
+        const unpack =
+          `mkdir -p ${ARCHIVE_DIR}; for f in ${NODE_HOME}/*.tar.gz ${NODE_HOME}/*.tgz; do ` +
+          `[ -f "$f" ] || continue; ` +
+          `tar tzf "$f" 2>/dev/null | grep -q "blocks_.*_to_.*\\.jsonl\\.gz" || continue; ` +
+          `tar xzf "$f" -C ${ARCHIVE_DIR} || continue; echo "unpacked $f"; done; ` +
+          // flatten: a tarball made from a directory nests the archives one
+          // or more levels down, and --archive-dir does not recurse
+          `find ${ARCHIVE_DIR} -mindepth 2 -name 'blocks_*_to_*.jsonl.gz' -exec mv {} ${ARCHIVE_DIR} \\; 2>/dev/null; true`;
+
+        let res = await ctx.services.ssh.exec(target(ctx), find);
+        if (!/^DIR /m.test(res.stdout)) {
+          const un = await ctx.services.ssh.exec(target(ctx), unpack);
+          for (const line of un.stdout.split("\n").filter((l) => l.startsWith("unpacked "))) {
+            ctx.log(`${params.key}: ${line}`);
+          }
+          res = await ctx.services.ssh.exec(target(ctx), find);
+        }
+        const hit = /^DIR (\S+) (\d+)/m.exec(res.stdout);
+        if (!hit) {
+          throw new AwaitUser(
+            p("find-archive"),
+            `${params.key} has no block archives to restore from: upload the ` +
+              "blocks_<from>_to_<to>.jsonl.gz files (or one .tar.gz containing them) with the " +
+              "fleet view's upload button, then resume. They land in the chain home, and this " +
+              "step unpacks a tarball into ./archives on its own.",
+          );
+        }
+        const dir = hit[1]!;
+        const count = hit[2]!;
+        const range = await archiveRange(ctx, dir);
+        ctx.log(
+          `${params.key}: replaying from ${count} archive file(s) in ${dir}` +
+            (range.target ? ` (blocks ${(range.floor ?? 0) + 1} to ${range.target})` : ""),
+        );
+        return { dir, files: Number(count), ...range };
+      },
+    },
+    {
+      name: p("stop-node"),
+      async run(ctx) {
+        // the replay opens the same LevelDBs the node holds open — a running
+        // sparkdreamd makes it fail on the lock, so stop it and confirm
+        const t = target(ctx);
+        await ctx.services.ssh.exec(t, "pkill -x sparkdreamd || true");
+        for (let i = 0; i < 20; i++) {
+          await ctx.services.sleep(2000);
+          const alive = await ctx.services.ssh.exec(t, "pgrep -x sparkdreamd >/dev/null && echo yes || echo no", {
+            quick: true,
+          });
+          if (alive.stdout.trim() === "no") return { stopped: true };
+          if (i === 9) await ctx.services.ssh.exec(t, "pkill -9 -x sparkdreamd || true");
+        }
+        throw new Error(`${params.key}: sparkdreamd is still running, so the replay cannot open its databases`);
+      },
+    },
+    {
+      name: p("replay"),
+      async run(ctx) {
+        const found = ctx.output<{ dir: string; target?: number; floor?: number }>(p("find-archive"));
+        const dir = found?.dir ?? ARCHIVE_DIR;
+        // find-archive is checkpointed, so a replay that started before it
+        // recorded a range (or under an older conductor) has none to read —
+        // re-derive it here rather than watch a bar-less replay for hours
+        const range = found?.target === undefined ? await archiveRange(ctx, dir) : found;
+        const endHeight = params.endHeight ?? range.target;
+        const floor = range.floor ?? 0;
+        const t = target(ctx);
+        const cmd =
+          `sparkdreamd replay-from-archive --home ${NODE_HOME} --archive-dir ${dir}` +
+          ` --validate ${validate}` +
+          (params.endHeight ? ` --end-height ${params.endHeight}` : "");
+
+        // re-attach if a previous run of this step (or a conductor restart)
+        // left the replay going; only start one when nothing is running
+        const state = await ctx.services.ssh.exec(
+          t,
+          `${REPLAY_PGREP} && echo RUNNING; [ -f ${REPLAY_EXIT} ] && echo "EXIT $(cat ${REPLAY_EXIT})"; true`,
+        );
+        if (!state.stdout.includes("RUNNING")) {
+          await ctx.services.ssh.exec(
+            t,
+            `rm -f ${REPLAY_LOG} ${REPLAY_EXIT}; cd ${NODE_HOME} && ` +
+              `nohup sh -c '${cmd} > ${REPLAY_LOG} 2>&1; echo $? > ${REPLAY_EXIT}' >/dev/null 2>&1 </dev/null & ` +
+              `sleep 3; ${REPLAY_PGREP} || [ -f ${REPLAY_EXIT} ]`,
+          );
+          ctx.log(`${params.key}: ${cmd}`);
+        } else {
+          ctx.log(`${params.key}: a replay is already running on the node — watching it`);
+        }
+
+        let lastLogged = 0;
+        let height = "";
+        // rate is measured from the first height this run of the step sees, not
+        // from block zero: a re-attach joins a replay already hours in, and
+        // dividing its height by this step's elapsed time would read as a rate
+        // several times the real one and an ETA in the past.
+        let firstHeight: number | undefined;
+        let firstAt = 0;
+        /** Rewrite the op's live position; the UI reads this, not the log. */
+        const publish = (elapsedMs: number) => {
+          const current = height ? Number(height) : undefined;
+          const span = endHeight && endHeight > floor ? endHeight - floor : undefined;
+          const percent =
+            current !== undefined && span
+              ? Math.min(100, Math.max(0, ((current - floor) / span) * 100))
+              : undefined;
+          // two distinct samples, or the rate is 0/0
+          const rate =
+            current !== undefined && firstHeight !== undefined && elapsedMs > firstAt
+              ? ((current - firstHeight) / (elapsedMs - firstAt)) * 1000
+              : undefined;
+          ctx.db.setFleetOpProgress(opId, {
+            label: `${params.key}: replaying block history`,
+            current,
+            target: endHeight,
+            percent: percent === undefined ? undefined : Math.round(percent * 10) / 10,
+            rate: rate && rate > 0 ? Math.round(rate * 100) / 100 : undefined,
+            etaSeconds:
+              rate && rate > 0 && endHeight && current !== undefined && endHeight > current
+                ? Math.round((endHeight - current) / rate)
+                : undefined,
+            elapsedSeconds: Math.round(elapsedMs / 1000),
+            updatedAt: new Date().toISOString(),
+          });
+        };
+        publish(0);
+
+        const polls = (REPLAY_MAX_HOURS * 3600 * 1000) / REPLAY_POLL_MS;
+        for (let i = 0; i < polls; i++) {
+          await ctx.services.sleep(REPLAY_POLL_MS);
+          const out = await ctx.services.ssh.exec(
+            t,
+            `[ -f ${REPLAY_EXIT} ] && echo "EXIT $(cat ${REPLAY_EXIT})"; ${REPLAY_PGREP} && echo RUNNING; ` +
+              `tail -n 3 ${REPLAY_LOG} 2>/dev/null; true`,
+            { quick: true },
+          );
+          height = /height=(\d+)/.exec(out.stdout)?.[1] ?? height;
+          const now = (i + 1) * REPLAY_POLL_MS;
+          if (height && firstHeight === undefined) {
+            firstHeight = Number(height);
+            firstAt = now;
+          }
+          const exit = /^EXIT (\d+)/m.exec(out.stdout);
+          if (exit) {
+            if (exit[1] !== "0") {
+              throw new Error(
+                `${params.key}: replay-from-archive exited ${exit[1]}. Last output:\n${await tail(ctx, 15)}`,
+              );
+            }
+            const done = await tail(ctx, 4);
+            publish(now);
+            ctx.log(`${params.key}: replay complete${height ? ` at height ${height}` : ""}\n${done}`);
+            return { height: height ? Number(height) : undefined, dir };
+          }
+          if (!out.stdout.includes("RUNNING")) {
+            // gone without writing an exit code: the container restarted (or
+            // something killed it) mid-replay. Replay is resumable — it picks
+            // up from the node's committed height — so say so plainly.
+            throw new Error(
+              `${params.key}: the replay process disappeared without finishing (the container may ` +
+                `have restarted). It resumes from where it stopped: run restore again. Last output:\n${await tail(ctx, 15)}`,
+            );
+          }
+          // the position the fleet view reads is rewritten every poll; the log
+          // still gets one line every ~2 min (the replay prints one every 5s)
+          publish(now);
+          if (now - lastLogged >= 120_000) {
+            lastLogged = now;
+            const pct =
+              endHeight && height && endHeight > floor
+                ? ` (${Math.round(((Number(height) - floor) / (endHeight - floor)) * 100)}%)`
+                : "";
+            ctx.log(
+              `${params.key}: replaying${height ? `, at height ${height}` : ""}${
+                endHeight ? ` of ${endHeight}` : ""
+              }${pct} (${Math.round(now / 60000)} min)`,
+            );
+          }
+        }
+        throw new Error(
+          `${params.key}: the replay is still running after ${REPLAY_MAX_HOURS}h${
+            height ? ` (height ${height})` : ""
+          }; it keeps going on the node — run restore again to re-attach and keep watching`,
+        );
+      },
+    },
+    {
+      name: p("start-node"),
+      async run(ctx) {
+        const t = target(ctx);
+        await ctx.services.ssh.exec(t, START_NODE_CMD);
+        await ctx.services.sleep(5000);
+        const alive = await ctx.services.ssh.exec(t, "pgrep -x sparkdreamd >/dev/null && echo yes || echo no", {
+          quick: true,
+        });
+        if (alive.stdout.trim() !== "yes") {
+          const log = await ctx.services.ssh.exec(t, `tail -n 15 ${NODE_LOG} 2>/dev/null || true`);
+          throw new Error(
+            `${params.key}: the node did not start on the restored state. Last output:\n${log.stdout.trim()}`,
+          );
+        }
+        // the op is over: drop the live position rather than leave a finished
+        // bar sitting at whatever the last poll saw
+        ctx.db.setFleetOpProgress(opId, null);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { started: true };
+      },
+    },
+  ];
+}
+
+export interface RepairParams {
+  /** The component the operator clicked. The sweep itself is fleet-wide;
+   *  this only shapes the log lines. */
+  key: string;
+}
+
+/**
+ * Repair (§5): reconcile the fleet against reality and fix what has drifted,
+ * without relaunching anything. One op made of independent passes, so future
+ * repairs are added here rather than as another button.
+ *
+ * **The contract every pass must keep**, because they share one action and
+ * one confirm dialog:
+ *
+ *  1. *Convergent* — find nothing wrong, change nothing, cost nothing. A
+ *     run on a healthy fleet must be free to click.
+ *  2. *Narrow* — touch only what is actually broken. A pass that would
+ *     restart a healthy component to fix a broken one does not belong.
+ *  3. *Priced up front* — whatever it can cost (a restart, a signature) is
+ *     named in {@link FleetService.repairWarnings}, since the operator agrees
+ *     to the whole op, not to one pass. A repair too expensive to state that
+ *     plainly should report the problem and let the operator choose the op.
+ *
+ * Today's passes all serve one failure: a component's mesh address moved and
+ * the fleet kept dialing the old one.
+ *
+ * Tailnet IPs move: a component relaunch or a headscale re-key hands out a
+ * different address, and everything that dials the old one goes dark. The
+ * relaunch op already repairs its own blast radius (persist re-aims the
+ * counterpart sentries, mesh-clients the explorer), but an address can go
+ * stale outside a relaunch — a re-key, an aborted op, a relaunch whose
+ * dependents were unplaced at the time, a deployment bounced by hand in
+ * another tool — and until now the only cure was relaunching the
+ * *dependents*, which moves them to new providers, re-syncs their volumes and
+ * costs an escrow cycle, all to change one env line.
+ *
+ * It starts by correcting what the launcher believes, not by acting on it —
+ * a repair driven off a stale record just bakes the wrong value in deeper:
+ *
+ *  - **endpoints**: where each component answers SSH, re-read from its
+ *    provider's lease status. The port is provider-assigned, so a container
+ *    recycled outside the launcher comes back on a different one, and every
+ *    later pass reaches components through this.
+ *  - **addresses**: each reachable component's live tailnet IP, which the
+ *    remaining passes — and every later relaunch, tmkms address and health
+ *    check — then read.
+ *
+ * Together those two are what make the launcher's state self-healing after
+ * work done outside it: a deployment bounced by hand in Akash Console comes
+ * back on a new forwarded port AND a new mesh address, and the launcher
+ * discovers both instead of being wedged by them.
+ *
+ * Two more places hold an address, and they need different treatment:
+ *
+ *  - **mesh-env**: tunnel targets in the SDL (a sentry's `TS_TUNNEL_<v>` at its validator's
+ *    p2p port, the explorer's at its sentry's LCD/RPC). Fixing it is a
+ *    deployment update: rewrite the SDL, one batched MsgUpdateDeployment,
+ *    re-push the manifests. The push restarts those containers, which is what
+ *    re-creates the tunnels at the right target.
+ *  - **peers**: `persistent_peers` in config.toml on the volume (a validator dialing
+ *    its sentries, sentries dialing each other — those ride the tailnet
+ *    directly, not a tunnel). Fixing it is an SSH edit plus a process
+ *    restart; nothing on-chain changes, so no hash can drift.
+ *
+ * So: a component already pointing at the current address is left alone, its
+ * container is never restarted, and a re-run of a finished op does nothing.
+ */
+export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const meshKeys = [
+    ...nodes(spec).map((n) => n.key),
+    ...statelessComponents(spec)
+      .filter((c) => c.mesh)
+      .map((c) => c.key),
+  ];
+
+  return [
+    {
+      name: p("endpoints"),
+      async run(ctx) {
+        // Every later pass reaches a component over the SSH endpoint on its
+        // row, and that endpoint is a provider-assigned forwarded port for
+        // 2222 — which a container recycled outside the launcher comes back
+        // on a DIFFERENT one of. The row then points at a port nothing
+        // listens on, the component reads as unreachable, and repair
+        // correctly declines to touch it while being unable to fix it. So
+        // re-read the mapping from lease status first: the provider is the
+        // authority on where a component answers, exactly as at launch.
+        const cert = loadCert(ctx);
+        const corrected: string[] = [];
+        const unreadable: string[] = [];
+        for (const row of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
+          // no recorded endpoint = the component runs no sshd; nothing to fix
+          if (row.state !== "active" || !row.ssh_host || !row.host_uri) continue;
+          let ssh: { host: string; port: number };
+          try {
+            const status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
+            ssh = extractForwardedPort(status, 2222);
+          } catch (e) {
+            // an unreachable provider (or a lease with no forwarded 2222)
+            // says nothing about whether the recorded endpoint still works
+            unreadable.push(`${row.key} (${String(e).slice(0, 60)})`);
+            continue;
+          }
+          if (ssh.host === row.ssh_host && ssh.port === row.ssh_port) continue;
+          ctx.log(
+            `${row.key}: SSH endpoint was ${row.ssh_host}:${row.ssh_port}, provider now forwards ` +
+              `${ssh.host}:${ssh.port}`,
+          );
+          ctx.db.updateComponentRuntime(ctx.launchId, row.key, {
+            ssh_host: ssh.host,
+            ssh_port: ssh.port,
+          });
+          corrected.push(row.key);
+        }
+        if (unreadable.length > 0) {
+          ctx.log(`could not read a lease status for ${unreadable.join(", ")} — keeping their endpoints`);
+        }
+        if (corrected.length === 0) ctx.log("every recorded SSH endpoint matches the provider's");
+        return { corrected, unreadable };
+      },
+    },
+    {
+      name: p("addresses"),
+      async run(ctx) {
+        // Ask each box what its address actually is. The launcher's record is
+        // a snapshot from the last time it placed or probed the component,
+        // and anything that restarted the container since — a hand-driven
+        // redeploy in another console, a provider bounce, a headscale re-key
+        // — re-joined the mesh on an address the launcher never saw. Fixing
+        // the links from a stale record would just bake the wrong address in.
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const corrected: Record<string, string> = {};
+        const unreachable: string[] = [];
+        for (const key of meshKeys) {
+          const row = rows.find((c) => c.key === key);
+          if (!row || row.state !== "active" || !row.ssh_host) continue;
+          const res = await ctx.services.ssh
+            .exec(
+              rowTarget(ctx, row),
+              `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`,
+              { quick: true },
+            )
+            .catch(() => ({ stdout: "" }));
+          const ip = res.stdout.trim().split("\n")[0] ?? "";
+          // not on the mesh right now (or not reachable): leave the record
+          // alone rather than erase an address that may still be correct
+          if (!/^100\./.test(ip)) {
+            unreachable.push(key);
+            continue;
+          }
+          if (ip === row.tailnet_ip) continue;
+          ctx.log(`${key}: recorded address was ${row.tailnet_ip ?? "unset"}, live address is ${ip}`);
+          ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
+          corrected[key] = ip;
+        }
+        if (unreachable.length > 0) {
+          ctx.log(
+            `no live address from ${unreachable.join(", ")} — keeping the recorded one for ` +
+              "them (a component off the mesh cannot be asked where it is)",
+          );
+        }
+        if (Object.keys(corrected).length === 0) {
+          ctx.log("every recorded address matches the live one");
+        } else {
+          // the tmkms checklist, the signer panel and future relaunches read
+          // the launch's await-mesh table rather than the component rows —
+          // left behind, they keep printing addresses that just moved
+          const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(
+            ctx.launchId,
+            "await-mesh",
+          );
+          if (launchMesh) {
+            ctx.db.stepDone(ctx.launchId, "await-mesh", {
+              ips: { ...launchMesh.ips, ...corrected },
+            });
+          }
+        }
+        return { corrected, unreachable };
+      },
+    },
+    {
+      name: p("images"),
+      async run(ctx) {
+        // The recorded image is a snapshot of the last placement or upgrade
+        // the LAUNCHER drove. A version swapped in outside it — an operator
+        // finishing a wedged upgrade by hand in the Akash console — leaves the
+        // row advertising a version that is not running, and the fleet card
+        // reads it straight off that row. Ask the binary: the node is the only
+        // authority on what it is executing. Chain nodes only; nothing else in
+        // the fleet can be asked its version this way.
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const corrected: Record<string, string> = {};
+        const unreadable: string[] = [];
+        for (const row of rows) {
+          if (row.state !== "active" || !row.ssh_host || !/^(val|sentry)-/.test(row.key)) continue;
+          const res = await ctx.services.ssh
+            .exec(rowTarget(ctx, row), "sparkdreamd version 2>&1 | head -1", { quick: true })
+            .catch(() => ({ stdout: "" }));
+          const version = /\d+\.\d+\.\d+[^\s]*/.exec(res.stdout.trim())?.[0];
+          if (!version) {
+            unreadable.push(row.key);
+            continue;
+          }
+          const wanted = retagImage(row.image, version);
+          if (!wanted || wanted === row.image) continue;
+          ctx.log(`${row.key}: recorded image was ${row.image}, node reports ${version}`);
+          ctx.db.updateComponentRuntime(ctx.launchId, row.key, { image: wanted });
+          // the on-disk SDL is the launcher's model of the deployment: left
+          // stale, the next upgrade derives its manifest from the wrong image
+          const sdlPath = sdlPathFor(ctx, row.key);
+          if (fs.existsSync(sdlPath)) {
+            fs.writeFileSync(
+              sdlPath,
+              fs.readFileSync(sdlPath, "utf8").replace(/image: .*/g, `image: ${wanted}`),
+            );
+          }
+          corrected[row.key] = wanted;
+        }
+        if (unreadable.length > 0) {
+          ctx.log(
+            `no version from ${unreadable.join(", ")} — keeping their recorded image (a node ` +
+              "that cannot be asked may still be running what the record says)",
+          );
+        }
+        if (Object.keys(corrected).length === 0) {
+          ctx.log("every recorded node image matches the version the node reports");
+        }
+        return { corrected, unreadable };
+      },
+    },
+    {
+      name: p("mesh-env"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const msgs: Msg[] = [];
+        const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
+        for (const key of meshKeys) {
+          if (tunnelPeers(spec, key).size === 0) continue;
+          const row = rows.find((c) => c.key === key);
+          if (!row || row.state !== "active") continue;
+          const sdlPath = sdlPathFor(ctx, key);
+          if (!fs.existsSync(sdlPath)) continue;
+          const retarget = retargetTunnelEnv(ctx, spec, key, fs.readFileSync(sdlPath, "utf8"));
+          if (retarget.changes.length === 0) continue;
+          for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
+          fs.writeFileSync(sdlPath, retarget.text);
+          const artifacts = sdlArtifacts(loadSdl(sdlPath));
+          fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+          pushes.push({ row, json: artifacts.manifestJson });
+          // convergent, like retarget: a deployment already at this version
+          // would reject the update ("nothing to change") — re-send only
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash === wantHash) continue;
+          msgs.push({
+            typeUrl: TypeUrl.UpdateDeployment,
+            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+          });
+        }
+        if (pushes.length === 0) {
+          ctx.log("every tunnel already names its peer's current address");
+          ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
+          return { repointed: [] };
+        }
+        if (msgs.length > 0) await ctx.requireTx(p("mesh-env"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
+        const cert = loadCert(ctx);
+        for (const { row, json } of pushes) {
+          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+        }
+        return { repointed: pushes.map((x) => x.row.key) };
+      },
+    },
+    {
+      name: p("peers"),
+      async run(ctx) {
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const nodeIds = ctx.output<GenerateKeysOutput>("generate-keys")?.nodeIds ?? {};
+        // node id → the component that owns it, so a peer entry can be
+        // matched to a fleet member without parsing its address first
+        const keyForId = new Map(Object.entries(nodeIds).map(([k, id]) => [id, k]));
+        const repaired: string[] = [];
+        for (const key of nodes(spec).map((n) => n.key)) {
+          const row = rows.find((c) => c.key === key);
+          if (!row || row.state !== "active" || !row.ssh_host) continue;
+          const target = rowTarget(ctx, row);
+          const got = await ctx.services.ssh
+            .exec(target, `grep '^persistent_peers' ${NODE_HOME}/config/config.toml`, { quick: true })
+            .catch(() => ({ stdout: "" }));
+          const line = /^persistent_peers\s*=\s*"(.*)"/m.exec(got.stdout);
+          if (!line) continue;
+          const changes: string[] = [];
+          const next = (line[1] ?? "")
+            .split(",")
+            .filter(Boolean)
+            .map((entry) => {
+              const m = /^([^@]+)@(.+):(\d+)$/.exec(entry.trim());
+              if (!m) return entry.trim();
+              const [, id, addr, port] = m as unknown as [string, string, string, string];
+              const peerKey = keyForId.get(id);
+              const ip = peerKey ? rows.find((c) => c.key === peerKey)?.tailnet_ip : undefined;
+              if (!peerKey || !ip || addr === ip) return entry.trim();
+              // 127.0.0.1 is a tunnel entry (a sentry reaches its validators
+              // through one) — the env pass owns those, and rewriting the
+              // loopback to a tailnet IP would break the design. A public
+              // hostname is a join-mode peer, deliberately off the mesh.
+              if (!addr.startsWith("100.") && !addr.startsWith("{{")) return entry.trim();
+              changes.push(`${peerKey} ${addr} → ${ip}`);
+              return `${id}@${ip}:${port}`;
+            })
+            .join(",");
+          if (changes.length === 0) continue;
+          for (const c of changes) ctx.log(`${key}: peer re-aimed at ${c}`);
+          await ctx.services.ssh.exec(
+            target,
+            `sed -i 's|^persistent_peers.*|persistent_peers = "${next}"|' ${NODE_HOME}/config/config.toml`,
+          );
+          // a peer change only takes effect on a restart of the process
+          await restartNode(ctx.services.ssh, target);
+          repaired.push(key);
+        }
+        if (repaired.length === 0) ctx.log("every peer entry already names its node's current address");
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { repaired };
+      },
+    },
+  ];
+}
+
+/**
+ * Op kinds whose steps run BEFORE the launch's own, not after (see
+ * {@link buildPreLaunchOpSteps}).
+ */
+const PRE_LAUNCH_OP_KINDS = new Set(["restore-archive", "repair"]);
+
+/**
+ * Steps for ops that must not queue behind the launch. The composed list is
+ * launch-steps-then-op-steps, so an op only ever runs once every launch step
+ * is done — right for a relaunch or an upgrade, and wrong for the two ops
+ * whose whole job is to cure what the launch is stuck on:
+ *
+ *  - **restore-archive**: a node missing its block history is usually why the
+ *    launch is parked (`verify-chain` failing on a chain that produces
+ *    nothing is exactly the state restore fixes).
+ *  - **repair**: a fleet dialing dead addresses does not gossip, so it does
+ *    not produce blocks, so `verify-chain` fails — the same step, for the
+ *    reason repair exists to fix.
+ *
+ * Behind that failure the op would never start. Seen live twice, and the
+ * symptom is identical both times: the op sits with no step rows at all while
+ * the operator watches a spinner that is really the LAUNCH's step, wondering
+ * whether the op is doing anything (it is not). These run first instead, so a
+ * parked launch is no obstacle; the launch's own steps then re-run against
+ * the repaired fleet.
+ */
+export function buildPreLaunchOpSteps(db: ConductorDb, launchId: string): StepDef[] {
+  return buildSteps(db, launchId, (kind) => PRE_LAUNCH_OP_KINDS.has(kind));
+}
+
 /** Steps for every active op of a launch, in creation order. */
-export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {  const launch = db.getLaunch(launchId);
+export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {
+  return buildSteps(db, launchId, (kind) => !PRE_LAUNCH_OP_KINDS.has(kind));
+}
+
+function buildSteps(
+  db: ConductorDb,
+  launchId: string,
+  wanted: (kind: string) => boolean,
+): StepDef[] {
+  const launch = db.getLaunch(launchId);
   if (!launch) return [];
   const spec = withDefaults(JSON.parse(launch.spec_json));
   const steps: StepDef[] = [];
   for (const op of db.listFleetOps(launchId) as FleetOpRow[]) {
     if (op.status !== "active" && op.status !== "done") continue;
+    if (!wanted(op.kind)) continue;
     // done ops keep their steps in the list — checkpointed rows skip instantly
     const params = JSON.parse(op.params_json);
     if (op.kind === "relaunch") {
@@ -2780,6 +3660,8 @@ export function buildOpSteps(db: ConductorDb, launchId: string): StepDef[] {  co
     if (op.kind === "reset-chain") steps.push(...resetChainSteps(op.id, params, spec));
     if (op.kind === "unjail") steps.push(...unjailSteps(op.id, params, spec));
     if (op.kind === "resume-signing") steps.push(...resumeSigningSteps(op.id, params, spec));
+    if (op.kind === "restore-archive") steps.push(...restoreArchiveSteps(op.id, params));
+    if (op.kind === "repair") steps.push(...repairSteps(op.id, params, spec));
   }
   return steps;
 }

@@ -29,6 +29,9 @@ afterAll(() => {
 function spec(overrides: Record<string, unknown> = {}): LaunchSpec {
   return testnetSpec({
     network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    // the placement assertions here (fleet spread, re-bid moves off the dead
+    // provider) are about anti-affinity, which no profile turns on by default
+    providers: { policy: { antiAffinity: "strict" } },
     topology: {
       validators: { count: 2 },
       sentries: { count: 2 },
@@ -529,6 +532,225 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     // sentry-0 was re-placed on a fresh deployment, others untouched
     const plan = db.stepOutput<any>("replace", "create-deployments")!;
     expect(plan.perNode["sentry-0"].dseq).not.toBe(deadDseq);
+    db.close();
+  }, 180_000);
+
+  it("a re-place asked to pick its own bid parks with the list, then leases the pick", async () => {
+    // The mid-launch twin of the relaunch op's picker: this placement is made
+    // by the launch itself, so there is no op row to park on. The pick must
+    // beat the policy outright — the provider an operator reaches for is
+    // typically one the hard filters keep rejecting.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec();
+    db.createLaunch("pickbid", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const fleet = new FleetService(db, services, work);
+
+    expect((await runWithSigner(db, "pickbid", s, work, allSteps(), services, signer)).status).toBe(
+      "completed",
+    );
+    fleet.materialize("pickbid");
+    db.setLaunchStatus("pickbid", "paused");
+    const sentry = db.listFleetComponents("pickbid").find((c) => c.key === "sentry-0")!;
+    const deadDseq = sentry.dseq;
+    services.provider.leaselessDseqs.add(deadDseq);
+    (services.api as any).leaseStates.set(deadDseq, "closed");
+
+    // "relaunch: pick bid…" on an unfinished launch: request the pick, then
+    // re-place through the launch
+    db.requestBidPick("pickbid", "sentry-0");
+    await fleet.requestReplace(db.getLaunch("pickbid")!, sentry);
+
+    // the re-place parks instead of choosing
+    const parked = await runWithSigner(db, "pickbid", s, work, allSteps(), services, signer);
+    expect(parked.status).toBe("awaiting-user");
+    expect(db.getStep("pickbid", "send-manifests")?.status).toBe("waiting");
+    const offered = db.getBidPick("pickbid", "sentry-0")!;
+    const bids = JSON.parse(offered.offers_json!) as Array<{
+      provider: string;
+      price: string;
+      rejected?: string;
+    }>;
+    expect(bids.length).toBeGreaterThan(1);
+    expect(bids.map((b) => Number(b.price))).toEqual(
+      [...bids.map((b) => Number(b.price))].sort((a, b) => a - b),
+    );
+    // the fleet payload carries the offer so the panel can render it
+    const view = (await fleet.fleetForOwner("akash1owner")).fleets.find(
+      (f) => f.launchId === "pickbid",
+    )!;
+    expect(view.bidPicks.map((p) => p.key)).toEqual(["sentry-0"]);
+
+    // pick the priciest bid — the one the policy would never take — and check
+    // the rejection reasons rode along for the operator to weigh
+    const dearest = [...bids].sort((a, b) => Number(b.price) - Number(a.price))[0]!;
+    expect(bids.some((b) => b.rejected)).toBe(true);
+    db.setBidPick("pickbid", "sentry-0", dearest.provider);
+
+    const done = await runWithSigner(db, "pickbid", s, work, allSteps(), services, signer);
+    if (done.status !== "completed") {
+      const step = db.listSteps("pickbid").find((x) => x.status !== "done");
+      throw new Error(`ended ${done.status} at ${step?.name}: ${step?.error}`);
+    }
+    const assignments = db.stepOutput<any>("pickbid", "collect-bids")!;
+    expect(assignments.perNode["sentry-0"].provider).toBe(dearest.provider);
+    const plan = db.stepOutput<any>("pickbid", "create-deployments")!;
+    expect(plan.perNode["sentry-0"].dseq).not.toBe(deadDseq);
+    // the pick applied to that placement only — nothing left to park on
+    expect(db.getBidPick("pickbid", "sentry-0")).toBeUndefined();
+    db.close();
+  }, 180_000);
+
+  it("providers.policy.manualBid: every placement waits to be picked by hand", async () => {
+    // The fleet-wide flag: no deployment is leased on the policy's say-so.
+    // headscale parks on its own step; the node batch records the bids for
+    // all of its components at once, so the fleet is picked in one pass
+    // rather than a resume per component.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({ providers: { policy: { manualBid: true } } });
+    db.createLaunch("allpick", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+
+    const atHeadscale = await runWithSigner(db, "allpick", s, work, allSteps(), services, signer);
+    expect(atHeadscale.status).toBe("awaiting-user");
+    expect(db.getStep("allpick", "deploy-headscale")?.status).toBe("waiting");
+    const hsOffers = JSON.parse(db.getBidPick("allpick", "headscale")!.offers_json!) as Array<{
+      provider: string;
+      price: string;
+    }>;
+    expect(hsOffers.length).toBeGreaterThan(1);
+    const hsPick = [...hsOffers].sort((a, b) => Number(b.price) - Number(a.price))[0]!;
+    db.setBidPick("allpick", "headscale", hsPick.provider);
+
+    const atNodes = await runWithSigner(db, "allpick", s, work, allSteps(), services, signer);
+    expect(atNodes.status).toBe("awaiting-user");
+    expect(db.getStep("allpick", "collect-bids")?.status).toBe("waiting");
+    const parked = db.listBidPicks("allpick").map((p) => p.key);
+    expect(parked).toEqual(["sentry-0", "sentry-1", "val-0", "val-1"]);
+    const picks: Record<string, string> = {};
+    for (const key of parked) {
+      const offers = JSON.parse(db.getBidPick("allpick", key)!.offers_json!) as Array<{
+        provider: string;
+        price: string;
+      }>;
+      // the dearest bid: what the policy would never have chosen on its own
+      picks[key] = [...offers].sort((a, b) => Number(b.price) - Number(a.price))[0]!.provider;
+      db.setBidPick("allpick", key, picks[key]!);
+    }
+
+    const done = await runWithSigner(db, "allpick", s, work, allSteps(), services, signer);
+    if (done.status !== "completed") {
+      const step = db.listSteps("allpick").find((x) => x.status !== "done");
+      throw new Error(`ended ${done.status} at ${step?.name}: ${step?.error}`);
+    }
+    const assignments = db.stepOutput<any>("allpick", "collect-bids")!;
+    for (const [key, provider] of Object.entries(picks)) {
+      expect(assignments.perNode[key].provider).toBe(provider);
+    }
+    expect(db.stepOutput<any>("allpick", "deploy-headscale")!.provider).toBe(hsPick.provider);
+    // the picks belonged to these placements; the next one asks anew
+    expect(db.listBidPicks("allpick")).toEqual([]);
+    db.close();
+  }, 180_000);
+
+  it("per component manualBid: sentries wait to be picked, everything else places itself", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec({ providers: { components: { sentries: { manualBid: true } } } });
+    db.createLaunch("onepick", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+
+    const parked = await runWithSigner(db, "onepick", s, work, allSteps(), services, signer);
+    expect(parked.status).toBe("awaiting-user");
+    // headscale placed itself; only the sentries are waiting
+    expect(db.getStep("onepick", "deploy-headscale")?.status).toBe("done");
+    expect(db.listBidPicks("onepick").map((p) => p.key)).toEqual(["sentry-0", "sentry-1"]);
+    for (const key of ["sentry-0", "sentry-1"]) {
+      const offers = JSON.parse(db.getBidPick("onepick", key)!.offers_json!) as Array<{
+        provider: string;
+      }>;
+      db.setBidPick("onepick", key, offers[offers.length - 1]!.provider);
+    }
+
+    const done = await runWithSigner(db, "onepick", s, work, allSteps(), services, signer);
+    if (done.status !== "completed") {
+      const step = db.listSteps("onepick").find((x) => x.status !== "done");
+      throw new Error(`ended ${done.status} at ${step?.name}: ${step?.error}`);
+    }
+    db.close();
+  }, 180_000);
+
+  it("a component an op already moved shows its new home after a launch re-place", async () => {
+    // The fleet row is what the UI and every later op read. It used to adopt a
+    // launch-made placement only at generation 0, so a component a relaunch op
+    // had moved (generation ≥ 1) stayed pinned to its dead deployment forever:
+    // seen live as a validator re-placed onto a new provider while the panel
+    // still showed the closed one. dseq (the deployment's creation height)
+    // orders the two writers instead.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec();
+    db.createLaunch("adopt", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const fleet = new FleetService(db, services, work);
+
+    expect((await runWithSigner(db, "adopt", s, work, allSteps(), services, signer)).status).toBe(
+      "completed",
+    );
+    fleet.materialize("adopt");
+    // pretend an earlier relaunch op moved sentry-0: the row is ahead of the
+    // launch outputs, exactly the case the old generation guard protected
+    const before = db.listFleetComponents("adopt").find((c) => c.key === "sentry-0")!;
+    db.updateComponentPlacement("adopt", "sentry-0", {
+      dseq: String(Number(before.dseq) + 1),
+      provider: "akash1opmovedprovider",
+      host_uri: "https://op-moved.example.com:8443",
+      price: before.price,
+      generation: 3,
+    });
+    db.updateComponentRuntime("adopt", "sentry-0", { ssh_host: "op-moved.example.com", ssh_port: 1 });
+    const opDseq = db.listFleetComponents("adopt").find((c) => c.key === "sentry-0")!.dseq;
+    // the guard still holds in the other direction: the op's placement is
+    // newer than the launch outputs, so materialize must not pull it back
+    fleet.materialize("adopt");
+    expect(db.listFleetComponents("adopt").find((c) => c.key === "sentry-0")!.dseq).toBe(opDseq);
+
+    // …then that op-made placement dies and the launch re-places it
+    db.setLaunchStatus("adopt", "paused");
+    services.provider.leaselessDseqs.add(opDseq);
+    (services.api as any).leaseStates.set(opDseq, "closed");
+    const plan = db.stepOutput<any>("adopt", "create-deployments")!;
+    plan.perNode["sentry-0"].dseq = opDseq; // the launch tracks the op's dseq
+    db.stepDone("adopt", "create-deployments", plan);
+    await fleet.requestReplace(db.getLaunch("adopt")!, db.listFleetComponents("adopt").find((c) => c.key === "sentry-0")!);
+    const again = await runWithSigner(db, "adopt", s, work, allSteps(), services, signer);
+    if (again.status !== "completed") {
+      const step = db.listSteps("adopt").find((x) => x.status !== "done");
+      throw new Error(`ended ${again.status} at ${step?.name}: ${step?.error}`);
+    }
+
+    fleet.materialize("adopt");
+    const after = db.listFleetComponents("adopt").find((c) => c.key === "sentry-0")!;
+    const placed = db.stepOutput<any>("adopt", "create-deployments")!.perNode["sentry-0"].dseq;
+    const ssh = db.stepOutput<any>("adopt", "send-manifests")!.perNode["sentry-0"];
+    expect(after.dseq).toBe(String(placed));
+    expect(after.provider).not.toBe("akash1opmovedprovider");
+    expect(after.state).toBe("active");
+    // endpoints follow the placement — a stale SSH port strands every later op
+    expect(after.ssh_host).toBe(ssh.host);
+    expect(after.ssh_port).toBe(ssh.port);
+    // the move count the ops keep is preserved, not reset
+    expect(after.generation).toBe(3);
+    // the fresh container's tailnet IP replaces the dead one: it is what the
+    // tmkms checklist and every peer config are built from
+    const meshIp = db.stepOutput<any>("adopt", "await-mesh")!.ips["sentry-0"];
+    expect(after.tailnet_ip).toBe(meshIp);
     db.close();
   }, 180_000);
 

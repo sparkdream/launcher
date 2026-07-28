@@ -22,7 +22,7 @@ describe("withDefaults", () => {
   it("fills a minimal wizard output from the testnet profile", () => {
     const spec = testnetSpec();
     expect(spec.providers.policy.auditedOnly).toBe(true);
-    expect(spec.providers.policy.antiAffinity).toBe("strict");
+    expect(spec.providers.policy.antiAffinity).toBe("off");
     expect(spec.security.keyMode).toBe("softsign");
     expect(spec.images.sparkdreamd).toContain("-testnet-ssh:");
     expect(spec.infra.resources.validator.storage.persistent).toBe(true);

@@ -16,7 +16,15 @@ import {
 import { feeCoin, feeConfig, launchFeeAmount } from "../fee.js";
 import { PRICING_DENOM } from "../render-sdl.js";
 import { pollBids } from "../akash/client.js";
-import { exclusionEntries, selectProvider, type Bid, type PolicyDecision } from "../akash/policy.js";
+import {
+  describeBids,
+  exclusionEntries,
+  manualBidRequired,
+  selectProvider,
+  type Bid,
+  type PolicyDecision,
+  type ProviderInfo,
+} from "../akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../akash/sdl-groups.js";
 import { vendorDir } from "../vendor.js";
 import type { Certificate, SshTarget } from "../services.js";
@@ -332,7 +340,7 @@ export const deployHeadscaleStep: StepDef = {
       // wallet-wide provider prefs apply to the initial pick, not just
       // relaunches — avoid is a hard filter, prefer outranks the spec's list
       const prefs = ctx.db.providerPrefs(addr);
-      const decision = selectProvider(openBids, {
+      let decision = selectProvider(openBids, {
         policy: {
           ...ctx.spec.providers.policy,
           preference: [...new Set([...prefs.prefer, ...ctx.spec.providers.policy.preference])],
@@ -344,6 +352,19 @@ export const deployHeadscaleStep: StepDef = {
         requiredStorageClass: artifacts.requiredStorageClass,
         providers,
       });
+      if (ensureBidPickRow(ctx, "headscale")) {
+        const outcome = resolveBidPick(ctx, "headscale", dseq, bids, providers, decision);
+        if ("chosen" in outcome) {
+          decision = { chosen: outcome.chosen, rejected: decision.rejected };
+        } else {
+          throw new AwaitUser(
+            "deploy-headscale",
+            `pick which bid to lease for headscale — the launch panel lists the ` +
+              `${outcome.pending} bid(s) on this deployment. Bids close a few minutes after ` +
+              "they arrive, so if the lease then fails, pick again on the fresh set.",
+          );
+        }
+      }
       if (!decision.chosen) {
         throw new AwaitUser(
           "deploy-headscale",
@@ -354,6 +375,10 @@ export const deployHeadscaleStep: StepDef = {
       price = decision.chosen.bid.price.amount;
       await ctx.requireTx("deploy-headscale:lease", [createLeaseMsg(bidId)]);
     }
+    // this placement is settled either way (leased on this pass, or on an
+    // earlier one) — a pick made for it has been spent, and the next
+    // placement of headscale asks anew when the spec keeps it manual (§6.6)
+    ctx.db.clearBidPick(ctx.launchId, "headscale");
 
     // the manifest hash must match the deployment on-chain — if the renderer
     // changed since the deployment tx (e.g. a manifest-shape fix), update the
@@ -622,6 +647,11 @@ export const collectBidsStep: StepDef = {
     };
     const avoidProviders = new Set(prefs.avoid);
     const perNode: Assignments["perNode"] = {};
+    // Components whose bids are on the table waiting to be picked by hand
+    // (§6.6). Every deployment is polled and recorded before the step parks,
+    // so the operator picks the whole fleet in one pass rather than resuming
+    // the launch once per component.
+    const awaitingPick: string[] = [];
     for (const [key, entry] of Object.entries(plan.perNode)) {
       const bids = await pollBids(ctx.services.api, addr, entry.dseq, {
         sleep: ctx.services.sleep,
@@ -629,7 +659,7 @@ export const collectBidsStep: StepDef = {
         // console-air-style: gather a fuller bid set before the policy engine picks
         settleRounds: 2,
       });
-      const decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
+      let decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
         policy,
         chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
         avoidProviders,
@@ -638,6 +668,15 @@ export const collectBidsStep: StepDef = {
         requiredStorageClass: entry.requiredStorageClass,
         providers,
       });
+      if (ensureBidPickRow(ctx, key)) {
+        const outcome = resolveBidPick(ctx, key, entry.dseq, bids, providers, decision);
+        if ("chosen" in outcome) {
+          decision = { chosen: outcome.chosen, rejected: decision.rejected };
+        } else {
+          awaitingPick.push(key);
+          continue;
+        }
+      }
       if (!decision.chosen) {
         throw new AwaitUser(
           "collect-bids",
@@ -654,6 +693,14 @@ export const collectBidsStep: StepDef = {
         oseq: bid.id.oseq,
         decision,
       };
+    }
+    if (awaitingPick.length > 0) {
+      throw new AwaitUser(
+        "collect-bids",
+        `pick which bid to lease for ${awaitingPick.join(", ")} — the launch panel lists the ` +
+          "bids on each deployment. Bids close a few minutes after they arrive, so if a lease " +
+          "then fails, pick again on the fresh set the next attempt draws.",
+      );
     }
     return { perNode };
   },
@@ -756,6 +803,9 @@ export const createLeasesStep: StepDef = {
       }
     }
     const txHash = await ctx.requireTx("create-leases", msgs);
+    // the picks applied to these placements; a later re-place is the policy's
+    // again, and asks anew when the spec keeps placement manual (§6.6)
+    for (const key of Object.keys(assignments.perNode)) ctx.db.clearBidPick(ctx.launchId, key);
     return { txHash, fee: feePaid };
   },
 };
@@ -826,6 +876,60 @@ function leaseGone(e: unknown): boolean {
   // deployment tx that never took effect). Both mean: this placement can
   // never serve, re-place it.
   return /no lease/i.test(s) || /deployment not found/i.test(s);
+}
+
+/**
+ * Manual bid selection for a placement the LAUNCH makes (§6.6), asked for
+ * either by the operator (the relaunch dialog's "pick the bid" option) or by
+ * the spec (providers.policy.manualBid, or the component group's override).
+ *
+ * A pick already named for THIS order wins outright — hard filters included,
+ * since the reason to pick by hand is usually a provider the filters keep
+ * rejecting (an uptime floor a cheap host misses by a tenth of a point,
+ * anti-affinity against a component already on that provider). Otherwise the
+ * bids are recorded on the pick row for the fleet panel to render and the
+ * caller is told to park.
+ */
+function resolveBidPick(
+  ctx: StepCtx,
+  key: string,
+  dseq: string,
+  bids: Bid[],
+  providers: Map<string, ProviderInfo>,
+  decision: PolicyDecision,
+): { chosen: Bid } | { pending: number } {
+  const pick = ctx.db.getBidPick(ctx.launchId, key);
+  const named =
+    pick?.provider && pick.dseq === dseq
+      ? bids.find((b) => b.bid.state === "open" && b.bid.id.provider === pick.provider)
+      : undefined;
+  if (named) {
+    const why = decision.rejected.find((r) => r.provider === named.bid.id.provider)?.reason;
+    ctx.log(
+      `${key}: leasing hand-picked bid from ${named.bid.id.provider}` +
+        (why ? ` — overriding the policy, which rejected it: ${why}` : ""),
+    );
+    return { chosen: named };
+  }
+  if (pick?.provider && pick.dseq === dseq) {
+    ctx.log(`${key}: the picked bid (${pick.provider}) is no longer on offer — pick again`);
+  }
+  const open = bids.filter((b) => b.bid.state === "open");
+  const offers = describeBids(open, providers, decision);
+  ctx.db.putBidOffers(ctx.launchId, key, dseq, offers);
+  ctx.log(`${key}: ${offers.length} bid(s) on offer, waiting for a manual pick`);
+  return { pending: offers.length };
+}
+
+/**
+ * Open a pick row for a placement the spec says the operator makes, unless one
+ * is already open — requestBidPick clears any choice already recorded, so
+ * calling it on every pass would wipe the pick as fast as it is made.
+ */
+function ensureBidPickRow(ctx: StepCtx, key: string): boolean {
+  if (!manualBidRequired(ctx.spec, key)) return ctx.db.getBidPick(ctx.launchId, key) !== undefined;
+  if (!ctx.db.getBidPick(ctx.launchId, key)) ctx.db.requestBidPick(ctx.launchId, key);
+  return true;
 }
 
 /**
@@ -1013,6 +1117,21 @@ async function rebidComponent(
         providers,
       });
     }
+    // Manual pick (§6.6): the operator asked to choose this placement, or the
+    // spec says every placement of this component is theirs to make.
+    if (ensureBidPickRow(ctx, key)) {
+      const outcome = resolveBidPick(ctx, key, dseq, bids, providers, decision);
+      if ("chosen" in outcome) {
+        decision = { chosen: outcome.chosen, rejected: decision.rejected };
+      } else {
+        throw new AwaitUser(
+          "send-manifests",
+          `${key}: pick which bid to lease — the fleet panel lists the ${outcome.pending} bid(s) ` +
+            "on this deployment. Bids close a few minutes after they arrive, so if the lease " +
+            "then fails, pick again on the fresh set the next attempt draws.",
+        );
+      }
+    }
     if (!decision.chosen) {
       throw new AwaitUser(
         "send-manifests",
@@ -1047,6 +1166,9 @@ async function rebidComponent(
   ctx.db.stepDone(ctx.launchId, "create-deployments", plan);
   ctx.db.stepDone(ctx.launchId, "collect-bids", assignments);
   clearPin(ctx, `rebid-${key}-dseq`);
+  // the pick applied to THIS placement; a later re-place of the same
+  // component is the policy's again unless the operator asks anew
+  ctx.db.clearBidPick(ctx.launchId, key);
   ctx.log(`${key}: moved to ${new URL(assignments.perNode[key]!.hostUri).hostname} (dseq ${dseq})`);
 }
 

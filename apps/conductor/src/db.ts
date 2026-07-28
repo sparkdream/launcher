@@ -61,13 +61,29 @@ CREATE TABLE IF NOT EXISTS fleet_components (
   image      TEXT,
   UNIQUE (launch_id, key)
 );
+-- progress_json: live progress of a long-running op (the archive replay),
+-- rewritten in place on every poll so the fleet view can show where it is
+-- without the step log having to carry a line per update.
 CREATE TABLE IF NOT EXISTS fleet_ops (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  launch_id     TEXT NOT NULL REFERENCES launches(id),
+  kind          TEXT NOT NULL,
+  params_json   TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  progress_json TEXT
+);
+-- Manual bid selection for placements the LAUNCH makes (its re-place step),
+-- which has no fleet_ops row to hang the offer list on. A row is created when
+-- the operator asks to pick, filled with the bids when the step parks, and
+-- deleted once the placement it belongs to is done.
+CREATE TABLE IF NOT EXISTS bid_picks (
   launch_id   TEXT NOT NULL REFERENCES launches(id),
-  kind        TEXT NOT NULL,
-  params_json TEXT NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'active',
-  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  key         TEXT NOT NULL,
+  dseq        TEXT,
+  offers_json TEXT,
+  provider    TEXT,
+  PRIMARY KEY (launch_id, key)
 );
 CREATE TABLE IF NOT EXISTS component_health (
   launch_id  TEXT NOT NULL REFERENCES launches(id),
@@ -140,6 +156,9 @@ export class ConductorDb {
       );
     if (!cols("provider_prefs").includes("name")) {
       this.db.exec("ALTER TABLE provider_prefs ADD COLUMN name TEXT");
+    }
+    if (!cols("fleet_ops").includes("progress_json")) {
+      this.db.exec("ALTER TABLE fleet_ops ADD COLUMN progress_json TEXT");
     }
     // one-time: lift any per-launch prefs into the wallet-global list
     this.db.exec(
@@ -214,7 +233,8 @@ export class ConductorDb {
     launch: LaunchRow;
     steps: Array<Omit<StepRow, "id">>;
     components: Array<Omit<FleetComponentRow, "id">>;
-    ops: Array<Omit<FleetOpRow, "id">>;
+    // progress_json optional: snapshots predating the column have no such key
+    ops: Array<Omit<FleetOpRow, "id" | "progress_json"> & { progress_json?: string | null }>;
     gentxs: Array<Omit<PendingGentxRow, "id">>;
     txs: Array<Omit<PendingTxRow, "id">>;
     prefs: Array<{ launch_id: string; provider: string; kind: string; name: string | null }>;
@@ -246,9 +266,11 @@ export class ConductorDb {
       for (const o of data.ops) {
         this.db
           .prepare(
-            "INSERT INTO fleet_ops (launch_id, kind, params_json, status, created_at) VALUES (@launch_id, @kind, @params_json, @status, @created_at)",
+            `INSERT INTO fleet_ops (launch_id, kind, params_json, status, created_at, progress_json)
+             VALUES (@launch_id, @kind, @params_json, @status, @created_at, @progress_json)`,
           )
-          .run(o);
+          // snapshots taken before progress_json existed have no such key
+          .run({ ...o, progress_json: o.progress_json ?? null });
       }
       for (const g of data.gentxs) {
         this.db
@@ -747,6 +769,70 @@ export class ConductorDb {
     this.db.prepare("UPDATE fleet_ops SET status = ? WHERE id = ?").run(status, opId);
   }
 
+  /**
+   * Overwrite an op's live progress (null clears it). Written on every poll of
+   * a long op, so it holds the CURRENT position only — no history.
+   */
+  setFleetOpProgress(opId: number, progress: FleetOpProgress | null): void {
+    this.db
+      .prepare("UPDATE fleet_ops SET progress_json = ? WHERE id = ?")
+      .run(progress ? JSON.stringify(progress) : null, opId);
+  }
+
+  /** Rewrite an op's params (manual bid selection stores its offer list and
+   *  the operator's pick there; buildOpSteps re-reads params on every drive). */
+  updateFleetOpParams(opId: number, params: unknown): void {
+    this.db
+      .prepare("UPDATE fleet_ops SET params_json = ? WHERE id = ?")
+      .run(JSON.stringify(params), opId);
+  }
+
+  // --- manual bid selection for launch-made placements (§6.6) ---
+
+  /** Ask for the next placement of `key` to be picked by hand. */
+  requestBidPick(launchId: string, key: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO bid_picks (launch_id, key) VALUES (?, ?)
+           ON CONFLICT (launch_id, key)
+           DO UPDATE SET dseq = NULL, offers_json = NULL, provider = NULL`,
+      )
+      .run(launchId, key);
+  }
+
+  /** Record the bids on offer for a parked placement (clears any prior pick:
+   *  a new order means new bids, so the old choice cannot apply). */
+  putBidOffers(launchId: string, key: string, dseq: string, offers: unknown): void {
+    this.db
+      .prepare(
+        `UPDATE bid_picks SET dseq = ?, offers_json = ?, provider = NULL
+           WHERE launch_id = ? AND key = ?`,
+      )
+      .run(dseq, JSON.stringify(offers), launchId, key);
+  }
+
+  setBidPick(launchId: string, key: string, provider: string): void {
+    this.db
+      .prepare("UPDATE bid_picks SET provider = ? WHERE launch_id = ? AND key = ?")
+      .run(provider, launchId, key);
+  }
+
+  getBidPick(launchId: string, key: string): BidPickRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM bid_picks WHERE launch_id = ? AND key = ?")
+      .get(launchId, key) as BidPickRow | undefined;
+  }
+
+  listBidPicks(launchId: string): BidPickRow[] {
+    return this.db
+      .prepare("SELECT * FROM bid_picks WHERE launch_id = ? ORDER BY key")
+      .all(launchId) as BidPickRow[];
+  }
+
+  clearBidPick(launchId: string, key: string): void {
+    this.db.prepare("DELETE FROM bid_picks WHERE launch_id = ? AND key = ?").run(launchId, key);
+  }
+
   // --- gentx signing loop (§5 step 3b, external operators) ---
 
   getPendingGentx(launchId: string, valIndex: number): PendingGentxRow | undefined {
@@ -836,6 +922,41 @@ export interface FleetOpRow {
   params_json: string;
   status: string;
   created_at: string;
+  /** {@link FleetOpProgress}, or null for ops that report no progress. */
+  progress_json: string | null;
+}
+
+/**
+ * Where a long-running op has got to. Every field past `label` is optional:
+ * an archive replay knows its height long before it can measure a rate, and
+ * a replay whose archives do not name a range never learns a target at all.
+ */
+export interface FleetOpProgress {
+  /** What is being worked on, e.g. "replaying block history". */
+  label: string;
+  /** Position and destination, in the op's own unit (blocks, for a replay). */
+  current?: number | undefined;
+  target?: number | undefined;
+  /** 0-100, only when a target is known. */
+  percent?: number | undefined;
+  /** Units per second over the run so far, once two samples exist. */
+  rate?: number | undefined;
+  etaSeconds?: number | undefined;
+  /** Seconds since this op's work started (or was re-attached to). */
+  elapsedSeconds?: number | undefined;
+  /** ISO timestamp of this sample, so the UI can tell fresh from stale. */
+  updatedAt: string;
+}
+
+/** A pending or answered manual bid pick for a launch-made placement. */
+export interface BidPickRow {
+  launch_id: string;
+  key: string;
+  /** The order the offers belong to; null while the request is unanswered. */
+  dseq: string | null;
+  offers_json: string | null;
+  /** The operator's pick; null while waiting for one. */
+  provider: string | null;
 }
 
 export interface ComponentHealthRow {

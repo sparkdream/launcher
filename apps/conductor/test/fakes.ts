@@ -216,8 +216,28 @@ export class FakeProviderGateway {
     }
   }
 
-  async leaseLogs(): Promise<string> {
-    return "fake log line 1\nfake log line 2\n";
+  /** Wired by fakeServices: the container log tail for a node, which is where
+   *  a halting node's `halt per configuration height` line shows up. */
+  onNodeLogs?: (sshId: string) => string | undefined;
+
+  async leaseLogs(
+    _creds: MtlsCredentials,
+    hostUri: string,
+    dseq: string,
+    _gseq = 1,
+    _oseq = 1,
+    _tail = 100,
+  ): Promise<string> {
+    const ep = this.assigned.get(`${hostUri}/${dseq}`);
+    const extra = ep ? this.onNodeLogs?.(`${ep.host}:${ep.port}`) : undefined;
+    return `fake log line 1\nfake log line 2\n${extra ?? ""}`;
+  }
+
+  /** Simulate containers recycled out of band: the provider re-forwards every
+   *  lease's ports, so the next leaseStatus hands out different external
+   *  ones and whatever the launcher recorded no longer answers. */
+  remapForwardedPorts(): void {
+    this.assigned.clear();
   }
 
   async leaseStatus(_creds: MtlsCredentials, hostUri: string, dseq: string): Promise<unknown> {
@@ -331,10 +351,52 @@ export class FakeSsh {
   /** When true, validators' config.toml still references the pre-rekey IPs
    *  (headscale relaunch's rewire probe). */
   configHasStaleIp = false;
+  /** persistent_peers value in a node's config.toml, per host:port. Unset →
+   *  the node has no such line (probes that read it simply find nothing). */
+  configPeers = new Map<string, string>();
+  /** Block archive files sitting on a node (restore op), per host:port. */
+  archiveFiles = new Map<string, number>();
+  /** Nodes holding an uploaded tarball the restore op can unpack. */
+  archiveTarballs = new Set<string>();
+  /** Exit code the detached replay writes (non-zero = a failed replay). */
+  replayExit = 0;
+  /** Polls the replay reports RUNNING before it writes that exit code. */
+  replayPolls = 2;
+  private replaying = new Map<string, number>();
   private rejoined = new Set<string>();
   execLog: Array<{ target: string; command: string }> = [];
   private ipCounter = 10;
   private ips = new Map<string, string>();
+  /** halt-height currently configured per node (0 = none). */
+  private haltHeights = new Map<string, number>();
+  /** Nodes that booted into their halt height and stopped there. */
+  private haltedAt = new Map<string, number>();
+  /** Fired when a node halts or is released, so the RPC fake can go dark the
+   *  way a stopped node's endpoint does. */
+  onHaltChange?: (haltedCount: number) => void;
+
+  private noteHalt(): void {
+    this.onHaltChange?.(this.haltedAt.size);
+  }
+
+  /** Nodes currently stopped at their halt height. */
+  haltedNodes(): string[] {
+    return [...this.haltedAt.keys()];
+  }
+
+  /** The halt line a halting node reprints on every crash-loop lap, as the
+   *  provider's log tail would carry it. */
+  haltLogFor(id: string): string | undefined {
+    const h = this.haltedAt.get(id);
+    return h === undefined ? undefined : `ERR halt per configuration height ${h} time 0\n`;
+  }
+
+  /** Attempts made against each crash-looping node, so the fake can refuse
+   *  the ones that land in the restart backoff. */
+  private haltingExecs = new Map<string, number>();
+  /** What `sparkdreamd version` reports per node. Unset → the node answers
+   *  nothing, the case where repair must keep the recorded image. */
+  nodeVersions = new Map<string, string>();
 
   /** Simulate a mesh re-key: previously assigned tailnet IPs are forgotten,
    *  so the next `ip -4` per target hands out fresh ones. */
@@ -349,8 +411,58 @@ export class FakeSsh {
   async exec(target: SshTarget, command: string): Promise<SshResult> {
     const id = this.id(target);
     if (this.failHosts.has(id)) throw new Error(`connect ECONNREFUSED ${id}`);
+    // A halted node is a crash loop, not a stopped process: sparkdreamd is
+    // PID 1, so the container exits and the provider restarts it. SSH answers
+    // only inside a boot window — model that as every other attempt landing in
+    // the restart backoff, where a real provider reports no replicas at all.
+    if (this.haltedAt.has(id)) {
+      const n = (this.haltingExecs.get(id) ?? 0) + 1;
+      this.haltingExecs.set(id, n);
+      if (n % 2 === 1) {
+        throw new Error(`ssh exit 1 (via lease-shell): lease shell: no active replicas for service`);
+      }
+    }
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
+
+    // --- restore op: archive discovery, the detached replay, its poll ---
+    if (command.includes("echo NONE")) {
+      const n = this.archiveFiles.get(id) ?? 0;
+      return ok(n > 0 ? `DIR /root/.sparkdream/archives ${n}` : "NONE");
+    }
+    if (command.includes("tar tzf")) {
+      // an uploaded tarball unpacks into the archive dir
+      if (!this.archiveTarballs.has(id)) return ok();
+      this.archiveFiles.set(id, 3);
+      return ok("unpacked /root/.sparkdream/archives.tar.gz");
+    }
+    // the archive file names, which is where the replay's target height
+    // comes from: one 1000-block file per archive the node holds
+    if (command.startsWith("ls ") && command.includes("blocks_*_to_*")) {
+      const n = this.archiveFiles.get(id) ?? 0;
+      return ok(
+        Array.from(
+          { length: n },
+          (_, i) => `/root/.sparkdream/archives/blocks_${i * 1000 + 1}_to_${(i + 1) * 1000}.jsonl.gz`,
+        ).join("\n"),
+      );
+    }
+    if (command.includes("replay-from-archive --home")) {
+      this.replaying.set(id, this.replayPolls);
+      return ok();
+    }
+    if (command.includes("replay[-]from-archive")) {
+      const left = this.replaying.get(id);
+      if (left === undefined) return ok(); // nothing running, no exit code yet
+      if (left > 0) {
+        this.replaying.set(id, left - 1);
+        // climbing, as a real replay's does: the op measures a rate off it
+        const height = 1000 * (this.replayPolls - left + 1);
+        return ok(`RUNNING\nINF Replay progress height=${height} blocks_replayed=100`);
+      }
+      this.replaying.delete(id);
+      return ok(`EXIT ${this.replayExit}`);
+    }
 
     if (command.includes("test -f") && command.includes(".node-data-uploaded")) {
       return ok(this.uploaded.has(id) ? "yes" : "no");
@@ -375,6 +487,17 @@ export class FakeSsh {
     // mesh re-key (headscale relaunch): config.toml peer-IP presence probe
     if (command.includes("grep -c") && command.includes("config.toml")) {
       return ok(this.configHasStaleIp ? "1" : "0");
+    }
+    // persistent_peers on the volume (the repoint op reads it, repairs stale
+    // tailnet addresses in it, and writes the whole line back)
+    if (command.includes("grep '^persistent_peers'")) {
+      const peers = this.configPeers.get(id);
+      return ok(peers === undefined ? "" : `persistent_peers = "${peers}"`);
+    }
+    if (command.includes("sed -i 's|^persistent_peers")) {
+      const next = /persistent_peers = "(.*)"\|/.exec(command);
+      if (next) this.configPeers.set(id, next[1]!);
+      return ok();
     }
     // await-mesh remediation: resolve headscale's IPv4 (the piped awk result)
     if (command.includes("nslookup")) return ok("104.21.47.136");
@@ -414,6 +537,20 @@ export class FakeSsh {
       // "no" no matter how the signer is configured
       return ok(this.started.has(id) ? "ok" : "no");
     }
+    // --- halt-height: the sed that configures it, the probe that reads it ---
+    if (command.includes("halt-height =")) {
+      const n = Number(/halt-height = (\d+)/.exec(command)?.[1] ?? 0);
+      this.haltHeights.set(id, n);
+      if (n === 0) {
+        this.haltedAt.delete(id);
+        this.noteHalt();
+      }
+      return ok();
+    }
+    if (command.includes("sparkdreamd version")) {
+      const v = this.nodeVersions.get(id);
+      return ok(v === undefined ? "" : v);
+    }
     if (command.includes("pgrep -x sparkdreamd")) {
       return ok(this.started.has(id) ? "yes" : "no");
     }
@@ -422,6 +559,14 @@ export class FakeSsh {
       return ok();
     }
     if (command.includes("sparkdreamd start")) {
+      const halt = this.haltHeights.get(id) ?? 0;
+      if (halt > 0) {
+        // boots, runs up to the configured height, refuses that block and
+        // exits — which is why restarting a halted node never brings it back
+        this.haltedAt.set(id, halt);
+        this.noteHalt();
+        return ok();
+      }
       this.started.add(id);
       return ok();
     }
@@ -448,7 +593,12 @@ export class FakeRpc {
     return this.httpStatusResult;
   }
 
+  /** While the chain is halted every node has stopped, so nothing serves RPC:
+   *  the probe fails outright rather than returning a stale height. */
+  chainHalted = false;
+
   async status(url: string) {
+    if (this.chainHalted) throw new Error(`rpc ${url}/status: connect ECONNREFUSED`);
     const h = (this.heights.get(url) ?? 0) + 5;
     this.heights.set(url, h);
     return { latestBlockHeight: h, catchingUp: false };
@@ -490,16 +640,25 @@ export function fakeServices(): FakeWorld {
   const ssh = new FakeSsh();
   const provider = new FakeProviderGateway();
   const api = new FakeAkashApi();
+  const rpc = new FakeRpc();
   provider.onChainHash = (dseq) => api.deploymentHashes.get(dseq);
   provider.onNodeManifest = (sshId, waitMode) => {
     if (waitMode) ssh.started.delete(sshId);
     else ssh.started.add(sshId);
   };
+  // a halted node stops serving RPC — the coupling that makes a height probe
+  // useless for detecting a deliberate halt
+  ssh.onHaltChange = (halted) => {
+    rpc.chainHalted = halted > 0;
+  };
+  // ...and prints its halt line to the container log, the one stream that
+  // outlives the restarts
+  provider.onNodeLogs = (sshId) => ssh.haltLogFor(sshId);
   return {
     api,
     provider,
     ssh,
-    rpc: new FakeRpc(),
+    rpc,
     certs: { generate: async () => FAKE_CERT },
     // "encryption" placeholder: a plain tarball, so bundle round-trips are
     // testable (real adapter pipes tar through the age CLI)

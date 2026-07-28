@@ -2,10 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
 import { chainId, resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
-import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
+import type { ConductorDb, FleetComponentRow, FleetOpProgress, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
+import type { OfferedBid } from "./akash/policy.js";
 import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
 import { NODE_HOME, restartNode, rpcUrl } from "./node-ops.js";
 import { sparkdreamd } from "./exec.js";
@@ -16,9 +17,10 @@ import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
+import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import type { ResetChainParams, RetargetParams } from "./fleet-ops.js";
+import type { RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -45,6 +47,17 @@ function leaseServiceName(key: string): string {
   return key.startsWith("val-") || key.startsWith("sentry-") ? "sparkdreamd" : key;
 }
 
+/** Directory an uploaded file lands in, per component. Node uploads go into
+ *  the chain home (where `config/` and `data/` live, so a dropped snapshot or
+ *  config file is already beside what reads it); the explorer's go into its
+ *  persistent `/data` volume, the only path that survives a container
+ *  restart. Throws for components that accept no uploads at all. */
+export function uploadDirFor(key: string): string {
+  if (key === "explorer") return "/data";
+  if (key.startsWith("val-") || key.startsWith("sentry-")) return NODE_HOME;
+  throw new Error(`${key} runs no sshd; cannot accept file uploads`);
+}
+
 export interface ComponentView {
   key: string;
   dseq: string;
@@ -61,6 +74,10 @@ export interface ComponentView {
   state: string;
   /** Deployed image reference (upgrades update it). */
   image: string | null;
+  /** Address on the headscale mesh (100.x), for components that joined it —
+   *  null for the headscale server itself and the frontend, which stay off
+   *  the tailnet. Re-read live by the repair and relaunch ops. */
+  tailnetIp: string | null;
   /** True when the component runs sshd and has a recorded forwarded endpoint —
    *  i.e. the user can push files to it (nodes + explorer; headscale and the
    *  frontend image run no sshd). */
@@ -78,7 +95,17 @@ export interface FleetView {
   /** softsign | tmkms — the UI gates signer-related actions on this. */
   keyMode: string;
   components: ComponentView[];
-  ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
+  ops: Array<{
+    id: number;
+    kind: string;
+    status: string;
+    params: unknown;
+    /** Live position of a long op (archive replay); absent for the rest. */
+    progress?: FleetOpProgress;
+  }>;
+  /** Placements the launch itself is holding for a manual bid pick (§6.6).
+   *  Op-made placements carry theirs on the op's params instead. */
+  bidPicks: Array<{ key: string; dseq: string; bids: OfferedBid[] }>;
 }
 
 export interface FleetSummary {
@@ -177,13 +204,13 @@ export class FleetService {
     if (hs && !hs.reused) {
       // adopt a redeployed headscale the same way as the node batch below
       const hsRow = this.db.listFleetComponents(launchId).find((c) => c.key === "headscale");
-      if (hsRow && hsRow.generation === 0 && hsRow.dseq !== hs.dseq) {
+      if (hsRow && Number(hs.dseq) > Number(hsRow.dseq)) {
         this.db.updateComponentPlacement(launchId, "headscale", {
           dseq: hs.dseq,
           provider: hs.provider,
           host_uri: hs.hostUri,
           price: hs.price,
-          generation: 0,
+          generation: hsRow.generation,
         });
       }
       this.db.upsertFleetComponent({
@@ -217,20 +244,30 @@ export class FleetService {
       for (const [key, entry] of Object.entries(plan.perNode)) {
         const a = assignments.perNode[key];
         if (!a) continue;
-        // stale-bid recovery redeploys the whole node batch inside the
-        // launch: the step outputs then carry NEW dseqs while the rows hold
-        // the closed old generation (upsert is DO NOTHING). Adopt the new
-        // identity — but only for generation-0 rows, so a relaunch op's
-        // placement (row ahead of the outputs, generation ≥ 1) is never
-        // clobbered.
+        // stale-bid recovery and the mid-launch re-place both redeploy inside
+        // the launch: the step outputs then carry a NEW dseq while the row
+        // holds the closed old placement (upsert is DO NOTHING). Adopt the
+        // newer one, ordered by dseq — the deployment's creation height, the
+        // only clock the launch and the relaunch ops share. A relaunch op
+        // writes the row ahead of these outputs, so its placement has the
+        // higher dseq and is never clobbered by them; generation counts the
+        // component's moves and is not that clock (a generation-3 row was
+        // stuck on a dead deployment because only generation-0 rows adopted).
         const row = existing.get(key);
-        if (row && row.generation === 0 && row.dseq !== entry.dseq) {
+        if (row && Number(entry.dseq) > Number(row.dseq)) {
           this.db.updateComponentPlacement(launchId, key, {
             dseq: entry.dseq,
             provider: a.provider,
             host_uri: a.hostUri,
             price: a.price,
-            generation: 0,
+            generation: row.generation,
+          });
+          // endpoints belong to the placement: a fresh lease means a fresh
+          // forwarded SSH port, and the new container joins the mesh under a
+          // new tailnet IP. COALESCE-style backfill would keep the dead ones.
+          this.db.updateComponentRuntime(launchId, key, {
+            ...(ssh?.perNode[key] ? { ssh_host: ssh.perNode[key]!.host, ssh_port: ssh.perNode[key]!.port } : {}),
+            ...(mesh?.ips[key] ? { tailnet_ip: mesh.ips[key]! } : {}),
           });
         }
         this.db.upsertFleetComponent({
@@ -246,6 +283,17 @@ export class FleetService {
           tailnet_ip: mesh?.ips[key] ?? null,
           image: componentImages.get(key) ?? spec?.images.sparkdreamd ?? null,
         });
+        // A tailnet IP belongs to a container, not to a component: the mesh
+        // hands out a new one every time a fresh container registers. When
+        // the row and the outputs name the SAME deployment, the IP await-mesh
+        // last read IS that container's, so adopt it — the backfill below
+        // only fills nulls and would keep a dead address (seen live: the
+        // tmkms checklist offered the previous container's IP after a
+        // re-place, and the signer dialed nothing).
+        const meshIp = mesh?.ips[key];
+        if (row && row.dseq === entry.dseq && meshIp && row.tailnet_ip !== meshIp) {
+          this.db.updateComponentRuntime(launchId, key, { tailnet_ip: meshIp });
+        }
         // endpoints land in later steps than the row itself
         this.db.backfillComponentEndpoints(launchId, key, {
           ssh_host: ssh?.perNode[key]?.host ?? null,
@@ -433,6 +481,7 @@ export class FleetService {
             escrow,
             state: c.state,
             image: c.image,
+            tailnetIp: c.tailnet_ip,
             ssh: c.ssh_host != null && c.ssh_port != null,
             health: h
               ? { status: h.status, detail: h.detail, checked_at: h.checked_at }
@@ -453,7 +502,20 @@ export class FleetService {
           kind: o.kind,
           status: o.status,
           params: JSON.parse(o.params_json),
+          ...(o.progress_json
+            ? { progress: JSON.parse(o.progress_json) as FleetOpProgress }
+            : {}),
         })),
+        // only rows with bids on them are offers; a row without is a request
+        // the placement has not reached yet, and an answered one is on its way
+        bidPicks: this.db
+          .listBidPicks(launch.id)
+          .filter((p) => p.offers_json && p.dseq && !p.provider)
+          .map((p) => ({
+            key: p.key,
+            dseq: p.dseq!,
+            bids: JSON.parse(p.offers_json!) as OfferedBid[],
+          })),
       });
     }
 
@@ -872,6 +934,133 @@ export class FleetService {
     await restartNode(this.services.ssh, this.sshTargetFor(launch, component));
   }
 
+  /**
+   * Pre-reset guard (§5 pre-action guards): wiping `data/` throws away every
+   * block the node holds and the app state with it. The node stays stopped
+   * afterwards — a restart would start re-syncing from peers and take the
+   * height with it, which is exactly what a following archive restore needs
+   * it not to do.
+   */
+  resetDataWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
+    const warnings = [
+      `This erases ${component.key}'s blockchain database: every block it holds and the ` +
+        "application state with it. Node key and consensus key are kept, so it keeps its " +
+        "identity. The node is left STOPPED — restore replays the archives from block 1 into " +
+        "the empty database, or restart re-syncs it from its peers (slow on a long chain).",
+    ];
+    if (!component.key.startsWith("val-")) return warnings;
+    const active = this.db
+      .listFleetComponents(launch.id)
+      .filter((c) => c.key.startsWith("val-") && c.state === "active").length;
+    warnings.push(
+      `${component.key} signs nothing from now until it is back at the chain head, which is a ` +
+        `downtime jail if that takes long enough${
+          active <= 1 ? ", and it is this fleet's only active validator, so the chain stops with it" : ""
+        }.`,
+    );
+    if (this.spec(launch).security.keyMode !== "tmkms") {
+      // softsign keeps the double-sign watermark in the data dir the reset
+      // wipes; tmkms keeps it on the signer, where the reset cannot reach it
+      warnings.push(
+        `${component.key} signs locally (softsign), so the reset also clears its ` +
+          "priv_validator_state.json — the file that stops it signing a second block at a " +
+          "height it already signed. If this node ever rejoins a chain that kept those blocks " +
+          "and re-signs one of them, that is a double sign and the stake is slashed.",
+      );
+    }
+    return warnings;
+  }
+
+  /**
+   * Wipe a node's chain data (`comet unsafe-reset-all`) and leave it stopped,
+   * ready for an archive restore from block 1 — replay only ever appends from
+   * the node's committed height, so rebuilding history BELOW it means starting
+   * from an empty database. Keys and the address book survive.
+   */
+  async resetData(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+  ): Promise<{ output: string }> {
+    if (!/^(val|sentry)-/.test(component.key)) {
+      throw new Error(`reset data applies to chain nodes, not ${component.key}`);
+    }
+    const target = this.sshTargetFor(launch, component);
+    // the reset opens the same databases the node holds — stop it first, and
+    // confirm, or the wipe half-happens against a live process
+    await this.services.ssh.exec(target, "pkill -x sparkdreamd || true");
+    for (let i = 0; i < 10; i++) {
+      const alive = await this.services.ssh.exec(
+        target,
+        "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+        { quick: true },
+      );
+      if (alive.stdout.trim() === "no") break;
+      if (i === 4) await this.services.ssh.exec(target, "pkill -9 -x sparkdreamd || true");
+      if (i === 9) throw new Error(`${component.key}: sparkdreamd will not stop; data left alone`);
+      await this.services.sleep(2000);
+    }
+    const res = await this.services.ssh.exec(
+      target,
+      `sparkdreamd comet unsafe-reset-all --home ${NODE_HOME} --keep-addr-book 2>&1`,
+    );
+    return { output: res.stdout.trim().slice(-2000) };
+  }
+
+  clearHaltHeightWarnings(launch: LaunchRow): string[] {
+    return [
+      "Every chain node's halt-height is set back to 0, so a node that stopped at it no longer " +
+        "stops there. Nothing is started: the nodes stay exactly as they are, and a node already " +
+        "halted stays down until you restart it or an upgrade replaces its image. Use this to " +
+        "recover a halt-height upgrade that was abandoned before it could clear the setting " +
+        "itself, which otherwise leaves every node halting again on each restart.",
+    ];
+  }
+
+  /**
+   * Reset `halt-height` to 0 across the fleet's chain nodes.
+   *
+   * The halt-upgrade op clears the setting itself once it has seen the halt
+   * (`halt-clear`), so this is the recovery path for the case where that op
+   * never got there: aborted, or wedged before the clear. Without it the
+   * setting is unreachable — the launcher exposes no other way to edit
+   * app.toml, restart re-halts at the same block, and the image swap does not
+   * touch the config volume — so the fleet halts forever at a height that has
+   * already passed.
+   */
+  async clearHaltHeight(launch: LaunchRow): Promise<{ cleared: string[] }> {
+    const nodes = this.db
+      .listFleetComponents(launch.id)
+      .filter((c) => c.state === "active" && /^(val|sentry)-/.test(c.key));
+    const cleared: string[] = [];
+    for (const component of nodes) {
+      // sparkdreamd is PID 1, so a node stopped at its halt height is really
+      // a crash loop: the container exits, the provider restarts it, and it
+      // halts again. SSH answers only inside each boot window, so a single
+      // attempt usually lands in the restart backoff instead.
+      let last = "";
+      for (let i = 0; i < 60; i++) {
+        try {
+          await this.services.ssh.exec(
+            this.sshTargetFor(launch, component),
+            `sed -i 's|^halt-height =.*|halt-height = 0|' ${NODE_HOME}/config/app.toml`,
+          );
+          cleared.push(component.key);
+          break;
+        } catch (e) {
+          last = e instanceof Error ? e.message : String(e);
+        }
+        await this.services.sleep(5000);
+      }
+      if (!cleared.includes(component.key)) {
+        throw new Error(
+          `${component.key}: halt-height not cleared — no boot window in 5 min (last: ${last}). ` +
+            `Cleared so far: ${cleared.join(", ") || "none"}.`,
+        );
+      }
+    }
+    return { cleared };
+  }
+
   private mtlsCreds(launch: LaunchRow) {
     const dirs = launchDirs(this.workRoot, launch.id);
     return {
@@ -906,16 +1095,15 @@ export class FleetService {
    *  fallback). Generic: the bytes are written verbatim to remotePath — no
    *  unpacking is done on the node; move or extract the file from the Akash
    *  shell afterwards. Only components that run sshd (nodes + explorer) are
-   *  valid targets; headscale and the frontend image have no sshd. */
+   *  valid targets; headscale and the frontend image have no sshd.
+   *  Callers pick the directory with {@link uploadDirFor}. */
   async uploadToNode(
     launch: LaunchRow,
     component: FleetComponentRow,
     localPath: string,
     remotePath: string,
   ): Promise<void> {
-    if (component.key === "headscale" || component.key === "frontend") {
-      throw new Error(`${component.key} runs no sshd; cannot accept file uploads`);
-    }
+    uploadDirFor(component.key); // rejects components with no sshd
     const target = this.sshTargetFor(launch, component);
     await this.services.ssh.upload(target, localPath, remotePath);
   }
@@ -984,16 +1172,28 @@ export class FleetService {
         JSON.stringify([closeDeploymentMsg(launch.owner, component.dseq)]),
       );
     }
-    // re-run the steps that place and bootstrap nodes. await-mesh and
-    // everything after it re-run anyway (they have not completed).
-    for (const name of ["send-manifests", "upload-node-data"]) {
+    // Re-run the steps that place and bootstrap nodes — and everything after
+    // them. A launch caught mid-flight has not completed those later steps
+    // anyway, so this used to reset only the two placement ones; but a launch
+    // that finished and was re-opened (a component died after the fact) has
+    // them all marked done, and they then skip. The fresh container is left
+    // with nobody discovering its tailnet IP (await-mesh), no peer repointed
+    // at it (wire-tunnels, patch-validator-peers), and, on a tmkms fleet, no
+    // pause to repoint the signer at its new address (await-signer) — the
+    // node boots, times out fetching its pubkey, and crash-loops.
+    const from = phaseEFSteps().map((s) => s.name);
+    for (const name of ["send-manifests", "upload-node-data", ...from]) {
       this.db.resetStep(launch.id, name);
     }
     return { ...(step ? { step } : {}), closing: info?.state === "active" };
   }
 
   /** Relaunch / rolling upgrade → fleet_ops rows; steps composed by buildOpSteps. */
-  async requestRelaunch(launch: LaunchRow, component: FleetComponentRow): Promise<number> {
+  async requestRelaunch(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    opts: { manualBid?: boolean } = {},
+  ): Promise<number> {
     // headscale relaunches through a dedicated flow (headscaleRelaunchSteps):
     // a naive redeploy re-keys the whole mesh. A shared-mesh fleet has no
     // headscale of its own to relaunch; the owning fleet runs the op.
@@ -1037,7 +1237,30 @@ export class FleetService {
       generation: component.generation + 1,
       avoidProviders,
       preferProviders: prefs.prefer,
+      ...(opts.manualBid ? { manualBid: true } : {}),
     });
+  }
+
+  /**
+   * Record the operator's hand-picked bid for a relaunch parked at its lease
+   * step (manualBid). The pick overrides the selection policy outright, so
+   * the only checks here are that it names a bid actually on offer for the
+   * deployment the op is waiting on.
+   */
+  chooseBid(launch: LaunchRow, opId: number, provider: string): { key: string } {
+    const op = this.db.listFleetOps(launch.id).find((o) => o.id === opId);
+    if (!op || op.status !== "active") throw new Error(`operation ${opId} is not active`);
+    const params = JSON.parse(op.params_json) as RelaunchParams;
+    const offers = params.offeredBids;
+    if (!offers) throw new Error(`operation ${opId} is not waiting for a bid to be picked`);
+    if (!offers.bids.some((b) => b.provider === provider)) {
+      throw new Error(`${provider} did not bid on deployment ${offers.dseq}`);
+    }
+    this.db.updateFleetOpParams(opId, {
+      ...params,
+      bidChoice: { dseq: offers.dseq, provider },
+    });
+    return { key: params.key };
   }
 
   /** Abort every still-active relaunch op targeting `key` so a fresh request
@@ -1181,6 +1404,99 @@ export class FleetService {
       throw new Error(`a resume-signing op (#${running.id}) is already in progress for ${component.key}`);
     }
     return this.db.createFleetOp(launch.id, "resume-signing", { key: component.key });
+  }
+
+  /**
+   * Pre-restore guard (§5 pre-action guards): the replay needs the node's
+   * databases to itself, so sparkdreamd is down for the whole run — hours
+   * on a large archive. A validator that stops is a validator missing
+   * blocks: on a small fleet the chain stops with it, and long enough
+   * offline gets it downtime-jailed (recoverable only through unjail).
+   */
+  restoreArchiveWarnings(launch: LaunchRow, component: FleetComponentRow): string[] {
+    const warnings: string[] = [];
+    if (!component.key.startsWith("val-")) return warnings;
+    const active = this.db
+      .listFleetComponents(launch.id)
+      .filter((c) => c.key.startsWith("val-") && c.state === "active").length;
+    warnings.push(
+      `${component.key} stays stopped for the whole replay (hours on a large archive), so it ` +
+        `signs nothing while it runs${
+          active <= 1 ? " — it is this fleet's only active validator, so the chain stops with it" : ""
+        }, and a long enough absence gets it downtime-jailed. Restore a sentry, or a validator you ` +
+        "can afford to have offline, when the chain has to keep producing blocks.",
+    );
+    return warnings;
+  }
+
+  /**
+   * Rebuild a node's block history from uploaded archive files (§5): stop
+   * the node, run `sparkdreamd replay-from-archive` detached (its output
+   * stays in a file on the node — the volume is what kills log viewers),
+   * watch it to completion, start the node back up.
+   */
+  requestRestoreArchive(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    opts: { archiveDir?: string; validate?: boolean; endHeight?: number } = {},
+  ): number {
+    if (!/^(val|sentry)-/.test(component.key)) {
+      throw new Error(`restore applies to chain nodes, not ${component.key}`);
+    }
+    const running = this.db
+      .listFleetOps(launch.id)
+      .find(
+        (o) =>
+          o.kind === "restore-archive" &&
+          o.status === "active" &&
+          JSON.parse(o.params_json).key === component.key,
+      );
+    if (running) {
+      throw new Error(`a restore op (#${running.id}) is already in progress for ${component.key}`);
+    }
+    return this.db.createFleetOp(launch.id, "restore-archive", { key: component.key, ...opts });
+  }
+
+  /**
+   * Pre-repair guard (§5 pre-action guards). The operator agrees to the whole
+   * op, not to one of its passes, so this states the worst any pass can cost
+   * — today a restart of the components being corrected, and one signature.
+   * A pass added later that can cost more has to be named here too (see
+   * {@link repairSteps}); one that cannot be stated this plainly should
+   * report the problem instead of acting on it.
+   */
+  repairWarnings(launch: LaunchRow): string[] {
+    return [
+      "The launcher's own records are corrected first: where each component answers SSH (re-read " +
+        "from its provider), its live mesh address, and the version each chain node reports " +
+        "running (both asked of the component itself), so work " +
+        "done outside the launcher does not leave it out of step. Components whose links are " +
+        "stale are then restarted in place so the " +
+        "correction takes effect: a sentry's public RPC and LCD blink, and a validator restarted " +
+        "this way misses the few blocks it is down for. Components already pointing at the right " +
+        "address are left alone. Nothing is redeployed, no volume is touched, no escrow is spent.",
+    ];
+  }
+
+  /**
+   * Reconcile the fleet against reality and fix what has drifted (§5), in
+   * place: re-read SSH endpoints from the providers and live mesh addresses
+   * from the components into the launcher's own record, then
+   * correct stale tunnel env (deployment update + manifest push) and stale
+   * `persistent_peers` (SSH edit + restart). The cure for an address that
+   * moved outside a relaunch — a headscale re-key, an aborted op, a relaunch
+   * whose dependents were not placed at the time, a container bounced by hand
+   * in another console — where the only alternative was relaunching the
+   * dependents onto new providers. Later repairs join this op as passes.
+   */
+  requestRepair(launch: LaunchRow, component: FleetComponentRow): number {
+    const running = this.db
+      .listFleetOps(launch.id)
+      .find((o) => o.kind === "repair" && o.status === "active");
+    if (running) {
+      throw new Error(`a repair op (#${running.id}) is already in progress for this fleet`);
+    }
+    return this.db.createFleetOp(launch.id, "repair", { key: component.key });
   }
 
   /**

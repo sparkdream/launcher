@@ -7,9 +7,9 @@ import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { toEncodeObject } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
-import { runWithSigner, type GentxSigner } from "../src/engine.js";
+import { runWithSigner, type GentxSigner, type StepDef } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
-import { buildOpSteps } from "../src/fleet-ops.js";
+import { buildOpSteps, buildPreLaunchOpSteps, retagImage } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { fakeServices, FakeSigner, keplrSignAmino, type FakeWorld } from "./fakes.js";
 
@@ -23,9 +23,12 @@ afterAll(() => {
   for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
+// relaunch ops are asserted by where the component lands, so these specs turn
+// anti-affinity on: no profile does by default
 function spec2x2(): LaunchSpec {
   return testnetSpec({
     network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    providers: { policy: { antiAffinity: "strict" } },
     topology: {
       validators: { count: 2 },
       sentries: { count: 2 },
@@ -42,6 +45,7 @@ function spec2x2(): LaunchSpec {
 function specWithComponents(): LaunchSpec {
   return testnetSpec({
     network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    providers: { policy: { antiAffinity: "strict" } },
     topology: {
       validators: { count: 1 },
       sentries: { count: 1 },
@@ -80,7 +84,7 @@ async function launched(s: LaunchSpec = spec2x2(), gentxSigner?: GentxSigner): P
 }
 
 async function driveOps(w: World) {
-  const steps = [...allSteps(), ...buildOpSteps(w.db, "fl")];
+  const steps = [...buildPreLaunchOpSteps(w.db, "fl"), ...allSteps(), ...buildOpSteps(w.db, "fl")];
   return runWithSigner(w.db, "fl", w.spec, w.work, steps, w.services, w.signer, undefined, w.gentxSigner);
 }
 
@@ -174,7 +178,10 @@ describe("relaunch op", () => {
         },
         headscale: { domain: "headscale.sparkdream.io" },
       },
-      providers: { components: { sentries: { exclude: ["provider4"] } } },
+      providers: {
+        policy: { antiAffinity: "strict" },
+        components: { sentries: { exclude: ["provider4"] } },
+      },
     });
     const w = await launched(s);
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
@@ -192,6 +199,36 @@ describe("relaunch op", () => {
     expect(after.provider).not.toBe(before.provider); // moved off the old provider
     expect(after.provider).not.toBe("akash1provider4"); // spec exclusion held
     expect(after.provider).toBe("akash1provider5");
+  }, 120_000);
+
+  it("manual bid selection parks with the bid list and leases the pick over the policy", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const launch = w.db.getLaunch("fl")!;
+    await w.fleet.requestRelaunch(launch, before, { manualBid: true });
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+
+    // parks at the lease step instead of picking
+    expect((await driveOps(w)).status).toBe("awaiting-user");
+    const opId = w.db.listFleetOps("fl").find((o) => o.status === "active")!.id;
+    const offers = JSON.parse(w.db.listFleetOps("fl").find((o) => o.id === opId)!.params_json)
+      .offeredBids as { dseq: string; bids: Array<{ provider: string; rejected?: string }> };
+    expect(offers.bids.length).toBeGreaterThan(1);
+    // cheapest first, and the reasons the policy passed a bid over travel
+    // to the picker (they are exactly what the operator is overriding)
+    const prices = offers.bids.map((b) => Number((b as { price: string }).price));
+    expect([...prices].sort((a, b) => a - b)).toEqual(prices);
+    // the fellow sentry's provider is rejected by anti-affinity — pick it
+    // anyway: a hand-picked bid beats every filter
+    const taken = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!.provider;
+    expect(offers.bids.find((b) => b.provider === taken)?.rejected).toMatch(/anti-affinity/);
+    w.fleet.chooseBid(launch, opId, taken);
+
+    expect((await driveOps(w)).status).toBe("completed");
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.state).toBe("active");
+    expect(after.provider).toBe(taken);
   }, 120_000);
 
   it("pauses on a genuine zombie container, proceeds past a mute closed-lease gateway", async () => {
@@ -254,6 +291,7 @@ describe("tmkms validator relaunch", () => {
     return testnetSpec({
       network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
       security: { keyMode: "tmkms" },
+      providers: { policy: { antiAffinity: "strict" } },
       topology: {
         validators: { count: 1 },
         sentries: { count: 1 },
@@ -1126,6 +1164,7 @@ describe("resume-signing op", () => {
     return testnetSpec({
       network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
       security: { keyMode: "tmkms" },
+      providers: { policy: { antiAffinity: "strict" } },
       topology: {
         validators: { count: 2 },
         sentries: { count: 2 },
@@ -1259,6 +1298,7 @@ describe("headscale relaunch op", () => {
     return testnetSpec({
       network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
       security: { keyMode: "tmkms" },
+      providers: { policy: { antiAffinity: "strict" } },
       topology: {
         validators: { count: 1 },
         sentries: { count: 1 },
@@ -1371,4 +1411,414 @@ describe("headscale relaunch op", () => {
     expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
     w.db.close();
   }, 240_000);
+});
+
+describe("repair op", () => {
+  it("re-reads live addresses the launcher never saw, then re-aims env and peers at them", async () => {
+    // The live shape: the fleet moved onto new tailnet addresses with the
+    // launcher not watching (a mesh re-key, containers bounced by hand in
+    // another console). Its records are stale, so every link it could repair
+    // from them would be repaired to the WRONG address — the op has to ask
+    // the boxes where they are before it fixes anything.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sentryId = `${sentry.ssh_host}:${sentry.ssh_port}`;
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+    const nodeIds = w.db.stepOutput<{ nodeIds: Record<string, string> }>("fl", "generate-keys")!
+      .nodeIds;
+    const before = Object.fromEntries(
+      w.db.listFleetComponents("fl").map((c) => [c.key, c.tailnet_ip]),
+    );
+    // the validator's peers name the sentry's pre-re-key address; the sentry
+    // reaches its validator through a loopback tunnel, as it always does
+    w.services.ssh.configPeers.set(valId, `${nodeIds["sentry-0"]}@${before["sentry-0"]}:26656`);
+    w.services.ssh.configPeers.set(
+      sentryId,
+      `${nodeIds["val-0"]}@127.0.0.1:27000,${nodeIds["sentry-0"]}@${before["sentry-0"]}:26656`,
+    );
+    w.services.ssh.remapTailnetIps(); // every box comes back on a new address
+    const sigsBefore = w.signer.signed.length;
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    // the launcher's own record is corrected from the live boxes first
+    const after = Object.fromEntries(
+      w.db.listFleetComponents("fl").map((c) => [c.key, c.tailnet_ip]),
+    );
+    expect(after["val-0"]).not.toBe(before["val-0"]);
+    expect(after["sentry-0"]).not.toBe(before["sentry-0"]);
+    // and with it the await-mesh table the tmkms panel and relaunches read
+    const mesh = w.db.stepOutput<{ ips: Record<string, string> }>("fl", "await-mesh")!;
+    expect(mesh.ips["val-0"]).toBe(after["val-0"]);
+
+    // env: the sentry's tunnel to the validator, and the explorer's to the
+    // sentry, both name the live addresses — not the ones on record before
+    const sentrySdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "sentry-0.yaml"), "utf8");
+    expect(sentrySdl).toContain(`${after["val-0"]}:26656`);
+    const explorerSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "explorer.yaml"), "utf8");
+    expect(explorerSdl).toContain(after["sentry-0"]);
+    // one batched update tx for the deployments that changed, no redeploy
+    expect(w.signer.signed.length).toBe(sigsBefore + 1);
+
+    // peers: the validator's stale entry is repaired in place...
+    expect(w.services.ssh.configPeers.get(valId)).toBe(
+      `${nodeIds["sentry-0"]}@${after["sentry-0"]}:26656`,
+    );
+    // ...and the sentry's loopback tunnel entry is left exactly alone —
+    // rewriting 127.0.0.1 to a tailnet IP would undo the tunnel design
+    expect(w.services.ssh.configPeers.get(sentryId)).toContain(`${nodeIds["val-0"]}@127.0.0.1:27000`);
+    expect(w.services.ssh.configPeers.get(sentryId)).toContain(`${after["sentry-0"]}:26656`);
+    w.db.close();
+  }, 120_000);
+
+  it("re-reads SSH endpoints from the providers before reaching for anything", async () => {
+    // The Console Air case: containers recycled outside the launcher come
+    // back on provider-assigned forwarded ports the launcher never saw. Its
+    // recorded endpoints then answer nothing, every later pass reads the box
+    // as unreachable, and repair could neither touch nor fix it — so the
+    // endpoint mapping is re-read from lease status before anything else.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const before = Object.fromEntries(
+      w.db.listFleetComponents("fl").map((c) => [c.key, c.ssh_port]),
+    );
+    w.services.provider.remapForwardedPorts();
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").filter((c) => c.ssh_port !== null);
+    expect(after.length).toBeGreaterThan(0);
+    for (const c of after) expect(c.ssh_port).not.toBe(before[c.key]);
+    w.db.close();
+  }, 120_000);
+
+  it("runs while a launch step is failing — the state it exists to fix", async () => {
+    // Seen live: a launch parked at verify-chain because the fleet was
+    // dialling dead mesh addresses (no gossip, no blocks, nothing to
+    // verify), the operator clicked repair, and the op sat with no step rows
+    // at all — op steps compose AFTER the launch's, so the failing step it
+    // was meant to cure blocked it forever. The spinner on screen was the
+    // LAUNCH's step, which reads exactly like a repair that is working.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.remapTailnetIps(); // the drift that stopped the chain
+    const opId = w.fleet.requestRepair(launch, val);
+
+    const stuck: StepDef = {
+      name: "verify-chain-stuck",
+      async run() {
+        throw new Error("sentry-0: chain not verified after ~5 min — height not increasing");
+      },
+    };
+    const steps = [
+      ...buildPreLaunchOpSteps(w.db, "fl"),
+      ...allSteps(),
+      stuck,
+      ...buildOpSteps(w.db, "fl"),
+    ];
+    const r = await runWithSigner(w.db, "fl", w.spec, w.work, steps, w.services, w.signer);
+    expect(r.failedStep).toBe("verify-chain-stuck");
+    // the repair ran regardless, ahead of the step it exists to unblock
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.db.getStep("fl", `op${opId}:peers`)!.status).toBe("done");
+    w.db.close();
+  }, 120_000);
+
+  it("keeps the recorded address of a component that cannot say where it is", async () => {
+    // an unreachable box is not evidence its address changed: erasing the
+    // record would strand every link that still, correctly, names it
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const recorded = val.tailnet_ip;
+    w.services.ssh.failHosts.add(`${val.ssh_host}:${val.ssh_port}`);
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!.tailnet_ip).toBe(recorded);
+    w.db.close();
+  }, 120_000);
+
+  it("is a no-op when every address is already current", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sigsBefore = w.signer.signed.length;
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+    // nothing stale: no update tx, and no component restarted for nothing
+    expect(w.signer.signed.length).toBe(sigsBefore);
+    expect(() => w.fleet.requestRepair(launch, val)).not.toThrow();
+    w.db.close();
+  }, 120_000);
+});
+
+describe("restore-from-archive op", () => {
+  it("unpacks an uploaded tarball, replays with the node stopped, restarts it", async () => {
+    // the live shape: the operator uploads block archives with the fleet
+    // view's upload button (they hold no SSH key), clicks restore, and the
+    // launcher runs the hours-long replay detached — the output that kills
+    // a console never crosses the wire
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+    const opId = w.fleet.requestRestoreArchive(launch, val);
+
+    // nothing uploaded yet: the op parks asking for the archives instead of
+    // replaying an empty directory
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:find-archive`);
+    expect(w.services.ssh.execLog.some((e) => e.command.includes("pkill -x sparkdreamd"))).toBe(
+      false,
+    );
+
+    w.services.ssh.archiveTarballs.add(valId); // operator uploads the archive
+    const done = await driveOps(w);
+    expect(done.status).toBe("completed");
+
+    const log = w.services.ssh.execLog.filter((e) => e.target === valId).map((e) => e.command);
+    const stopAt = log.findIndex((c) => c.includes("pkill -x sparkdreamd"));
+    const replayAt = log.findIndex((c) => c.includes("replay-from-archive --home"));
+    // the launch itself started the node earlier — the restart is the last one
+    const startAt = log.findLastIndex((c) => c.includes("sparkdreamd start"));
+    // the replay opens the node's databases: it only runs between the stop
+    // and the restart
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(replayAt).toBeGreaterThan(stopAt);
+    expect(startAt).toBeGreaterThan(replayAt);
+    expect(log[replayAt]).toContain("--archive-dir /root/.sparkdream/archives");
+    expect(log[replayAt]).toContain("--validate true");
+    // detached, with the output parked in a file on the node
+    expect(log[replayAt]).toContain("nohup");
+    expect(log[replayAt]).toContain("/root/.sparkdream/replay-archive.log");
+    expect(w.services.ssh.started.has(valId)).toBe(true);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 120_000);
+
+  it("publishes how far the replay has got, and clears it once the node is back", async () => {
+    // a replay runs for hours: the step log alone (one line per two minutes)
+    // cannot say how far along it is, so the op carries a live position the
+    // fleet view reads. The target height comes from the archive file names.
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const id = `${sentry.ssh_host}:${sentry.ssh_port}`;
+    w.services.ssh.archiveFiles.set(id, 4); // blocks 1..4000
+    w.services.ssh.replayExit = 1; // stop mid-flight so the position survives
+    const opId = w.fleet.requestRestoreArchive(launch, sentry);
+
+    expect((await driveOps(w)).status).toBe("paused");
+    const op = () => w.db.listFleetOps("fl").find((o) => o.id === opId)!;
+    const progress = JSON.parse(op().progress_json!);
+    expect(progress.target).toBe(4000);
+    expect(progress.current).toBe(2000);
+    expect(progress.percent).toBe(50);
+    // rate is measured between samples of THIS run, so a re-attach to a
+    // replay already hours in does not read as impossibly fast
+    expect(progress.rate).toBeGreaterThan(0);
+    expect(progress.etaSeconds).toBeGreaterThan(0);
+    expect(progress.label).toContain("sentry-0");
+
+    // it finishes on a re-run: the position goes away with the op
+    w.services.ssh.replayExit = 0;
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(op().status).toBe("done");
+    expect(op().progress_json).toBeNull();
+    w.db.close();
+  }, 120_000);
+
+  it("fails with the replay's own output when it exits non-zero", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    w.services.ssh.archiveFiles.set(`${sentry.ssh_host}:${sentry.ssh_port}`, 4);
+    w.services.ssh.replayExit = 1;
+    const opId = w.fleet.requestRestoreArchive(launch, sentry);
+
+    const failed = await driveOps(w);
+    expect(failed.status).toBe("paused");
+    expect(failed.failedStep).toBe(`op${opId}:replay`);
+    // the node stays stopped: restarting it on a half-replayed database is
+    // the operator's call (re-running restore resumes the replay)
+    expect(w.services.ssh.started.has(`${sentry.ssh_host}:${sentry.ssh_port}`)).toBe(false);
+    w.db.close();
+  }, 120_000);
+
+  it("warns before stopping a validator, and refuses non-nodes and doubled-up ops", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    // a validator is down for the whole replay — signing nothing, jailable
+    expect(w.fleet.restoreArchiveWarnings(launch, val)[0]).toMatch(/downtime-jailed/);
+    expect(w.fleet.restoreArchiveWarnings(launch, sentry)).toEqual([]);
+
+    w.fleet.requestRestoreArchive(launch, val);
+    expect(() => w.fleet.requestRestoreArchive(launch, val)).toThrow(/already in progress/);
+    // a second node can restore at the same time
+    expect(() => w.fleet.requestRestoreArchive(launch, sentry)).not.toThrow();
+    w.db.close();
+  }, 120_000);
+
+  it("runs while a launch step is failing — the state it exists to fix", async () => {
+    // Seen live: a launch parked at verify-chain ("height not increasing")
+    // because the node had no block history, the operator clicked restore,
+    // and the op sat with no steps at all — op steps compose AFTER the
+    // launch's, so the failing step it was meant to cure blocked it forever.
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.archiveFiles.set(`${val.ssh_host}:${val.ssh_port}`, 2);
+    const opId = w.fleet.requestRestoreArchive(launch, val);
+
+    const stuck: StepDef = {
+      name: "verify-chain-stuck",
+      async run() {
+        throw new Error("sentry-0: chain not verified after ~5 min — height not increasing");
+      },
+    };
+    const steps = [
+      ...buildPreLaunchOpSteps(w.db, "fl"),
+      ...allSteps(),
+      stuck,
+      ...buildOpSteps(w.db, "fl"),
+    ];
+    const r = await runWithSigner(w.db, "fl", w.spec, w.work, steps, w.services, w.signer);
+    expect(r.failedStep).toBe("verify-chain-stuck");
+    // the restore finished regardless, and the node is back up on the
+    // restored state — which is what lets the launch step pass on retry
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    expect(w.services.ssh.started.has(`${val.ssh_host}:${val.ssh_port}`)).toBe(true);
+    w.db.close();
+  }, 120_000);
+});
+
+describe("halt-height upgrade", () => {
+  it("completes though a halted node crash-loops: no RPC, SSH only in boot windows", async () => {
+    // Live wedge (2026-07-27), in two acts. halt-wait first polled the
+    // sentry's RPC for `height >= haltHeight`, a gate nothing can satisfy:
+    // cosmos refuses the halt-height block inside FinalizeBlock so the
+    // committed head stops at H-1, and the sentry carries the same
+    // halt-height, so it stops serving RPC exactly when the condition comes
+    // true. Probing over SSH instead then failed too — sparkdreamd is PID 1,
+    // so a halted node is a crash loop and SSH answers only inside each boot
+    // window ("lease shell: no active replicas for service"). Both times the
+    // fleet was stranded halted, with halt-clear — the only thing that resets
+    // the setting — parked behind the gate.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.30";
+    const opId = w.fleet.requestHaltUpgrade(launch, image, 10);
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    // the halt WAS observed, at the block below the halt height
+    expect(w.db.stepOutput("fl", `op${opId}:halt-wait`)).toMatchObject({ haltedAt: 9 });
+    // and the fleet came back out of it: setting cleared, images swapped
+    expect(w.services.ssh.haltedNodes()).toEqual([]);
+    expect(w.services.rpc.chainHalted).toBe(false);
+    for (const c of w.db.listFleetComponents("fl").filter((x) => /^(val|sentry)-/.test(x.key))) {
+      expect(c.image).toBe(image);
+    }
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 120_000);
+
+  it("clear-halt-height releases a fleet an abandoned halt upgrade left stranded", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const nodes = w.db.listFleetComponents("fl").filter((c) => /^(val|sentry)-/.test(c.key));
+    const target = (c: (typeof nodes)[number]) => ({ host: c.ssh_host!, port: c.ssh_port! });
+    const boot = "nohup sparkdreamd start --home /root/.sparkdream";
+
+    // the state an aborted op leaves behind: halt-height set on every node and
+    // nobody left to clear it, so each restart halts again at a passed block
+    for (const c of nodes) {
+      await w.services.ssh.exec(
+        target(c),
+        "sed -i 's|^halt-height =.*|halt-height = 500|' /root/.sparkdream/config/app.toml",
+      );
+      await w.services.ssh.exec(target(c), boot);
+    }
+    expect(w.services.ssh.haltedNodes()).toHaveLength(nodes.length);
+    expect(w.services.rpc.chainHalted).toBe(true);
+
+    const { cleared } = await w.fleet.clearHaltHeight(launch);
+    expect(cleared.sort()).toEqual(nodes.map((c) => c.key).sort());
+
+    // a restart now actually brings the node up instead of re-halting
+    for (const c of nodes) await w.services.ssh.exec(target(c), boot);
+    expect(w.services.ssh.haltedNodes()).toEqual([]);
+    expect(w.services.rpc.chainHalted).toBe(false);
+    for (const c of nodes) {
+      expect(w.services.ssh.started.has(`${c.ssh_host}:${c.ssh_port}`)).toBe(true);
+    }
+    w.db.close();
+  }, 120_000);
+});
+
+describe("repair op: node versions", () => {
+  it("corrects a version swapped in outside the launcher, in the row and the SDL", async () => {
+    // Live (2026-07-27): a halt-height upgrade wedged, the operator finished
+    // it by hand in the Akash console, and the launcher went on advertising
+    // the version it last installed itself — the fleet card reads the row.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const nodes = w.db.listFleetComponents("fl").filter((c) => /^(val|sentry)-/.test(c.key));
+    const before = Object.fromEntries(nodes.map((c) => [c.key, c.image]));
+    expect(before["val-0"]).toMatch(/:v\d+\.\d+\.\d+$/);
+    for (const c of nodes) {
+      w.services.ssh.nodeVersions.set(`${c.ssh_host}:${c.ssh_port}`, "1.0.30");
+    }
+
+    w.fleet.requestRepair(launch, nodes[0]!);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    for (const c of w.db.listFleetComponents("fl").filter((x) => /^(val|sentry)-/.test(x.key))) {
+      expect(c.image).toBe(before[c.key]!.replace(/:v.*$/, ":v1.0.30"));
+      // the SDL is the launcher's model of the deployment: a stale one would
+      // have the next upgrade derive its manifest from the wrong image
+      const sdl = fs.readFileSync(path.join(w.work, `launches/fl/sdl/${c.key}.yaml`), "utf8");
+      expect(sdl).toContain("image: " + c.image);
+    }
+    w.db.close();
+  }, 120_000);
+
+  it("keeps the recorded image when a node cannot be asked its version", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    // nodeVersions unset: the node answers nothing. Silence is not evidence
+    // that the recorded image is wrong, so it must survive the repair.
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!.image).toBe(val.image);
+    w.db.close();
+  }, 120_000);
+});
+
+describe("retagImage", () => {
+  it("swaps a version tag, preserving the v prefix, and refuses to guess", () => {
+    expect(retagImage("sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.29", "1.0.30")).toBe(
+      "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.30",
+    );
+    expect(retagImage("repo/img:1.0.29", "v1.0.30")).toBe("repo/img:1.0.30");
+    // nothing that isn't already a version tag gets rewritten
+    expect(retagImage("repo/img:latest", "1.0.30")).toBeUndefined();
+    expect(retagImage("repo/img", "1.0.30")).toBeUndefined();
+    expect(retagImage("repo/img@sha256:abc123", "1.0.30")).toBeUndefined();
+    expect(retagImage(null, "1.0.30")).toBeUndefined();
+  });
 });

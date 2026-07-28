@@ -28,6 +28,7 @@ import {
   setChainAssetMode,
 } from "./chain-assets/index.js";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
+import { manualBidRequired } from "./akash/policy.js";
 import { launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
 import {
@@ -56,9 +57,9 @@ import type {
   SshEndpoints,
 } from "./steps/phase-bcd.js";
 import type { SshTarget } from "./services.js";
-import { describePendingTx, FleetService } from "./fleet.js";
+import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
-import { buildOpSteps } from "./fleet-ops.js";
+import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
 import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
 import { prefillSpecFromGenesis } from "./genesis-prefill.js";
@@ -203,8 +204,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
     running.add(id);
     // fleet ops (relaunch/upgrade) compose onto the launch's step list —
-    // completed launch steps checkpoint-skip, then op steps run
-    const steps = [...deps.steps, ...buildOpSteps(deps.db, id)];
+    // completed launch steps checkpoint-skip, then op steps run. Restore runs
+    // ahead of them all: the launch step it would otherwise queue behind is
+    // usually the one failing for want of the block history it restores.
+    const steps = [
+      ...buildPreLaunchOpSteps(deps.db, id),
+      ...deps.steps,
+      ...buildOpSteps(deps.db, id),
+    ];
     void runLaunch(deps.db, id, spec, deps.workRoot, steps, deps.services, (m) =>
       app.log.info(`launch ${id}: ${m}`),
     )
@@ -505,12 +512,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.post("/api/fleet/:launchId/:dseq/actions", async (req, reply) => {
     const { launchId, dseq } = req.params as { launchId: string; dseq: string };
     const body = req.body as {
-      action: "close" | "restart" | "relaunch" | "upgrade" | "halt-upgrade" | "topup" | "unjail" | "resume-signing";
+      action:
+        | "close"
+        | "restart"
+        | "relaunch"
+        | "upgrade"
+        | "halt-upgrade"
+        | "topup"
+        | "unjail"
+        | "resume-signing"
+        | "restore-archive"
+        | "repair"
+        | "clear-halt-height"
+        | "reset-data";
       confirm?: boolean;
       image?: string;
       components?: string[];
       amount?: string;
       haltHeight?: number;
+      /** restore-archive: where the blocks_*.jsonl.gz live, and how far to
+       *  replay (both resolved on the node when absent). */
+      archiveDir?: string;
+      validate?: boolean;
+      endHeight?: number;
+      /** relaunch: park at the lease step and let the operator pick the bid. */
+      manualBid?: boolean;
     };
     const launch = deps.db.getLaunch(launchId);
     if (!launch) return reply.status(404).send({ error: "launch not found" });
@@ -536,6 +562,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return { status: "restarted" };
       }
       case "relaunch": {
+        // the spec can make every placement of a component the operator's
+        // (providers.policy.manualBid, or the component group's override),
+        // in which case the relaunch parks for a pick whether asked or not
+        const picksBids = body.manualBid === true || manualBidRequired(spec, component.key);
         // "Move this component to another provider" is one user intent; how
         // it is carried out depends on whether the launch has finished. A
         // relaunch OP cannot run mid-launch (buildOpSteps appends op steps
@@ -543,6 +573,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         // the same intent is served by re-placing the component through the
         // launch itself. The caller does not need to know the difference.
         if (launch.status !== "completed") {
+          // mid-launch the move runs through the launch's own re-place step,
+          // which has no op row — the pick is requested on the launch instead
+          // (§6.6), and the step parks with the bid list when it gets there
+          if (picksBids) deps.db.requestBidPick(launchId, component.key);
           // The usual relaunch warnings (double-sign window, sentry
           // isolation) are about a live chain — before start-chain nothing
           // is signing or serving, so they would only be noise.
@@ -562,12 +596,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             // when the current step finishes, so say so rather than looking
             // like the click did nothing
             const started = drive(launchId, spec);
+            const where = picksBids
+              ? "and will pause with its bids for you to pick"
+              : "on another provider";
             return {
               status: "replacing",
               note:
                 started === "started"
-                  ? `${component.key} is being re-placed on another provider`
-                  : `${component.key} will be re-placed when the current step finishes`,
+                  ? `${component.key} is being re-placed ${where}`
+                  : `${component.key} will be re-placed when the current step finishes ${where}`,
             };
           } catch (e) {
             return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
@@ -583,9 +620,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
           });
         }
-        const opId = await fleet.requestRelaunch(launch, component);
+        const opId = await fleet.requestRelaunch(launch, component, { manualBid: picksBids });
         drive(launchId, spec);
-        return { status: "relaunch-started", opId };
+        return { status: "relaunch-started", opId, manualBid: picksBids };
       }
       case "upgrade": {
         if (!body.image) return reply.status(400).send({ error: "image required" });
@@ -638,6 +675,71 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
         }
       }
+      case "restore-archive": {
+        try {
+          // pre-action guard (§5): the node is down for the whole replay
+          const warnings = fleet.restoreArchiveWarnings(launch, component);
+          if (warnings.length > 0 && !body.confirm) return reply.status(409).send({ warnings });
+          const opId = fleet.requestRestoreArchive(launch, component, {
+            ...(body.archiveDir ? { archiveDir: body.archiveDir } : {}),
+            ...(body.validate !== undefined ? { validate: body.validate } : {}),
+            ...(body.endHeight ? { endHeight: body.endHeight } : {}),
+          });
+          drive(launchId, spec);
+          return { status: "restore-archive-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "repair": {
+        try {
+          // pre-action guard (§5): the corrected components restart in place
+          const warnings = fleet.repairWarnings(launch);
+          if (warnings.length > 0 && !body.confirm) return reply.status(409).send({ warnings });
+          const opId = fleet.requestRepair(launch, component);
+          drive(launchId, spec);
+          return { status: "repair-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "clear-halt-height": {
+        try {
+          // pre-action guard (§5): nothing is started, and the operator has to
+          // know that before they expect a halted chain to come back on its own
+          const warnings = fleet.clearHaltHeightWarnings(launch);
+          if (warnings.length > 0 && !body.confirm) return reply.status(409).send({ warnings });
+          const { cleared } = await fleet.clearHaltHeight(launch);
+          return {
+            status: "halt-height-cleared",
+            cleared,
+            note:
+              `halt-height reset to 0 on ${cleared.join(", ") || "no chain nodes"}. Nodes are ` +
+              "left as they were — restart a halted node to resume on its current image, or run " +
+              "an upgrade to bring it back on a new one.",
+          };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "reset-data": {
+        try {
+          // pre-action guard (§5), and the loudest one: this destroys blocks
+          const warnings = fleet.resetDataWarnings(launch, component);
+          if (warnings.length > 0 && !body.confirm) {
+            return reply.status(409).send({ warnings, confirmPrompt: "Erase the chain data?" });
+          }
+          await fleet.resetData(launch, component);
+          return {
+            status: "reset",
+            note:
+              `${component.key}: chain data erased, node left stopped. Run restore to replay ` +
+              "the archives from block 1, or restart to re-sync it from its peers.",
+          };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
       default:
         return reply.status(400).send({ error: "unknown action" });
     }
@@ -645,9 +747,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   // Push a file into a component's container. Body is the raw file bytes
   // (octet-stream); the destination filename rides in x-filename. The file is
-  // written verbatim to /root/<filename> — no unpacking; the user moves or
-  // extracts it from the Akash shell. Like restart, this carries no signature:
-  // the session must own the fleet (§2 scoping rule).
+  // written verbatim into the component's upload directory (the chain home for
+  // nodes, /data for the explorer) — no unpacking; the user moves or extracts
+  // it from the Akash shell. Like restart, this carries no signature: the
+  // session must own the fleet (§2 scoping rule).
   app.post(
     "/api/fleet/:launchId/components/:key/upload",
     { bodyLimit: 256 * 1024 * 1024 },
@@ -663,7 +766,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       const raw = String(req.headers["x-filename"] ?? "upload.bin");
       const safe =
         path.basename(raw).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128) || "upload.bin";
-      const remotePath = `/root/${safe}`;
+      let remotePath: string;
+      try {
+        remotePath = `${uploadDirFor(component.key)}/${safe}`;
+      } catch (e) {
+        return reply
+          .status(400)
+          .send({ error: String(e instanceof Error ? e.message : e) });
+      }
 
       const tmp = fs.mkdtempSync(`${deps.workRoot}/upload-`);
       try {
@@ -752,6 +862,47 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     try {
       const result = await fleet.requestAbortOp(launch, Number(opId));
       return { status: "aborted", ...result };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // manual bid selection, launch-made placement: name the bid the launch's
+  // own re-place step should lease (the op-scoped twin is below)
+  app.post("/api/fleet/:launchId/bid", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const { key, provider } = (req.body ?? {}) as { key?: string; provider?: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (!key || !provider) return reply.status(400).send({ error: "key and provider required" });
+    const pick = deps.db.getBidPick(launchId, key);
+    if (!pick?.offers_json) {
+      return reply.status(409).send({ error: `${key} is not waiting for a bid to be picked` });
+    }
+    const offers = JSON.parse(pick.offers_json) as Array<{ provider: string }>;
+    if (!offers.some((o) => o.provider === provider)) {
+      return reply.status(409).send({ error: `${provider} did not bid on deployment ${pick.dseq}` });
+    }
+    deps.db.setBidPick(launchId, key, provider);
+    drive(launchId, JSON.parse(launch.spec_json) as LaunchSpec);
+    return { status: "bid-chosen", key, provider };
+  });
+
+  // manual bid selection: name the bid a parked relaunch should lease
+  app.post("/api/fleet/:launchId/ops/:opId/bid", async (req, reply) => {
+    const { launchId, opId } = req.params as { launchId: string; opId: string };
+    const { provider } = (req.body ?? {}) as { provider?: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (!provider) return reply.status(400).send({ error: "provider required" });
+    try {
+      const { key } = fleet.chooseBid(launch, Number(opId), provider);
+      // the lease step is parked as 'waiting'; driving re-runs it, and it
+      // now finds the pick recorded on the op row
+      drive(launchId, JSON.parse(launch.spec_json) as LaunchSpec);
+      return { status: "bid-chosen", key, provider };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

@@ -94,14 +94,35 @@ export function exclusionEntries(spec: LaunchSpec, key: string): ExclusionEntry[
     entry,
     source: "fleet",
   }));
-  const group = /^val-\d+$/.test(key) ? "validators" : /^sentry-\d+$/.test(key) ? "sentries" : key;
-  const own = (
-    spec.providers.components as
-      | Record<string, { exclude?: string[] } | undefined>
-      | undefined
-  )?.[group];
-  for (const entry of own?.exclude ?? []) out.push({ entry, source: group });
+  const group = componentGroup(key);
+  for (const entry of componentRules(spec, key)?.exclude ?? []) out.push({ entry, source: group });
   return out;
+}
+
+/** val-N -> validators, sentry-N -> sentries, every other key maps to itself. */
+export function componentGroup(key: string): string {
+  return /^val-\d+$/.test(key) ? "validators" : /^sentry-\d+$/.test(key) ? "sentries" : key;
+}
+
+function componentRules(
+  spec: LaunchSpec,
+  key: string,
+): { exclude?: string[]; manualBid?: boolean } | undefined {
+  return (
+    spec.providers.components as
+      | Record<string, { exclude?: string[]; manualBid?: boolean } | undefined>
+      | undefined
+  )?.[componentGroup(key)];
+}
+
+/**
+ * Whether this component's placements are the operator's to make (§6.6):
+ * the component group's manualBid if it sets one, else the fleet-wide
+ * providers.policy.manualBid. Same null-tolerance as exclusionEntries —
+ * specs stored before either flag existed replay with both undefined.
+ */
+export function manualBidRequired(spec: LaunchSpec, key: string): boolean {
+  return componentRules(spec, key)?.manualBid ?? spec.providers.policy.manualBid ?? false;
 }
 
 /**
@@ -118,6 +139,57 @@ export function matchesExclusion(entry: string, info: ProviderInfo): boolean {
     host = info.hostUri.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
   }
   return host.toLowerCase().includes(entry.toLowerCase());
+}
+
+/**
+ * A bid as the manual picker shows it: enough to compare cost against what
+ * the policy thinks of the provider. Written by whichever placement path is
+ * parked (a relaunch op, or the launch's own re-place) and rendered the same
+ * way in the fleet panel.
+ */
+export interface OfferedBid {
+  provider: string;
+  hostUri: string;
+  /** Micro-denom per block, as the chain quotes it. */
+  price: string;
+  priceDenom: string;
+  audited: boolean;
+  uptime7d: number;
+  /** Why the policy would have passed this bid over; absent if it survived. */
+  rejected?: string;
+  /** The bid the policy would have leased on its own. */
+  autoPick?: boolean;
+}
+
+/**
+ * Describe the open bids for a manual pick, cheapest first, carrying each
+ * one's policy verdict. A bidder missing from the Console provider list is
+ * dropped: without a hostUri there is nowhere to send the manifest, so it
+ * cannot be leased by hand any more than automatically.
+ */
+export function describeBids(
+  open: Bid[],
+  providers: Map<string, ProviderInfo>,
+  decision: PolicyDecision,
+): OfferedBid[] {
+  const offers = open.flatMap((b) => {
+    const info = providers.get(b.bid.id.provider);
+    if (!info) return [];
+    const rejected = decision.rejected.find((r) => r.provider === b.bid.id.provider)?.reason;
+    return [
+      {
+        provider: b.bid.id.provider,
+        hostUri: info.hostUri,
+        price: b.bid.price.amount,
+        priceDenom: b.bid.price.denom,
+        audited: info.isAudited,
+        uptime7d: info.uptime7d,
+        ...(rejected ? { rejected } : {}),
+        ...(decision.chosen?.bid.id.provider === b.bid.id.provider ? { autoPick: true } : {}),
+      },
+    ];
+  });
+  return offers.sort((a, b) => Number(a.price) - Number(b.price));
 }
 
 /**
@@ -185,7 +257,9 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
     if (hit) return { chosen: hit, rejected };
   }
 
-  // preferSpread: soft anti-affinity — prefer unused providers, fall back if none
+  // preferSpread: soft anti-affinity — prefer unused providers, fall back if none.
+  // "off" (the profile default) skips both this and the strict filter above:
+  // price alone decides, and a whole fleet may land on one provider.
   let pool = survivors;
   if (ctx.policy.antiAffinity === "preferSpread") {
     const fresh = survivors.filter((b) => !ctx.chosenProviders.has(b.bid.id.provider));

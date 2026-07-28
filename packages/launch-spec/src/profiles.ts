@@ -13,7 +13,7 @@ export interface Profile {
       auditedOnly: boolean;
       minUptime7d: number;
       maxPriceMultiplier: number;
-      antiAffinity: "strict" | "preferSpread";
+      antiAffinity: "strict" | "preferSpread" | "off";
     };
     escrow: { targetRunwayDays: number };
   };
@@ -94,7 +94,7 @@ export const profiles: Record<NetworkType, Profile> = {
         auditedOnly: false,
         minUptime7d: 0.9,
         maxPriceMultiplier: 3.0,
-        antiAffinity: "preferSpread",
+        antiAffinity: "off",
       },
       escrow: { targetRunwayDays: 7 },
     },
@@ -128,9 +128,9 @@ export const profiles: Record<NetworkType, Profile> = {
     providers: {
       policy: {
         auditedOnly: true,
-        minUptime7d: 0.99,
+        minUptime7d: 0.95,
         maxPriceMultiplier: 2.0,
-        antiAffinity: "strict",
+        antiAffinity: "off",
       },
       escrow: { targetRunwayDays: 30 },
     },
@@ -159,9 +159,9 @@ export const profiles: Record<NetworkType, Profile> = {
     providers: {
       policy: {
         auditedOnly: true,
-        minUptime7d: 0.99,
+        minUptime7d: 0.95,
         maxPriceMultiplier: 2.0,
-        antiAffinity: "strict",
+        antiAffinity: "off",
       },
       escrow: { targetRunwayDays: 30 },
     },

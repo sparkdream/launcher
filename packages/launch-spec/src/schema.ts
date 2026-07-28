@@ -101,14 +101,17 @@ const componentToggle = z.object({
 });
 
 /**
- * Provider exclusions (§6): entries are either an akash1... provider owner
- * address (exact match) or a case-insensitive substring of the provider's
- * hostname (parsed from its hostUri). Matching is client-side only, in the
- * conductor's policy engine; SDL placement requirements stay empty.
+ * Per component group provider rules (§6). `exclude` entries are either an
+ * akash1... provider owner address (exact match) or a case-insensitive
+ * substring of the provider's hostname (parsed from its hostUri). Matching is
+ * client-side only, in the conductor's policy engine; SDL placement
+ * requirements stay empty. `manualBid` overrides providers.policy.manualBid
+ * for this group in either direction.
  */
-const providerExclusions = z
+const componentProviderRules = z
   .object({
     exclude: z.array(z.string().min(1)).default([]),
+    manualBid: z.boolean().optional(),
   })
   .strict();
 
@@ -307,19 +310,26 @@ export const launchSpecSchema = z.object({
       minUptime7d: rate,
       maxPriceMultiplier: z.number().min(1),
       preference: z.array(z.string()).default([]),
-      antiAffinity: z.enum(["strict", "preferSpread"]),
+      antiAffinity: z.enum(["strict", "preferSpread", "off"]),
+      /**
+       * Never place automatically: every deployment parks with its bids
+       * listed and waits for the operator to name the one to lease (§6.6).
+       * Per component groups override this under providers.components.
+       */
+      manualBid: z.boolean().default(false),
     }),
     /** Fleet-wide: providers on this list may host NO component. */
     exclude: z.array(z.string().min(1)).default([]),
-    /** Per component group, merged over the fleet-wide list. */
+    /** Per component group: exclusions merged over the fleet-wide list,
+     *  and a manualBid override of the fleet-wide setting. */
     components: z
       .object({
-        headscale: providerExclusions.optional(),
-        validators: providerExclusions.optional(),
-        sentries: providerExclusions.optional(),
-        explorer: providerExclusions.optional(),
-        frontend: providerExclusions.optional(),
-        hub: providerExclusions.optional(),
+        headscale: componentProviderRules.optional(),
+        validators: componentProviderRules.optional(),
+        sentries: componentProviderRules.optional(),
+        explorer: componentProviderRules.optional(),
+        frontend: componentProviderRules.optional(),
+        hub: componentProviderRules.optional(),
       })
       .strict()
       .default({}),

@@ -337,16 +337,19 @@ topology:
 providers:
   policy:
     auditedOnly: true
-    minUptime7d: 0.99
+    minUptime7d: 0.95
     maxPriceMultiplier: 2.0          # vs median bid, sanity ceiling
     preference: []                   # ordered provider addresses, tried first
-    antiAffinity: strict             # headscale/validators/sentries all on distinct providers
+    antiAffinity: off                # off | preferSpread | strict (distinct providers)
+    manualBid: false                 # true: pick every placement by hand (§6.6)
   exclude: []                        # fleet-wide: providers no component may use
   components:                        # per-component exclusions, merged over the
     headscale:                       # fleet-wide list. Entries: akash1... owner
       exclude: ["provider-host"]     # address (exact) or hostname fragment
-    # sentries: { exclude: [] }      # (case-insensitive substring of the
-    # validators: { exclude: [] }    # provider's hostUri hostname)
+    # sentries:                      # (case-insensitive substring of the
+    #   exclude: []                  # provider's hostUri hostname)
+    #   manualBid: true              # overrides policy.manualBid for this group
+    # validators: { exclude: [] }
   escrow:
     targetRunwayDays: 30             # sizes the initial deposit per deployment
 
@@ -920,6 +923,195 @@ until the user updates `chain_id` in tmkms.toml and the privval probe
 passes). Node keys, consensus keys, tailnet IPs, and SSH endpoints all
 survive.
 
+### Repair (day-2)
+
+The **repair op** (fleet-panel button, "repair fleet") reconciles a fleet
+against reality and fixes what has drifted, in place. It is one op made of
+independent passes, so a repair added later joins it rather than becoming
+another button the operator has to diagnose their way to.
+
+Three rules hold the umbrella together, since every pass shares one action
+and one confirm dialog:
+
+1. **Convergent** — a pass that finds nothing wrong changes nothing and costs
+   nothing, so a run on a healthy fleet is free to click.
+2. **Narrow** — it touches only what is actually broken. A pass that would
+   restart a healthy component to fix a broken one does not belong.
+3. **Priced up front** — whatever it can cost (a restart, a signature) is
+   named in the pre-action guard, because the operator agrees to the *op*,
+   not to one pass. A repair too expensive to state that plainly should
+   report the problem and let the operator pick the op that fixes it.
+
+Today's passes all serve one failure, described below: a component's mesh
+address moved and the fleet kept dialling the old one.
+
+#### Mesh addresses
+
+Tailnet addresses move. A component relaunch or a headscale re-key hands out
+a different IP, and everything still naming the old one goes dark: a sentry
+whose `TS_TUNNEL_<v>` aims at a dead validator address never peers, an
+explorer tunnelled to a moved sentry serves nothing. The relaunch op repairs
+its own blast radius (persist re-aims the counterpart sentries, mesh-clients
+the explorer), but an address can go stale outside a relaunch — a re-key, an
+aborted op, a relaunch whose dependents were not placed at the time — and
+then the only cure was relaunching the *dependents*: new providers, fresh
+volumes, an escrow cycle, all to change one env line.
+
+Repair corrects what the launcher *believes* before acting on it — a repair
+driven off a stale record only bakes the wrong value in deeper:
+
+- **endpoints** — where each component answers SSH, re-read from its
+  provider's lease status (the forwarded port for 2222). The port is
+  provider-assigned, so a container recycled out of band comes back on a
+  different one, and the recorded endpoint then answers nothing: every later
+  pass reads that component as unreachable, and repair could neither touch it
+  nor fix it. The provider is the authority here, exactly as at launch. A
+  provider that cannot be reached, or a lease with no forwarded 2222, leaves
+  the recorded endpoint alone — it is no evidence the endpoint moved.
+- **addresses** — every reachable mesh component is asked
+  for its live tailnet IPv4, and a component row that disagrees is corrected,
+  along with the launch's `await-mesh` table (what the tmkms checklist, the
+  signer panel and later relaunches read). This is what makes the launcher's
+  state self-healing after work done outside it: a deployment bounced by hand
+  in Akash Console comes back on a new forwarded port *and* a new mesh
+  address, the launcher discovers both instead of being wedged by them, and
+  every link repaired from the stale record would have been repaired *wrong*. A
+  component that cannot be reached, or is off the mesh, keeps its recorded
+  address — silence is not evidence the address changed, and erasing it would
+  strand links that still correctly name it.
+
+Then the two places that actually hold an address, each needing its own
+treatment:
+
+- **mesh-env** — tunnel targets in the SDL: a sentry's tunnel to its validators' p2p port,
+  the explorer's to its sentry's LCD and RPC. This is a deployment update:
+  rewrite the SDL, one batched `MsgUpdateDeployment` across the affected
+  deployments (one signature), re-push the manifests. The push restarts those
+  containers, and that restart is what re-creates the tunnels on target.
+- **peers** — `persistent_peers` in config.toml on the volume: a validator dialling
+  its sentries, sentries dialling each other, both over the tailnet directly.
+  This is an SSH edit plus a process restart; nothing on-chain changes, so no
+  hash can drift. Entries are matched by *node id*, so the rewrite is exact:
+  a `127.0.0.1` entry (a sentry reaching its validator through a tunnel, which
+  the env pass owns) and a public hostname (a join-mode peer, deliberately off
+  the mesh) are both left alone — rewriting either would undo the design.
+
+Like restore, repair's steps compose **before** the launch's own rather than
+after (`PRE_LAUNCH_OP_KINDS`). A fleet dialling dead addresses does not gossip,
+so it produces no blocks, so `verify-chain` fails — the launch parks on the
+exact condition repair exists to cure, and behind that failure the op would
+never start. Seen live: a repair clicked on a launch parked at `verify-chain`
+sat with no step rows at all, while the spinner on screen (the *launch's*
+step) read exactly like a repair that was working. Running first means a
+parked launch is no obstacle, and the launch's own steps then re-run against
+the repaired fleet.
+
+Convergent and quiet, per rule 1: a link already naming the current address
+is skipped, its component is never restarted, and a re-run does nothing. The
+guard states the cost — the corrected components restart, so a sentry's public
+RPC and LCD blink and a validator misses the blocks it is down for — and that
+nothing is redeployed, no volume is touched and no escrow is spent.
+
+### Block archive restore (day-2)
+
+A node whose block history is missing (a fresh node, a state-synced one,
+a rebuilt volume) fills it in from the chain's block archives with the
+**restore op**, the fleet-panel button beside restart on every validator
+and sentry. It runs the chain binary's own
+`sparkdreamd replay-from-archive --home /root/.sparkdream --archive-dir
+<dir> --validate true`, which reopens the node's blockstore, state and
+application databases and replays every archived block through the ABCI
+app.
+
+Two properties of that command shape the op. It needs the databases to
+itself, so sparkdreamd has to be **stopped** for the whole run; and it
+prints a progress line every five seconds for as long as the replay
+takes (hours on a full archive), which is what makes driving it by hand
+untenable — Akash Console dies on the output volume, and losing the
+shell takes the replay with it. So the op detaches the process
+(`nohup`, output to `replay-archive.log` in the chain home, exit code to
+`replay-archive.exit`) and polls: it logs only the height reached, about
+one line every two minutes, and never streams the raw output anywhere.
+The log is deliberately *not* mirrored to the container's stdout the way
+the node log is (§ step 16), so the provider log stream — and the fleet
+view's logs button — stay usable while a replay runs.
+
+Steps: **find-archive** resolves where the archives are (an explicit
+directory, `~/.sparkdream/archives`, `.../archive`, or the chain home
+itself) and, finding none, unpacks any uploaded `.tar.gz`/`.tgz` whose
+listing contains `blocks_*_to_*.jsonl.gz` into `~/.sparkdream/archives`,
+flattening one level — the upload action writes files verbatim and the
+operator never holds the SSH key, so nothing else on the box can open a
+tarball. With still nothing found it parks at AwaitUser asking for the
+upload. **stop-node** kills sparkdreamd and confirms it is gone (escalating
+to `-9`), since the LevelDB lock is what the replay would fail on.
+**replay** starts the command detached — or re-attaches to one already
+running, so a conductor restart or a re-run of the op never starts a
+second replay — and polls to the exit code, failing with the log tail on
+a non-zero exit, and on a process that vanished without one (a container
+restart mid-replay; the replay resumes from the committed height, so the
+remedy is simply to run restore again). **start-node** brings sparkdreamd
+back up on the restored state and verifies the process is alive.
+
+**Showing where it is.** A run of hours needs more than a heartbeat, but
+an append-only step log is the wrong place to put it: a line per poll is
+the output volume the op exists to avoid. So each poll rewrites a
+`progress_json` on the op row itself (label, current and target height,
+percent, blocks/s, ETA, elapsed), which the fleet endpoint hands to the
+UI as `op.progress`; the step log keeps its one line every two minutes.
+It is drawn in two places, because the replay is watched from both: on
+the **running `op<id>:replay` step row** in the launch step list (where a
+long op is otherwise a spinner with nothing beside it) and on the fleet
+panel's active-op chip. The target height comes from the archive file
+names — the highest `blocks_<from>_to_<to>` on the node, with the lowest
+`from` as the floor, so archives that start well above block 1 do not
+read as 0% when they are nearly done (an explicit `--end-height` wins
+over both). `find-archive` records it, and **replay** re-derives it when
+that step's checkpointed output has none, so a replay begun before the
+range was recorded still gets a bar rather than running bar-less for
+hours. Archives not named that way report a height and no percentage. The
+rate is
+measured between samples of the *current* step run, not from block zero:
+a re-attach joins a replay already hours in, and dividing its height by
+this run's elapsed time would claim a rate several times the real one and
+an ETA in the past. The position is cleared when the op finishes and left
+in place when it fails, where it says how far the replay got.
+
+Unlike every other op, restore's steps compose **before** the launch's
+own rather than after. Op steps normally run only once every launch step
+is done, which is right for a relaunch and wrong here: a node with no
+block history is usually why the launch is parked in the first place
+(`verify-chain` failing on a chain that produces nothing is the exact
+state restore fixes), so behind that failure the op would never start.
+Seen live on the first restore: the op sat with no step rows at all
+while the operator watched the node for a replay that could not begin.
+Running first means a parked launch is no obstacle, and the launch's own
+steps then re-run against the restored node.
+
+Requesting a restore on a *validator* warns first (the 409-confirm
+pattern shared with close/unjail): the node signs nothing for the whole
+replay, on a single-validator fleet the chain stops with it, and long
+enough offline is a downtime jail. Nothing here touches a deployment or
+a manifest, so no on-chain hash can drift (§ relaunch).
+
+**Reset data.** Replay only ever appends from the node's committed
+height — it cannot fill in history *below* it (upstream lists backwards
+fill as a future enhancement). Rebuilding a full archive node from block
+1 therefore starts from an empty database, which the **reset data**
+action on any validator or sentry provides: stop the node, confirm it is
+gone, `sparkdreamd comet unsafe-reset-all --keep-addr-book`, and leave it
+stopped. Stopped is the point — a restart would re-sync from peers and
+carry the height back up, which is exactly what the following restore
+needs not to happen. It is a direct SSH action rather than an op (it
+takes seconds, and queuing it behind a launch would defeat it), and it
+warns first with what it destroys: every block and the app state, the
+validator's silence until it is back at the head, the single-validator
+case where the chain stops with it, and — softsign only — that the wipe
+also clears `priv_validator_state.json`, the file that prevents signing
+twice at one height (tmkms keeps that watermark on the signer, out of
+the reset's reach). Node key, consensus key and the address book
+survive, so the node keeps its identity and its peers.
+
 ### Public peering & the join bundle
 
 The sentry layer is designed to be the chain's public edge: the sentry SDL
@@ -1232,9 +1424,39 @@ this launch.
    rejection table as `excluded by spec (<list>): <entry>`.
 5. **Escape hatch**: zero survivors → pause that deployment's row, render the
    rejection table, allow manual override or re-bid (close+recreate).
+6. **Hand-picked bid** (`manualBid` on the relaunch request): the lease step
+   records every bid on the order (host, price, audited, uptime, and the
+   policy's reason for passing it over) on the op row and parks as
+   awaiting-user; the fleet panel lists them and `POST
+   /api/fleet/:launchId/ops/:opId/bid` names the winner, which is then leased
+   whatever steps 1–3 concluded. Rejected bids stay choosable on purpose:
+   the reason to pick by hand is usually a cheap provider the price median
+   or the uptime floor keeps rejecting. The pick is scoped to the deployment
+   it was made for, so a later attempt draws (and re-offers) fresh bids.
+   A move made mid-launch runs through the launch's own re-place step
+   instead, which has no op row to hold the offers: the request and the bids
+   live in `bid_picks` (per launch + component key), the step parks the same
+   way, and `POST /api/fleet/:launchId/bid` answers it. The row is dropped
+   once that placement lands, so the next re-place is the policy's again.
+   Both paths surface in the same fleet-panel picker, and both log the
+   policy's reason for rejecting a hand-picked bid when they honor it.
+7. **Placement by hand as the rule** (`providers.policy.manualBid: true`, or
+   `providers.components.<group>.manualBid` for one group, which overrides the
+   fleet-wide setting in either direction): the operator picks every placement
+   of those components, without asking per relaunch. The initial launch parks
+   too, not just relaunches and re-places — headscale on its own step,
+   the node batch (validators, sentries, explorer, frontend, hub) at
+   collect-bids, which records the bids for every component still unpicked
+   before it parks so the whole fleet is picked in one pass instead of one
+   resume per component. Picks are cleared when the lease they were made for
+   is signed, so the next placement of the same component asks again.
 
-Non-strict anti-affinity variant (`preferSpread`) allowed for devnet where few
-providers bid.
+Anti-affinity defaults to `off` in every profile: bids are judged on price and
+the hard filters alone, and nothing stops the whole fleet landing on one
+provider. `preferSpread` prefers unused providers but falls back when none are
+left; `strict` rejects any already-used provider outright (headscale, every
+validator, every sentry on distinct providers, as DEPLOYMENT.md recommends).
+Mainnet warns when it is `off`.
 
 ---
 

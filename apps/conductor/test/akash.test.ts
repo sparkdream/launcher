@@ -18,7 +18,9 @@ function bid(provider: string, amount: string, state = "open"): Bid {
   };
 }
 
-const basePolicy = testnetSpec().providers.policy;
+// anti-affinity is off by default now; these cases are about what the policy
+// does when a spec turns it on, so pin it here rather than in every case
+const basePolicy = { ...testnetSpec().providers.policy, antiAffinity: "strict" as const };
 
 describe("policy engine (§6)", () => {
   it("picks the cheapest audited bid and explains rejections", () => {

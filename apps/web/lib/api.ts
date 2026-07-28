@@ -310,6 +310,8 @@ export interface ComponentView {
   state: string;
   /** Deployed image reference (upgrades update it). */
   image?: string | null;
+  /** Address on the headscale mesh (100.x), when the component joined it. */
+  tailnetIp?: string | null;
   /** True when the component runs sshd with a recorded endpoint — eligible
    *  for the upload-file action (nodes + explorer). */
   ssh?: boolean;
@@ -326,9 +328,53 @@ export interface FleetSummary {
     /** softsign | tmkms — signer-related actions are gated on this. */
     keyMode: string;
     components: ComponentView[];
-    ops: Array<{ id: number; kind: string; status: string; params: unknown }>;
+    ops: Array<{
+      id: number;
+      kind: string;
+      status: string;
+      params: OpParams;
+      progress?: OpProgress;
+    }>;
+    /** Placements the launch itself is holding for a manual bid pick. */
+    bidPicks: Array<{ key: string; dseq: string; bids: OfferedBid[] }>;
   }>;
   unmanaged: Array<{ dseq: string; state: string }>;
+}
+
+/** A bid offered to the manual picker of a parked relaunch. */
+export interface OfferedBid {
+  provider: string;
+  hostUri: string;
+  /** Micro-denom per block, as the chain quotes lease prices. */
+  price: string;
+  priceDenom: string;
+  audited: boolean;
+  uptime7d: number;
+  /** Why the selection policy passed it over; absent if the policy accepted it. */
+  rejected?: string;
+  /** The bid the policy would have leased on its own. */
+  autoPick?: boolean;
+}
+
+/** Op params, as far as the UI reads them (manual bid selection). */
+export interface OpParams {
+  key?: string;
+  manualBid?: boolean;
+  bidChoice?: { dseq: string; provider: string };
+  offeredBids?: { dseq: string; bids: OfferedBid[] };
+}
+
+/** Live position of a long-running op (the archive replay reports one). */
+export interface OpProgress {
+  label: string;
+  current?: number;
+  target?: number;
+  percent?: number;
+  /** Units per second (blocks/s for a replay). */
+  rate?: number;
+  etaSeconds?: number;
+  elapsedSeconds?: number;
+  updatedAt: string;
 }
 
 export async function getFleet(owner: string): Promise<FleetSummary> {
@@ -347,7 +393,19 @@ export type FleetAction =
   | "unjail"
   /** tmkms validator whose signer stalled it: gate on the session, restart
    *  the process in place, watch it sign again. */
-  | "resume-signing";
+  | "resume-signing"
+  /** Rebuild block history from uploaded archive files: stop the node, run
+   *  replay-from-archive detached, watch it, start the node again. */
+  | "restore-archive"
+  /** Re-aim stale mesh links (tunnel env, persistent_peers) at the fleet's
+   *  current tailnet addresses, in place — no redeploy. */
+  | "repair"
+  /** Reset halt-height to 0 across the chain nodes: the recovery path for a
+   *  halt-height upgrade abandoned before it cleared the setting itself. */
+  | "clear-halt-height"
+  /** Wipe a node's chain data and leave it stopped (the empty database a
+   *  from-genesis restore replays into). */
+  | "reset-data";
 
 export async function postFleetAction(
   launchId: string,
@@ -359,6 +417,10 @@ export async function postFleetAction(
     components?: string[];
     amount?: string;
     haltHeight?: number;
+    manualBid?: boolean;
+    archiveDir?: string;
+    validate?: boolean;
+    endHeight?: number;
   } = {},
 ): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
@@ -506,6 +568,36 @@ export async function postAbortOp(
   return json(await afetch(`/api/fleet/${launchId}/ops/${opId}/abort`, { method: "POST" }));
 }
 
+/** Name the bid the launch's own re-place step should lease. */
+export async function postChooseLaunchBid(
+  launchId: string,
+  key: string,
+  provider: string,
+): Promise<{ status: string; key: string; provider: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/bid`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, provider }),
+    }),
+  );
+}
+
+/** Name the bid a relaunch parked on manual selection should lease. */
+export async function postChooseBid(
+  launchId: string,
+  opId: number,
+  provider: string,
+): Promise<{ status: string; key: string; provider: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/ops/${opId}/bid`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider }),
+    }),
+  );
+}
+
 export interface ProviderPrefs {
   avoid: string[];
   prefer: string[];
@@ -583,8 +675,9 @@ export async function importLauncherBackup(
   return res.json();
 }
 
-/** Push a file into a component's container. The bytes are written verbatim to
- *  /root/<filename>; returns the remote path. */
+/** Push a file into a component's container. The bytes are written verbatim
+ *  into the component's upload directory (/root/.sparkdream for nodes, /data
+ *  for the explorer); returns the remote path. */
 export async function uploadToComponent(
   launchId: string,
   key: string,
