@@ -877,6 +877,73 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     db.close();
   }, 180_000);
 
+  it("re-run persist-start: signs the drifted component only, and stops on a closed one", async () => {
+    // Seen live: a validator whose relaunch was aborted after its deploy came
+    // back on a deployment rendered from a GATED SDL (WAIT_FOR_CONFIG=true),
+    // and the re-run of persist-start skipped its update tx — the step's one
+    // pending-tx row had been confirmed at the original launch, months
+    // earlier — so the provider 422'd the PUT on every retry. The update must
+    // follow the drift, not the step's first signature.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec();
+    db.createLaunch("repersist", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const api = services.api as any;
+    const signer = new FakeSigner();
+    const applyTxEffects = (msgs: any[]) => {
+      for (const m of msgs) {
+        if (m.typeUrl.includes("MsgCreateDeployment") || m.typeUrl.includes("MsgUpdateDeployment")) {
+          api.deploymentHashes.set(String(m.value.id.dseq), m.value.hash);
+        }
+      }
+    };
+    const drive = async () => {
+      for (;;) {
+        const result = await runLaunch(db, "repersist", s, work, allSteps(), services);
+        if (result.status !== "awaiting-signature") return result;
+        const pending = db.nextPendingTx("repersist")!;
+        const msgs = JSON.parse(pending.msgs_json);
+        const txHash = await signer.sign(msgs);
+        applyTxEffects(msgs);
+        db.setPendingTxSigned("repersist", pending.step, txHash);
+      }
+    };
+    expect((await drive()).status).toBe("completed");
+
+    const plan = db.stepOutput<any>("repersist", "create-deployments")!;
+    const val0 = String(plan.perNode["val-0"].dseq);
+    const persistedHash = api.deploymentHashes.get(val0);
+    // val-0 alone is off the persisted version, the way an aborted relaunch's
+    // fresh deployment is; everything else still matches its SDL
+    api.deploymentHashes.set(val0, "aoJRU8KL/PXB3rkX4Nh+K+aMQ6o7tCcfiRqVhiaxUTg=");
+    db.resetStep("repersist", "persist-start");
+    const sigsBefore = signer.signed.length;
+
+    expect((await drive()).status).toBe("completed");
+
+    // exactly one update, for the drifted deployment, carrying the SDL's own
+    // version — the matching ones must not be re-signed (an update whose hash
+    // equals the live one fails on-chain and wedges the signing queue)
+    const updates = signer.signed
+      .slice(sigsBefore)
+      .flat()
+      .filter((m) => m.typeUrl.includes("MsgUpdateDeployment"));
+    expect(updates).toHaveLength(1);
+    expect(String((updates[0]!.value as any).id.dseq)).toBe(val0);
+    expect((updates[0]!.value as any).hash).toBe(persistedHash);
+
+    // a deployment that is gone (closed under the launch) is named, not
+    // signed into a tx the chain would reject
+    api.leaseStates.set(String(plan.perNode["sentry-0"].dseq), "closed");
+    db.resetStep("repersist", "persist-start");
+    const stuck = await drive();
+    expect(stuck.status).toBe("paused");
+    expect(stuck.failedStep).toBe("persist-start");
+    expect(db.getStep("repersist", "persist-start")!.error).toMatch(/sentry-0.*is closed/);
+    db.close();
+  }, 180_000);
+
   it("re-deploys a component whose lease the provider closed, without blaming the provider", async () => {
     // A manifest timeout closes the lease while the launch is blocked
     // elsewhere. The provider is healthy (it hosts the rest of the fleet), so

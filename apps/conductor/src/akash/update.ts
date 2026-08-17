@@ -14,9 +14,19 @@ export interface UpdateInput {
   mesh: Record<string, string>;
 }
 
+/** One component's persisted SDL: what to sign for it, and what to PUT. */
+export interface PersistUpdate {
+  key: string;
+  dseq: string;
+  /** base64 manifest version — the value the provider recomputes and checks. */
+  hash: string;
+  manifestJson: string;
+  msg: Msg;
+}
+
 /**
  * §5 step 20b: rewrite each node's SDL — WAIT_FOR_CONFIG=false and real
- * tunnel targets — and build the batched MsgUpdateDeployment plus the
+ * tunnel targets — and build the per-component MsgUpdateDeployment plus the
  * manifests to re-PUT. Same providers, no re-bid.
  *
  * Mesh components (the explorer) ride along: their TS_TUNNEL targets carry
@@ -24,13 +34,14 @@ export interface UpdateInput {
  * the env here means the container self-heals on any later restart — no SSH
  * rewiring step needed. The frontend has no placeholders and no
  * WAIT_FOR_CONFIG gate, so it is left alone (an update would only restart it).
+ *
+ * Per component rather than one batch because the caller reconciles each
+ * against the on-chain version before signing: a component whose deployment
+ * was re-placed since the last persist is on a different hash from its
+ * neighbours, and only the drifted ones belong in the tx.
  */
-export function updateDeploymentMsgs(input: UpdateInput): {
-  msgs: Msg[];
-  manifests: Record<string, string>;
-} {
-  const msgs: Msg[] = [];
-  const manifests: Record<string, string> = {};
+export function updateDeploymentMsgs(input: UpdateInput): PersistUpdate[] {
+  const updates: PersistUpdate[] = [];
   const keys = [
     ...nodes(input.spec).map((n) => n.key),
     ...statelessComponents(input.spec)
@@ -47,14 +58,18 @@ export function updateDeploymentMsgs(input: UpdateInput): {
     fs.writeFileSync(sdlPath, text);
 
     const artifacts = sdlArtifacts(loadSdl(sdlPath));
-    manifests[key] = artifacts.manifestJson;
-    msgs.push({
-      typeUrl: TypeUrl.UpdateDeployment,
-      value: {
-        id: { owner: input.owner, dseq: input.plan.perNode[key]!.dseq },
-        hash: Buffer.from(artifacts.hash).toString("base64"),
+    const dseq = input.plan.perNode[key]!.dseq;
+    const hash = Buffer.from(artifacts.hash).toString("base64");
+    updates.push({
+      key,
+      dseq,
+      hash,
+      manifestJson: artifacts.manifestJson,
+      msg: {
+        typeUrl: TypeUrl.UpdateDeployment,
+        value: { id: { owner: input.owner, dseq }, hash },
       },
     });
   }
-  return { msgs, manifests };
+  return updates;
 }

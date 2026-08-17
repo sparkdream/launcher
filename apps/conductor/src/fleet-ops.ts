@@ -9,7 +9,7 @@ import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
 import { feeCoin, feeConfig } from "./fee.js";
 import { PRICING_DENOM } from "./render-sdl.js";
-import { pollBids } from "./akash/client.js";
+import { isManifestAlreadyDeployed, pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
@@ -1647,19 +1647,6 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
   });
 
   return steps;
-}
-
-/**
- * A provider's PUT rejection for a manifest identical to the one it already
- * runs. Akash surfaces "no change to apply" as HTTP 422 "manifest version
- * validation failed" — the same text a genuine hash mismatch produces, so
- * callers must only read it as "already deployed" once they've confirmed the
- * on-chain deployment version equals this manifest's hash (a mismatch there
- * is a real fault to raise, not swallow).
- */
-function isManifestAlreadyDeployed(e: unknown): boolean {
-  const msg = String(e);
-  return /HTTP 422/.test(msg) && /manifest version validation failed/i.test(msg);
 }
 
 /** Rolling upgrade (§5 "Node upgrades"): serial per component, health-gated. */

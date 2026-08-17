@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
+import { isManifestAlreadyDeployed } from "../akash/client.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
 import type { SshTarget } from "../services.js";
@@ -556,6 +558,23 @@ async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void
   return { started: true, syncedAt: caughtUp };
 }
 
+/**
+ * The on-chain deployment record, retried past a momentary LCD failure: the
+ * caller signs (or refuses to sign) on what this answers, and an endpoint
+ * returning one 502 must not read as "the deployment is gone".
+ */
+async function deploymentInfoWithRetry(
+  ctx: StepCtx,
+  owner: string,
+  dseq: string,
+): Promise<{ state: string; hash?: string } | undefined> {
+  for (let i = 1; ; i++) {
+    const info = await ctx.services.api.deploymentInfo(owner, dseq).catch(() => undefined);
+    if (info || i >= 3) return info;
+    await ctx.services.sleep(3000 * i);
+  }
+}
+
 export const persistStartStep: StepDef = {
   name: "persist-start",
   async run(ctx) {
@@ -569,20 +588,81 @@ export const persistStartStep: StepDef = {
     const addr = ctx.db.getLaunch(ctx.launchId)!.owner;
 
     // Flip WAIT_FOR_CONFIG + persist real tunnel targets into the SDL env (§5 step 20b)
-    const { msgs, manifests } = updateDeploymentMsgs({
+    const updates = updateDeploymentMsgs({
       spec: ctx.spec,
       owner: addr,
       sdlDir: ctx.dirs.sdl,
       plan,
       mesh: mesh.ips,
     });
-    await ctx.requireTx("persist-start", msgs);
-    const cert = loadCert(ctx);
-    for (const [key, manifestJson] of Object.entries(manifests)) {
-      const a = assignments.perNode[key]!;
-      await ctx.services.provider.sendManifest(cert, a.hostUri, plan.perNode[key]!.dseq, manifestJson);
+
+    // Reconcile against the on-chain version before signing anything. The
+    // provider recomputes the manifest version on every PUT and 422s any
+    // mismatch, and this step is re-run far more often than it is first run:
+    // a re-placed component (relaunch, send-manifests re-bid) comes back on a
+    // fresh deployment carrying the PRE-persist hash, while its neighbours
+    // are already persisted. Signing the whole batch again would fail
+    // on-chain for the ones that never moved ("invalid: deployment hash"),
+    // and signing nothing — what a single confirmed `persist-start` tx used
+    // to mean forever — 422'd the re-placed one's PUT. Seen live: a validator
+    // relaunched months after the launch first ran 422'd every retry, its
+    // deployment still on WAIT_FOR_CONFIG=true.
+    const drifted: typeof updates = [];
+    const persisted: string[] = [];
+    for (const u of updates) {
+      const onChain = await deploymentInfoWithRetry(ctx, addr, u.dseq);
+      // Both of these would otherwise be signed into a doomed tx: an update
+      // against a closed (or unknown) deployment fails on-chain, and a failed
+      // tx wedges the signing queue behind a re-signature that can never
+      // succeed. Say what is wrong instead.
+      if (!onChain) {
+        throw new Error(
+          `${u.key}: deployment ${u.dseq} is not on-chain (or the LCD did not answer) — retry, ` +
+            "and relaunch the component if it stays gone",
+        );
+      }
+      if (onChain.state !== "active") {
+        throw new Error(
+          `${u.key}: deployment ${u.dseq} is ${onChain.state} — relaunch the component, then retry`,
+        );
+      }
+      if (onChain.hash !== u.hash) drifted.push(u);
+      else ctx.log(`${u.key}: on-chain version already persisted`);
     }
-    return { persisted: Object.keys(manifests) };
+    if (drifted.length > 0) {
+      // Key scoped to the exact set being signed: a later drift (another
+      // re-place) is a different tx, not a confirmed row that skips the
+      // signature the provider is waiting for. An older launch's unscoped
+      // row stays as history when it was signed; an unsigned one is dropped,
+      // since the oldest-first signing queue would surface it ahead of this
+      // request and the operator would sign a payload nothing is waiting on.
+      ctx.db.discardUnsignedPendingTx(ctx.launchId, "persist-start");
+      const tag = createHash("sha256")
+        .update(drifted.map((u) => `${u.key}:${u.hash}`).join("|"))
+        .digest("hex")
+        .slice(0, 8);
+      await ctx.requireTx(
+        `persist-start:${tag}`,
+        drifted.map((u) => u.msg),
+      );
+    }
+
+    const cert = loadCert(ctx);
+    for (const u of updates) {
+      const a = assignments.perNode[u.key]!;
+      try {
+        await ctx.services.provider.sendManifest(cert, a.hostUri, u.dseq, u.manifestJson);
+      } catch (e) {
+        // Every deployment here is on this manifest's hash (matched above, or
+        // just updated), so the provider's 422 can only be its "no change to
+        // apply" — the component already runs what we are pushing. Anything
+        // else is a real fault.
+        if (!isManifestAlreadyDeployed(e)) throw e;
+        ctx.log(`${u.key}: already running the persisted manifest — provider reports no change`);
+      }
+      persisted.push(u.key);
+    }
+    return { persisted };
   },
 };
 
