@@ -400,6 +400,10 @@ export type FleetAction =
   /** Re-aim stale mesh links (tunnel env, persistent_peers) at the fleet's
    *  current tailnet addresses, in place — no redeploy. */
   | "repair"
+  /** Make the provider re-create a component's container from its current
+   *  manifest (nonce-bumped so the manifest is genuinely new). For a
+   *  deployment that is already correct while the container never was. */
+  | "force-redeploy"
   /** Reset halt-height to 0 across the chain nodes: the recovery path for a
    *  halt-height upgrade abandoned before it cleared the setting itself. */
   | "clear-halt-height"

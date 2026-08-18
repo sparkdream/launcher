@@ -1327,7 +1327,7 @@ export class FleetService {
       // path consensus no longer uses
       const peers = await this.services.ssh.exec(
         this.sshTargetFor(launch, component),
-        "grep ^persistent_peers /root/.sparkdream/config/config.toml",
+        "grep '^persistent_peers[[:space:]]*=' /root/.sparkdream/config/config.toml",
         { quick: true },
       );
       if (/@(?!100\.64\.|127\.0\.0\.1)[^:]+:/.test(peers.stdout)) return warnings;
@@ -1497,6 +1497,27 @@ export class FleetService {
       throw new Error(`a repair op (#${running.id}) is already in progress for this fleet`);
     }
     return this.db.createFleetOp(launch.id, "repair", { key: component.key });
+  }
+
+  /**
+   * Force the provider to re-create one component's container (§5). For the
+   * case a repair cannot reach: the deployment already carries the right
+   * manifest, so every convergent pass correctly does nothing, while the
+   * running container still serves env from before the update landed.
+   */
+  requestForceRedeploy(launch: LaunchRow, component: FleetComponentRow): number {
+    const running = this.db
+      .listFleetOps(launch.id)
+      .find(
+        (o) =>
+          o.kind === "force-redeploy" &&
+          o.status === "active" &&
+          (JSON.parse(o.params_json) as { key?: string }).key === component.key,
+      );
+    if (running) {
+      throw new Error(`a redeploy op (#${running.id}) is already in progress for ${component.key}`);
+    }
+    return this.db.createFleetOp(launch.id, "force-redeploy", { key: component.key });
   }
 
   /**

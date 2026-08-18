@@ -1095,6 +1095,7 @@ export default function Page() {
       | "resume-signing"
       | "restore-archive"
       | "repair"
+      | "force-redeploy"
       | "clear-halt-height"
       | "reset-data",
     extra: {
@@ -3756,6 +3757,13 @@ export default function Page() {
                                       upgrade…
                                     </button>
                                   )}
+                                  <button
+                                    className="btn"
+                                    title="Make the provider re-create this container from its current manifest, on the same deployment and provider. For when the deployment already carries the right settings but the running container was never rebuilt from them, so it keeps serving stale env (a tunnel aimed at an address that has since moved). Carries a nonce so the manifest is genuinely new, since a provider refuses an identical one. One signature; the component restarts, nothing else is touched."
+                                    onClick={() => fleetAction(f.launchId, c.dseq, "force-redeploy")}
+                                  >
+                                    force redeploy
+                                  </button>
                                   <button
                                     className="btn amber"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}

@@ -30,6 +30,33 @@ export function launchDirs(workRoot: string, launchId: string): LaunchDirs {
   };
 }
 
+/**
+ * Proto-JSON bytes must be base64 STRINGS, never raw byte arrays. Msgs are
+ * persisted here with JSON.stringify, which turns a Uint8Array into
+ * {"0":5,"1":179,...} without complaining; the browser then decodes it with
+ * atob (packages/akash-tx), where that object coerces to "[object Object]"
+ * and throws a bare DOM "InvalidCharacterError: String contains an invalid
+ * character" at Keplr signing time, naming neither the field nor the step.
+ * The CLI path hides the same mistake behind Buffer.from's lenient parsing.
+ * So reject it at enqueue, where the offending field can still be named.
+ */
+function assertBytesAreBase64(msgs: Msg[], stepName: string): void {
+  const walk = (v: unknown, at: string): void => {
+    if (ArrayBuffer.isView(v)) {
+      throw new Error(
+        `${stepName}: msg field ${at} is raw bytes; proto-JSON needs a base64 string. ` +
+          `Wrap it in Buffer.from(x).toString("base64")`,
+      );
+    }
+    if (Array.isArray(v)) {
+      v.forEach((e, i) => walk(e, `${at}[${i}]`));
+    } else if (v && typeof v === "object") {
+      for (const [k, e] of Object.entries(v)) walk(e, `${at}.${k}`);
+    }
+  };
+  msgs.forEach((m, i) => walk(m.value, `msgs[${i}] (${m.typeUrl})`));
+}
+
 /** Thrown by a step to pause the launch until the browser/CLI signs. */
 export class AwaitSignature extends Error {
   constructor(readonly step: string) {
@@ -121,6 +148,7 @@ export async function runLaunch(
     log,
     output: (name) => db.stepOutput(launchId, name),
     requireTx: async (stepName, msgs) => {
+      assertBytesAreBase64(msgs, stepName);
       const row = db.getPendingTx(launchId, stepName);
       if (!row) {
         db.enqueuePendingTx(launchId, stepName, JSON.stringify(msgs));

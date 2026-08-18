@@ -490,8 +490,10 @@ export class FakeSsh {
     }
     // persistent_peers on the volume (the repoint op reads it, repairs stale
     // tailnet addresses in it, and writes the whole line back)
-    if (command.includes("grep '^persistent_peers'")) {
+    if (command.includes("grep '^persistent_peers")) {
       const peers = this.configPeers.get(id);
+      // the real file also carries persistent_peers_max_dial_period; the
+      // launcher's pattern anchors on the assignment so it never comes back
       return ok(peers === undefined ? "" : `persistent_peers = "${peers}"`);
     }
     if (command.includes("sed -i 's|^persistent_peers")) {
@@ -671,8 +673,14 @@ export function fakeServices(): FakeWorld {
 
 export class FakeSigner implements Signer {
   signed: Msg[][] = [];
+  /** Apply to chain state what a CONFIRMED tx does (deployment versions,
+   *  lease states). requireTx only returns once the tx confirms, so a step
+   *  that signs and then pushes really does meet a chain that has moved —
+   *  tests whose steps depend on that ordering wire this up. */
+  onSigned?: (msgs: Msg[]) => void;
   async sign(msgs: Msg[]): Promise<string> {
     this.signed.push(msgs);
+    this.onSigned?.(msgs);
     return `FAKETX${this.signed.length.toString().padStart(4, "0")}`;
   }
 }

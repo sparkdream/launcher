@@ -22,7 +22,7 @@ import {
 } from "./steps/phase-a.js";
 import { sparkdreamd } from "./exec.js";
 import { explorerChainEnv, renderComponentSdl, EXPLORER_SENTRY, EXPLORER_TUNNELS } from "./render-component-sdl.js";
-import { ingressHost } from "./steps/phase-ef.js";
+import { deploymentInfoWithRetry, ingressHost } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
 import {
@@ -177,6 +177,152 @@ function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
 
 function sdlPathFor(ctx: StepCtx, key: string): string {
   return path.join(ctx.dirs.sdl, `${key}.yaml`);
+}
+
+/**
+ * Path to a component's tailscaled control socket. tailscaled puts it in
+ * TS_STATE_DIR, and the images disagree on where that is: the node image uses
+ * ${NODE_HOME}/tailscale, while components rendered by render-component-sdl
+ * (the explorer) use /data/tailscale. Probing the node path on the explorer
+ * finds no socket and reads as "never joined the mesh" no matter how healthy
+ * the container is — a false negative that fails the whole rekey. Resolve it
+ * from the component's own rendered SDL, which is what set the variable, and
+ * fall back to the node default for anything that does not name one.
+ */
+function meshSocket(ctx: StepCtx, key: string): string {
+  let stateDir: string | undefined;
+  try {
+    const sdl = fs.readFileSync(sdlPathFor(ctx, key), "utf8");
+    stateDir = /^\s*-\s*"?TS_STATE_DIR=([^\s"']+)/m.exec(sdl)?.[1];
+  } catch {
+    stateDir = undefined;
+  }
+  return `${stateDir ?? `${NODE_HOME}/tailscale`}/tailscaled.sock`;
+}
+
+/**
+ * Put a set of components on-chain at the manifest they are about to be sent,
+ * then send it. Re-runs are the normal case for these ops (a rekey that died
+ * halfway, a fleet the operator repaired by hand in the meantime), and by then
+ * the live deployments can sit at a version this launcher never signed. A tx
+ * keyed to the step alone would read its own months-old confirmed row, sign
+ * nothing, and push a manifest at a version nobody updated — which is exactly
+ * what a provider rejects with "422 manifest version validation failed". It is
+ * the wedge persist-start already had (§ phase-ef), so this follows the same
+ * rule: read each deployment first, sign only the ones that drifted under a
+ * key scoped to that exact set, and let a 422 pass only once the versions
+ * already agree, where it can only be the provider's "no change to apply".
+ */
+async function updateOnChainAndPush(
+  ctx: StepCtx,
+  owner: string,
+  cert: ReturnType<typeof loadCert>,
+  baseStep: string,
+  items: { row: FleetComponentRow; hash: string; manifestJson: string }[],
+): Promise<void> {
+  if (items.length === 0) return;
+  const drifted: typeof items = [];
+  for (const it of items) {
+    const onChain = await deploymentInfoWithRetry(ctx, owner, it.row.dseq);
+    // Neither of these can be signed into a working tx: an update against a
+    // closed or unknown deployment fails on-chain, and a failed tx wedges the
+    // signing queue behind a signature that can never succeed.
+    if (!onChain) {
+      throw new Error(
+        `${it.row.key}: deployment ${it.row.dseq} is not on-chain (or the LCD did not answer): ` +
+          "retry, and relaunch the component if it stays gone",
+      );
+    }
+    if (onChain.state !== "active") {
+      throw new Error(
+        `${it.row.key}: deployment ${it.row.dseq} is ${onChain.state}: relaunch the component, then retry`,
+      );
+    }
+    if (onChain.hash !== it.hash) drifted.push(it);
+    else ctx.log(`${it.row.key}: on-chain version already matches the manifest`);
+  }
+  if (drifted.length > 0) {
+    // Scoped to the exact set being signed, so a later drift is a new request
+    // rather than a confirmed row that skips the signature the provider is
+    // waiting on. Any unsigned row under the bare key is dropped: the
+    // oldest-first signing queue would otherwise surface it ahead of this one
+    // and the operator would sign a payload nothing is waiting for.
+    ctx.db.discardUnsignedPendingTx(ctx.launchId, baseStep);
+    const tag = crypto
+      .createHash("sha256")
+      .update(drifted.map((d) => `${d.row.key}:${d.hash}`).join("|"))
+      .digest("hex")
+      .slice(0, 8);
+    await ctx.requireTx(
+      `${baseStep}:${tag}`,
+      drifted.map((d) => ({
+        typeUrl: TypeUrl.UpdateDeployment,
+        value: { id: { owner, dseq: d.row.dseq }, hash: d.hash },
+      })),
+    );
+  }
+  const justSigned = new Set(drifted.map((d) => d.row.key));
+  for (const it of items) {
+    await pushManifest(ctx, cert, it.row, it.manifestJson, justSigned.has(it.row.key));
+  }
+}
+
+/**
+ * PUT a manifest, treating the provider's 422 by what we know rather than by
+ * its wording.
+ *
+ * "manifest version validation failed" is the same answer a provider gives for
+ * "already running this" and for a genuine version mismatch, so the message
+ * alone proves nothing. It is benign for a deployment that was ALREADY at this
+ * version. For one whose version we just moved it is not: swallowing it leaves
+ * the chain carrying a manifest the provider never applied, and that split is
+ * invisible afterwards — every later convergence check reads chain and
+ * launcher as agreeing and skips the component, while its container goes on
+ * serving the old env. Retry a few times first, since a provider's own node
+ * can still be reading the previous version moments after our tx confirmed.
+ */
+async function pushManifest(
+  ctx: StepCtx,
+  cert: ReturnType<typeof loadCert>,
+  row: FleetComponentRow,
+  manifestJson: string,
+  justSigned: boolean,
+): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifestJson);
+      return;
+    } catch (e) {
+      if (!isManifestAlreadyDeployed(e)) throw e;
+      if (!justSigned) {
+        ctx.log(`${row.key}: already running this manifest, provider reports no change`);
+        return;
+      }
+      if (attempt >= 3) {
+        throw new Error(
+          `${row.key}: the provider kept rejecting the manifest for deployment ${row.dseq} at the ` +
+            "version just signed: the chain carries that version but the provider is not serving " +
+            "it, so the deployment would keep running the old one. Retry the step",
+        );
+      }
+      ctx.log(`${row.key}: provider has not caught up to the new version yet, retrying the push`);
+      await ctx.services.sleep(5000);
+    }
+  }
+}
+
+/**
+ * Rewrite every old tailnet address to its new one in a single pass. Applying
+ * the pairs one after another corrupts a swap: headscale reallocates from an
+ * empty database in registration order, so a relaunch really can hand val-0
+ * the address sentry-0 used to hold. Replacing 100.64.0.1→100.64.0.2 and then
+ * 100.64.0.2→100.64.0.1 over the same text collapses BOTH peers onto one
+ * address, silently pointing every tunnel at the wrong node.
+ */
+export function rewriteTailnetIps(text: string, map: Map<string, string>): string {
+  if (map.size === 0) return text;
+  const alt = [...map.keys()].map((o) => o.replace(/\./g, "\\.")).join("|");
+  return text.replace(new RegExp(`(?<![\\d.])(${alt})(?![\\d.])`, "g"), (m) => map.get(m) ?? m);
 }
 
 async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<number | undefined> {
@@ -714,7 +860,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       for (let attempt = 1; attempt <= 30; attempt++) {
         const res = await ctx.services.ssh.exec(
           target,
-          `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`,
+          `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`,
         );
         ip = res.stdout.trim().split("\n")[0] ?? "";
         if (/^100\./.test(ip)) break;
@@ -1152,10 +1298,10 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
   const hsShell = (ctx: StepCtx, hs: { hostUri: string; dseq: string; gseq: number; oseq: number }, script: string) =>
     ctx.services.provider.shellExec(loadCert(ctx), hs.hostUri, hs.dseq, hs.gseq, hs.oseq, "headscale", ["sh", "-c", script]);
 
-  /** A node's assigned tailnet IPv4, or undefined while it has not joined. */
-  const tailnetIp = async (ctx: StepCtx, target: SshTarget): Promise<string | undefined> => {
+  /** A component's assigned tailnet IPv4, or undefined while it has not joined. */
+  const tailnetIp = async (ctx: StepCtx, key: string, target: SshTarget): Promise<string | undefined> => {
     const res = await ctx.services.ssh
-      .exec(target, `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`)
+      .exec(target, `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`)
       .catch(() => ({ stdout: "" }));
     const ip = res.stdout.trim().split("\n")[0]!;
     return ip && ip.startsWith("100.") ? ip : undefined;
@@ -1176,12 +1322,13 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
     let ip: string | undefined;
     for (let i = 0; i < 30 && !ip; i++) {
       if (i > 0) await ctx.services.sleep(5000);
-      ip = await tailnetIp(ctx, target);
+      ip = await tailnetIp(ctx, row.key, target);
     }
     if (!ip) {
       throw new Error(
         `${row.key} never joined the new mesh: headscale answers at ${domain} (the op verified it), ` +
-          "so check the node's tailscaled log and that its provider can reach the new headscale host",
+          `and its tailscaled socket was probed at ${meshSocket(ctx, row.key)}. Check the component's ` +
+          "tailscaled log and that its provider can reach the new headscale host",
       );
     }
     return ip;
@@ -1482,7 +1629,6 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       // phase A: fresh preauth key into every mesh component's env. The
       // manifest push restarts the container, whose entrypoint re-runs
       // tailscale up with the new key against the new mesh.
-      const updateMsgs: Msg[] = [];
       const planned: { row: FleetComponentRow; text: string }[] = [];
       for (const k of meshKeys) {
         const row = componentRow(ctx, k);
@@ -1492,23 +1638,21 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         text = text.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${keys.perNode[k]}`);
         planned.push({ row, text });
       }
+      // hashes go on-chain before any PUT; providers 422 a manifest whose hash
+      // drifted from the deployment
+      const items: { row: FleetComponentRow; hash: string; manifestJson: string }[] = [];
       for (const { row, text } of planned) {
         const sdlPath = sdlPathFor(ctx, row.key);
         fs.writeFileSync(sdlPath, text);
-        // hashes go on-chain in ONE tx (one signature) before any PUT;
-        // providers 422 a manifest whose hash drifted from the deployment
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), artifacts.manifestJson);
-        updateMsgs.push({
-          typeUrl: TypeUrl.UpdateDeployment,
-          value: { id: { owner, dseq: row.dseq }, hash: artifacts.hash },
+        items.push({
+          row,
+          hash: Buffer.from(artifacts.hash).toString("base64"),
+          manifestJson: artifacts.manifestJson,
         });
       }
-      if (updateMsgs.length > 0) await ctx.requireTx(p("rekey"), updateMsgs);
-      for (const { row } of planned) {
-        const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), "utf8");
-        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifest);
-      }
+      await updateOnChainAndPush(ctx, owner, cert, p("rekey"), items);
 
       // collect: every component re-registers and reports its new tailnet IP
       // (sequential allocation on a fresh db — IPs can shuffle)
@@ -1525,34 +1669,26 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         const oldIp = componentRow(ctx, k).tailnet_ip ?? launchMesh?.ips[k];
         if (oldIp && newIps[k] && oldIp !== newIps[k]) ipMap.set(oldIp, newIps[k]);
       }
-      const ipMsgs: Msg[] = [];
-      const changedRows: FleetComponentRow[] = [];
+      const ipItems: { row: FleetComponentRow; hash: string; manifestJson: string }[] = [];
       for (const { row } of planned) {
         const sdlPath = sdlPathFor(ctx, row.key);
-        let text = fs.readFileSync(sdlPath, "utf8");
-        let changed = false;
-        for (const [o, n] of ipMap) {
-          if (!text.includes(o)) continue;
-          text = text.replace(new RegExp(`(?<![\\d.])${o.replace(/\./g, "\\.")}(?![\\d.])`, "g"), n);
-          changed = true;
-        }
-        if (!changed) continue;
+        const before = fs.readFileSync(sdlPath, "utf8");
+        // one pass over the whole map: see rewriteTailnetIps on why applying
+        // the pairs in sequence corrupts a swapped pair
+        const text = rewriteTailnetIps(before, ipMap);
+        if (text === before) continue;
         fs.writeFileSync(sdlPath, text);
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), artifacts.manifestJson);
-        ipMsgs.push({
-          typeUrl: TypeUrl.UpdateDeployment,
-          value: { id: { owner, dseq: row.dseq }, hash: artifacts.hash },
+        ipItems.push({
+          row,
+          hash: Buffer.from(artifacts.hash).toString("base64"),
+          manifestJson: artifacts.manifestJson,
         });
-        changedRows.push(row);
       }
-      if (ipMsgs.length > 0) await ctx.requireTx(p("rekey-ips"), ipMsgs);
-      for (const row of changedRows) {
-        const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), "utf8");
-        await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifest);
-      }
+      await updateOnChainAndPush(ctx, owner, cert, p("rekey-ips"), ipItems);
       // the second push restarts them again; wait for the mesh to settle
-      for (const row of changedRows) await collectIp(ctx, row);
+      for (const { row } of ipItems) await collectIp(ctx, row);
       return { newIps, ipMap: Object.fromEntries(ipMap) };
     },
   });
@@ -1575,20 +1711,31 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       // validators' persistent_peers live in config.toml on the volume (not
       // the env): sed stale IPs and restart. Fleets peered over the sentry's
       // PUBLIC endpoint match nothing and skip the restart.
+      const esc = (s: string): string => s.replace(/\./g, "\\.");
       for (const vk of valKeys) {
         const row = componentRow(ctx, vk);
         const target = rowTarget(ctx, row);
-        let touched = false;
+        const cfg = `${NODE_HOME}/config/config.toml`;
+        const present: [string, string][] = [];
         for (const [o, n] of pairs) {
-          const has = await ctx.services.ssh.exec(
-            target,
-            `grep -c '${o.replace(/\./g, "\\.")}' ${NODE_HOME}/config/config.toml || true`,
-          );
-          if (has.stdout.trim() === "0" || has.stdout.trim() === "") continue;
-          await ctx.services.ssh.exec(target, `sed -i 's|${o}|${n}|g' ${NODE_HOME}/config/config.toml`);
-          touched = true;
+          const has = await ctx.services.ssh.exec(target, `grep -c '${esc(o)}' ${cfg} || true`);
+          const count = has.stdout.trim();
+          if (count === "0" || count === "") continue;
+          present.push([o, n]);
         }
-        if (touched) await restartNode(ctx.services.ssh, target);
+        if (present.length === 0) continue;
+        // Two passes inside ONE sed: every old address becomes a unique token
+        // before any token becomes a new address. Substituting the pairs one
+        // after another folds a swapped pair onto a single address (see
+        // rewriteTailnetIps), which would point persistent_peers at the wrong
+        // node. The match patterns escape their dots; the replacements are
+        // literal addresses.
+        const args = [
+          ...present.map(([o], i) => `-e 's|${esc(o)}|@@TSIP${i}@@|g'`),
+          ...present.map(([, n], i) => `-e 's|@@TSIP${i}@@|${n}|g'`),
+        ].join(" ");
+        await ctx.services.ssh.exec(target, `sed -i ${args} ${cfg}`);
+        await restartNode(ctx.services.ssh, target);
       }
       return { rewired: true };
     },
@@ -3260,6 +3407,86 @@ export interface RepairParams {
   key: string;
 }
 
+export interface ForceRedeployParams {
+  key: string;
+}
+
+/** Env var carrying the force-redeploy nonce. Inert to every image. */
+export const REDEPLOY_NONCE_ENV = "LAUNCHER_REDEPLOY_NONCE";
+
+/**
+ * Set (or refresh) the redeploy nonce in an SDL's env list.
+ *
+ * Edited as text rather than by re-dumping parsed YAML: the rendered SDLs
+ * carry folded scalars (the SSH key) and are regex-edited by half a dozen
+ * other steps, so a round trip through the YAML printer risks reshaping lines
+ * those patterns depend on. The nonce line is inserted beside an existing
+ * plain env entry so it inherits that entry's indentation.
+ */
+export function withRedeployNonce(text: string, nonce: string): string {
+  const existing = new RegExp(`^(\\s*)- ${REDEPLOY_NONCE_ENV}=.*$`, "m");
+  if (existing.test(text)) {
+    return text.replace(existing, (_m, indent: string) => `${indent}- ${REDEPLOY_NONCE_ENV}=${nonce}`);
+  }
+  const anchor = /^(\s*)- [A-Z][A-Z0-9_]*=.*$/m.exec(text);
+  if (!anchor) throw new Error("SDL has no plain env entry to anchor the redeploy nonce to");
+  return text.replace(anchor[0], `${anchor[0]}\n${anchor[1]}- ${REDEPLOY_NONCE_ENV}=${nonce}`);
+}
+
+/**
+ * Force a provider to re-create a component's container.
+ *
+ * A deployment can sit at the right manifest while the container the provider
+ * actually runs was never re-created from it — the two are separate facts, and
+ * once they diverge nothing notices, because every convergence check compares
+ * the chain against the launcher and sees them agree. That is not a state the
+ * fleet can be argued out of: an identical PUT is refused ("nothing to
+ * redeploy"), and signalling the process is useless where it is the
+ * container's PID 1 and the kernel drops signals init does not handle.
+ *
+ * So make the manifest genuinely new. The nonce exists only to change the
+ * hash; the redeploy it forces is what re-applies whatever env had gone stale.
+ * Seen live: a sentry running a tunnel aimed at the address it had itself been
+ * given, peering with itself, while chain and launcher both read as correct.
+ */
+export function forceRedeploySteps(
+  opId: number,
+  params: ForceRedeployParams,
+  _spec: LaunchSpec,
+): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const key = params.key;
+  return [
+    {
+      name: p("redeploy"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const row = componentRow(ctx, key);
+        if (row.state !== "active") {
+          throw new Error(`${key} is ${row.state}: relaunch it instead of forcing a redeploy`);
+        }
+        const sdlPath = sdlPathFor(ctx, key);
+        // pinnedValue: a re-run must reuse the nonce it already signed for,
+        // or the step would sign a fresh manifest on every retry and never
+        // agree with the version the operator just approved
+        const nonce = await pinnedValue(ctx, `${p("redeploy")}.nonce`, async () =>
+          String(Math.floor(Date.now() / 1000)),
+        );
+        const text = withRedeployNonce(fs.readFileSync(sdlPath, "utf8"), nonce);
+        fs.writeFileSync(sdlPath, text);
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+        ctx.log(`${key}: redeploying at nonce ${nonce}`);
+        await updateOnChainAndPush(ctx, owner, loadCert(ctx), p("redeploy"), [
+          { row, hash: Buffer.from(artifacts.hash).toString("base64"), manifestJson: artifacts.manifestJson },
+        ]);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { key, nonce };
+      },
+    },
+  ];
+}
+
 /**
  * Repair (§5): reconcile the fleet against reality and fix what has drifted,
  * without relaunching anything. One op made of independent passes, so future
@@ -3392,11 +3619,9 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           const row = rows.find((c) => c.key === key);
           if (!row || row.state !== "active" || !row.ssh_host) continue;
           const res = await ctx.services.ssh
-            .exec(
-              rowTarget(ctx, row),
-              `tailscale --socket=${NODE_HOME}/tailscale/tailscaled.sock ip -4 2>/dev/null || true`,
-              { quick: true },
-            )
+            .exec(rowTarget(ctx, row), `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`, {
+              quick: true,
+            })
             .catch(() => ({ stdout: "" }));
           const ip = res.stdout.trim().split("\n")[0] ?? "";
           // not on the mesh right now (or not reachable): leave the record
@@ -3499,32 +3724,51 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           const sdlPath = sdlPathFor(ctx, key);
           if (!fs.existsSync(sdlPath)) continue;
           const retarget = retargetTunnelEnv(ctx, spec, key, fs.readFileSync(sdlPath, "utf8"));
-          if (retarget.changes.length === 0) continue;
           for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
-          fs.writeFileSync(sdlPath, retarget.text);
+          if (retarget.changes.length > 0) fs.writeFileSync(sdlPath, retarget.text);
           const artifacts = sdlArtifacts(loadSdl(sdlPath));
-          fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
-          pushes.push({ row, json: artifacts.manifestJson });
-          // convergent, like retarget: a deployment already at this version
-          // would reject the update ("nothing to change") — re-send only
           const wantHash = Buffer.from(artifacts.hash).toString("base64");
           const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          // The PUT is unconditional, and deliberately so. Gating it on
+          // "something changed this run" cannot work here: the signature
+          // pauses the step, and on the re-run the chain already carries the
+          // new version, so the very component that needed the push reads as
+          // settled and gets skipped — the update lands on-chain and the
+          // provider is never told, which is the silent split this step exists
+          // to close. Seen live: a sentry left tunnelling to its own address,
+          // with chain and launcher both reading as correct. Re-sending a
+          // manifest a provider already runs is refused as "nothing to
+          // redeploy" and changes nothing, so the only cost of pushing anyway
+          // is the request itself.
+          fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+          pushes.push({ row, json: artifacts.manifestJson });
+          // Convergent: an update whose hash already matches is rejected
+          // on-chain ("nothing to change") and wedges the signing queue behind
+          // a signature that can never succeed, so never sign into that.
+          // Beyond it, we sign when we just rewrote the SDL (the manifest is
+          // then different by construction) or when the chain positively
+          // reports a different version. A chain that reported no version at
+          // all is a reason to leave it alone, not to sign blindly — the
+          // manifest is pushed either way, and that is what repairs the
+          // container.
           if (onChain?.hash === wantHash) continue;
+          if (retarget.changes.length === 0 && !onChain?.hash) continue;
           msgs.push({
             typeUrl: TypeUrl.UpdateDeployment,
             value: { id: { owner, dseq: row.dseq }, hash: wantHash },
           });
         }
         if (pushes.length === 0) {
-          ctx.log("every tunnel already names its peer's current address");
+          ctx.log("no meshed component has a tunnel to re-aim");
           ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
           return { repointed: [] };
         }
         if (msgs.length > 0) await ctx.requireTx(p("mesh-env"), msgs);
         else ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
         const cert = loadCert(ctx);
+        const justSigned = new Set(msgs.map((m) => String((m.value as { id: { dseq: string } }).id.dseq)));
         for (const { row, json } of pushes) {
-          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+          await pushManifest(ctx, cert, row, json, justSigned.has(row.dseq));
         }
         return { repointed: pushes.map((x) => x.row.key) };
       },
@@ -3543,7 +3787,9 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           if (!row || row.state !== "active" || !row.ssh_host) continue;
           const target = rowTarget(ctx, row);
           const got = await ctx.services.ssh
-            .exec(target, `grep '^persistent_peers' ${NODE_HOME}/config/config.toml`, { quick: true })
+            .exec(target, `grep '^persistent_peers[[:space:]]*=' ${NODE_HOME}/config/config.toml`, {
+              quick: true,
+            })
             .catch(() => ({ stdout: "" }));
           const line = /^persistent_peers\s*=\s*"(.*)"/m.exec(got.stdout);
           if (!line) continue;
@@ -3569,9 +3815,16 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             .join(",");
           if (changes.length === 0) continue;
           for (const c of changes) ctx.log(`${key}: peer re-aimed at ${c}`);
+          // Anchor on the assignment. `^persistent_peers.*` also matches
+          // CometBFT's persistent_peers_max_dial_period, twenty lines further
+          // down the [p2p] section, and rewriting THAT line to a second
+          // `persistent_peers = "..."` leaves a config the node refuses to
+          // parse at all ("toml: key persistent_peers is already defined") —
+          // it exits before it can tell anyone why. Seen live on a validator.
           await ctx.services.ssh.exec(
             target,
-            `sed -i 's|^persistent_peers.*|persistent_peers = "${next}"|' ${NODE_HOME}/config/config.toml`,
+            `sed -i 's|^persistent_peers[[:space:]]*=.*|persistent_peers = "${next}"|' ` +
+              `${NODE_HOME}/config/config.toml`,
           );
           // a peer change only takes effect on a restart of the process
           await restartNode(ctx.services.ssh, target);
@@ -3649,6 +3902,7 @@ function buildSteps(
     if (op.kind === "resume-signing") steps.push(...resumeSigningSteps(op.id, params, spec));
     if (op.kind === "restore-archive") steps.push(...restoreArchiveSteps(op.id, params));
     if (op.kind === "repair") steps.push(...repairSteps(op.id, params, spec));
+    if (op.kind === "force-redeploy") steps.push(...forceRedeploySteps(op.id, params, spec));
   }
   return steps;
 }

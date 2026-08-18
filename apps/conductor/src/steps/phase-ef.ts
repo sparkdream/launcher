@@ -563,7 +563,7 @@ async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void
  * caller signs (or refuses to sign) on what this answers, and an endpoint
  * returning one 502 must not read as "the deployment is gone".
  */
-async function deploymentInfoWithRetry(
+export async function deploymentInfoWithRetry(
   ctx: StepCtx,
   owner: string,
   dseq: string,

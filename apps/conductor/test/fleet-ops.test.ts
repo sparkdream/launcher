@@ -4,12 +4,18 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
-import { toEncodeObject } from "@sparkdream/akash-tx";
+import { toEncodeObject, TypeUrl } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner, type GentxSigner, type StepDef } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
-import { buildOpSteps, buildPreLaunchOpSteps, retagImage } from "../src/fleet-ops.js";
+import {
+  buildOpSteps,
+  buildPreLaunchOpSteps,
+  retagImage,
+  rewriteTailnetIps,
+  withRedeployNonce,
+} from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { fakeServices, FakeSigner, keplrSignAmino, type FakeWorld } from "./fakes.js";
 
@@ -1366,12 +1372,15 @@ describe("headscale relaunch op", () => {
     expect(explorerSdl).not.toContain(launchMesh.ips["sentry-0"]!);
     expect(explorerSdl).toContain(mesh.ips["sentry-0"]!);
 
-    // validator config re-patched (sed old→new sentry IP over SSH)
+    // validator config re-patched over SSH: one sed that maps old→token→new,
+    // so a swapped pair cannot fold both peers onto one address. The match
+    // pattern escapes its dots; the replacement is the literal new address.
+    const escapedOldSentry = launchMesh.ips["sentry-0"]!.replace(/\./g, "\\.");
     expect(
       w.services.ssh.execLog.some(
         (e) =>
           e.command.includes("sed -i") &&
-          e.command.includes(launchMesh.ips["sentry-0"]!) &&
+          e.command.includes(escapedOldSentry) &&
           e.command.includes(mesh.ips["sentry-0"]!),
       ),
     ).toBe(true);
@@ -1556,6 +1565,52 @@ describe("repair op", () => {
     // nothing stale: no update tx, and no component restarted for nothing
     expect(w.signer.signed.length).toBe(sigsBefore);
     expect(() => w.fleet.requestRepair(launch, val)).not.toThrow();
+    w.db.close();
+  }, 120_000);
+
+  it("re-pushes a component whose deployment fell behind the launcher's manifest", async () => {
+    // The live shape: an op moved the chain to a new manifest and was then
+    // re-run into an EARLIER hash, so the tunnel target on disk is right while
+    // the container still serves the old env. Nothing in the SDL needs
+    // changing, so a repair that only reacted to text drift walked past it —
+    // and the sentry sat peering with its own address, not syncing.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sigsBefore = w.signer.signed.length;
+
+    // the chain reports a version this launcher never produced, while every
+    // tunnel target on disk is already correct
+    const stale = "c3RhbGUtdmVyc2lvbi1ub2JvZHktc2lnbmVkLW5vdz0=";
+    w.services.api.deploymentHashes.set(sentry.dseq, stale);
+    // a confirmed update moves the on-chain version, which is what lets the
+    // provider's version check accept the PUT that follows it
+    w.signer.onSigned = (msgs) => {
+      for (const m of msgs) {
+        if (m.typeUrl === TypeUrl.UpdateDeployment) {
+          w.services.api.deploymentHashes.set(String((m.value as any).id.dseq), (m.value as any).hash);
+        }
+      }
+    };
+
+    w.fleet.requestRepair(launch, sentry);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    // the manifest actually reached the provider — the point of the step.
+    // It must survive the signature pause: the tx moves the chain, so on the
+    // re-run the component reads as settled, and a push gated on "changed
+    // this run" would skip the very component that needed it.
+    expect(w.services.provider.manifests.some((x) => x.dseq === sentry.dseq)).toBe(true);
+
+    // and moved the on-chain version onto the manifest it pushed
+    const upd = w.signer.signed
+      .slice(sigsBefore)
+      .flat()
+      .find(
+        (m) => m.typeUrl === TypeUrl.UpdateDeployment && String((m.value as any).id.dseq) === sentry.dseq,
+      );
+    expect(upd).toBeDefined();
+    expect((upd!.value as any).hash).not.toBe(stale);
     w.db.close();
   }, 120_000);
 });
@@ -1820,5 +1875,110 @@ describe("retagImage", () => {
     expect(retagImage("repo/img", "1.0.30")).toBeUndefined();
     expect(retagImage("repo/img@sha256:abc123", "1.0.30")).toBeUndefined();
     expect(retagImage(null, "1.0.30")).toBeUndefined();
+  });
+});
+
+describe("withRedeployNonce", () => {
+  const sdl = [
+    "    env:",
+    "      - >-",
+    "        SSH_PUBLIC_KEY=ssh-ed25519 AAAA",
+    "        launch-abc",
+    "      - TS_HOSTNAME=sentry-0",
+    "      - TS_TUNNEL_1=16656:100.64.0.2:26656",
+    "    params:",
+  ].join("\n");
+
+  it("inserts the nonce beside an existing env entry, matching its indentation", () => {
+    const out = withRedeployNonce(sdl, "1700000000");
+    expect(out).toContain("      - LAUNCHER_REDEPLOY_NONCE=1700000000");
+    // the folded SSH key block is left exactly as it was: other steps regex
+    // over these lines, so the nonce must not reshape them
+    expect(out).toContain("      - >-\n        SSH_PUBLIC_KEY=ssh-ed25519 AAAA\n        launch-abc");
+    expect(out).toContain("      - TS_TUNNEL_1=16656:100.64.0.2:26656");
+  });
+
+  it("refreshes the nonce in place rather than stacking a second one", () => {
+    const once = withRedeployNonce(sdl, "1700000000");
+    const twice = withRedeployNonce(once, "1700000999");
+    expect(twice).toContain("LAUNCHER_REDEPLOY_NONCE=1700000999");
+    expect(twice).not.toContain("1700000000");
+    expect(twice.match(/LAUNCHER_REDEPLOY_NONCE=/g)).toHaveLength(1);
+  });
+
+  it("refuses an SDL with no env entry to anchor to", () => {
+    expect(() => withRedeployNonce("services:\n  x:\n    image: y\n", "1")).toThrow(/anchor/);
+  });
+});
+
+describe("force redeploy op", () => {
+  it("moves the manifest version and re-pushes, so the provider re-creates the container", async () => {
+    // the state repair cannot reach: chain and launcher agree, while the
+    // running container still serves env from before the update landed
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sigsBefore = w.signer.signed.length;
+    const pushesBefore = w.services.provider.manifests.length;
+
+    w.fleet.requestForceRedeploy(launch, sentry);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const upd = w.signer.signed
+      .slice(sigsBefore)
+      .flat()
+      .find(
+        (m) => m.typeUrl === TypeUrl.UpdateDeployment && String((m.value as any).id.dseq) === sentry.dseq,
+      );
+    expect(upd).toBeDefined();
+    expect(w.services.provider.manifests.slice(pushesBefore).some((x) => x.dseq === sentry.dseq)).toBe(true);
+    // the nonce lands in the SDL the launcher keeps for that component
+    const sdl = fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "sentry-0.yaml"), "utf8");
+    expect(sdl).toMatch(/LAUNCHER_REDEPLOY_NONCE=\d+/);
+    w.db.close();
+  }, 120_000);
+
+  it("fails loudly when the provider refuses the version it just signed", async () => {
+    // the 422 message is the same one a provider sends for "already running
+    // this", so it must not be swallowed for a component we just moved —
+    // that would leave the chain on a manifest the provider never applied
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    w.services.provider.manifestUnchangedDseqs.add(sentry.dseq);
+
+    w.fleet.requestForceRedeploy(launch, sentry);
+    const res = await driveOps(w);
+    expect(res.status).not.toBe("completed");
+    const step = w.db.listSteps("fl").find((s) => s.name.endsWith(":redeploy"));
+    expect(step?.error).toMatch(/not serving it|rejected the manifest/);
+    w.db.close();
+  }, 120_000);
+});
+
+describe("rewriteTailnetIps", () => {
+  it("rewrites a swapped pair without folding both peers onto one address", () => {
+    // headscale reallocates from an empty db in registration order, so a
+    // relaunch really can hand val-0 the address sentry-0 used to hold.
+    // Substituting the pairs one after another would turn .1→.2 and then
+    // every .2 (including the one just written) back into .1.
+    const swap = new Map([
+      ["100.64.0.1", "100.64.0.2"],
+      ["100.64.0.2", "100.64.0.1"],
+    ]);
+    const sdl = "- TS_TUNNEL_1=16656:100.64.0.1:26656\n- TS_TUNNEL_2=11317:100.64.0.2:1317\n";
+    expect(rewriteTailnetIps(sdl, swap)).toBe(
+      "- TS_TUNNEL_1=16656:100.64.0.2:26656\n- TS_TUNNEL_2=11317:100.64.0.1:1317\n",
+    );
+  });
+
+  it("matches whole addresses only, and leaves unmapped ones alone", () => {
+    const map = new Map([["100.64.0.1", "100.64.0.7"]]);
+    // 100.64.0.10 must not be rewritten as 100.64.0.7 plus a stray "0"
+    expect(rewriteTailnetIps("a=100.64.0.10 b=100.64.0.1 c=100.64.0.3", map)).toBe(
+      "a=100.64.0.10 b=100.64.0.7 c=100.64.0.3",
+    );
+    expect(rewriteTailnetIps("nothing here", map)).toBe("nothing here");
+    expect(rewriteTailnetIps("a=100.64.0.1", new Map())).toBe("a=100.64.0.1");
   });
 });

@@ -523,6 +523,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "resume-signing"
         | "restore-archive"
         | "repair"
+        | "force-redeploy"
         | "clear-halt-height"
         | "reset-data";
       confirm?: boolean;
@@ -699,6 +700,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           const opId = fleet.requestRepair(launch, component);
           drive(launchId, spec);
           return { status: "repair-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "force-redeploy": {
+        try {
+          // the container is re-created in place: same deployment, same
+          // provider, one signature to move the manifest version
+          const opId = fleet.requestForceRedeploy(launch, component);
+          drive(launchId, spec);
+          return { status: "force-redeploy-started", opId };
         } catch (e) {
           return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
         }

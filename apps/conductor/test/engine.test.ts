@@ -95,6 +95,55 @@ describe("runLaunch checkpointing", () => {
     db.close();
   });
 
+  it("refuses a msg carrying raw bytes instead of a base64 string", async () => {
+    // A Uint8Array survives JSON.stringify as {"0":5,...}, which the browser's
+    // atob decode coerces to "[object Object]" and rejects with a bare DOM
+    // InvalidCharacterError at Keplr signing time — no field, no step named.
+    // The headscale-relaunch rekey step shipped exactly this. Fail at enqueue.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const spec = testnetSpec();
+    db.createLaunch("l-bytes", JSON.stringify(spec));
+
+    const hash = new Uint8Array([5, 179, 171, 242]);
+    const steps: StepDef[] = [
+      {
+        name: "raw-bytes",
+        run: async (ctx) => ({
+          txHash: await ctx.requireTx("raw-bytes", [
+            { typeUrl: "/akash.deployment.v1beta4.MsgUpdateDeployment", value: { id: { owner: "a", dseq: "1" }, hash } },
+          ]),
+        }),
+      },
+    ];
+
+    const res = await runLaunch(db, "l-bytes", spec, work, steps, fakeServices());
+    expect(res.status).toBe("paused");
+    const step = db.getStep("l-bytes", "raw-bytes");
+    expect(step?.error).toMatch(/raw bytes/);
+    expect(step?.error).toContain("hash");
+    // nothing was queued for the wallet to sign
+    expect(db.getPendingTx("l-bytes", "raw-bytes")).toBeFalsy();
+
+    // the corrected form passes the same guard
+    const ok: StepDef[] = [
+      {
+        name: "raw-bytes",
+        run: async (ctx) => ({
+          txHash: await ctx.requireTx("raw-bytes", [
+            {
+              typeUrl: "/akash.deployment.v1beta4.MsgUpdateDeployment",
+              value: { id: { owner: "a", dseq: "1" }, hash: Buffer.from(hash).toString("base64") },
+            },
+          ]),
+        }),
+      },
+    ];
+    const retry = await runLaunch(db, "l-bytes", spec, work, ok, fakeServices());
+    expect(retry.status).toBe("awaiting-signature");
+    db.close();
+  });
+
   it("refreshes an unsigned pending gentx sign doc when the caller rebuilds it", async () => {
     // promote-validator sign docs embed the live account sequence: after a
     // stale-sequence broadcast failure the caller resets the row and builds

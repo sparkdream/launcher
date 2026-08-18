@@ -27,8 +27,34 @@ export const START_NODE_CMD =
   `pgrep -f "^tail -F ${NODE_LOG}" >/dev/null || ` +
   `(nohup tail -F ${NODE_LOG} > /proc/1/fd/1 2>/dev/null &)`;
 
-/** Kill + start pair for config changes that need a process restart. */
+/**
+ * Restart the node after a config change.
+ *
+ * Two shapes exist in the fleet and they need opposite handling. Where the
+ * entrypoint execs the binary, sparkdreamd IS the container's PID 1: cosmos
+ * installs a SIGTERM handler, so `pkill` really does stop it, but stopping
+ * init tears down the whole container. The provider then brings it back with
+ * the node already started, while the shell that would have run the start
+ * command dies along with it — leaving that second exec waiting on a channel
+ * that is going away. Seen live: a rewire stuck past ten minutes with its sed
+ * long since applied and the validator already back up and producing.
+ *
+ * So probe PID 1 first. When it is the node, detach the signal (the exec must
+ * return before the container goes down, and nothing can acknowledge it
+ * afterwards) and send no start command, since the restart supplies one. When
+ * the node is an ordinary child process, the original kill-then-start pair is
+ * still what relaunches it.
+ */
 export async function restartNode(ssh: Services["ssh"], target: SshTarget): Promise<void> {
+  const pid1 = await ssh
+    .exec(target, "cat /proc/1/comm 2>/dev/null || true")
+    .catch(() => ({ stdout: "" }));
+  if (pid1.stdout.trim() === "sparkdreamd") {
+    await ssh
+      .exec(target, "(sleep 1; pkill -x sparkdreamd) >/dev/null 2>&1 &")
+      .catch(() => undefined);
+    return;
+  }
   await ssh.exec(target, "pkill -x sparkdreamd || true");
   await ssh.exec(target, `sleep 1 && ${START_NODE_CMD}`);
 }
