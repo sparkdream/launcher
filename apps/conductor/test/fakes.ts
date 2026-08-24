@@ -140,7 +140,9 @@ export class FakeAkashApi implements AkashApi {
 }
 
 export class FakeProviderGateway {
-  manifests: Array<{ hostUri: string; dseq: string }> = [];
+  /** waitMode records the gate the pushed manifest carried, for the node
+   *  manifests that have one (a stateless component's has none). */
+  manifests: Array<{ hostUri: string; dseq: string; waitMode?: boolean }> = [];
   private portCounter = 30000;
   private assigned = new Map<string, { host: string; port: number }>();
   /** Wired by fakeServices: a node manifest push restarts the container,
@@ -205,14 +207,17 @@ export class FakeProviderGateway {
         );
       }
     }
-    this.manifests.push({ hostUri, dseq });
-    if (manifestJson?.includes("WAIT_FOR_CONFIG=")) {
+    const gated = manifestJson?.includes("WAIT_FOR_CONFIG=")
+      ? manifestJson.includes("WAIT_FOR_CONFIG=true")
+      : undefined;
+    this.manifests.push({ hostUri, dseq, ...(gated === undefined ? {} : { waitMode: gated }) });
+    if (gated !== undefined) {
       const key = `${hostUri}/${dseq}`;
       if (!this.assigned.has(key)) {
         this.assigned.set(key, { host: new URL(hostUri).hostname, port: ++this.portCounter });
       }
       const ep = this.assigned.get(key)!;
-      this.onNodeManifest?.(`${ep.host}:${ep.port}`, manifestJson.includes("WAIT_FOR_CONFIG=true"));
+      this.onNodeManifest?.(`${ep.host}:${ep.port}`, gated);
     }
   }
 
@@ -330,6 +335,13 @@ export class FakeSsh {
   signerConnected = true;
   /** host:port targets that refuse connections (torn-down containers). */
   failHosts = new Set<string>();
+  /** Containers whose entrypoint owns sparkdreamd on a home that was never
+   *  filled: with no config the SDK writes a default app.toml, refuses its
+   *  empty minimum-gas-prices and exits. sparkdreamd is PID 1, so the
+   *  provider restarts it forever and lease-shell finds no replica — which is
+   *  what makes an un-gated deployment on a fresh volume unrecoverable
+   *  (upload-node-data can never get in to deliver the config). */
+  crashLooping = new Set<string>();
   /** What `tailscale ping` reports (unjail latency guard). */
   pingOutput = "pong from val-0 (100.64.0.10) via 10.0.0.1:41641 in 12ms";
   /** host:port whose old container still answers after close (zombie check). */
@@ -411,6 +423,9 @@ export class FakeSsh {
   async exec(target: SshTarget, command: string): Promise<SshResult> {
     const id = this.id(target);
     if (this.failHosts.has(id)) throw new Error(`connect ECONNREFUSED ${id}`);
+    if (this.crashLooping.has(id)) {
+      throw new Error(`ssh exit 1 (via lease-shell): lease shell: no active replicas for service`);
+    }
     // A halted node is a crash loop, not a stopped process: sparkdreamd is
     // PID 1, so the container exits and the provider restarts it. SSH answers
     // only inside a boot window — model that as every other attempt landing in
@@ -645,8 +660,15 @@ export function fakeServices(): FakeWorld {
   const rpc = new FakeRpc();
   provider.onChainHash = (dseq) => api.deploymentHashes.get(dseq);
   provider.onNodeManifest = (sshId, waitMode) => {
-    if (waitMode) ssh.started.delete(sshId);
-    else ssh.started.add(sshId);
+    if (waitMode) {
+      ssh.started.delete(sshId);
+      ssh.crashLooping.delete(sshId);
+    } else {
+      ssh.started.add(sshId);
+      // the entrypoint boots the node itself now: on a volume nobody has
+      // uploaded to, that is a crash loop, not a running node
+      if (!ssh.uploaded.has(sshId)) ssh.crashLooping.add(sshId);
+    }
   };
   // a halted node stops serving RPC — the coupling that makes a height probe
   // useless for detecting a deliberate halt

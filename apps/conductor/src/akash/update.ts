@@ -73,3 +73,33 @@ export function updateDeploymentMsgs(input: UpdateInput): PersistUpdate[] {
   }
   return updates;
 }
+
+/**
+ * The inverse of the persist rewrite, for a component about to be deployed
+ * onto a FRESH volume. Every new dseq is a new persistent volume, and a node
+ * whose home is empty with the gate off boots straight into `sparkdreamd
+ * start`: the SDK writes a default app.toml, refuses to start on its empty
+ * `minimum-gas-prices` and exits. sparkdreamd is PID 1, so the container
+ * crash-loops, and a crash-looping container has no replica to lease-shell
+ * into — upload-node-data, the step that would deliver the very config the
+ * node is missing, then fails with "no active replicas" and the launch is
+ * wedged (seen live on a devnet sentry re-placed after persist-start).
+ *
+ * So every path that creates a deployment from an already-persisted SDL has
+ * to re-gate first: the relaunch op, an in-launch re-place, and the
+ * whole-batch redeploy after stale bids. No-op on a first launch (the SDL is
+ * still gated from Phase A) and on a stateless component, whose SDL carries
+ * no gate at all.
+ */
+export function gateForFreshVolume(text: string): string {
+  return text.replace(/WAIT_FOR_CONFIG=false/g, "WAIT_FOR_CONFIG=true");
+}
+
+/** File form of {@link gateForFreshVolume}: true when it actually re-gated. */
+export function gateSdlForFreshVolume(sdlPath: string): boolean {
+  const text = fs.readFileSync(sdlPath, "utf8");
+  const gated = gateForFreshVolume(text);
+  if (gated === text) return false;
+  fs.writeFileSync(sdlPath, gated);
+  return true;
+}

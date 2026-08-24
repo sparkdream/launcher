@@ -877,6 +877,82 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     db.close();
   }, 180_000);
 
+  it("re-place a NODE after persist-start: the fresh volume is re-gated, not booted empty", async () => {
+    // Seen live on a devnet sentry: the re-place deployed from the persisted
+    // SDL, whose WAIT_FOR_CONFIG persist-start had already flipped off. The
+    // fresh volume is empty, so the entrypoint's sparkdreamd found no config,
+    // died on "set min gas price in app.toml" and crash-looped as PID 1 —
+    // leaving no replica for upload-node-data to lease-shell into, the step
+    // that would have delivered the config. Every new deployment off a
+    // persisted SDL has to wait for node-data again.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec();
+    db.createLaunch("nodereplace", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const api = services.api as any;
+    const signer = new FakeSigner();
+    const fleet = new FleetService(db, services, work);
+    const applyTxEffects = (msgs: any[]) => {
+      for (const m of msgs) {
+        if (m.typeUrl.includes("MsgCreateDeployment") || m.typeUrl.includes("MsgUpdateDeployment")) {
+          api.deploymentHashes.set(String(m.value.id.dseq), m.value.hash);
+        }
+        if (m.typeUrl.includes("MsgCloseDeployment")) {
+          api.leaseStates.set(String(m.value.id.dseq), "closed");
+        }
+      }
+    };
+    const drive = async () => {
+      for (;;) {
+        const result = await runLaunch(db, "nodereplace", s, work, allSteps(), services);
+        if (result.status !== "awaiting-signature") return result;
+        const pending = db.nextPendingTx("nodereplace")!;
+        const msgs = JSON.parse(pending.msgs_json);
+        const txHash = await signer.sign(msgs);
+        applyTxEffects(msgs);
+        db.setPendingTxSigned("nodereplace", pending.step, txHash);
+      }
+    };
+    const finish = (label: string, result: any) => {
+      if (result.status !== "completed") {
+        const step = db.listSteps("nodereplace").find((x) => x.status !== "done");
+        throw new Error(`${label} ended ${result.status} at ${step?.name}: ${step?.error}`);
+      }
+    };
+
+    finish("first run", await drive());
+    // the SDL on disk is the persisted one now: gate off, tunnels baked
+    const sdlPath = path.join(launchDirs(work, "nodereplace").sdl, "sentry-0.yaml");
+    expect(fs.readFileSync(sdlPath, "utf8")).toContain("WAIT_FOR_CONFIG=false");
+
+    fleet.materialize("nodereplace");
+    db.setLaunchStatus("nodereplace", "paused");
+    const sentry = db.listFleetComponents("nodereplace").find((c) => c.key === "sentry-0")!;
+    const deadDseq = sentry.dseq;
+    await fleet.requestReplace(db.getLaunch("nodereplace")!, sentry);
+    const close = db.nextPendingTx("nodereplace")!;
+    const closeMsgs = JSON.parse(close.msgs_json);
+    const closeHash = await signer.sign(closeMsgs);
+    applyTxEffects(closeMsgs);
+    db.setPendingTxSigned("nodereplace", close.step, closeHash);
+
+    finish("re-place", await drive());
+
+    // the replacement's FIRST manifest parks the container in wait mode, so
+    // upload-node-data can still get in; persist-start hands it back to the
+    // entrypoint afterwards
+    const plan = db.stepOutput<any>("nodereplace", "create-deployments")!;
+    const freshDseq = String(plan.perNode["sentry-0"].dseq);
+    expect(freshDseq).not.toBe(deadDseq);
+    const gates = services.provider.manifests
+      .filter((m) => m.dseq === freshDseq)
+      .map((m) => m.waitMode);
+    expect(gates[0]).toBe(true);
+    expect(gates.at(-1)).toBe(false);
+    db.close();
+  }, 180_000);
+
   it("re-run persist-start: signs the drifted component only, and stops on a closed one", async () => {
     // Seen live: a validator whose relaunch was aborted after its deploy came
     // back on a deployment rendered from a GATED SDL (WAIT_FOR_CONFIG=true),

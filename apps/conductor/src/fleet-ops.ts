@@ -12,6 +12,7 @@ import { PRICING_DENOM } from "./render-sdl.js";
 import { isManifestAlreadyDeployed, pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
+import { gateForFreshVolume } from "./akash/update.js";
 import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
@@ -569,7 +570,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         let sdl = fs.readFileSync(sdlPath, "utf8");
         sdl = sdl.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${authkey}`);
         // fresh volume must wait for node-data again (no-op for components)
-        sdl = sdl.replace(/WAIT_FOR_CONFIG=false/g, "WAIT_FOR_CONFIG=true");
+        sdl = gateForFreshVolume(sdl);
         // the peers this component tunnels to may have moved since its env
         // was last written (their own relaunch, a headscale re-key) — deploy
         // with their CURRENT addresses so the fresh container comes up

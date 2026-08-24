@@ -26,6 +26,7 @@ import {
   type ProviderInfo,
 } from "../akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../akash/sdl-groups.js";
+import { gateForFreshVolume, gateSdlForFreshVolume } from "../akash/update.js";
 import { vendorDir } from "../vendor.js";
 import type { Certificate, SshTarget } from "../services.js";
 import { placeholder } from "./phase-a.js";
@@ -592,6 +593,12 @@ export const createDeploymentsStep: StepDef = {
       let rendered = fs.readFileSync(sdlPath, "utf8");
       const authkey = preauth.perNode[key];
       if (authkey) rendered = rendered.replace(placeholder.tsAuthkey(key), authkey);
+      // this step re-runs on the PERSISTED SDLs after stale-bid recovery (and
+      // on a re-opened launch), and every dseq below is a new deployment on an
+      // empty volume — re-gate or the node boots against no config at all
+      const gated = gateForFreshVolume(rendered);
+      if (gated !== rendered) ctx.log(`${key}: fresh volume, WAIT_FOR_CONFIG re-gated`);
+      rendered = gated;
       fs.writeFileSync(sdlPath, rendered);
 
       const artifacts = sdlArtifacts(loadSdl(sdlPath));
@@ -990,7 +997,11 @@ async function rebidComponent(
   //    is keyed by that attempt's dseq: a second re-place of the same
   //    component would otherwise find the FIRST attempt's confirmed rows
   //    under the same step name and "succeed" without deploying anything.
-  const artifacts = sdlArtifacts(loadSdl(path.join(ctx.dirs.sdl, `${key}.yaml`)));
+  const sdlPath = path.join(ctx.dirs.sdl, `${key}.yaml`);
+  // the replacement lands on a fresh volume, so it must wait for node-data
+  // again — the persisted SDL boots it against an empty home (gateForFreshVolume)
+  if (gateSdlForFreshVolume(sdlPath)) ctx.log(`${key}: fresh volume, WAIT_FOR_CONFIG re-gated`);
+  const artifacts = sdlArtifacts(loadSdl(sdlPath));
   const dseq = await pinnedValue(ctx, `rebid-${key}-dseq`, async () =>
     String(await ctx.services.api.latestBlockHeight()),
   );
