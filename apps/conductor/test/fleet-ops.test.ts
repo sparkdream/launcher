@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { toEncodeObject, TypeUrl } from "@sparkdream/akash-tx";
-import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { testnetSpec, VENDORED_CHAIN_VERSION, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner, type GentxSigner, type StepDef } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
@@ -28,6 +28,12 @@ function tmp(): string {
 afterAll(() => {
   for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
+
+/** The version one patch above the vendored one, which the profiles pin. */
+function nextChainVersion(): string {
+  const [major, minor, patch] = VENDORED_CHAIN_VERSION.replace(/^v/, "").split(".").map(Number);
+  return `v${major}.${minor}.${patch! + 1}`;
+}
 
 // relaunch ops are asserted by where the component lands, so these specs turn
 // anti-affinity on: no profile does by default
@@ -896,7 +902,11 @@ describe("chain reset op", () => {
   it("swaps the node image mid-reset when the reset rides an upgrade", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
-    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.27";
+    // one patch PAST the vendored version: a reset re-validates the spec, and
+    // an image older than the vendored reference genesis is refused there. A
+    // pinned tag would go stale on the next sync-vendor, which is how this
+    // test started failing once the vendor moved to v1.0.31.
+    const image = `sparkdreamnft/sparkdreamd-testnet-ssh:${nextChainVersion()}`;
     const edited = JSON.parse(launch.spec_json);
     edited.images = { ...edited.images, sparkdreamd: image };
     w.fleet.requestChainReset(launch, edited);
