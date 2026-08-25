@@ -365,18 +365,20 @@ export function retagImage(image: string | null, version: string): string | unde
 /**
  * Has this node hit its configured halt height?
  *
- * Read from the container's own log stream, and deliberately neither an RPC
- * probe nor an SSH one — both fail for the same reason. sparkdreamd is PID 1
- * (deploy/docker/entrypoint_ssh.sh `exec "$@"`), so refusing the halt-height
- * block exits the container and Akash restarts it, which boots straight back
- * into the same halt: a halted node is a CRASH LOOP, not a stopped process.
- * There is no window where the container is up and the node is down, so
- * "sparkdreamd is gone" is never observable; RPC is dead throughout (and
- * cosmos refuses the halt block inside FinalizeBlock, so the head stops at
- * H-1 and never reaches H anyway); and SSH only answers during each boot
- * attempt, disappearing entirely into the provider's restart backoff
- * ("no active replicas for service"). The log stream is the one source that
- * outlives the restarts, and the halt line is reprinted on every lap.
+ * Read from the container's own log stream, because the halt leaves nothing
+ * else to read. cosmos refuses the halt-height block inside FinalizeBlock, so
+ * the committed head stops at H-1: an RPC gate of `height >= H` is one
+ * nothing can ever satisfy, and comet tears its consensus routine down around
+ * the refusal, so the height it does serve stops moving whether or not the
+ * halt is why. The log line is the only statement of the halt itself, and the
+ * one the operator would read too.
+ *
+ * The process does not exit (2026-08-25, devnet at 25000): comet logs
+ * CONSENSUS FAILURE, stops the WAL, and leaves the container up and quiet,
+ * p2p still running. So SSH keeps answering — halt-clear lands on the first
+ * try — and the halt line stays in the tail rather than scrolling past on a
+ * restart. It can still scroll out on a node that keeps chattering (pex on a
+ * sentry), which is what the caller's stickiness is for.
  */
 async function haltObserved(
   ctx: StepCtx,

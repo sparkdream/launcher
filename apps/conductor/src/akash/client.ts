@@ -29,6 +29,25 @@ export interface AkashApi {
   aktUsdPrice(): Promise<number | undefined>;
 }
 
+/**
+ * One log websocket frame → one printable line: `{"name":"sparkdreamd-0",
+ * "message":"…"}` becomes `[sparkdreamd] …`, the replica suffix dropped the
+ * way console renders it. Anything that isn't a log frame is passed through
+ * untouched, so a provider that says something unexpected still reaches the
+ * reader instead of being swallowed.
+ */
+export function formatLogFrame(frame: string): string {
+  let entry: { name?: string; message?: string };
+  try {
+    entry = JSON.parse(frame) as { name?: string; message?: string };
+  } catch {
+    return frame;
+  }
+  if (typeof entry.message !== "string") return frame;
+  const service = entry.name?.split("-")[0];
+  return service ? `[${service}] ${entry.message}` : entry.message;
+}
+
 export interface DeploymentSummary {
   dseq: string;
   state: string;
@@ -120,20 +139,10 @@ export class ProviderClient {
     cmd: string[],
     opts: { timeoutMs?: number } = {},
   ): Promise<{ stdout: string; stderr: string }> {
-    const base = new URL(hostUri);
     const query = new URLSearchParams({ service, podIndex: "0", tty: "0", stdin: "0" });
     cmd.forEach((c, i) => query.set(`cmd${i}`, c));
-    const url = `wss://${base.hostname}:${base.port || 8443}/lease/${dseq}/${gseq}/${oseq}/shell?${query}`;
-    const { default: WebSocket } = await import("ws");
+    const ws = await this.leaseSocket(hostUri, `/lease/${dseq}/${gseq}/${oseq}/shell?${query}`);
     return new Promise((resolve, reject) => {
-      // servername passes through to tls.connect but ws's types don't
-      // declare it — same no-SNI mTLS-path reason as request()
-      const ws = new WebSocket(url, {
-        cert: this.creds.certPem,
-        key: this.creds.keyPem,
-        rejectUnauthorized: false,
-        servername: "",
-      } as unknown as ConstructorParameters<typeof WebSocket>[1]);
       let stdout = "";
       let stderr = "";
       let settled = false;
@@ -202,18 +211,75 @@ export class ProviderClient {
     return JSON.parse(body || "{}");
   }
 
+  /**
+   * mTLS websocket to one of a lease's streaming endpoints.
+   *
+   * Both of them (logs and shell) need the same no-SNI handshake the REST
+   * calls do, so the trick lives in one place.
+   */
+  private async leaseSocket(hostUri: string, path: string) {
+    const base = new URL(hostUri);
+    const { default: WebSocket } = await import("ws");
+    // servername passes through to tls.connect but ws's types don't
+    // declare it — same no-SNI mTLS-path reason as request()
+    return new WebSocket(`wss://${base.hostname}:${base.port || 8443}${path}`, {
+      cert: this.creds.certPem,
+      key: this.creds.keyPem,
+      rejectUnauthorized: false,
+      servername: "",
+    } as unknown as ConstructorParameters<typeof WebSocket>[1]);
+  }
+
+  /**
+   * Recent service logs for a lease.
+   *
+   * `/lease/.../logs` reads like a REST endpoint and is not one: the gateway
+   * hands the request straight to its websocket upgrader, so a plain GET is
+   * refused with a bodyless `400 Bad Request` naming neither the endpoint
+   * nor the reason. Same transport as lease-shell, different framing: one
+   * JSON object per frame, `{"name","message"}`, and under follow=false the
+   * provider streams the tail and then drops the connection without a close
+   * handshake — an ordinary end of stream here, not an error, so close
+   * resolves with whatever arrived rather than rejecting.
+   */
   async leaseLogs(
     hostUri: string,
     dseq: string,
     gseq: number,
     oseq: number,
     tail: number,
+    opts: { timeoutMs?: number } = {},
   ): Promise<string> {
-    return this.request(
-      "GET",
-      hostUri,
-      `/lease/${dseq}/${gseq}/${oseq}/logs?follow=false&tail=${tail}`,
-    );
+    const query = new URLSearchParams({ follow: "false", tail: String(tail) });
+    const ws = await this.leaseSocket(hostUri, `/lease/${dseq}/${gseq}/${oseq}/logs?${query}`);
+    return new Promise((resolve, reject) => {
+      const lines: string[] = [];
+      let settled = false;
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          ws.terminate();
+        } catch {
+          // already closed
+        }
+        fn();
+      };
+      // a provider that accepts the socket and then never finishes the tail
+      // still owes the caller the lines it did send
+      const timer = setTimeout(
+        () => done(() => resolve(lines.join("\n"))),
+        opts.timeoutMs ?? 60_000,
+      );
+      ws.on("message", (data: Buffer) => {
+        for (const frame of data.toString().split("\n")) {
+          if (frame.trim()) lines.push(formatLogFrame(frame));
+        }
+      });
+      ws.on("error", (e: Error) => done(() => reject(e)));
+      ws.on("close", () => done(() => resolve(lines.join("\n"))));
+    });
   }
 
   private request(method: string, hostUri: string, path: string, body?: string): Promise<string> {
