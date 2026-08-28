@@ -165,6 +165,26 @@ describe("relaunch op", () => {
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
 
+  it("takes the node's own RPC as proof of the restart when its shell goes quiet", async () => {
+    // the live shape: the persist push re-creates the container, its
+    // forwarded SSH port moves with it, and the wait that follows failed a
+    // relaunch whose node had booted and was serving
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const launch = w.db.getLaunch("fl")!;
+    await w.fleet.requestRelaunch(launch, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    // wherever the node ends up, the one question the wait asks over SSH
+    // goes unanswered
+    w.services.ssh.mutedCommands.push(/pgrep -x sparkdreamd/);
+
+    expect((await driveOps(w)).status).toBe("completed");
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+  }, 120_000);
+
   it("a stacked relaunch on the same component supersedes the prior op (no deploy→lease→deploy loop)", async () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;

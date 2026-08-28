@@ -330,6 +330,12 @@ export function rewriteTailnetIps(text: string, map: Map<string, string>): strin
  *  that turns out to be. */
 const SSH_POLL_DEADLINE_MS = 6 * 60_000;
 
+/** How long a node gets to come back on its own before a poll starts
+ *  issuing the start command itself: long enough for a re-created
+ *  container's entrypoint (image pull, tailscale join) to reach the
+ *  binary, short enough that a node nothing restarted isn't left idle. */
+const NODE_NUDGE_GRACE_MS = 60_000;
+
 /**
  * Poll until `probe` returns true, bounded by attempts AND by the clock.
  *
@@ -414,6 +420,50 @@ async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<numbe
   if (!sentry) return undefined;
   const url = await nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
   return (await ctx.services.rpc.status(url)).latestBlockHeight;
+}
+
+/**
+ * Height a node reports for ITSELF, over paths that do not run through its
+ * SSH endpoint.
+ *
+ * Two readings, cheapest first: the forwarded CometBFT RPC where the
+ * component exposes one, and otherwise the container's own localhost RPC
+ * through the provider's lease-shell — the path console-air's shell uses,
+ * which keeps answering when a forwarded port has moved. (Validators expose
+ * no RPC port, so for them the second reading is the only one.)
+ *
+ * Either answer is proof this node is up and past genesis, which is what a
+ * restart wait is actually asking. SSH silence answers a different question
+ * — whether the launcher can still reach the node's shell — and standing in
+ * for this one is what turned a moved forwarded port into a failed op.
+ */
+async function nodeSelfHeight(
+  ctx: StepCtx,
+  row: FleetComponentRow,
+): Promise<number | undefined> {
+  try {
+    const url = await nodeRpcUrl(ctx, row.host_uri, row.dseq);
+    const h = (await ctx.services.rpc.status(url)).latestBlockHeight;
+    if (h > 0) return h;
+  } catch {
+    // no forwarded RPC on this component, or the port moved with the restart
+  }
+  try {
+    const cert = loadCert(ctx);
+    const r = await ctx.services.provider.shellExec(
+      { certPem: cert.certPem, keyPem: cert.keyPem },
+      row.host_uri,
+      row.dseq,
+      1,
+      1,
+      "sparkdreamd",
+      ["sh", "-c", "wget -qO- http://127.0.0.1:26657/status 2>/dev/null"],
+    );
+    const h = Number(/latest_block_height."?:?"?(\d+)/.exec(r.stdout)?.[1]);
+    return Number.isFinite(h) && h > 0 ? h : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The line cosmos prints on its way down when `halt-height` fires. */
@@ -1241,24 +1291,53 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       for (const { row: r, json } of manifests.filter((m) => m.row.key === key)) {
         await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
       }
+      // Every manifest pushed above re-created a container, and a re-created
+      // container answers SSH on a different forwarded port: probing without
+      // re-reading spends the whole wait on a port nothing listens on, and
+      // leaves the rows wrong for await-signer and verify after it.
+      await refreshSshEndpoints(ctx, manifests.map((m) => m.row));
       // the push boots the relaunched node (entrypoint-owned, its first and
-      // only start) — wait for the process before declaring the op done
+      // only start) — wait for the process before declaring the op done,
+      // reading it both ways round: its shell, and its own RPC, which does
+      // not go through its shell. A node that is demonstrably serving blocks
+      // is back whatever its endpoint record says; failing the op over an
+      // unreachable shell aborts a relaunch that worked, and the stale
+      // record is repair-fleet's job.
       const row = componentRow(ctx, key);
-      let back = false;
-      for (let i = 0; i < 36 && !back; i++) {
-        if (i > 0) await ctx.services.sleep(5000);
-        try {
-          const r = await ctx.services.ssh.exec(
-            rowTarget(ctx, row),
-            "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-            { quick: true },
-          );
-          back = r.stdout.trim() === "yes";
-        } catch {
-          // container restarting
-        }
+      let height: number | undefined;
+      const back = await pollSsh(
+        ctx,
+        async (i) => {
+          if (i > 0 && i % 6 === 0) ctx.log(`${key}: waiting for the node (attempt ${i})`);
+          try {
+            const r = await ctx.services.ssh.exec(
+              rowTarget(ctx, row),
+              "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+              { quick: true },
+            );
+            if (r.stdout.trim() === "yes") return true;
+          } catch {
+            // container restarting, endpoint moved, or the provider is
+            // refusing the shell: the loop is the retry
+          }
+          height = await nodeSelfHeight(ctx, row);
+          return height !== undefined;
+        },
+        // a first boot can include an image pull and a state-sync restore
+        { attempts: 60, deadlineMs: 8 * 60_000 },
+      );
+      if (!back) {
+        throw new Error(
+          `${key} did not come back after the persist restart: no answer over SSH, and it is ` +
+            "serving no RPC either",
+        );
       }
-      if (!back) throw new Error(`${key} did not come back after the persist restart`);
+      if (height !== undefined) {
+        ctx.log(
+          `${key}: no answer over SSH, but it is serving RPC at height ${height} — treating the ` +
+            "restart as done. Run repair fleet to re-read where it answers.",
+        );
+      }
       if (lastStep === p("persist")) ctx.db.setFleetOpStatus(opId, "done");
       return { persisted: targets };
     },
@@ -1280,7 +1359,11 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         for (let attempt = 0; attempt < 12 && !connected; attempt++) {
           if (attempt > 0) await ctx.services.sleep(5000);
           const probe = await ctx.services.ssh
-            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE)
+            // quick: one attempt, bounded — this is a probe inside a
+            // caller-owned retry loop, and an unbounded one hangs the
+            // whole gate on an endpoint that answers the handshake and
+            // then goes quiet
+            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE, { quick: true })
             .catch(() => ({ stdout: "" }));
           connected = probeSaysConnected(probe.stdout);
         }
@@ -1841,7 +1924,10 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         for (const vk of valKeys) {
           const row = componentRow(ctx, vk);
           const probe = await ctx.services.ssh
-            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE)
+            // quick: one attempt, bounded — a probe inside a caller-owned
+            // retry loop, and an unbounded one here hangs the whole gate on
+            // an endpoint that answers the handshake and then goes quiet
+            .exec(rowTarget(ctx, row), SIGNER_CONNECTED_PROBE, { quick: true })
             .catch(() => ({ stdout: "" }));
           if (!probeSaysConnected(probe.stdout)) missing.push(vk);
         }
@@ -2755,31 +2841,100 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
         // endpoints on these rows are exactly as stale as the restart made
         // them; re-read them from the providers before probing
         await refreshSshEndpoints(ctx, rows);
-        const silent: string[] = [];
-        for (const row of rows) {
-          const running = await pollSsh(ctx, async (i) => {
-            if (i > 0 && i % 6 === 0) ctx.log(`${row.key}: waiting for the node (attempt ${i})`);
-            const r = await ctx.services.ssh.exec(
-              rowTarget(ctx, row),
-              "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-              { quick: true },
+        // What the resume is FOR is the chain, and the sentry's RPC states
+        // it directly: the reset restarts at height 1, on nodes whose data
+        // this op wiped, so a committed block is this chain's and means the
+        // validators booted, reached their signers and are producing. SSH
+        // is the secondary reading — the way to nudge a node whose
+        // deployment hash didn't change (no container restart, so nothing
+        // started it), and the only reading there is before the first
+        // block. Gating on SSH alone spent a full poll budget PER NODE
+        // whenever the shells had moved or gone quiet, against a chain that
+        // was already minting blocks the fleet view was drawing — and the
+        // budget is not even a floor: a probe that hangs never comes back
+        // to be timed, so this ran for over an hour on a devnet whose chain
+        // had restarted cleanly and was past height 2000 (2026-08-28). So
+        // the chain is asked first and on every round, the nodes are probed
+        // together rather than one budget after another, and the whole
+        // fleet shares one clock.
+        const sentry = rows.find((r) => r.key.startsWith("sentry-"));
+        let rpcUrl: string | undefined;
+        const chainHeight = async (): Promise<number | undefined> => {
+          if (!sentry) return undefined;
+          try {
+            rpcUrl ??= await nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
+            const h = (await ctx.services.rpc.status(rpcUrl)).latestBlockHeight;
+            // height 0 is comet up on the new genesis with nothing committed
+            // — exactly what a sentry serves when the validator never came
+            // back, so it is not proof of anything yet
+            return h > 0 ? h : undefined;
+          } catch {
+            rpcUrl = undefined; // a restart moves the forwarded RPC port too
+            return undefined;
+          }
+        };
+        const nudgeAfter = Date.now() + NODE_NUDGE_GRACE_MS;
+        const up = new Set<string>();
+        let height: number | undefined;
+        const resumed = await pollSsh(
+          ctx,
+          async (i) => {
+            // blocks are proof for the FLEET, not for each node in it: a
+            // chain can produce with a sentry still stopped, and the only
+            // thing that starts a node nothing restarted is the nudge
+            // below. So the chain ends the wait once every node has had its
+            // grace period and its nudge — before that, keep probing.
+            height = await chainHeight();
+            if (height !== undefined && Date.now() >= nudgeAfter) return true;
+            const pending = rows.filter((r) => !up.has(r.key));
+            if (i > 0 && i % 6 === 0) {
+              ctx.log(`waiting for ${pending.map((r) => r.key).join(", ")} (attempt ${i})`);
+            }
+            // probed together: independent nodes on independent providers,
+            // where a probe that fails costs the full SSH timeout — run in
+            // series they turn one node's dead endpoint into every other
+            // node's wait
+            const answers = await Promise.all(
+              pending.map(async (row) => {
+                try {
+                  const r = await ctx.services.ssh.exec(
+                    rowTarget(ctx, row),
+                    "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+                    { quick: true },
+                  );
+                  return { row, running: r.stdout.trim() === "yes" };
+                } catch {
+                  return { row, running: undefined }; // unreachable: the loop is the retry
+                }
+              }),
             );
-            if (r.stdout.trim() === "yes") return true;
-            // a node whose deployment hash didn't change (relaunched nodes
-            // already carried wait mode) gets no container restart and must
-            // be started the SSH way. Only ever off a probe that ANSWERED
-            // "no": nudging a node we cannot reach used to fire blind after
-            // 12 failures, which both risked double-starting a node that was
+            for (const a of answers) if (a.running) up.add(a.row.key);
+            // nudges stay in row order (sentries first — validators dial
+            // them on start), and only ever off a probe that ANSWERED "no":
+            // nudging a node we cannot reach used to fire blind after 12
+            // failures, which both risked double-starting a node that was
             // running fine and, being non-quick, cost four websocket
-            // timeouts per attempt. The grace period keeps the nudge clear
-            // of a restarting container's entrypoint (tailscale join etc.).
-            if (i >= 12) await ctx.services.ssh.exec(rowTarget(ctx, row), START_NODE_CMD, {
-              quick: true,
-            });
-            return false;
-          });
-          if (!running) silent.push(row.key);
-        }
+            // timeouts per attempt.
+            for (const a of answers) {
+              if (a.running !== false || Date.now() < nudgeAfter) continue;
+              await ctx.services.ssh
+                .exec(rowTarget(ctx, a.row), START_NODE_CMD, { quick: true })
+                .catch(() => {
+                  // the probe answered, so this should reach it too; if it
+                  // doesn't, the next round re-probes and the chain check
+                  // still decides the step
+                });
+            }
+            return rows.every((r) => up.has(r.key));
+          },
+          // one clock for the fleet, wide enough for a slow container
+          // restart (image pull, mesh join) to reach its first block; the
+          // chain check ends the poll the moment it does, so the ceiling
+          // only ever costs a fleet that really did not come back
+          { attempts: 200, deadlineMs: 12 * 60_000 },
+        );
+        if (!resumed) height ??= await chainHeight();
+        const silent = rows.filter((r) => !up.has(r.key)).map((r) => r.key);
         if (silent.length > 0) {
           // SSH silence is not proof a node is down — the endpoint may have
           // moved again, or its provider may be refusing the shell. The
@@ -2788,7 +2943,6 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
           // stale record is repair-fleet's job, not a reason to fail a reset
           // that worked (observed live: this step failing a fleet whose
           // chain had been up for ten minutes).
-          const height = await sentryRpcHeight(ctx).catch(() => undefined);
           if (height === undefined) {
             throw new Error(
               `${silent.join(", ")} did not come back after the resume flip, and no sentry RPC ` +
@@ -2801,7 +2955,11 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
               "they answer.",
           );
         }
-        return { resumed: rows.map((r) => r.key), ...(silent.length > 0 ? { silent } : {}) };
+        return {
+          resumed: rows.map((r) => r.key),
+          ...(height !== undefined ? { height } : {}),
+          ...(silent.length > 0 ? { silent } : {}),
+        };
       },
     },
     {

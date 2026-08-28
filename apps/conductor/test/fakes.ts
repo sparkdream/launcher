@@ -335,6 +335,11 @@ export class FakeSsh {
   signerConnected = true;
   /** host:port targets that refuse connections (torn-down containers). */
   failHosts = new Set<string>();
+  /** Commands that go unanswered wherever they are sent: the endpoint
+   *  completes a handshake and then says nothing, which is what a forwarded
+   *  port left pointing at a re-created container does — and what a poll
+   *  cannot tell apart from a node that is down. */
+  mutedCommands: RegExp[] = [];
   /** Containers whose entrypoint owns sparkdreamd on a home that was never
    *  filled: with no config the SDK writes a default app.toml, refuses its
    *  empty minimum-gas-prices and exits. sparkdreamd is PID 1, so the
@@ -423,6 +428,9 @@ export class FakeSsh {
   async exec(target: SshTarget, command: string): Promise<SshResult> {
     const id = this.id(target);
     if (this.failHosts.has(id)) throw new Error(`connect ECONNREFUSED ${id}`);
+    for (const re of this.mutedCommands) {
+      if (re.test(command)) throw new Error(`ssh timeout after 20000ms: ${command}`);
+    }
     if (this.crashLooping.has(id)) {
       throw new Error(`ssh exit 1 (via lease-shell): lease shell: no active replicas for service`);
     }

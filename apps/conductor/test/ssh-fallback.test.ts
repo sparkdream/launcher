@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { Server } from "ssh2";
 import { Ssh2Runner } from "../src/adapters.js";
 import { generateSshKeypair } from "../src/keys.js";
 import type { SshTarget } from "../src/services.js";
@@ -120,6 +121,37 @@ describe("lease-shell SSH fallback", () => {
     );
     expect(attempts).toBe(1);
   });
+
+  it("reroutes exec when the endpoint answers the handshake and then goes quiet", async () => {
+    // the live shape (2026-08-28): a forwarded port that still accepts TCP
+    // and completes an SSH handshake, but whose command stream never
+    // answers. It is not a connect failure, so the fallback used to sit it
+    // out and throw — leaving the one path that could still reach the node,
+    // the one console-air uses, untried, and holding a reset's resume for
+    // its whole poll budget while the chain was producing blocks
+    const hostKey = generateSshKeypair().privateKeyPem;
+    const server = new Server({ hostKeys: [hostKey] }, (client) => {
+      client.on("authentication", (a) => a.accept());
+      client.on("ready", () => {
+        client.on("session", (accept) => {
+          accept().on("exec", () => {
+            /* accepts the command and never answers it */
+          });
+        });
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const stub = stubShell();
+      const runner = new Ssh2Runner(() => stub.client);
+      const target = { ...deadTarget(), port };
+      const r = await runner.exec(target, "pgrep -x sparkdreamd", { timeoutMs: 300 });
+      expect(r.stdout).toBe("ran:pgrep -x sparkdreamd");
+    } finally {
+      server.close();
+    }
+  }, 30_000);
 
   it("does not retry command failures, only handshake errors", async () => {
     let attempts = 0;

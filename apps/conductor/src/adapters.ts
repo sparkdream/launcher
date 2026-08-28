@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import { Client } from "ssh2";
+import { Client, type ClientChannel } from "ssh2";
 import { ProviderClient, type MtlsCredentials } from "./akash/client.js";
 import { run } from "./exec.js";
 import type {
@@ -22,6 +22,21 @@ function isConnectFailure(e: unknown): boolean {
   return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|Timed out while waiting for handshake/i.test(s);
 }
 
+/**
+ * The session came up and then the command said nothing inside the caller's
+ * window (see exec's streamTimeout).
+ *
+ * Its own class because it is not a connect failure and reads nothing like
+ * one, while being exactly as good a reason to try the provider's
+ * lease-shell: a forwarded port that completes a handshake and then goes
+ * quiet is the shape of a port pointing at a container other than the one it
+ * used to. Matched as a plain error it was thrown straight to the caller, so
+ * the one path that could still have reached the node — the same path
+ * console-air uses, and which works when direct SSH does not — was never
+ * tried.
+ */
+class SshStreamTimeout extends Error {}
+
 /** ssh2-backed runner (§9). One connection per operation — orchestration is low-volume. */
 export class Ssh2Runner implements SshRunner {
   constructor(
@@ -36,30 +51,45 @@ export class Ssh2Runner implements SshRunner {
     command: string,
     opts: { quick?: boolean; timeoutMs?: number } = {},
   ): Promise<SshResult> {
-    // readyTimeout below bounds the handshake, but nothing bounds the
-    // command stream once a session is up: a probe whose stream never
-    // closes waits forever, inside a retry loop that then never gets to
-    // retry. Bounded only where a caller asked for it — long-running work
-    // (archive replay, genesis rebuild) has no business being cut off.
+    // readyTimeout below bounds the handshake, but nothing bounds what
+    // happens after one: a probe that gets no answer waits forever, inside
+    // a retry loop that then never gets to retry. Bounded only where a
+    // caller asked for it — long-running work (archive replay, genesis
+    // rebuild) has no business being cut off.
+    //
+    // The bound runs from the moment the command is ASKED for, not from the
+    // moment a stream comes back. ssh2 does not call the exec callback
+    // until the peer confirms the channel, so a timer armed inside it
+    // covers only the case where a session opened and answered nothing —
+    // and misses the case where the channel open itself is never answered,
+    // which hangs with no timer running at all. That is the shape a
+    // forwarded port left pointing at some other container has, and it held
+    // a reset's resume for its whole poll budget.
     const streamTimeout = opts.timeoutMs ?? (opts.quick ? Ssh2Runner.QUICK_STREAM_MS : undefined);
     try {
       return await this.withConnection(target, (conn) =>
         new Promise<SshResult>((resolve, reject) => {
-          conn.exec(command, (err, stream) => {
-            if (err) return reject(err);
+          let stream: ClientChannel | undefined;
+          const timer =
+            streamTimeout === undefined
+              ? undefined
+              : setTimeout(() => {
+                  stream?.destroy();
+                  reject(new SshStreamTimeout(`ssh timeout after ${streamTimeout}ms: ${command}`));
+                }, streamTimeout);
+          conn.exec(command, (err, ch) => {
+            if (err) {
+              clearTimeout(timer);
+              return reject(err);
+            }
+            stream = ch;
             let stdout = "";
             let stderr = "";
-            const timer =
-              streamTimeout === undefined
-                ? undefined
-                : setTimeout(() => {
-                    stream.destroy();
-                    reject(new Error(`ssh timeout after ${streamTimeout}ms: ${command}`));
-                  }, streamTimeout);
-            stream
-              .on("data", (d: Buffer) => (stdout += d.toString()))
-              .stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-            stream.on("close", (code: number) => {
+            ch.on("data", (d: Buffer) => (stdout += d.toString())).stderr.on(
+              "data",
+              (d: Buffer) => (stderr += d.toString()),
+            );
+            ch.on("close", (code: number) => {
               clearTimeout(timer);
               if (code === 0 || code === null) resolve({ stdout, code: code ?? 0 });
               else reject(new Error(`ssh exit ${code}: ${command}\n${stderr.slice(-1000)}`));
@@ -68,7 +98,7 @@ export class Ssh2Runner implements SshRunner {
         }),
       );
     } catch (e) {
-      if (!target.shellFallback || !isConnectFailure(e)) throw e;
+      if (!target.shellFallback || !(isConnectFailure(e) || e instanceof SshStreamTimeout)) throw e;
       return this.fallbackExec(target, command, opts);
     }
   }
