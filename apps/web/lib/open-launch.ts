@@ -10,7 +10,9 @@
  * another chain's fleet.
  *
  * That leaves the account's fleets as the authority, and the choice is a
- * ranking over them rather than a stored id alone.
+ * ranking over them rather than a stored id alone. An account with no fleets
+ * ranks nothing, and is not necessarily a deploy account at all: a validator
+ * operator connects that way to sign its gentx. It keeps the panel it has.
  */
 
 /** A row of the wallet-scoped fleet view, reduced to what the choice needs. */
@@ -34,6 +36,16 @@ export function openLaunchFor(
   fleets: LaunchChoice[],
   current: string | null,
 ): string | null {
+  // An account with no fleets of its own has nothing to swap the panel to,
+  // and this is exactly how a signing account arrives: the gentx and unjail
+  // banners ask for the operator account ("select the matching account in
+  // Keplr"), not the deploy account, and those banners live in this panel.
+  // Clearing it there took the Sign button off the screen at the one moment
+  // it was needed. What it remembered counts too, so a reload mid-signature
+  // comes back to the banner: nothing here can check that id against fleets
+  // that do not exist, so the panel's own poll clears it if the launch is
+  // gone (404) or not this account's to read (403).
+  if (fleets.length === 0) return stored === EDITOR ? null : (stored ?? current);
   // a remembered launch the account still has stays open
   if (stored && fleets.some((f) => f.launchId === stored)) return stored;
   // a launch just created is stored and open before the next sweep sees it:

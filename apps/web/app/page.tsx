@@ -608,7 +608,9 @@ export default function Page() {
   // the testnet account to the devnet one) left the header naming a chain
   // that no card below it belonged to. The account's own fleets are the
   // authority, re-checked on every sweep — so a launch whose account is no
-  // longer connected cannot stay open either.
+  // longer connected cannot stay open either, unless the account that took
+  // its place has no fleets to rank (a validator operator connecting to sign
+  // its gentx: openLaunchFor).
   const owner = wallet?.address ?? null;
   const openLaunch = useCallback(
     (id: string) => {
@@ -629,8 +631,12 @@ export default function Page() {
     setLaunchId(null);
   }, [owner]);
   useEffect(() => {
-    if (!owner) return setLaunchId(null);
-    if (!fleet) return;
+    // A Keplr account switch drops the wallet for a beat before it reconnects
+    // as the new account. The open launch waits out that gap instead of being
+    // cleared in it: a gentx signer switches accounts exactly here, and the
+    // banner it came for is in this panel. The new account's own fleet sweep
+    // re-resolves it a moment later.
+    if (!owner || !fleet) return;
     const next = openLaunchFor(
       localStorage.getItem(lastLaunchKey(owner)),
       fleet.fleets.map((f) => ({
@@ -640,6 +646,9 @@ export default function Page() {
       })),
       launchId,
     );
+    // a signing account has no fleets to rank, so nothing would re-derive
+    // this after a reload: remember what it is holding open
+    if (next && fleet.fleets.length === 0) localStorage.setItem(lastLaunchKey(owner), next);
     setLaunchId(next);
   }, [owner, fleet, launchId]);
 
@@ -1212,14 +1221,19 @@ export default function Page() {
     }
   };
 
-  // poll launch status + pending tx while a launch is active
+  // drop the previous launch's state immediately on switch — a stale pending
+  // tx must never be signable against the new launch id. Its own effect, so
+  // that re-running the poll below (a Keplr account switch re-binds it) does
+  // not blank a banner that is still current.
   useEffect(() => {
-    // drop the previous launch's state immediately on switch — a stale
-    // pending tx must never be signable against the new launch id
     setLaunch(null);
     setPending(null);
     setPendingGentx(null);
     setStepsExpanded(false);
+  }, [launchId]);
+
+  // poll launch status + pending tx while a launch is active
+  useEffect(() => {
     if (!launchId) return;
     let stop = false;
     const tick = async () => {
@@ -1232,7 +1246,14 @@ export default function Page() {
         setPending(await getPendingTx(launchId));
         setPendingGentx(await getPendingGentx(launchId));
       } catch (e) {
-        if (!stop) setError(String(e));
+        if (stop) return;
+        // The open launch is held across a Keplr account switch for the
+        // signing accounts, which have no fleet list to check it against.
+        // This poll is that check: a launch since deleted (404), or one this
+        // session is not allowed to read (403, wallet auth on), is not a
+        // choice to keep remembering.
+        if (/^Error: (404|403):/.test(String(e))) return forgetLaunch();
+        setError(String(e));
       }
     };
     tick();
@@ -1241,7 +1262,7 @@ export default function Page() {
       stop = true;
       clearInterval(t);
     };
-  }, [launchId]);
+  }, [launchId, forgetLaunch]);
 
   const create = async () => {
     if (!wallet) return setError("connect Keplr first");
@@ -3012,8 +3033,21 @@ export default function Page() {
         {/* ---------- empty fleet placeholder ---------- */}
         {wallet && (!fleet || fleet.fleets.length === 0) && (
           <div className="placeholder">
-            Your fleet appears here once the chain is live: validator, sentry, headscale,
-            explorer and frontend.
+            {launch ? (
+              // a gentx signer connects its operator account, which owns no
+              // deployments of its own: the panel above stays (it holds the
+              // signing banner), but the cards down here belong to the
+              // deploy account and only come back with it
+              <>
+                This account owns no deployments. The launch above belongs to the deploy
+                account: select that account in Keplr to see its fleet cards again.
+              </>
+            ) : (
+              <>
+                Your fleet appears here once the chain is live: validator, sentry, headscale,
+                explorer and frontend.
+              </>
+            )}
           </div>
         )}
 

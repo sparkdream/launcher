@@ -49,9 +49,19 @@ describe("open launch", () => {
     expect(openLaunchFor(null, [done("first"), done("second")], null)).toBe("second");
   });
 
+  it("keeps the open launch for an account with no fleets of its own", () => {
+    // the reported case: a gentx pauses the launch and asks for the operator
+    // account ("select the matching account in Keplr"). That account owns no
+    // deployments, and clearing the panel took the Sign button with it
+    expect(openLaunchFor(null, [], "signing-launch")).toBe("signing-launch");
+    // and what it remembered, so a reload mid-signature comes back to the
+    // banner rather than to an empty editor
+    expect(openLaunchFor("signing-launch", [], null)).toBe("signing-launch");
+    expect(openLaunchFor(EDITOR, [], "signing-launch")).toBe(null);
+  });
+
   it("opens nothing for an account with no fleets, or only closed ones", () => {
     expect(openLaunchFor(null, [], null)).toBe(null);
-    expect(openLaunchFor("gone", [], null)).toBe(null);
     expect(openLaunchFor(null, [closed("shut")], null)).toBe(null);
   });
 
