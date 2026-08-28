@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { chainId, resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, frozenResetViolations, resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpProgress, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -1698,8 +1698,10 @@ export class FleetService {
    * stored one; genesis-shaping fields (accounts + members, chainParams,
    * token) are free to change and the keyring is rebuilt around them, but
    * anything the deployed fleet embodies — topology, domains, resources —
-   * must stay as launched. The chain-id suffix always moves forward so
-   * signer state can never bleed across resets.
+   * must stay as launched, the chain-id included: a reset restarts the
+   * same chain rather than standing up a new one beside it. That makes the
+   * signer watermark the thing that has to move, so the op stops for the
+   * operator to clear it before any node comes back up.
    */
   requestChainReset(launch: LaunchRow, proposedInput: unknown): number {
     const current = this.spec(launch);
@@ -1737,41 +1739,17 @@ export class FleetService {
         "spec invalid: " + check.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
       );
     }
-    const frozen: Array<[string, unknown, unknown]> = [
-      ["network.name", current.network.name, proposed.network.name],
-      ["network.type", current.network.type, proposed.network.type],
-      ["network.bech32Prefix", current.network.bech32Prefix, proposed.network.bech32Prefix],
-      ["security.keyMode", current.security.keyMode, proposed.security.keyMode],
-      [
-        "topology.validators.count",
-        current.topology.validators.count,
-        proposed.topology.validators.count,
-      ],
-      ["topology.sentries.count", current.topology.sentries.count, proposed.topology.sentries.count],
-      ["topology.components", current.topology.components, proposed.topology.components],
-      [
-        "topology.publicEndpoints",
-        current.topology.publicEndpoints,
-        proposed.topology.publicEndpoints,
-      ],
-      ["topology.headscale", current.topology.headscale, proposed.topology.headscale],
-      ["infra", current.infra, proposed.infra],
-      ["images.headscale", current.images.headscale, proposed.images.headscale],
-      ["images.explorer", current.images.explorer, proposed.images.explorer],
-      ["images.frontend", current.images.frontend, proposed.images.frontend],
-      ["images.hub", current.images.hub, proposed.images.hub],
-    ];
-    for (const [field, a, b] of frozen) {
-      if (JSON.stringify(a) !== JSON.stringify(b)) {
-        throw new Error(
-          `${field} cannot change in a chain reset — the deployed fleet embodies it ` +
-            "(use the domain-update or upgrade ops, or shut down and launch anew)",
-        );
-      }
-    }
-    // always a NEW chain-id: an edited suffix is honored if it moves forward
-    if (proposed.network.chainIdSuffix <= current.network.chainIdSuffix) {
-      proposed.network.chainIdSuffix = current.network.chainIdSuffix + 1;
+    // one list, shared with the web UI's reset flow, which projects these
+    // same fields off the deployed spec so the editor can never contradict
+    // the running fleet; report every violation at once, since fixing them
+    // one 409 at a time is the slowest way to learn what a reset can move
+    const violations = frozenResetViolations(current, proposed);
+    if (violations.length > 0) {
+      throw new Error(
+        `cannot change in a chain reset: ${violations.join(", ")} (the deployed fleet embodies ` +
+          (violations.length === 1 ? "it" : "them") +
+          "; use the domain-update or upgrade ops, or shut down and launch anew)",
+      );
     }
     const image =
       proposed.images.sparkdreamd !== current.images.sparkdreamd
@@ -1811,8 +1789,8 @@ export class FleetService {
     );
     if (!fs.existsSync(genesisPath)) throw new Error("genesis file missing from the launch workdir");
     // the on-disk genesis is the authority for both hash and chain id: a
-    // chain reset rewrites this file (and bumps the chain id) under an
-    // op-scoped step, so the original build-genesis output can be stale
+    // chain reset rewrites this file under an op-scoped step, so the
+    // original build-genesis output can be stale (same id, new hash)
     const genesisDoc = JSON.parse(fs.readFileSync(genesisPath, "utf8")) as { chain_id?: unknown };
     const genesisSha256 = canonicalGenesisSha256(genesisDoc);
     const bundleChainId =

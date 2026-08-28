@@ -294,8 +294,8 @@ export const buildGenesisStep: StepDef = {
  * params onto the master's init skeleton, genesis accounts, one gentx per
  * validator (locally signed or browser-signed with verification), collect,
  * validate, distribute to every node home. Shared by build-genesis and the
- * reset-chain fleet op, which re-runs it against a fresh skeleton with a
- * bumped chain-id.
+ * reset-chain fleet op, which re-runs it against a fresh skeleton under
+ * the same chain-id.
  */
 export async function buildGenesisFiles(
   ctx: StepCtx,

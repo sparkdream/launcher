@@ -976,7 +976,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // wipe the chain and restart from a rebuilt genesis on the same
   // deployments (reset-chain op, for state-breaking upgrades): the posted
   // spec replaces the stored one — accounts/members/chainParams/token
-  // changes take effect, the keyring is rebuilt, the chain-id suffix bumps
+  // changes take effect and the keyring is rebuilt; the chain-id does not
+  // move, so the op stops for signer state to be cleared before the restart
   app.post("/api/fleet/:launchId/reset-chain", async (req, reply) => {
     const { launchId } = req.params as { launchId: string };
     const launch = deps.db.getLaunch(launchId);

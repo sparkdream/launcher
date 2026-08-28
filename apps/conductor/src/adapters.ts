@@ -34,8 +34,14 @@ export class Ssh2Runner implements SshRunner {
   async exec(
     target: SshTarget,
     command: string,
-    opts: { quick?: boolean } = {},
+    opts: { quick?: boolean; timeoutMs?: number } = {},
   ): Promise<SshResult> {
+    // readyTimeout below bounds the handshake, but nothing bounds the
+    // command stream once a session is up: a probe whose stream never
+    // closes waits forever, inside a retry loop that then never gets to
+    // retry. Bounded only where a caller asked for it — long-running work
+    // (archive replay, genesis rebuild) has no business being cut off.
+    const streamTimeout = opts.timeoutMs ?? (opts.quick ? Ssh2Runner.QUICK_STREAM_MS : undefined);
     try {
       return await this.withConnection(target, (conn) =>
         new Promise<SshResult>((resolve, reject) => {
@@ -43,10 +49,18 @@ export class Ssh2Runner implements SshRunner {
             if (err) return reject(err);
             let stdout = "";
             let stderr = "";
+            const timer =
+              streamTimeout === undefined
+                ? undefined
+                : setTimeout(() => {
+                    stream.destroy();
+                    reject(new Error(`ssh timeout after ${streamTimeout}ms: ${command}`));
+                  }, streamTimeout);
             stream
               .on("data", (d: Buffer) => (stdout += d.toString()))
               .stderr.on("data", (d: Buffer) => (stderr += d.toString()));
             stream.on("close", (code: number) => {
+              clearTimeout(timer);
               if (code === 0 || code === null) resolve({ stdout, code: code ?? 0 });
               else reject(new Error(`ssh exit ${code}: ${command}\n${stderr.slice(-1000)}`));
             });
@@ -106,13 +120,18 @@ export class Ssh2Runner implements SshRunner {
    *  (pod not yet running — hit when a relaunch upload raced the fresh
    *  container's first boot). A command that ran and exited non-zero
    *  surfaces as "lease shell: exit N" and is never retried. */
+  /** Ceiling on a quick probe's command stream (the handshake has its own
+   *  readyTimeout); a probe that cannot answer inside this is unreachable
+   *  as far as its caller's poll is concerned. */
+  private static readonly QUICK_STREAM_MS = 20_000;
+
   private static readonly TRANSIENT_SHELL_ERROR =
     /Unexpected server response: 5\d\d|ECONNRESET|socket hang up|provider reported a failure|no active replicase/;
 
   private async fallbackExec(
     target: SshTarget,
     command: string,
-    opts: { quick?: boolean } = {},
+    opts: { quick?: boolean; timeoutMs?: number } = {},
   ): Promise<SshResult> {
     const f = target.shellFallback!;
     const client = this.shellClient(f.creds);
@@ -128,7 +147,11 @@ export class Ssh2Runner implements SshRunner {
           f.oseq,
           f.service,
           ["sh", "-c", command],
-          opts.quick ? { timeoutMs: 15_000 } : {},
+          opts.timeoutMs !== undefined
+            ? { timeoutMs: opts.timeoutMs }
+            : opts.quick
+              ? { timeoutMs: 15_000 }
+              : {},
         );
         return { stdout: r.stdout, code: 0 };
       } catch (e) {

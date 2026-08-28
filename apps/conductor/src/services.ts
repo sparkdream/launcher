@@ -32,9 +32,20 @@ export interface SshRunner {
    * opts.quick marks a probe inside a caller-owned retry loop: one attempt,
    * short lease-shell timeout, no transient-error retries — without it a
    * flaky provider turns a bounded poll gate into hours (up to 4 × 60s
-   * websocket timeouts per probe).
+   * websocket timeouts per probe). quick also bounds the direct-SSH command
+   * stream, which is otherwise open-ended: a port that completes a TCP
+   * handshake and then says nothing hangs the read forever.
+   *
+   * opts.timeoutMs bounds one attempt explicitly. Left unset, a non-quick
+   * exec keeps its open-ended stream, because plenty of the work here
+   * legitimately outruns any default worth picking (an archive replay, a
+   * genesis rebuild); set it on anything that should not be allowed to.
    */
-  exec(target: SshTarget, command: string, opts?: { quick?: boolean }): Promise<SshResult>;
+  exec(
+    target: SshTarget,
+    command: string,
+    opts?: { quick?: boolean; timeoutMs?: number },
+  ): Promise<SshResult>;
   upload(target: SshTarget, localPath: string, remotePath: string): Promise<void>;
   download(target: SshTarget, remotePath: string, localPath: string): Promise<void>;
 }

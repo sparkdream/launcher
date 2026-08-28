@@ -893,7 +893,8 @@ export class ConductorDb {
   }
 
   /** Drop all gentx rows so requireGentx enqueues fresh sign docs — needed
-   *  when the docs themselves went stale (reset-chain bumps the chain-id). */
+   *  when the docs themselves went stale (reset-chain rebuilds genesis, so
+   *  the old docs sign for accounts and a validator set that are gone). */
   deleteGentxs(launchId: string): void {
     this.db.prepare("DELETE FROM pending_gentxs WHERE launch_id = ?").run(launchId);
   }

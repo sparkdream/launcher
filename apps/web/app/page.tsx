@@ -3,8 +3,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
-import { checkSpec, type SpecCheck } from "@sparkdream/launch-spec";
+import { checkSpec, type LaunchSpec, type SpecCheck } from "@sparkdream/launch-spec";
 import yaml from "js-yaml";
+import { EDITOR, openLaunchFor } from "../lib/open-launch";
+import { resetSource } from "../lib/reset-spec";
 import { specPathLine } from "../lib/spec-lines";
 import {
   createLaunch,
@@ -143,7 +145,9 @@ topology:
 #     # sentries:   { exclude: [] }
 `;
 
-const LAST_LAUNCH_KEY = "launcher.lastLaunchId";
+// the open launch is remembered per deploy account: switching accounts in
+// Keplr swaps the fleet cards, and the Launch panel has to swap with them
+const lastLaunchKey = (owner: string) => `launcher.lastLaunchId.${owner}`;
 const SPEC_KEY = "launcher.specText";
 const MODE_KEY = "launcher.editMode";
 const WALLET_CONNECTED_KEY = "launcher.walletConnected";
@@ -278,6 +282,9 @@ function usePersistedState<T>(key: string, initial: T) {
 export default function Page() {
   const [chain, setChain] = useState<ChainConfig>(DEFAULT_CHAIN);
   const [wallet, setWallet] = useState<ConnectedWallet | null>(null);
+  // a reload that is about to reconnect a wallet has not resolved its open
+  // launch yet: the panel waits rather than flashing the launch editor
+  const [reconnecting, setReconnecting] = useState(false);
   const [specText, setSpecText] = useState(EXAMPLE_SPEC);
   const [launchId, setLaunchId] = useState<string | null>(null);
   const [launch, setLaunch] = useState<LaunchView | null>(null);
@@ -344,7 +351,7 @@ export default function Page() {
   // localStorage only after mount — the page is statically prerendered
   useEffect(() => {
     setChain(loadChainConfig());
-    setLaunchId(localStorage.getItem(LAST_LAUNCH_KEY));
+    setReconnecting(localStorage.getItem(WALLET_CONNECTED_KEY) !== null);
     const savedSpec = localStorage.getItem(SPEC_KEY);
     if (savedSpec) setSpecText(savedSpec);
     const savedMode = localStorage.getItem(MODE_KEY);
@@ -450,6 +457,7 @@ export default function Page() {
     (async () => {
       const { waitForKeplr } = await import("../lib/keplr");
       if (await waitForKeplr()) await connect(cfg, true);
+      setReconnecting(false);
     })();
   }, [connect]);
 
@@ -464,7 +472,9 @@ export default function Page() {
       setBalances(null);
       setLedger(null);
       setFleet(null);
+      setReconnecting(true);
       await connect(undefined, true);
+      setReconnecting(false);
     };
     window.addEventListener("keplr_keystorechange", onKeystoreChange);
     return () => window.removeEventListener("keplr_keystorechange", onKeystoreChange);
@@ -592,18 +602,46 @@ export default function Page() {
     };
   }, [wallet]);
 
-  // never orphan a launch that needs attention: if no launch board is open
-  // (fresh browser, or "New launch" clicked) and some launch is not
-  // completed — running, paused on a signature, failed — reattach to the
-  // most recent one so its banners stay reachable
+  // The Launch panel opens on a launch of the CONNECTED account, and only
+  // ever on one: the fleet view is wallet-scoped, so an id remembered while
+  // another deploy account was connected (the reported case: switching from
+  // the testnet account to the devnet one) left the header naming a chain
+  // that no card below it belonged to. The account's own fleets are the
+  // authority, re-checked on every sweep — so a launch whose account is no
+  // longer connected cannot stay open either.
+  const owner = wallet?.address ?? null;
+  const openLaunch = useCallback(
+    (id: string) => {
+      if (owner) localStorage.setItem(lastLaunchKey(owner), id);
+      setLaunchId(id);
+    },
+    [owner],
+  );
+  // "new launch": the editor is open by choice, so nothing reattaches to it
+  const closeLaunch = useCallback(() => {
+    if (owner) localStorage.setItem(lastLaunchKey(owner), EDITOR);
+    setLaunchId(null);
+  }, [owner]);
+  // a deleted launch is not a choice to remember: the account falls back to
+  // whatever it is still running
+  const forgetLaunch = useCallback(() => {
+    if (owner) localStorage.removeItem(lastLaunchKey(owner));
+    setLaunchId(null);
+  }, [owner]);
   useEffect(() => {
-    if (launchId || !fleet) return;
-    const active = [...fleet.fleets].reverse().find((f) => f.launchStatus !== "completed");
-    if (active) {
-      localStorage.setItem(LAST_LAUNCH_KEY, active.launchId);
-      setLaunchId(active.launchId);
-    }
-  }, [fleet, launchId]);
+    if (!owner) return setLaunchId(null);
+    if (!fleet) return;
+    const next = openLaunchFor(
+      localStorage.getItem(lastLaunchKey(owner)),
+      fleet.fleets.map((f) => ({
+        launchId: f.launchId,
+        launchStatus: f.launchStatus,
+        alive: f.components.some((c) => c.state !== "closed"),
+      })),
+      launchId,
+    );
+    setLaunchId(next);
+  }, [owner, fleet, launchId]);
 
   // real-time block height for active nodes (validators + sentries; not
   // headscale/explorer/frontend — they have no RPC). Lighter + faster than
@@ -1136,8 +1174,7 @@ export default function Page() {
         showToast(`restart requested (${dseq})`);
       } else if (action !== "reset-data") {
         // reset-data acts over SSH and is already done: its note says so
-        localStorage.setItem(LAST_LAUNCH_KEY, launchId);
-        setLaunchId(launchId);
+        openLaunch(launchId);
       }
     } catch (e) {
       setError(String(e));
@@ -1159,8 +1196,7 @@ export default function Page() {
           ? await api.postChooseBid(launchId, target.opId, provider)
           : await api.postChooseLaunchBid(launchId, target.key, provider);
       showToast(`${key}: leasing the picked bid — sign the lease when prompted`);
-      localStorage.setItem(LAST_LAUNCH_KEY, launchId);
-      setLaunchId(launchId);
+      openLaunch(launchId);
     } catch (e) {
       setError(String(e));
     }
@@ -1215,8 +1251,7 @@ export default function Page() {
       const spec = yaml.load(specText);
       const created = await createLaunch(spec, wallet.address);
       setWarnings(created.warnings);
-      localStorage.setItem(LAST_LAUNCH_KEY, created.id);
-      setLaunchId(created.id);
+      openLaunch(created.id);
       await startLaunch(created.id);
     } catch (e) {
       setError(String(e));
@@ -1390,9 +1425,12 @@ export default function Page() {
   }, [tmkms, tmkmsId]);
 
   // ---- derived view state for the mission-control layout ----
-  // a selected launch whose first poll hasn't answered yet: render a quiet
-  // loading header instead of flashing the idle wizard during the switch
-  const loadingLaunch = launchId !== null && launch === null;
+  // Nothing is known to be open until the account's fleet says which launch
+  // is: render a quiet loading header for that wait — a reconnect on reload,
+  // the fleet's first sweep, the selected launch's first poll — instead of
+  // flashing the idle wizard through every one of them.
+  const loadingLaunch =
+    reconnecting || (wallet !== null && fleet === null) || (launchId !== null && launch === null);
   const launching =
     launch !== null && ["created", "running", "paused"].includes(launch.status);
   const launched = launch?.status === "completed";
@@ -2460,8 +2498,7 @@ export default function Page() {
                       className="btn"
                       title="Close the launch editor and go back to your running chain (nothing is discarded; the spec stays as edited)"
                       onClick={() => {
-                        localStorage.setItem(LAST_LAUNCH_KEY, cancelTargetId);
-                        setLaunchId(cancelTargetId);
+                        openLaunch(cancelTargetId);
                         setWizStep(0);
                         setWizMax(0);
                       }}
@@ -2551,8 +2588,7 @@ export default function Page() {
                     title="Start a fresh launch from the spec editor (this chain keeps running)"
                     onClick={(e) => {
                       e.stopPropagation();
-                      localStorage.removeItem(LAST_LAUNCH_KEY);
-                      setLaunchId(null);
+                      closeLaunch();
                     }}
                   >
                     new launch
@@ -3013,10 +3049,7 @@ export default function Page() {
             try {
               const { deleteLaunch } = await import("../lib/api");
               await deleteLaunch(f.launchId);
-              if (launchId === f.launchId) {
-                localStorage.removeItem(LAST_LAUNCH_KEY);
-                setLaunchId(null);
-              }
+              if (launchId === f.launchId) forgetLaunch();
               setFleet((cur) =>
                 cur
                   ? { ...cur, fleets: cur.fleets.filter((x) => x.launchId !== f.launchId) }
@@ -3041,8 +3074,7 @@ export default function Page() {
                     // first click selects the fleet (same as the old "view
                     // launch" button); expand/collapse only once selected
                     if (!viewing) {
-                      localStorage.setItem(LAST_LAUNCH_KEY, f.launchId);
-                      setLaunchId(f.launchId);
+                      openLaunch(f.launchId);
                       return;
                     }
                     if (shutDown) {
@@ -3139,10 +3171,21 @@ export default function Page() {
                               fee && fee.upgradeFlat > 0
                                 ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
                                 : "";
+                            // prefill with a current node image, as the rolling
+                            // prompt does: the expected ns/repo:tag shape is
+                            // then obvious, and a tag typed from memory cannot
+                            // quietly disagree with what the fleet runs
+                            const nodes = f.components.filter(
+                              (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                            );
                             const image = window.prompt(
                               `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
+                              nodes[0]?.image ?? undefined,
                             );
-                            if (!image) return;
+                            // an unedited prefill on a fleet already running it
+                            // would halt consensus to install what is installed;
+                            // a mixed fleet is the aborted-upgrade retry path
+                            if (!image || !nodes.some((c) => c.image !== image)) return;
                             const h = window.prompt("Halt height:");
                             const first = f.components.find(
                               (c) => c.state === "active" && c.key !== "headscale",
@@ -3153,7 +3196,7 @@ export default function Page() {
                                 image,
                                 haltHeight: Number(h),
                               }).catch((e) => setError(String(e)));
-                              setLaunchId(f.launchId);
+                              openLaunch(f.launchId);
                             }
                           }}
                         >
@@ -3189,7 +3232,7 @@ export default function Page() {
                               }
                               const { postDomainUpdate } = await import("../lib/api");
                               await postDomainUpdate(f.launchId, changes);
-                              setLaunchId(f.launchId); // surfaces the signing banner
+                              openLaunch(f.launchId); // surfaces the signing banner
                             } catch (e) {
                               setError(String(e));
                             }
@@ -3252,22 +3295,54 @@ export default function Page() {
                     {!shutDown && (
                       <>
                         <button
-                          className="btn amber"
-                          title="Wipe all chain state and restart from a genesis rebuilt from the spec editor: accounts and members are re-seeded (fresh mnemonics!), the chain-id suffix bumps, deployments stay"
+                          className="btn"
+                          title="Copy this fleet's live spec into the spec editor, replacing the draft there. The starting point for a chain reset that changes accounts, chainParams or token: edited from the fleet's own spec, those edits are carried into the reset instead of being ignored."
                           onClick={async () => {
                             try {
-                              const edited = yaml.load(specText) as any;
+                              const live = (await getLaunch(f.launchId)).spec;
+                              if (
+                                specText.trim() &&
+                                !window.confirm(
+                                  `Replace the spec editor with ${f.chainId}'s live spec? Your current draft there is lost.`,
+                                )
+                              )
+                                return;
+                              updateSpec(yaml.dump(live, { lineWidth: 100, noRefs: true }));
+                              setAdvOpen(true);
+                            } catch (e) {
+                              setError(String(e));
+                            }
+                          }}
+                        >
+                          load spec into editor
+                        </button>
+                        <button
+                          className="btn amber"
+                          title="Wipe all chain state and restart from a genesis rebuilt from this fleet's own spec: accounts and members are re-seeded (fresh mnemonics!), deployments and the chain-id stay. The op pauses after the wipe for you to clear every signer's watermark before the chain restarts. Prompts for the node image; edit accounts, chainParams or token in the spec editor first to change those too."
+                          onClick={async () => {
+                            try {
+                              // the fleet's own spec is the baseline, so the
+                              // reset never has to be reconciled by hand with
+                              // whatever draft the spec editor happens to hold
+                              const live = (await getLaunch(f.launchId)).spec as LaunchSpec;
+                              const { spec, fromEditor } = resetSource(specText, live);
+                              const image = window.prompt(
+                                "sparkdreamd image for the reset chain (the fleet restarts on it):",
+                                spec.images.sparkdreamd,
+                              );
+                              if (image === null) return;
+                              if (image.trim()) spec.images.sparkdreamd = image.trim();
                               const ok = window.confirm(
-                                `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis built from the spec editor (chain-id moves past ${f.chainId}). ` +
-                                  "The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones." +
-                                  (edited?.images?.sparkdreamd
-                                    ? ` Node image: ${edited.images.sparkdreamd}.`
-                                    : ""),
+                                `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis, still as ${f.chainId}, built from ` +
+                                  (fromEditor
+                                    ? "your edited spec in the spec editor"
+                                    : "this fleet's own current spec") +
+                                  `. The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones. The op then waits for you to clear every signer's watermark (tmkms state, and any validator outside this fleet) before the chain restarts at height 1. Node image: ${spec.images.sparkdreamd}.`,
                               );
                               if (!ok) return;
                               const { postChainReset } = await import("../lib/api");
-                              await postChainReset(f.launchId, edited);
-                              setLaunchId(f.launchId); // surfaces the signing banner
+                              await postChainReset(f.launchId, spec);
+                              openLaunch(f.launchId); // surfaces the signing banner
                             } catch (e) {
                               setError(String(e));
                             }
@@ -3286,7 +3361,7 @@ export default function Page() {
                             const { postFleetShutdown } = await import("../lib/api");
                             try {
                               await postFleetShutdown(f.launchId);
-                              setLaunchId(f.launchId); // surfaces the signing banner
+                              openLaunch(f.launchId); // surfaces the signing banner
                             } catch (e) {
                               setError(String(e));
                             }
@@ -3343,7 +3418,7 @@ export default function Page() {
                               try {
                                 const r = await postAbortOp(f.launchId, o.id);
                                 if (r.warning) setError(`Abandoned, but: ${r.warning}`);
-                                if (r.step) setLaunchId(f.launchId); // sign the close
+                                if (r.step) openLaunch(f.launchId); // sign the close
                               } catch (e) {
                                 setError(String(e));
                               }

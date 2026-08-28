@@ -326,6 +326,87 @@ export function rewriteTailnetIps(text: string, map: Map<string, string>): strin
   return text.replace(new RegExp(`(?<![\\d.])(${alt})(?![\\d.])`, "g"), (m) => map.get(m) ?? m);
 }
 
+/** How long an SSH poll may run in wall-clock terms, however few attempts
+ *  that turns out to be. */
+const SSH_POLL_DEADLINE_MS = 6 * 60_000;
+
+/**
+ * Poll until `probe` returns true, bounded by attempts AND by the clock.
+ *
+ * An attempt count is not a bound on its own. A probe against a live box
+ * fails in milliseconds; a probe against an endpoint that completes a TCP
+ * handshake and then goes quiet burns the ssh readyTimeout and then the
+ * lease-shell fallback's own — some forty seconds — so "36 attempts, 5s
+ * apart" reads as three minutes and runs for twenty-five. Observed live:
+ * a reset's resume poll sat for ten minutes against two forwarded ports
+ * that had moved, while the chain it was waiting for was producing blocks
+ * the whole time.
+ */
+export async function pollSsh(
+  ctx: StepCtx,
+  probe: (attempt: number) => Promise<boolean>,
+  opts: { attempts?: number; everyMs?: number; deadlineMs?: number } = {},
+): Promise<boolean> {
+  const attempts = opts.attempts ?? 36;
+  const everyMs = opts.everyMs ?? 5000;
+  const until = Date.now() + (opts.deadlineMs ?? SSH_POLL_DEADLINE_MS);
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) {
+      if (Date.now() >= until) break;
+      await ctx.services.sleep(everyMs);
+    }
+    try {
+      if (await probe(i)) return true;
+    } catch {
+      // unreachable, mid-restart, or refusing connections: the loop is the retry
+    }
+  }
+  return false;
+}
+
+/**
+ * Re-read where each component answers SSH from its provider, correcting
+ * the rows that moved.
+ *
+ * The endpoint on a row is a provider-assigned forwarded port for 2222, and
+ * a re-created container comes back on a different one. Any step that
+ * restarts containers therefore invalidates its own way back in, and has to
+ * re-read before it can reach anything — otherwise its next poll spends its
+ * whole budget on a port nothing listens on. The repair op's `endpoints`
+ * pass is this same read, run on demand.
+ *
+ * A provider that cannot be read leaves its row alone: an unreachable
+ * provider says nothing about whether the recorded endpoint still works.
+ */
+async function refreshSshEndpoints(
+  ctx: StepCtx,
+  rows: FleetComponentRow[],
+): Promise<{ corrected: string[]; unreadable: string[] }> {
+  const cert = loadCert(ctx);
+  const corrected: string[] = [];
+  const unreadable: string[] = [];
+  for (const row of rows) {
+    // no recorded endpoint = the component runs no sshd; nothing to fix
+    if (row.state !== "active" || !row.ssh_host || !row.host_uri) continue;
+    let ssh: { host: string; port: number };
+    try {
+      const status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
+      ssh = extractForwardedPort(status, 2222);
+    } catch (e) {
+      unreadable.push(`${row.key} (${String(e).slice(0, 60)})`);
+      continue;
+    }
+    if (ssh.host === row.ssh_host && ssh.port === row.ssh_port) continue;
+    ctx.log(
+      `${row.key}: SSH endpoint was ${row.ssh_host}:${row.ssh_port}, provider now forwards ` +
+        `${ssh.host}:${ssh.port}`,
+    );
+    ctx.db.updateComponentRuntime(ctx.launchId, row.key, { ssh_host: ssh.host, ssh_port: ssh.port });
+    corrected.push(row.key);
+  }
+  return { corrected, unreadable };
+}
+
 async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<number | undefined> {
   const sentry = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
     (c) => c.key.startsWith("sentry-") && c.state === "active" && c.key !== excludeKey,
@@ -2363,14 +2444,18 @@ async function flipWaitMode(
 
 /**
  * Chain reset (§5 "Chain reset"): wipe all chain state and restart from a
- * freshly built genesis under a bumped chain-id, on the SAME deployments —
- * no new leases, providers, mesh, or DNS. For state-breaking chain upgrades:
- * the (already-updated) spec's genesis-shaping fields — accounts, members,
+ * freshly built genesis, on the SAME deployments and under the SAME
+ * chain-id — no new leases, providers, mesh, or DNS, and nothing pointed at
+ * the chain has to be re-aimed. For state-breaking chain upgrades: the
+ * (already-updated) spec's genesis-shaping fields — accounts, members,
  * chainParams, token — all take effect, and the operator/account keyring is
  * rebuilt from scratch (fresh mnemonics; edited account lists just work).
- * The bumped chain-id is also what makes restarting safe: signer state
- * (softsign priv_validator_state, tmkms) can never confuse the new chain
- * with the old one.
+ *
+ * Keeping the chain-id means signer state is what has to be made safe: the
+ * new chain starts at height 1 under an id every signer has already voted
+ * on. op:signer stops the reset between the wipe and the restart — the one
+ * window where nothing can sign — for the operator to clear every signer's
+ * watermark, this fleet's and anyone else's on the same chain.
  */
 export function resetChainSteps(opId: number, params: ResetChainParams, spec: LaunchSpec): StepDef[] {
   const p = (s: string) => `op${opId}:${s}`;
@@ -2394,31 +2479,27 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
         for (const { row, json } of manifests) {
           await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
         }
+        // the flip above re-created every container, and a re-created
+        // container answers SSH on a new forwarded port — re-read before
+        // probing, or the poll below talks to nothing
+        await refreshSshEndpoints(ctx, nodeRows(ctx));
         // converge to "stopped": once the wait-mode env is on-chain, ANY
         // container restart lands in wait mode — so killing a straggler
         // (even PID-1 sparkdreamd) is terminal, not a self-heal loop
         for (const row of nodeRows(ctx)) {
-          let stopped = false;
-          for (let i = 0; i < 36 && !stopped; i++) {
-            if (i > 0) await ctx.services.sleep(5000);
+          const stopped = await pollSsh(ctx, async (i) => {
             if (i > 0 && i % 6 === 0) ctx.log(`${row.key}: waiting for wait mode (attempt ${i})`);
-            try {
-              const running = await ctx.services.ssh.exec(
-                rowTarget(ctx, row),
-                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-                { quick: true },
-              );
-              if (running.stdout.trim() === "no") {
-                stopped = true;
-                break;
-              }
-              await ctx.services.ssh.exec(rowTarget(ctx, row), "pkill -x sparkdreamd || true", {
-                quick: true,
-              });
-            } catch {
-              // container restarting into wait mode
-            }
-          }
+            const running = await ctx.services.ssh.exec(
+              rowTarget(ctx, row),
+              "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+              { quick: true },
+            );
+            if (running.stdout.trim() === "no") return true;
+            await ctx.services.ssh.exec(rowTarget(ctx, row), "pkill -x sparkdreamd || true", {
+              quick: true,
+            });
+            return false;
+          });
           if (!stopped) throw new Error(`${row.key}: sparkdreamd still running after the wait-mode flip`);
         }
         return { halted: nodeRows(ctx).map((r) => r.key) };
@@ -2562,37 +2643,51 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
     },
   );
 
-  if (spec.security.keyMode === "tmkms") {
-    steps.push({
-      name: p("signer"),
-      async run(ctx) {
-        // new chain-id → the signer needs [chain] id updated BEFORE the
-        // nodes resume (tmkms state is per-chain-id, so it starts fresh).
-        //
-        // Announce-once, not probe: op:halt left every node in wait mode, so
-        // sparkdreamd — the process that owns the privval listener — is not
-        // running, and any port check here reports "no signer" no matter how
-        // correctly the signer is configured. Gating on that wedged the op
-        // permanently (the same defect the relaunch had). The signer is
-        // verifiable only after the nodes boot, which op:verify covers: no
-        // signer means no blocks, and its failure says so.
-        const notice = `op${opId}-signer-notice`;
-        const alreadyAsked = fs.existsSync(path.join(ctx.dirs.root, `${notice}.pin`));
-        await pinnedValue(ctx, notice, async () => "asked");
-        if (!alreadyAsked) {
-          const vals = nodeRows(ctx).filter((r) => r.key.startsWith("val-")).map((r) => r.key);
-          throw new AwaitUser(
-            p("signer"),
-            `update your tmkms config for ${vals.join(", ")}: set chain_id = "${cid}" in ` +
-              "tmkms.toml (both [[chain]] and [[validator]]), restart the signer, then resume. " +
-              "The reset's new chain-id also means a fresh state file, which is correct here: " +
-              "the old watermark belongs to the chain being discarded.",
-          );
-        }
-        return { signersReady: true };
-      },
-    });
-  }
+  steps.push({
+    name: p("signer"),
+    async run(ctx) {
+      // The reset keeps the chain-id, so nothing about the signer's config
+      // changes — but the chain it signs for restarts at height 1 while the
+      // signer still holds a watermark from the chain being discarded. That
+      // watermark is the only thing standing between the two chains, and
+      // clearing it is the operator's move, not ours: tmkms state lives on
+      // their box, and a validator outside this fleet is not ours to touch
+      // at all. So the op stops here, after the wipe and before any node
+      // restarts, which is the one window where nothing can sign.
+      //
+      // Announce-once, not probe: op:halt left every node in wait mode, so
+      // sparkdreamd — the process that owns the privval listener — is not
+      // running, and any port check here reports "no signer" no matter how
+      // correctly the signer is configured. Gating on that wedged the op
+      // permanently (the same defect the relaunch had). The signer is
+      // verifiable only after the nodes boot, which op:verify covers: no
+      // signer means no blocks, and its failure says so.
+      const notice = `op${opId}-signer-notice`;
+      const alreadyAsked = fs.existsSync(path.join(ctx.dirs.root, `${notice}.pin`));
+      await pinnedValue(ctx, notice, async () => "asked");
+      if (!alreadyAsked) {
+        const vals = nodeRows(ctx).filter((r) => r.key.startsWith("val-")).map((r) => r.key);
+        const tmkms = spec.security.keyMode === "tmkms";
+        throw new AwaitUser(
+          p("signer"),
+          `${cid} restarts at height 1 on a fresh genesis, and every signer for it must be ` +
+            "back to a zero watermark before it does. " +
+            (tmkms
+              ? `For ${vals.join(", ")}: clear the tmkms state file (delete it, or set height, ` +
+                "round and step to 0) and restart the signer. Leave chain_id as it is: the " +
+                `chain-id has not changed. A signer still holding the old chain's height will ` +
+                "sign nothing, and the fleet will come up producing no blocks. "
+              : `This fleet's own nodes (${vals.join(", ")}) were reset with their data, so ` +
+                "their priv_validator_state.json is already zeroed. ") +
+            `Any validator signing on ${cid} from outside this fleet must have its own signer ` +
+            "state cleared too, and must not sign again until it does: the old chain's votes " +
+            "and this one's now share a chain-id, so the same key voting twice at one height " +
+            "is a double-sign. Resume once every signer is clear.",
+        );
+      }
+      return { signersReady: true };
+    },
+  });
 
   steps.push(
     {
@@ -2656,31 +2751,57 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
             (a.key.startsWith("val-") ? 1 : 0) - (b.key.startsWith("val-") ? 1 : 0) ||
             a.key.localeCompare(b.key),
         );
+        // the manifest push above re-created every container, so the SSH
+        // endpoints on these rows are exactly as stale as the restart made
+        // them; re-read them from the providers before probing
+        await refreshSshEndpoints(ctx, rows);
+        const silent: string[] = [];
         for (const row of rows) {
-          let running = false;
-          for (let i = 0; i < 36 && !running; i++) {
-            if (i > 0) await ctx.services.sleep(5000);
+          const running = await pollSsh(ctx, async (i) => {
             if (i > 0 && i % 6 === 0) ctx.log(`${row.key}: waiting for the node (attempt ${i})`);
-            try {
-              const r = await ctx.services.ssh.exec(
-                rowTarget(ctx, row),
-                "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
-                { quick: true },
-              );
-              if (r.stdout.trim() === "yes") running = true;
-              // a node whose deployment hash didn't change (relaunched nodes
-              // already carried wait mode) gets no container restart and
-              // must be started the SSH way. The long grace period keeps the
-              // nudge clear of a restarting container's entrypoint (tailscale
-              // join etc.) — racing it would double-start sparkdreamd.
-              else if (i >= 12) await ctx.services.ssh.exec(rowTarget(ctx, row), START_NODE_CMD);
-            } catch {
-              // container restarting
-            }
-          }
-          if (!running) throw new Error(`${row.key} did not come back after the resume flip`);
+            const r = await ctx.services.ssh.exec(
+              rowTarget(ctx, row),
+              "pgrep -x sparkdreamd >/dev/null && echo yes || echo no",
+              { quick: true },
+            );
+            if (r.stdout.trim() === "yes") return true;
+            // a node whose deployment hash didn't change (relaunched nodes
+            // already carried wait mode) gets no container restart and must
+            // be started the SSH way. Only ever off a probe that ANSWERED
+            // "no": nudging a node we cannot reach used to fire blind after
+            // 12 failures, which both risked double-starting a node that was
+            // running fine and, being non-quick, cost four websocket
+            // timeouts per attempt. The grace period keeps the nudge clear
+            // of a restarting container's entrypoint (tailscale join etc.).
+            if (i >= 12) await ctx.services.ssh.exec(rowTarget(ctx, row), START_NODE_CMD, {
+              quick: true,
+            });
+            return false;
+          });
+          if (!running) silent.push(row.key);
         }
-        return { resumed: rows.map((r) => r.key) };
+        if (silent.length > 0) {
+          // SSH silence is not proof a node is down — the endpoint may have
+          // moved again, or its provider may be refusing the shell. The
+          // chain cannot be stale in the same way, so let it answer: if it
+          // is producing blocks the resume did what it was for, and the
+          // stale record is repair-fleet's job, not a reason to fail a reset
+          // that worked (observed live: this step failing a fleet whose
+          // chain had been up for ten minutes).
+          const height = await sentryRpcHeight(ctx).catch(() => undefined);
+          if (height === undefined) {
+            throw new Error(
+              `${silent.join(", ")} did not come back after the resume flip, and no sentry RPC ` +
+                "is answering either — the chain is not running",
+            );
+          }
+          ctx.log(
+            `${silent.join(", ")}: no answer over SSH, but ${cid} is producing blocks (height ` +
+              `${height}) — treating the resume as done. Run repair fleet to re-read where ` +
+              "they answer.",
+          );
+        }
+        return { resumed: rows.map((r) => r.key), ...(silent.length > 0 ? { silent } : {}) };
       },
     },
     {
@@ -2719,8 +2840,10 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
           throw new Error(
             "chain did not start producing blocks after the reset" +
               (spec.security.keyMode === "tmkms"
-                ? ` — check the signer: with the new chain-id "${cid}" tmkms must have chain_id ` +
-                  "updated in both [[chain]] and [[validator]], and no votes are signed until it reconnects"
+                ? `: check the signer. The chain-id is still "${cid}", so tmkms needs no config ` +
+                  "change — but it signs nothing until its state file is back to a zero " +
+                  "watermark, and the height it carries from the discarded chain is far ahead " +
+                  "of the one this chain restarted at"
                 : ""),
           );
         }
@@ -3572,33 +3695,12 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         // correctly declines to touch it while being unable to fix it. So
         // re-read the mapping from lease status first: the provider is the
         // authority on where a component answers, exactly as at launch.
-        const cert = loadCert(ctx);
-        const corrected: string[] = [];
-        const unreadable: string[] = [];
-        for (const row of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
-          // no recorded endpoint = the component runs no sshd; nothing to fix
-          if (row.state !== "active" || !row.ssh_host || !row.host_uri) continue;
-          let ssh: { host: string; port: number };
-          try {
-            const status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
-            ssh = extractForwardedPort(status, 2222);
-          } catch (e) {
-            // an unreachable provider (or a lease with no forwarded 2222)
-            // says nothing about whether the recorded endpoint still works
-            unreadable.push(`${row.key} (${String(e).slice(0, 60)})`);
-            continue;
-          }
-          if (ssh.host === row.ssh_host && ssh.port === row.ssh_port) continue;
-          ctx.log(
-            `${row.key}: SSH endpoint was ${row.ssh_host}:${row.ssh_port}, provider now forwards ` +
-              `${ssh.host}:${ssh.port}`,
-          );
-          ctx.db.updateComponentRuntime(ctx.launchId, row.key, {
-            ssh_host: ssh.host,
-            ssh_port: ssh.port,
-          });
-          corrected.push(row.key);
-        }
+        // Shared with the steps that restart containers and so invalidate
+        // their own way back in (the reset's halt and start).
+        const { corrected, unreadable } = await refreshSshEndpoints(
+          ctx,
+          ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[],
+        );
         if (unreadable.length > 0) {
           ctx.log(`could not read a lease status for ${unreadable.join(", ")} — keeping their endpoints`);
         }

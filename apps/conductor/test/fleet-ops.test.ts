@@ -12,6 +12,7 @@ import { FleetService } from "../src/fleet.js";
 import {
   buildOpSteps,
   buildPreLaunchOpSteps,
+  pollSsh,
   retagImage,
   rewriteTailnetIps,
   withRedeployNonce,
@@ -67,6 +68,20 @@ function specWithComponents(): LaunchSpec {
         hub: { enabled: false },
       },
       publicEndpoints: { api: "api.sparkdream.io", rpc: "rpc.sparkdream.io" },
+      headscale: { domain: "headscale.sparkdream.io" },
+    },
+  });
+}
+
+function tmkms1x1(): LaunchSpec {
+  return testnetSpec({
+    network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    security: { keyMode: "tmkms" },
+    providers: { policy: { antiAffinity: "strict" } },
+    topology: {
+      validators: { count: 1 },
+      sentries: { count: 1 },
+      components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
       headscale: { domain: "headscale.sparkdream.io" },
     },
   });
@@ -299,20 +314,6 @@ describe("relaunch op", () => {
 });
 
 describe("tmkms validator relaunch", () => {
-  function tmkms1x1(): LaunchSpec {
-    return testnetSpec({
-      network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
-      security: { keyMode: "tmkms" },
-      providers: { policy: { antiAffinity: "strict" } },
-      topology: {
-        validators: { count: 1 },
-        sentries: { count: 1 },
-        components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
-        headscale: { domain: "headscale.sparkdream.io" },
-      },
-    });
-  }
-
   it("gates on the signer AFTER the node boots, with the new address", async () => {
     // The gate used to run before persist, probing the privval port on a
     // container that had not started sparkdreamd yet — unsatisfiable, so
@@ -820,8 +821,55 @@ describe("top-up", () => {
   }, 120_000);
 });
 
+describe("pollSsh", () => {
+  const ctx = { services: { sleep: async () => {} } } as never;
+
+  it("gives up on the clock, not just the attempt count", async () => {
+    // the defect this exists for: a probe against an endpoint that accepts
+    // TCP and then says nothing costs ~40s, so 36 attempts "5s apart" runs
+    // for twenty-five minutes rather than three
+    let attempts = 0;
+    const ok = await pollSsh(
+      ctx,
+      async () => {
+        attempts++;
+        throw new Error("connect ECONNREFUSED");
+      },
+      { attempts: 36, deadlineMs: 0 },
+    );
+    expect(ok).toBe(false);
+    expect(attempts).toBe(1);
+  });
+
+  it("spends all its attempts when the clock allows", async () => {
+    let attempts = 0;
+    const ok = await pollSsh(ctx, async () => (attempts++, false), { attempts: 7 });
+    expect(ok).toBe(false);
+    expect(attempts).toBe(7);
+  });
+
+  it("stops at the first satisfied probe", async () => {
+    let attempts = 0;
+    const ok = await pollSsh(ctx, async () => ++attempts === 3, { attempts: 36 });
+    expect(ok).toBe(true);
+    expect(attempts).toBe(3);
+  });
+});
+
 describe("chain reset op", () => {
-  it("rebuilds genesis under a bumped chain-id with edited accounts, wipes and restarts", async () => {
+  /**
+   * Drive a reset through op:signer — the pause the reset exists around now
+   * that the chain-id is kept: it stops between the wipe and the restart so
+   * every signer's watermark can be cleared while nothing is able to sign.
+   * The gate announces once, so a second drive is the operator's "resume".
+   */
+  async function driveReset(w: World) {
+    const parked = await driveOps(w);
+    if (parked.status !== "awaiting-user") return parked;
+    return driveOps(w);
+  }
+
+  it("rebuilds genesis under the SAME chain-id with edited accounts, wipes and restarts", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
     const treasuryBefore = w.db.stepOutput<{ accounts: Record<string, string> }>(
@@ -842,7 +890,7 @@ describe("chain reset op", () => {
     w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
     const sigsBefore = w.signer.signed.length;
 
-    const result = await driveOps(w);
+    const result = await driveReset(w);
     expect(result.status).toBe("completed");
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
 
@@ -860,7 +908,7 @@ describe("chain reset op", () => {
     expect(sdl).toContain("WAIT_FOR_CONFIG=false");
     expect(sdl).not.toContain("WAIT_FOR_CONFIG=true");
 
-    // every node home carries the rebuilt genesis: new chain-id, new
+    // every node home carries the rebuilt genesis: same chain-id, new
     // account seeded as a member, spec override applied
     const keys = w.db.stepOutput<{ accounts: Record<string, string> }>("fl", "generate-keys")!;
     const newcomer = keys.accounts["acct-newcomer"]!;
@@ -869,7 +917,7 @@ describe("chain reset op", () => {
       const g = JSON.parse(
         fs.readFileSync(path.join(w.work, `launches/fl/nodes/${key}/config/genesis.json`), "utf8"),
       );
-      expect(g.chain_id).toBe("sparkdream-2");
+      expect(g.chain_id).toBe("sparkdream-1");
       expect(g.app_state.gov.params.voting_period).toBe("600s");
       expect(g.app_state.rep.member_map.map((m: any) => m.address)).toEqual([founder, newcomer]);
       expect(g.app_state.bank.balances.some((b: any) => b.address === newcomer)).toBe(true);
@@ -885,7 +933,7 @@ describe("chain reset op", () => {
     const wipes = w.services.ssh.execLog.filter((e) => e.command.includes("unsafe-reset-all"));
     expect(wipes).toHaveLength(4);
     const seds = w.services.ssh.execLog.filter((e) =>
-      e.command.includes('chain-id = "sparkdream-2"'),
+      e.command.includes('chain-id = "sparkdream-1"'),
     );
     expect(seds).toHaveLength(4);
 
@@ -896,7 +944,7 @@ describe("chain reset op", () => {
       "-O",
       "config/genesis.json",
     ]).toString();
-    expect(JSON.parse(bundled).chain_id).toBe("sparkdream-2");
+    expect(JSON.parse(bundled).chain_id).toBe("sparkdream-1");
   }, 120_000);
 
   it("swaps the node image mid-reset when the reset rides an upgrade", async () => {
@@ -913,7 +961,7 @@ describe("chain reset op", () => {
     w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
     const sigsBefore = w.signer.signed.length;
 
-    const result = await driveOps(w);
+    const result = await driveReset(w);
     expect(result.status).toBe("completed");
 
     // three signatures: halt flip (4 updates), image swap (4 updates + the
@@ -946,7 +994,7 @@ describe("chain reset op", () => {
     w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
     const sigsBefore = w.signer.signed.length;
 
-    const result = await driveOps(w);
+    const result = await driveReset(w);
     expect(result.status).toBe("completed");
 
     // resume tx carries the frontend + explorer updates alongside the two
@@ -955,8 +1003,8 @@ describe("chain reset op", () => {
     expect(txs.map((msgs) => msgs.length)).toEqual([2, 4]);
     const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/frontend.yaml"), "utf8");
     expect(sdl).toContain("DISPLAY_DENOM=SPARZ");
-    expect(sdl).toContain("CHAIN_ID=sparkdream-2");
-    // the explorer's env is patched in place: new chain identity, but the
+    expect(sdl).toContain("CHAIN_ID=sparkdream-1");
+    // the explorer's env is patched in place: new denom identity, but the
     // persist-start-resolved tunnel targets survive (no placeholders back)
     const explorerSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/explorer.yaml"), "utf8");
     expect(explorerSdl).toContain("DISPLAY_DENOM=SPARZ");
@@ -990,12 +1038,137 @@ describe("chain reset op", () => {
     expect(JSON.parse(op.params_json).image).toBeUndefined();
   }, 120_000);
 
-  it("rejects edits the deployed fleet embodies", async () => {
+  it("stops between the wipe and the restart for signer state to be cleared", async () => {
+    // the chain-id is kept, so the watermark is the only thing separating
+    // the discarded chain from the new one: nothing may restart until the
+    // operator has zeroed every signer that votes on this chain-id
+    const w = await launched(tmkms1x1());
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:signer`);
+    // it names the chain-id that did NOT move, and what to do about it
+    expect(parked.reason).toContain("sparkdream-1");
+    expect(parked.reason).toContain("tmkms state file");
+    expect(parked.reason).toContain("double-sign");
+    // the pause lands after the wipe (nothing left to sign for)...
+    expect(
+      w.services.ssh.execLog.some((e) => e.command.includes("unsafe-reset-all")),
+    ).toBe(true);
+    // ...and before any node is let out of wait mode
+    expect(
+      fs.readFileSync(path.join(w.work, "launches/fl/sdl/val-0.yaml"), "utf8"),
+    ).toContain("WAIT_FOR_CONFIG=true");
+
+    const done = await driveOps(w); // operator cleared the signer, resumed
+    expect(done.status).toBe("completed");
+    expect(
+      fs.readFileSync(path.join(w.work, "launches/fl/sdl/val-0.yaml"), "utf8"),
+    ).toContain("WAIT_FOR_CONFIG=false");
+  }, 120_000);
+
+  it("gates a softsign fleet too, for validators it does not own", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    // its own nodes were wiped with the data; the warning is about the rest
+    expect(parked.reason).toContain("priv_validator_state.json is already zeroed");
+    expect(parked.reason).toContain("outside this fleet");
+  }, 120_000);
+
+  it("refuses to move the chain-id, however the spec asks", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const edited = JSON.parse(launch.spec_json);
+    edited.network.chainIdSuffix = 7;
+    expect(() => w.fleet.requestChainReset(launch, edited)).toThrow(/chainIdSuffix/);
+    // and an untouched spec resets in place, still as sparkdream-1
+    const opId = w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).network.chainIdSuffix).toBe(1);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.kind).toBe("reset-chain");
+  }, 120_000);
+
+  it("re-reads the SSH endpoints the restarts moved, instead of probing dead ports", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const nodeRows = () =>
+      w.db.listFleetComponents("fl").filter((c) => /^(val|sentry)-/.test(c.key));
+    const live = new Map(nodeRows().map((c) => [c.key, `${c.ssh_host}:${c.ssh_port}`]));
+
+    // a wait-mode flip re-creates every container, and the provider hands a
+    // re-created container a different external port for 2222 — so the rows
+    // end up pointing at ports nothing listens on, which is worse than a
+    // refused connection: they accept TCP and then go quiet
+    const dead: string[] = [];
+    for (const c of nodeRows()) {
+      const port = c.ssh_port! + 9000;
+      w.db.updateComponentRuntime("fl", c.key, { ssh_port: port });
+      const id = `${c.ssh_host}:${port}`;
+      w.services.ssh.failHosts.add(id);
+      dead.push(id);
+    }
+
+    w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    expect((await driveReset(w)).status).toBe("completed");
+
+    // the rows are back on the provider's actual mapping...
+    expect(new Map(nodeRows().map((c) => [c.key, `${c.ssh_host}:${c.ssh_port}`]))).toEqual(live);
+    // ...and the reset never burned a probe on a port known to be dead
+    expect(w.services.ssh.execLog.some((e) => dead.includes(e.target))).toBe(false);
+  }, 120_000);
+
+  it("takes block production as proof the resume worked when SSH stays quiet", async () => {
+    // the live shape: the chain came back and produced blocks for ten
+    // minutes while op:start failed a fleet over two unanswering ports
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+
+    await driveOps(w); // park at the signer gate, then go quiet over SSH
+    for (const c of w.db.listFleetComponents("fl")) {
+      if (/^(val|sentry)-/.test(c.key)) w.services.ssh.failHosts.add(`${c.ssh_host}:${c.ssh_port}`);
+    }
+    await driveOps(w);
+
+    // op:start did not fail the reset: it asked the chain instead
+    const start = w.db
+      .listSteps("fl")
+      .find((st) => st.name === `op${opId}:start`)!;
+    expect(start.status).toBe("done");
+    const out = JSON.parse(start.output_json!) as { resumed: string[]; silent?: string[] };
+    expect(out.silent?.sort()).toEqual(["sentry-0", "sentry-1", "val-0", "val-1"]);
+  }, 120_000);
+
+  it("rejects edits the deployed fleet embodies, naming all of them at once", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
     const edited = JSON.parse(launch.spec_json);
     edited.topology.sentries.count = 3;
-    expect(() => w.fleet.requestChainReset(launch, edited)).toThrow(/sentries.count/);
+    expect(() => w.fleet.requestChainReset(launch, edited)).toThrow(/sentries\.count/);
+    // a second violation behind the first is reported with it: fixing them
+    // one rejection at a time is the slowest way to learn what a reset moves
+    edited.network.type = edited.network.type === "devnet" ? "testnet" : "devnet";
+    edited.infra.akashNetwork = "sandbox";
+    try {
+      w.fleet.requestChainReset(launch, edited);
+      throw new Error("expected the reset to be rejected");
+    } catch (e) {
+      const msg = String(e);
+      expect(msg).toContain("network.type");
+      expect(msg).toContain("topology.sentries.count");
+      expect(msg).toContain("infra");
+    }
   }, 120_000);
 
   it("rejects denoms the chain's identity module would refuse, before touching anything", async () => {
