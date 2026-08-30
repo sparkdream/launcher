@@ -13,6 +13,7 @@ import {
   withDefaults,
   VENDORED_CHAIN_VERSION,
   type LaunchSpec,
+  type LaunchSpecInput,
 } from "@sparkdream/launch-spec";
 import {
   bakedSatisfies,
@@ -63,6 +64,7 @@ import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
 import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
 import { prefillSpecFromGenesis } from "./genesis-prefill.js";
+import { joinSpecFromBundle } from "./join-prefill.js";
 import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
@@ -98,6 +100,33 @@ export interface ServerDeps {
 const SLOW_PROBE_CACHE_MS = 60_000;
 const netcheckCache = new Map<string, { at: number; info: NetcheckInfo | null }>();
 const chainRpcCache = new Map<string, { at: number; url: string | null }>();
+
+/**
+ * A join draft is named "<origin>-join", which collides the second time the
+ * same chain is expanded (and the name is how headscale.reuseFleet and the
+ * fleet list identify a fleet). Bump it to the first free variant instead
+ * of handing back a name the operator has to notice is taken.
+ */
+function nameFleetUniquely(db: ConductorDb, spec: LaunchSpecInput): void {
+  const taken = new Set(
+    db.listLaunches().map((l) => {
+      try {
+        return (JSON.parse(l.spec_json) as LaunchSpec).network.name;
+      } catch {
+        return "";
+      }
+    }),
+  );
+  const wanted = spec.network.name;
+  if (!taken.has(wanted)) return;
+  const stem = wanted.slice(0, 29).replace(/-+$/, "");
+  for (let n = 2; n <= 99; n++) {
+    if (!taken.has(`${stem}-${n}`)) {
+      spec.network.name = `${stem}-${n}`;
+      return;
+    }
+  }
+}
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify();
@@ -316,6 +345,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const { genesis } = req.body as { genesis: unknown };
     try {
       const result = prefillSpecFromGenesis(genesis as Record<string, unknown>);
+      const check = checkSpec(result.spec);
+      return {
+        ...result,
+        issues: [...check.errors, ...check.warnings.map((w) => ({ ...w, warning: true }))],
+      };
+    } catch (e) {
+      return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // "Prefill spec from join bundle" (§5): fan a fleet's published join
+  // bundle out into the four places its fields live in a spec. Read-only,
+  // and the draft is reviewed in the editor like any other.
+  app.post("/api/join-prefill", async (req, reply) => {
+    const { bundle } = req.body as { bundle: unknown };
+    try {
+      const result = joinSpecFromBundle(bundle);
+      nameFleetUniquely(deps.db, result.spec);
       const check = checkSpec(result.spec);
       return {
         ...result,
@@ -860,6 +907,41 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     try {
       const bundle = await fleet.joinBundle(launch);
       return reply.type("application/json").send(JSON.stringify(bundle, null, 2));
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // join spec (§5 "Join mode"): the self-expansion path — this fleet's own
+  // spec, stripped of everything that belongs to the chain or is already
+  // spoken for by the running fleet, with the live join block filled in.
+  // A draft for the editor, not a launchable file: what it drops, it says.
+  app.get("/api/fleet/:launchId/join-spec", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      const bundle = await fleet.joinBundle(launch);
+      const base = JSON.parse(launch.spec_json) as LaunchSpec;
+      // only the nodes' own providers: a shared headscale provider costs
+      // the new pair nothing, and over-excluding shrinks the bid pool
+      const colocatedProviders = [
+        ...new Set(
+          deps.db
+            .listFleetComponents(launchId)
+            .filter((c) => /^(val|sentry)-/.test(c.key) && c.state !== "closed")
+            .map((c) => c.provider)
+            .filter(Boolean),
+        ),
+      ];
+      const result = joinSpecFromBundle(bundle, { base, colocatedProviders });
+      nameFleetUniquely(deps.db, result.spec);
+      const check = checkSpec(result.spec);
+      return {
+        ...result,
+        issues: [...check.errors, ...check.warnings.map((w) => ({ ...w, warning: true }))],
+      };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

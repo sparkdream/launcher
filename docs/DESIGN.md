@@ -1163,6 +1163,35 @@ fully *manual* joiners following the chain repo's
   the bundle is public information; the origin operator hands the JSON to
   prospective operators out of band.
 
+**From bundle to spec.** The bundle's fields land in four places in a
+spec (`join`, `network.bech32Prefix`, `token`, `images.sparkdreamd`), so
+transcribing it by hand is where a joiner mistypes the one field whose
+mismatch is silent (the image). Two editor helpers do the fanning out,
+both producing a DRAFT that leads with its own caveats as YAML comments,
+exactly as "prefill from genesis.json" does, and neither is a spec to
+launch on sight:
+
+- **Prefill from join bundle** (`POST /api/join-prefill`): the joiner's
+  side. The bundle plus a one-validator/one-sentry skeleton on profile
+  defaults; everything the bundle cannot know (providers, resources,
+  headscale domain, the stake, key custody) arrives as a note.
+- **Join spec** (`GET /api/fleet/:launchId/join-spec`, a fleet-card
+  button next to the bundle download): the origin operator's side, for
+  growing their own chain. The fleet's stored spec carries over, so
+  resources, provider policy and key mode are not retyped, minus the
+  genesis-shaping fields validate-spec would reject anyway and minus the
+  fields whose reuse is quietly wrong: the operator addresses (one
+  address can hold one validator, and `create-validator` SKIPS an
+  address that already has one, so the launch would finish green with a
+  synced but unbonded node), the pinned `consensusPubkeys` (two nodes on
+  one consensus key double-sign), the monikers, the public endpoints and
+  component domains the origin's ingress already answers, the headscale
+  domain (a suggestion in the same zone replaces it) and its S3 backup
+  (two fleets into one bucket path). The providers hosting the origin's
+  own validators and sentries are seeded into the new pair's exclusions:
+  a second pair sharing a provider with the first is not a second pair
+  for anything that takes the provider out.
+
 No new sync machinery is needed: snapshot production is already on
 (`snapshotInterval`, §4 `sentrySettings`, whose "so later joiners can
 sync" comment was written for exactly this), so a joiner state-syncs off
@@ -1549,6 +1578,10 @@ POST /api/fleet/import                import bundle → this instance can
 GET  /api/fleet/:launchId/join-bundle chainId, token, image tag, genesis
                                       URL + canonical sha256, sentry peer
                                       strings, state-sync RPCs
+POST /api/join-prefill                bundle JSON → spec draft + notes +
+                                      checkSpec issues (editor helper)
+GET  /api/fleet/:launchId/join-spec   the same draft built on THIS fleet's
+                                      own spec: expand your own chain
 
 # auth (Akash mode)
 POST /api/auth/nonce ; POST /api/auth/verify   (signArbitrary, allowlist)

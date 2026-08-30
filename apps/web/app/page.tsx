@@ -35,6 +35,7 @@ import {
   type OpProgress,
   type PendingGentx,
   type PendingTx,
+  type SpecPrefill,
 } from "../lib/api";
 import {
   connectKeplr,
@@ -305,6 +306,8 @@ export default function Page() {
   // mission-control UI state
   const [mode, setMode] = useState<EditMode>("guided");
   const [wizStep, setWizStep] = useState(0);
+  /** The launch card, so a join spec built on a fleet card scrolls into view. */
+  const launchCardRef = useRef<HTMLElement | null>(null);
   const [wizMax, setWizMax] = useState(0);
   const [advOpen, setAdvOpen] = useState(false);
   const [costOpen, setCostOpen] = useState(false);
@@ -370,27 +373,88 @@ export default function Page() {
     localStorage.setItem(SPEC_KEY, text);
   };
 
+  // The editor draft is one localStorage slot, so every prefill overwrites
+  // whatever is in it. An untouched example is nobody's work; anything else
+  // is asked about first.
+  const confirmDraftOverwrite = (): boolean =>
+    specText.trim() === EXAMPLE_SPEC.trim() ||
+    window.confirm(
+      "Replace the spec in the editor? The draft it holds now is not saved anywhere else.",
+    );
+
+  /**
+   * Land a prefill draft in the editor. Notes and validation issues lead
+   * the YAML as comments so they are read before Review, which is what
+   * makes a prefill a draft rather than a spec to launch on sight.
+   */
+  const applyPrefill = (result: SpecPrefill, source: string) => {
+    const noteLines = [
+      `# Prefilled from ${source}. Review before launching:`,
+      ...result.notes.map((n) => `#  - ${n}`),
+      ...result.issues.map((i) => `#  ${i.warning ? "warning" : "ERROR"} ${i.path}: ${i.message}`),
+    ];
+    updateSpec(`${noteLines.join("\n")}\n${yaml.dump(result.spec, { lineWidth: 100 })}`);
+    setAdvOpen(true);
+  };
+
   // "Prefill from genesis.json": reverse-map an uploaded genesis into a
-  // spec draft; unmappable facts arrive as notes and lead the YAML as
-  // comments so they are read before Review
+  // spec draft; unmappable facts arrive as notes
   const prefillFromGenesisFile = async (file: File) => {
+    if (!confirmDraftOverwrite()) return;
     setBusy("prefilling spec from genesis…");
     setError(null);
     try {
       const genesis = JSON.parse(await file.text());
       const { postSpecPrefill } = await import("../lib/api");
-      const result = await postSpecPrefill(genesis);
-      const noteLines = [
-        `# Prefilled from ${file.name} — review before launching:`,
-        ...result.notes.map((n) => `#  - ${n}`),
-        ...result.issues.map(
-          (i) => `#  ${i.warning ? "warning" : "ERROR"} ${i.path}: ${i.message}`,
-        ),
-      ];
-      updateSpec(`${noteLines.join("\n")}\n${yaml.dump(result.spec, { lineWidth: 100 })}`);
-      setAdvOpen(true);
+      applyPrefill(await postSpecPrefill(genesis), file.name);
     } catch (e) {
       setError(`genesis prefill: ${String(e instanceof Error ? e.message : e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // "Prefill from join bundle": the joiner's side of §5. The bundle's
+  // fields land in four places (join, network.bech32Prefix, token,
+  // images.sparkdreamd); the rest of the spec is the joiner's own and
+  // arrives as notes.
+  const prefillFromJoinBundleFile = async (file: File) => {
+    if (!confirmDraftOverwrite()) return;
+    setBusy("prefilling spec from join bundle…");
+    setError(null);
+    try {
+      const bundle = JSON.parse(await file.text());
+      const { postJoinPrefill } = await import("../lib/api");
+      applyPrefill(await postJoinPrefill(bundle), file.name);
+    } catch (e) {
+      setError(`join bundle prefill: ${String(e instanceof Error ? e.message : e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * "Join spec" off a fleet card: a draft for adding a sovereign pair to
+   * the chain this fleet already runs. The editor only shows when no
+   * launch is open, so the open one is closed (it keeps running) and the
+   * page scrolls back up to the draft it just wrote.
+   */
+  const joinSpecFromFleet = async (fleet: { launchId: string; chainId: string }) => {
+    if (!confirmDraftOverwrite()) return;
+    setBusy("building a join spec…");
+    setError(null);
+    try {
+      const { getFleetJoinSpec } = await import("../lib/api");
+      const result = await getFleetJoinSpec(fleet.launchId);
+      closeLaunch();
+      switchMode("yaml"); // the notes are YAML comments; guided mode hides them
+      applyPrefill(result, `${fleet.chainId}'s join bundle`);
+      setTimeout(
+        () => launchCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+        0,
+      );
+    } catch (e) {
+      setError(`join spec: ${String(e instanceof Error ? e.message : e)}`);
     } finally {
       setBusy(null);
     }
@@ -2485,7 +2549,10 @@ export default function Page() {
         {/* ---------- launch card ---------- */}
         {/* the accent border matches the selected fleet pair below, tying the
             step log to the fleet it belongs to */}
-        <section className={`card${loadingLaunch || launching || launched ? " viewing" : ""}`}>
+        <section
+          ref={launchCardRef}
+          className={`card${loadingLaunch || launching || launched ? " viewing" : ""}`}
+        >
           <div
             className={`card-head${launched ? " clickable" : ""}`}
             title={launched ? "show / hide the launch step log" : undefined}
@@ -2800,6 +2867,23 @@ export default function Page() {
                           const file = e.target.files?.[0];
                           e.target.value = "";
                           if (file) void prefillFromGenesisFile(file);
+                        }}
+                      />
+                    </label>
+                    <label
+                      className="btn link"
+                      style={{ cursor: "pointer" }}
+                      title="Join an existing chain: the bundle its operator published becomes the spec's join block, token, prefix and node image. Everything else (your providers, resources, keys) stays yours."
+                    >
+                      Prefill from join bundle…
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        style={{ display: "none" }}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = "";
+                          if (file) void prefillFromJoinBundleFile(file);
                         }}
                       />
                     </label>
@@ -3307,6 +3391,13 @@ export default function Page() {
                       }}
                     >
                       join bundle
+                    </button>
+                    <button
+                      className="btn"
+                      title="Add another sovereign validator/sentry pair to this chain: writes a join spec into the editor, built from this fleet's own spec (its resources, providers and key mode) plus the live join bundle. What it cannot carry over, it says in the notes."
+                      onClick={() => void joinSpecFromFleet(f)}
+                    >
+                      join spec
                     </button>
                     {!shutDown && active.length > 0 && (
                       <button

@@ -729,6 +729,35 @@ export async function postSpecPrefill(genesis: unknown): Promise<SpecPrefill> {
   );
 }
 
+/**
+ * "Prefill spec from join bundle" (§5): fan a published join bundle out
+ * into the four places its fields live in a spec, as a reviewable draft.
+ */
+export async function postJoinPrefill(bundle: unknown): Promise<SpecPrefill> {
+  return json(
+    await afetch(`/api/join-prefill`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bundle }),
+    }),
+  );
+}
+
+/**
+ * A join spec draft for expanding THIS fleet's chain: its own spec minus
+ * everything the running fleet already holds, plus the live join block.
+ */
+export async function getFleetJoinSpec(launchId: string): Promise<SpecPrefill> {
+  const res = await afetch(`/api/fleet/${launchId}/join-spec`);
+  if (!res.ok) {
+    // the 409 here is the bundle's own refusal (no public p2p port, one
+    // RPC), which reads as guidance, not as an HTTP failure
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `join spec: HTTP ${res.status}`);
+  }
+  return res.json() as Promise<SpecPrefill>;
+}
+
 /** Offline path: submit a pasted `tx sign --offline` output instead of a wallet response. */
 export async function postSignedGentxTx(
   id: string,
