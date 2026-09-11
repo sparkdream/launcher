@@ -1,0 +1,22 @@
+// Syncthing ignore patterns for launcher (pnpm workspace)
+// Keep identical on every peer. NOTE: 'vendor' is tracked, do not exclude it.
+
+// Dependencies, ~1.2 GB across 6 dirs. pnpm uses a symlink farm; never sync it.
+node_modules
+
+// Build output, apps/web/.next alone is 330 MB
+.next
+dist
+out
+build
+.turbo
+*.tsbuildinfo
+
+// Live SQLite state (state.db + -wal + -shm). Syncing an open DB corrupts it.
+/apps/conductor/data
+
+// Noise
+*.log
+.DS_Store
+Thumbs.db
+*.swp

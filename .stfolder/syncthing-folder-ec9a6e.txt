@@ -1,0 +1,5 @@
+# This directory is a Syncthing folder marker.
+# Do not delete.
+
+folderID: launcher
+created: 2026-09-02T01:19:38-04:00
