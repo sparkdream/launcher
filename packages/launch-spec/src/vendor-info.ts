@@ -4,7 +4,7 @@
 // SDLs) is vendored into vendor/sparkdream-deploy. Profile image defaults and
 // validateSpec's minimum-image floor derive from it: binaries older than the
 // vendored genesis regeneration reject its params at InitChain.
-export const VENDORED_CHAIN_VERSION = "v1.0.34";
+export const VENDORED_CHAIN_VERSION = "v1.0.35";
 
 /** Chain repo commit the vendor sync was taken from. */
-export const VENDORED_CHAIN_COMMIT = "f084b1fe98cb465f8bc8e181f3e360a32f86c510";
+export const VENDORED_CHAIN_COMMIT = "67ec08873096bc9344df6edace1e2a8c83be3009";
