@@ -1994,13 +1994,19 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         if (sdl.includes("WAIT_FOR_CONFIG=true")) {
           throw new Error(`${key}: WAIT_FOR_CONFIG still true — run persist-start (step 20b) first`);
         }
+        // both web components read their chain identity from env (the
+        // explorer renders /chain-config.json from it, the frontend serves
+        // /api/config from it) — refresh the current values on upgrade so
+        // installing an image that reads a newly added var also delivers
+        // the var, without needing a chain reset. The explorer is patched
+        // in place, so persist-start's resolved tunnel targets survive; the
+        // frontend re-renders wholesale, then takes the new image below.
+        if (key === "frontend") {
+          rerenderFrontendSdl(ctx, spec, sdlPath);
+          sdl = fs.readFileSync(sdlPath, "utf8");
+        }
         sdl = sdl.replace(/image: .*/g, `image: ${params.image}`);
         fs.writeFileSync(sdlPath, sdl);
-        // the explorer reads its chain identity from env (v1.0.6+ renders
-        // /chain-config.json from it) — inject the current values on upgrade
-        // so installing the env-aware image also delivers the env, without
-        // needing a chain reset. In place, so persist-start's resolved
-        // tunnel targets survive.
         if (key === "explorer") setExplorerChainEnv(sdlPath, spec);
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(
@@ -2490,6 +2496,30 @@ function setExplorerChainEnv(sdlPath: string, spec: LaunchSpec): void {
 }
 
 /**
+ * Re-render the frontend's SDL from the spec. The frontend is the one
+ * component whose deployed SDL holds nothing the spec doesn't — it never
+ * joins the mesh, so there are no resolved tunnel targets or auth keys to
+ * preserve — so refreshing its runtime env (chain identity, denoms and
+ * display symbols, endpoints) is a wholesale re-render rather than the
+ * in-place patching setExplorerChainEnv has to do.
+ */
+function rerenderFrontendSdl(ctx: StepCtx, spec: LaunchSpec, sdlPath: string): void {
+  const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+  if (!keys) throw new Error("generate-keys output missing");
+  // an upgrade/reset op can name a component the edited spec has since
+  // turned off: say so rather than crashing inside the renderer
+  const component = statelessComponents(spec).find((c) => c.key === "frontend");
+  if (!component) throw new Error("frontend is disabled in the spec — cannot re-render its SDL");
+  renderComponentSdl({
+    spec,
+    component,
+    sshPublicKey: keys.sshPublicKey,
+    outPath: sdlPath,
+    placeholder,
+  });
+}
+
+/**
  * Rewrite WAIT_FOR_CONFIG in the on-disk node SDLs and build the batched
  * MsgUpdateDeployment + manifests. This is how a reset stops and resumes
  * the chain: after persist-start the entrypoint execs sparkdreamd as PID 1,
@@ -2796,16 +2826,7 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
         for (const row of componentRows) {
           const sdlPath = sdlPathFor(ctx, row.key);
           if (row.key === "frontend") {
-            const keys = ctx.output<GenerateKeysOutput>("generate-keys");
-            if (!keys) throw new Error("generate-keys output missing");
-            const component = statelessComponents(spec).find((c) => c.key === "frontend")!;
-            renderComponentSdl({
-              spec,
-              component,
-              sshPublicKey: keys.sshPublicKey,
-              outPath: sdlPath,
-              placeholder,
-            });
+            rerenderFrontendSdl(ctx, spec, sdlPath);
           } else {
             setExplorerChainEnv(sdlPath, spec);
           }

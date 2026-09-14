@@ -330,6 +330,10 @@ describe("Phase A golden run — explorer + frontend enabled", () => {
         bech32Prefix: "sprkdrm",
         displayName: "Spark Dream",
       },
+      // Deliberately not the "DREAM" default (the bond token keeps the
+      // fixture's uspark/SPARK): the frontend and explorer env assertions
+      // below would pass on a hardcoded ticker otherwise.
+      token: { dreamDenom: "uglow.sparkdreamtest", dreamDisplayDenom: "GLOW" },
       topology: {
         validators: { count: 1 },
         sentries: { count: 2 },
@@ -355,6 +359,7 @@ describe("Phase A golden run — explorer + frontend enabled", () => {
     expect(explorer).toContain("TS_TUNNEL_2=26657:{{TAILNET_IP:sentry-0}}:26657");
     expect(explorer).toContain("explorer.sparkdream.io");
     expect(explorer).toContain("NODE_API_ENDPOINT=/api");
+    expect(explorer).toContain("DREAM_DISPLAY_DENOM=GLOW");
     expect(explorer).toContain("persistent: true");
     expect(explorer).toContain("denom: uact");
 
@@ -366,6 +371,10 @@ describe("Phase A golden run — explorer + frontend enabled", () => {
     expect(frontend).toContain("LCD_ENDPOINT=https://api.sparkdream.io");
     expect(frontend).toContain("RPC_ENDPOINT=https://rpc.sparkdream.io");
     expect(frontend).toContain("CHAIN_DENOM=uspark.sparkdreamtest");
+    expect(frontend).toContain("DISPLAY_DENOM=SPARK");
+    // The UI names the dream token in its own copy, so it needs the ticker
+    // too — not just the explorer.
+    expect(frontend).toContain("DREAM_DISPLAY_DENOM=GLOW");
     expect(frontend).toContain("BECH32_PREFIX=sprkdrm");
     expect(frontend).toContain("EXPLORER_URL=https://explorer.sparkdream.io/sparkdream");
     expect(frontend).not.toContain("TS_AUTHKEY");

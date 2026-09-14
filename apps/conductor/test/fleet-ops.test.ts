@@ -685,6 +685,38 @@ describe("component upgrade", () => {
     // reject the (unchanged) editor spec as a frozen-image change
     expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.explorer).toBe(image);
   }, 120_000);
+
+  it("re-renders the frontend's chain-identity env on upgrade", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const sdlPath = path.join(w.work, "launches/fl/sdl", "frontend.yaml");
+    // a fleet launched before an env var existed: its deployed SDL predates
+    // the renderer, so the upgrade has to put the var back, not just the
+    // image (the explorer's setExplorerChainEnv is the same move)
+    fs.writeFileSync(
+      sdlPath,
+      fs.readFileSync(sdlPath, "utf8").replace(/\s*- DREAM_DISPLAY_DENOM=.*\n/, "\n"),
+    );
+    expect(fs.readFileSync(sdlPath, "utf8")).not.toContain("DREAM_DISPLAY_DENOM");
+
+    const image = "sparkdreamnft/sparkdream-ui:v1.1.0";
+    w.fleet.requestUpgrade(launch, ["frontend"], image);
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const sdl = fs.readFileSync(sdlPath, "utf8");
+    expect(sdl).toContain(`image: ${image}`);
+    expect(sdl).toContain("DREAM_DISPLAY_DENOM=DREAM");
+    // the re-render comes from the spec, so the rest of the runtime env and
+    // the accept-domain ingress survive it
+    expect(sdl).toContain("CHAIN_ID=sparkdream-1");
+    expect(sdl).toContain("LCD_ENDPOINT=https://api.sparkdream.io");
+    expect(sdl).toContain("EXPLORER_URL=https://explorer.sparkdream.io/sparkdream");
+    expect(sdl).toContain("app.sparkdream.io");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!.image).toBe(image);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
 });
 
 describe("domain retarget", () => {

@@ -154,6 +154,11 @@ function frontendSdl(input: RenderComponentSdlInput) {
     `RPC_ENDPOINT=https://${pub.rpc}`,
     `CHAIN_DENOM=${spec.token.baseDenom}`,
     `DISPLAY_DENOM=${spec.token.displayDenom}`,
+    // The frontend names the dream token in its own copy (stake/bond/budget
+    // amounts, param labels), so it needs the ticker the same way the explorer
+    // does. Without it the UI falls back to a hardcoded "DREAM" and disagrees
+    // with the explorer beside it on any chain that renamed the token.
+    `DREAM_DISPLAY_DENOM=${spec.token.dreamDisplayDenom}`,
     `BECH32_PREFIX=${spec.network.bech32Prefix}`,
   ];
   if (explorer.enabled && explorer.domain) {
