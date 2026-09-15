@@ -1054,10 +1054,25 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         // §5: relaunching a validator re-wires its sentries' tunnels.
         // socatTunnelCmd self-cleans the port, so no manual pkill (which,
         // unanchored, could kill its own sh wrapper mid-command).
+        // A sentry that cannot be reached right now (its provider is gone,
+        // it is mid-relaunch) is logged and skipped rather than failing the
+        // op: this write lands on a DIFFERENT machine, and failing it here
+        // stranded the validator at WAIT_FOR_CONFIG so it never started at
+        // all, over a link that has its own reconcilers. The sentry's own
+        // relaunch re-aims this tunnel when it comes back, and repair's
+        // mesh-env pass re-aims it from the SDL meanwhile, which is the same
+        // tolerance the sentry branch below already applies to its peers.
         for (const s of topo.validatorSentries[valIndex] ?? []) {
           const sentryRow = componentRow(ctx, `sentry-${s}`);
           const port = tunnelPort(valIndex);
-          await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
+          try {
+            await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
+          } catch (e) {
+            ctx.log(
+              `${key}: sentry-${s} unreachable (${e instanceof Error ? e.message : String(e)}); ` +
+                `leaving its tunnel for its own relaunch or repair to re-aim`,
+            );
+          }
         }
         if (spec.join) {
           // join validators with no public path still dial OUT through a
@@ -1267,10 +1282,26 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // i.e. a deterministic crash loop. Observed live twice; a restore
       // from a stable sentry executed cleanly.
       const counterparts = manifests.filter((m) => m.row.key !== key);
+      // A counterpart whose provider will not answer is logged and dropped
+      // from the ordering below rather than failing the op. That ordering
+      // exists to keep a sentry serving at the head while the validator
+      // state-syncs off it, and a sentry nobody can reach is serving nothing,
+      // so there is no snapshot stream left to interrupt. Failing here
+      // instead stranded the validator unbooted behind a sentry that may
+      // never come back; the sentry's own relaunch re-pushes this manifest.
+      const pushed: typeof counterparts = [];
       for (const { row: r, json } of counterparts) {
-        await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
+        try {
+          await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
+          pushed.push({ row: r, json });
+        } catch (e) {
+          ctx.log(
+            `${r.key}: manifest push failed (${e instanceof Error ? e.message : String(e)}); ` +
+              `continuing without it, its own relaunch or repair re-pushes`,
+          );
+        }
       }
-      for (const { row: r } of counterparts) {
+      for (const { row: r } of pushed) {
         let ok = false;
         let lastProblem = "unreachable";
         for (let i = 0; i < 60 && !ok; i++) {
@@ -1420,7 +1451,18 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         if (msgs.length > 0) await ctx.requireTx(p("mesh-clients"), msgs);
         else ctx.db.deletePendingTx(ctx.launchId, p("mesh-clients"));
         for (const { row, json } of pushes) {
-          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+          try {
+            await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+          } catch (e) {
+            // same tolerance as the counterpart sentries above: a mesh client
+            // on an unreachable provider keeps dialing the old address until
+            // its own relaunch or a repair re-pushes, which beats failing a
+            // relaunch that otherwise finished
+            ctx.log(
+              `${row.key}: manifest push failed (${e instanceof Error ? e.message : String(e)}); ` +
+                `leaving its tunnel for its own relaunch or repair to re-aim`,
+            );
+          }
         }
         ctx.db.setFleetOpStatus(opId, "done");
         return { repointed: pushes.map((p2) => p2.row.key) };

@@ -3141,13 +3141,21 @@ export default function Page() {
             f.components.length > 0 && f.components.every((c) => c.state === "closed");
           const collapsed = shutDown && !showClosedFleet[f.launchId];
           // delete is offered on shut-down fleets (collapsed or not) and on
-          // stale records that never placed anything (failed/aborted
-          // attempts). A live draft ("created") or driving launch ("running")
-          // gets no button; the server 409s a delete raced against the driver
+          // stale records that never placed anything (failed/aborted attempts,
+          // and drafts). "created" is normally transient — the new-launch flow
+          // creates then immediately starts — but a start that never happens
+          // (closed tab, failed call) strands the launch in it forever, and
+          // withholding the button there left an empty fleet card with no way
+          // to dismiss it. Placing anything moves the launch off "created", so
+          // this only ever offers delete on a draft that owns no deployments;
+          // a driving launch ("running") still gets no button, and the server
+          // 409s a delete raced against the driver.
           const deletable =
             shutDown ||
             (f.components.length === 0 &&
-              (f.launchStatus === "aborted" || f.launchStatus === "paused"));
+              (f.launchStatus === "aborted" ||
+                f.launchStatus === "paused" ||
+                f.launchStatus === "created"));
           const active = f.components.filter((c) => c.state === "active");
           const unhealthy = active.filter((c) => healthKind(c) !== "ok");
           const monthly = fleetMonthlyUsd(f.components);
