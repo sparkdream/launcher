@@ -9,35 +9,63 @@
         {
           "@type": "/cosmos.auth.v1beta1.BaseAccount",
           "account_number": "0",
-          "address": "sprkdrm1mm04tct5hspk2qzjtf0xaqyjl46ajhcuc4wxcs",
+          "address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
           "pub_key": null,
           "sequence": "0"
         },
         {
           "@type": "/cosmos.auth.v1beta1.BaseAccount",
           "account_number": "1",
-          "address": "sprkdrm16ef99dd70nzl2lpvwcpz6k84tnhasw009uexc6",
+          "address": "sprkdrm1ctk6qnsg5rf7ddupvkxth8q6h7d49h80vcjgg0",
           "pub_key": null,
           "sequence": "0"
         },
         {
           "@type": "/cosmos.auth.v1beta1.BaseAccount",
           "account_number": "2",
-          "address": "sprkdrm1a5wpjpcj0g7s38lqtlp54muytlal3j6jcmhjqw",
+          "address": "sprkdrm17tce9p442054fkwl9zrntt7k7h3fs92fcwjxke",
           "pub_key": null,
           "sequence": "0"
         },
         {
           "@type": "/cosmos.auth.v1beta1.BaseAccount",
           "account_number": "3",
-          "address": "sprkdrm1v94rgfy8d3e345yva7p2p9uaaf6hle07lhkfs9",
+          "address": "sprkdrm1m6xjdt97j9a67smsy6n6h4vqgdkjy7jm8hvq8x",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "4",
+          "address": "sprkdrm1jzxgmcv3xgqlagkfrppaf8jvpvf3lyqpkhljn9",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "5",
+          "address": "sprkdrm1tfl0ys2wws5shrfre259drs5llh4ug83ne7q9e",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "6",
+          "address": "sprkdrm1kllgzkzvjyq09r8unw4l69wl993u0tex5gd3v0",
+          "pub_key": null,
+          "sequence": "0"
+        },
+        {
+          "@type": "/cosmos.auth.v1beta1.BaseAccount",
+          "account_number": "7",
+          "address": "sprkdrm1enva2et8wh6mn3j04lz0lyxezz0mjsyw0kz49s",
           "pub_key": null,
           "sequence": "0"
         },
         {
           "@type": "/cosmos.auth.v1beta1.ModuleAccount",
           "base_account": {
-            "account_number": "4",
+            "account_number": "8",
             "address": "sprkdrm1jv65s3grqf6v6jl3dp4t6c9t9rk99cd868re8z",
             "pub_key": null,
             "sequence": "0"
@@ -57,38 +85,74 @@
     "bank": {
       "balances": [
         {
-          "address": "sprkdrm1mm04tct5hspk2qzjtf0xaqyjl46ajhcuc4wxcs",
+          "address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
           "coins": [
             {
-              "amount": "20000000000000",
-              "denom": "uspark.sparkdreamdev"
+              "amount": "1250000000000",
+              "denom": "usparz.sparkdreamdev"
             }
           ]
         },
         {
-          "address": "sprkdrm16ef99dd70nzl2lpvwcpz6k84tnhasw009uexc6",
+          "address": "sprkdrm1ctk6qnsg5rf7ddupvkxth8q6h7d49h80vcjgg0",
           "coins": [
             {
-              "amount": "10000000000000",
-              "denom": "uspark.sparkdreamdev"
+              "amount": "750000000000",
+              "denom": "usparz.sparkdreamdev"
             }
           ]
         },
         {
-          "address": "sprkdrm1a5wpjpcj0g7s38lqtlp54muytlal3j6jcmhjqw",
+          "address": "sprkdrm17tce9p442054fkwl9zrntt7k7h3fs92fcwjxke",
           "coins": [
             {
-              "amount": "5000000000000",
-              "denom": "uspark.sparkdreamdev"
+              "amount": "450000000000",
+              "denom": "usparz.sparkdreamdev"
             }
           ]
         },
         {
-          "address": "sprkdrm1v94rgfy8d3e345yva7p2p9uaaf6hle07lhkfs9",
+          "address": "sprkdrm1m6xjdt97j9a67smsy6n6h4vqgdkjy7jm8hvq8x",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "usparz.sparkdreamdev"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1jzxgmcv3xgqlagkfrppaf8jvpvf3lyqpkhljn9",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "usparz.sparkdreamdev"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1tfl0ys2wws5shrfre259drs5llh4ug83ne7q9e",
+          "coins": [
+            {
+              "amount": "450000000000",
+              "denom": "usparz.sparkdreamdev"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1kllgzkzvjyq09r8unw4l69wl993u0tex5gd3v0",
+          "coins": [
+            {
+              "amount": "375000000000",
+              "denom": "usparz.sparkdreamdev"
+            }
+          ]
+        },
+        {
+          "address": "sprkdrm1enva2et8wh6mn3j04lz0lyxezz0mjsyw0kz49s",
           "coins": [
             {
               "amount": "5000000",
-              "denom": "uspark.sparkdreamdev"
+              "denom": "usparz.sparkdreamdev"
             }
           ]
         },
@@ -97,45 +161,45 @@
           "coins": [
             {
               "amount": "95000000000000",
-              "denom": "uspark.sparkdreamdev"
+              "denom": "usparz.sparkdreamdev"
             }
           ]
         }
       ],
       "denom_metadata": [
         {
-          "base": "uspark.sparkdreamdev",
+          "base": "usparz.sparkdreamdev",
           "denom_units": [
             {
-              "denom": "uspark.sparkdreamdev",
+              "denom": "usparz.sparkdreamdev",
               "exponent": 0
             },
             {
-              "denom": "spark",
+              "denom": "sparz",
               "exponent": 6
             }
           ],
           "description": "Native token of Spark Dream A T E L I E R.",
-          "display": "spark",
-          "name": "spark",
-          "symbol": "spark"
+          "display": "sparz",
+          "name": "sparz",
+          "symbol": "sparz"
         },
         {
-          "base": "udream.sparkdreamdev",
+          "base": "udrmz.sparkdreamdev",
           "denom_units": [
             {
-              "denom": "udream.sparkdreamdev",
+              "denom": "udrmz.sparkdreamdev",
               "exponent": 0
             },
             {
-              "denom": "dream",
+              "denom": "drmz",
               "exponent": 6
             }
           ],
           "description": "Internal coordination token - earned through contribution, not traded.",
-          "display": "dream",
-          "name": "dream",
-          "symbol": "dream"
+          "display": "drmz",
+          "name": "drmz",
+          "symbol": "drmz"
         }
       ],
       "params": {
@@ -145,8 +209,8 @@
       "send_enabled": [],
       "supply": [
         {
-          "amount": "130000005000000",
-          "denom": "uspark.sparkdreamdev"
+          "amount": "99175005000000",
+          "denom": "usparz.sparkdreamdev"
         }
       ]
     },
@@ -322,14 +386,71 @@
       ],
       "council_members": [],
       "decision_policies": [],
-      "founding_members": [],
+      "founding_members": [
+        {
+          "address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
+          "display_name": "Alice",
+          "founder": true,
+          "handles": [
+            "alice"
+          ]
+        },
+        {
+          "address": "sprkdrm1ctk6qnsg5rf7ddupvkxth8q6h7d49h80vcjgg0",
+          "display_name": "Bob",
+          "founder": false,
+          "handles": [
+            "bob"
+          ]
+        },
+        {
+          "address": "sprkdrm17tce9p442054fkwl9zrntt7k7h3fs92fcwjxke",
+          "display_name": "Carol",
+          "founder": false,
+          "handles": [
+            "carol"
+          ]
+        },
+        {
+          "address": "sprkdrm1m6xjdt97j9a67smsy6n6h4vqgdkjy7jm8hvq8x",
+          "display_name": "Dave",
+          "founder": false,
+          "handles": [
+            "dave"
+          ]
+        },
+        {
+          "address": "sprkdrm1jzxgmcv3xgqlagkfrppaf8jvpvf3lyqpkhljn9",
+          "display_name": "Erin",
+          "founder": false,
+          "handles": [
+            "erin"
+          ]
+        },
+        {
+          "address": "sprkdrm1tfl0ys2wws5shrfre259drs5llh4ug83ne7q9e",
+          "display_name": "Felix",
+          "founder": false,
+          "handles": [
+            "felix"
+          ]
+        },
+        {
+          "address": "sprkdrm1kllgzkzvjyq09r8unw4l69wl993u0tex5gd3v0",
+          "display_name": "Gwen",
+          "founder": false,
+          "handles": [
+            "gwen"
+          ]
+        }
+      ],
       "group_map": [],
       "next_category_id": 7,
       "next_council_id": "0",
       "next_proposal_id": "0",
       "next_recurring_spend_id": "0",
       "params": {
-        "proposal_fee": "5000000uspark.sparkdreamdev"
+        "proposal_fee": "5000000usparz.sparkdreamdev"
       },
       "policy_permissions_map": [],
       "policy_versions": [],
@@ -345,7 +466,7 @@
         "community_pool": [
           {
             "amount": "95000000000000",
-            "denom": "uspark.sparkdreamdev"
+            "denom": "usparz.sparkdreamdev"
           }
         ]
       },
@@ -525,14 +646,79 @@
       }
     },
     "genutil": {
-      "gen_txs": []
+      "gen_txs": [
+        {
+          "auth_info": {
+            "fee": {
+              "amount": [],
+              "gas_limit": "200000",
+              "granter": "",
+              "payer": ""
+            },
+            "signer_infos": [
+              {
+                "mode_info": {
+                  "single": {
+                    "mode": "SIGN_MODE_LEGACY_AMINO_JSON"
+                  }
+                },
+                "public_key": {
+                  "@type": "/cosmos.crypto.secp256k1.PubKey",
+                  "key": "A/ZHq1P3FZpFbvrIJXDRELjnpq5mJ5mnGMK8KnVuxMNI"
+                },
+                "sequence": "0"
+              }
+            ],
+            "tip": null
+          },
+          "body": {
+            "extension_options": [],
+            "memo": "7303b6e45ee4b42d436e46fc06e36dac28d09b9a@127.0.0.1:26656",
+            "messages": [
+              {
+                "@type": "/cosmos.staking.v1beta1.MsgCreateValidator",
+                "commission": {
+                  "max_change_rate": "0.010000000000000000",
+                  "max_rate": "0.200000000000000000",
+                  "rate": "0.100000000000000000"
+                },
+                "delegator_address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
+                "description": {
+                  "details": "",
+                  "identity": "",
+                  "moniker": "🦢 Svanmøy-01 // ⚡",
+                  "security_contact": "",
+                  "website": ""
+                },
+                "min_self_delegation": "1",
+                "pubkey": {
+                  "@type": "/cosmos.crypto.ed25519.PubKey",
+                  "key": "X9dyzQXpj+hlIplpOsUQ7UPSySscx2Sn5nVMDDAo3CM="
+                },
+                "validator_address": "sprkdrmvaloper1jct5shlz26j2qgdeyzj2nwe5e79djprhvg2w4c",
+                "value": {
+                  "amount": "400000000000",
+                  "denom": "usparz.sparkdreamdev"
+                }
+              }
+            ],
+            "non_critical_extension_options": [],
+            "timeout_height": "0",
+            "timeout_timestamp": null,
+            "unordered": false
+          },
+          "signatures": [
+            "CmpEjYuEJXzUFISiteEL2PeuJCRvWcjiOMt3+Ym6fVJr3mCDXQ0x2eUCfooJeauXLAokNdf2i04AzHDfl/1mBg=="
+          ]
+        }
+      ]
     },
     "gnovm": {
       "params": {
         "chain_domain": "gno.land",
-        "default_deposit": "100000uspark.sparkdreamdev",
+        "default_deposit": "100000usparz.sparkdreamdev",
         "storage_fee_collector": "aLpYisb4Fny8ElIzuT4SKbVeJqU=",
-        "storage_price": "1uspark.sparkdreamdev",
+        "storage_price": "1usparz.sparkdreamdev",
         "sysnames_pkgpath": ""
       },
       "realm_params": null,
@@ -549,7 +735,7 @@
         "expedited_min_deposit": [
           {
             "amount": "100000000",
-            "denom": "uspark.sparkdreamdev"
+            "denom": "usparz.sparkdreamdev"
           }
         ],
         "expedited_threshold": "0.667000000000000000",
@@ -558,7 +744,7 @@
         "min_deposit": [
           {
             "amount": "50000000",
-            "denom": "uspark.sparkdreamdev"
+            "denom": "usparz.sparkdreamdev"
           }
         ],
         "min_deposit_ratio": "0.010000000000000000",
@@ -622,16 +808,16 @@
     "identity": {
       "allow_chain_id_mismatch": true,
       "identity": {
-        "bond_denom": "uspark.sparkdreamdev",
+        "bond_denom": "usparz.sparkdreamdev",
         "bond_display_decimals": 6,
-        "bond_display_name": "Sparkdream Dev Spark",
-        "bond_display_symbol": "SPARK",
+        "bond_display_name": "Sparz",
+        "bond_display_symbol": "SPARZ",
         "chain_human_name": "SparkdreamDev",
         "chain_ticker_prefix": "SDD",
-        "dream_denom": "udream.sparkdreamdev",
+        "dream_denom": "udrmz.sparkdreamdev",
         "dream_display_decimals": 6,
-        "dream_display_name": "Sparkdream Dev Dream",
-        "dream_display_symbol": "DREAM",
+        "dream_display_name": "Drmz",
+        "dream_display_symbol": "DRMZ",
         "founded_at": "1735689600"
       }
     },
@@ -667,7 +853,7 @@
         "inflation_max": "0.05",
         "inflation_min": "0.02",
         "inflation_rate_change": "0.13",
-        "mint_denom": "uspark.sparkdreamdev"
+        "mint_denom": "usparz.sparkdreamdev"
       }
     },
     "name": {
@@ -827,10 +1013,10 @@
       "jury_review_list": [],
       "member_map": [
         {
-          "address": "sprkdrm1mm04tct5hspk2qzjtf0xaqyjl46ajhcuc4wxcs",
+          "address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
           "completed_initiatives_count": 0,
           "completed_interims_count": 0,
-          "dream_balance": "50000000000",
+          "dream_balance": "5000000000",
           "invitation_chain": [],
           "invitation_credits": 10,
           "invited_by": "",
@@ -839,7 +1025,7 @@
           "last_decay_epoch": 0,
           "last_tip_epoch": 0,
           "lifetime_burned": "0",
-          "lifetime_earned": "50000000000",
+          "lifetime_earned": "5000000000",
           "lifetime_reputation": {},
           "reputation_scores": {},
           "staked_dream": "0",
@@ -851,10 +1037,34 @@
           "zeroed_count": 0
         },
         {
-          "address": "sprkdrm16ef99dd70nzl2lpvwcpz6k84tnhasw009uexc6",
+          "address": "sprkdrm1ctk6qnsg5rf7ddupvkxth8q6h7d49h80vcjgg0",
           "completed_initiatives_count": 0,
           "completed_interims_count": 0,
-          "dream_balance": "25000000000",
+          "dream_balance": "3500000000",
+          "invitation_chain": [],
+          "invitation_credits": 7,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "3500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_TRUSTED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm17tce9p442054fkwl9zrntt7k7h3fs92fcwjxke",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
           "invitation_chain": [],
           "invitation_credits": 5,
           "invited_by": "",
@@ -863,7 +1073,7 @@
           "last_decay_epoch": 0,
           "last_tip_epoch": 0,
           "lifetime_burned": "0",
-          "lifetime_earned": "25000000000",
+          "lifetime_earned": "2500000000",
           "lifetime_reputation": {},
           "reputation_scores": {},
           "staked_dream": "0",
@@ -875,10 +1085,82 @@
           "zeroed_count": 0
         },
         {
-          "address": "sprkdrm1a5wpjpcj0g7s38lqtlp54muytlal3j6jcmhjqw",
+          "address": "sprkdrm1m6xjdt97j9a67smsy6n6h4vqgdkjy7jm8hvq8x",
           "completed_initiatives_count": 0,
           "completed_interims_count": 0,
-          "dream_balance": "10000000000",
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1jzxgmcv3xgqlagkfrppaf8jvpvf3lyqpkhljn9",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1tfl0ys2wws5shrfre259drs5llh4ug83ne7q9e",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2500000000",
+          "invitation_chain": [],
+          "invitation_credits": 5,
+          "invited_by": "",
+          "joined_at": 0,
+          "joined_season": 0,
+          "last_decay_epoch": 0,
+          "last_tip_epoch": 0,
+          "lifetime_burned": "0",
+          "lifetime_earned": "2500000000",
+          "lifetime_reputation": {},
+          "reputation_scores": {},
+          "staked_dream": "0",
+          "status": "MEMBER_STATUS_ACTIVE",
+          "tips_given_this_epoch": 0,
+          "trust_level": "TRUST_LEVEL_ESTABLISHED",
+          "trust_level_updated_at": 0,
+          "zeroed_at": 0,
+          "zeroed_count": 0
+        },
+        {
+          "address": "sprkdrm1kllgzkzvjyq09r8unw4l69wl993u0tex5gd3v0",
+          "completed_initiatives_count": 0,
+          "completed_interims_count": 0,
+          "dream_balance": "2000000000",
           "invitation_chain": [],
           "invitation_credits": 3,
           "invited_by": "",
@@ -887,7 +1169,7 @@
           "last_decay_epoch": 0,
           "last_tip_epoch": 0,
           "lifetime_burned": "0",
-          "lifetime_earned": "10000000000",
+          "lifetime_earned": "2000000000",
           "lifetime_reputation": {},
           "reputation_scores": {},
           "staked_dream": "0",
@@ -1216,68 +1498,130 @@
       "member_profile_map": [
         {
           "achievements": [
-            "first_step",
-            "voice_heard",
-            "contributor"
+            "first_spark",
+            "genesis_founder"
           ],
-          "address": "sprkdrm1mm04tct5hspk2qzjtf0xaqyjl46ajhcuc4wxcs",
-          "challenges_won": 2,
+          "address": "sprkdrm1jct5shlz26j2qgdeyzj2nwe5e79djprhcgpwrc",
+          "challenges_won": 0,
           "display_name": "Alice",
-          "display_title": "veteran",
-          "forum_helpful_count": 50,
-          "invitations_successful": 5,
-          "jury_duties_completed": 3,
-          "lifetime_xp": 5000,
-          "season_level": 8,
-          "season_xp": 5000,
-          "unlocked_titles": [
-            "newcomer",
-            "veteran",
-            "rising_star"
-          ],
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
           "username": "alice",
-          "votes_cast": 15
+          "votes_cast": 0
         },
         {
           "achievements": [
-            "first_step",
-            "voice_heard"
+            "genesis_founder"
           ],
-          "address": "sprkdrm16ef99dd70nzl2lpvwcpz6k84tnhasw009uexc6",
+          "address": "sprkdrm1ctk6qnsg5rf7ddupvkxth8q6h7d49h80vcjgg0",
           "challenges_won": 0,
           "display_name": "Bob",
-          "display_title": "newcomer",
-          "forum_helpful_count": 15,
-          "invitations_successful": 2,
-          "jury_duties_completed": 1,
-          "lifetime_xp": 1500,
-          "season_level": 6,
-          "season_xp": 1500,
-          "unlocked_titles": [
-            "newcomer"
-          ],
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
           "username": "bob",
-          "votes_cast": 5
+          "votes_cast": 0
         },
         {
           "achievements": [
-            "voice_heard"
+            "genesis_founder"
           ],
-          "address": "sprkdrm1a5wpjpcj0g7s38lqtlp54muytlal3j6jcmhjqw",
+          "address": "sprkdrm17tce9p442054fkwl9zrntt7k7h3fs92fcwjxke",
           "challenges_won": 0,
           "display_name": "Carol",
           "display_title": "",
-          "forum_helpful_count": 5,
+          "forum_helpful_count": 0,
           "invitations_successful": 0,
           "jury_duties_completed": 0,
-          "lifetime_xp": 300,
-          "season_level": 2,
-          "season_xp": 300,
-          "unlocked_titles": [
-            "newcomer"
-          ],
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
           "username": "carol",
-          "votes_cast": 2
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1m6xjdt97j9a67smsy6n6h4vqgdkjy7jm8hvq8x",
+          "challenges_won": 0,
+          "display_name": "Dave",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "dave",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1jzxgmcv3xgqlagkfrppaf8jvpvf3lyqpkhljn9",
+          "challenges_won": 0,
+          "display_name": "Erin",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "erin",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1tfl0ys2wws5shrfre259drs5llh4ug83ne7q9e",
+          "challenges_won": 0,
+          "display_name": "Felix",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "felix",
+          "votes_cast": 0
+        },
+        {
+          "achievements": [
+            "genesis_founder"
+          ],
+          "address": "sprkdrm1kllgzkzvjyq09r8unw4l69wl993u0tex5gd3v0",
+          "challenges_won": 0,
+          "display_name": "Gwen",
+          "display_title": "",
+          "forum_helpful_count": 0,
+          "invitations_successful": 0,
+          "jury_duties_completed": 0,
+          "lifetime_xp": 0,
+          "season_level": 0,
+          "season_xp": 0,
+          "unlocked_titles": [],
+          "username": "gwen",
+          "votes_cast": 0
         }
       ],
       "member_quest_progress_map": [],
@@ -1845,7 +2189,7 @@
       "last_total_power": "0",
       "last_validator_powers": [],
       "params": {
-        "bond_denom": "uspark.sparkdreamdev",
+        "bond_denom": "usparz.sparkdreamdev",
         "historical_entries": 10000,
         "max_entries": 7,
         "max_validators": 100,
@@ -1894,6 +2238,6 @@
       }
     }
   },
-  "genesis_time": "2026-04-20T16:52:28.536298323Z",
+  "genesis_time": "2026-09-15T19:39:01.617993239Z",
   "initial_height": 1
 }

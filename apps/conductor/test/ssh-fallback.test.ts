@@ -38,10 +38,20 @@ function stubShell() {
   };
 }
 
+/**
+ * A target whose SSH connect cannot succeed, reached the same way on every
+ * machine. The port is not the mechanism: a closed port refuses on one host,
+ * blackholes on another, and under WSL2's loopback actually accepts, so
+ * relying on it made these tests pass or hang by environment. readyTimeoutMs
+ * bounds the handshake instead — whatever the socket does, ssh2 gives up
+ * inside it with "Timed out while waiting for handshake", which the runner
+ * classifies as a connect failure and hands to the lease-shell fallback.
+ */
 function deadTarget(): SshTarget {
   return {
     host: "127.0.0.1",
-    port: 1, // nothing listens — instant ECONNREFUSED
+    port: 1,
+    readyTimeoutMs: 150,
     user: "root",
     privateKeyPem: generateSshKeypair().privateKeyPem,
     shellFallback: {

@@ -21,6 +21,7 @@ import {
   applyFoundingMembers,
   applyGenesisMembers,
   applyReferenceGenesis,
+  assertNoReferenceAccounts,
   commissionFlags,
 } from "../genesis-params.js";
 import {
@@ -316,6 +317,13 @@ export async function buildGenesisFiles(
   applyGenesisMembers(genesis, reference, spec, keys.accounts);
   applyFoundingMembers(genesis, spec, keys.accounts);
   applyChainParams(genesis, spec);
+  // Nothing address-keyed may survive the overlay unless the spec asked for
+  // it. Runs before any genesis account is added, so everything present is
+  // either a module address or something the four calls above placed.
+  assertNoReferenceAccounts(genesis, reference, [
+    ...Object.values(keys.accounts),
+    ...spec.accounts.initial.map((a) => a.address).filter((a): a is string => Boolean(a)),
+  ]);
   fs.writeFileSync(genesisPath, JSON.stringify(genesis, null, 2));
 
   // 2. genesis accounts: initial allocations + operator self-delegation

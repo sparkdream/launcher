@@ -79,6 +79,14 @@ export function applyReferenceGenesis(genesis: Json, reference: Json, spec: Laun
     return JSON.parse(s) as T;
   };
 
+  // Addresses the spec names outright. Generated accounts get fresh keys and
+  // can never collide with the reference's, so an explicit address is the
+  // only way a launch legitimately reuses one — which is what distinguishes a
+  // relaunch of the reference network from a new chain inheriting its state.
+  const explicitAddresses = new Set(
+    spec.accounts.initial.map((a) => a.address).filter((a): a is string => Boolean(a)),
+  );
+
   for (const [module, refState] of Object.entries(refApp)) {
     if (module === "genutil") continue;
     // a module the binary no longer ships (x/crisis left with sdk 0.53):
@@ -93,13 +101,50 @@ export function applyReferenceGenesis(genesis: Json, reference: Json, spec: Laun
     if (module === "distribution" && app.distribution?.fee_pool) {
       overlaid.fee_pool = app.distribution.fee_pool;
     }
+    // The reference network's seeded content is written by one of its own
+    // accounts: testnet's welcome post is authored by a founder address and
+    // its body names sparkdream-test-1. On a NEW chain that is a post by an
+    // account which does not exist, telling readers about a chain they are not
+    // on — so it goes. On a relaunch of the reference network itself the same
+    // post is correct and wanted, and the spec proves that case by carrying
+    // the author's address explicitly (a generated key can never match one).
+    // Keep exactly the posts whose author survives; post_count is a next-id
+    // counter, so the reference's value stays valid either way.
+    if (module === "blog") {
+      const refPosts = (overlaid.posts ?? []) as Json[];
+      const kept = refPosts.filter(
+        (post) => typeof post.creator === "string" && explicitAddresses.has(post.creator),
+      );
+      if (kept.length !== refPosts.length) {
+        // Replies and reactions are keyed to post ids, so they go with the
+        // posts rather than being filtered separately. post_count is a
+        // next-id counter: the reference's value stays valid while any post
+        // survives, and resets to the skeleton's when none do.
+        overlaid.posts = kept;
+        overlaid.replies = app.blog?.replies ?? [];
+        overlaid.reply_count = app.blog?.reply_count ?? "1";
+        overlaid.reactions = app.blog?.reactions ?? [];
+        overlaid.reaction_counts = app.blog?.reaction_counts ?? [];
+        if (kept.length === 0) overlaid.post_count = app.blog?.post_count ?? "1";
+      }
+    }
     app[module] = overlaid;
   }
 
   // Membership is spec-driven (accounts[].member, applyGenesisMembers) —
-  // the reference network's seeded members don't carry over.
+  // the reference network's seeded members don't carry over. Neither do its
+  // founding members: they name the reference network's own addresses, which
+  // a launched chain never has, and x/commons treats a non-empty
+  // founding_members as an override of the image's compiled-in founders. Left
+  // in place it would bootstrap governance around accounts that do not exist,
+  // and BootstrapGovernance logs "No founding member accounts found in
+  // genesis!" and returns — a chain that starts fine and has no councils, with
+  // no way to create one. applyFoundingMembers refills this from the spec's
+  // council accounts; leaving it empty is what selects the compiled-in
+  // fallback that validateSpec's no-council branch assumes.
   if (app.rep) app.rep.member_map = [];
   if (app.season) app.season.member_profile_map = [];
+  if (app.commons) app.commons.founding_members = [];
 
   // Token display naming follows the spec like the base denoms do. The
   // metadata keeps the reference's lowercase convention (display "spark");
@@ -283,15 +328,76 @@ export function applyCommunityPool(genesis: Json, spec: LaunchSpec): Json {
 }
 
 /**
+ * Fail the build if any of the reference network's own accounts survived the
+ * overlay into the genesis being assembled.
+ *
+ * applyReferenceGenesis keeps the reference's module params and bootstrap
+ * state while replacing everything address-keyed, but it does that with a
+ * hand-maintained list of fields to skip, zero or replace. Every time the
+ * chain repo seeds a new address-bearing field, that list silently grows a
+ * hole — and the symptom is not a crash. x/commons founding_members was
+ * exactly this: non-empty, it overrides the image's compiled-in founders, so
+ * a leak means BootstrapGovernance looks up addresses the launched chain has
+ * never heard of, logs "No founding member accounts found in genesis!" and
+ * returns. The chain starts, produces blocks, and has no councils — and
+ * council creation permissions live on the councils, so it can never grow
+ * one.
+ *
+ * The check is the reference's own BaseAccounts: those are precisely the
+ * human accounts of the reference network, and none of them belongs in a new
+ * chain. Module accounts are deliberately not checked — their addresses are
+ * derived from the module name and are identical on every chain sharing the
+ * bech32 prefix, so params that legitimately name one (session's
+ * authorized_grant_creators) are not leaks.
+ *
+ * `placed` are the addresses the launcher put in itself. A canonical-network
+ * relaunch legitimately reuses the reference's addresses, but only when the
+ * spec names them explicitly — which is the difference between a deliberate
+ * reuse and a leak.
+ */
+export function assertNoReferenceAccounts(
+  genesis: Json,
+  reference: Json,
+  placed: Iterable<string>,
+): void {
+  const allowed = new Set(placed);
+  const refHuman = ((reference.app_state?.auth?.accounts ?? []) as Json[])
+    .filter((a) => a["@type"] === "/cosmos.auth.v1beta1.BaseAccount")
+    .map((a) => a.address as string)
+    .filter((a): a is string => Boolean(a) && !allowed.has(a));
+  if (refHuman.length === 0) return;
+
+  // One pass over the serialized genesis per module, so the error can name
+  // the module that carried the address rather than just the address.
+  const found: string[] = [];
+  for (const [module, state] of Object.entries((genesis.app_state ?? {}) as Json)) {
+    const blob = JSON.stringify(state);
+    for (const address of refHuman) {
+      if (blob.includes(address)) found.push(`${module}: ${address}`);
+    }
+  }
+  if (found.length > 0) {
+    throw new Error(
+      "reference genesis accounts leaked into the launched chain's genesis — " +
+        "applyReferenceGenesis needs to strip the field carrying them:\n  " +
+        found.join("\n  ") +
+        "\nThese addresses belong to the reference network and do not exist on " +
+        "this chain; state keyed to them is silently inert at InitGenesis.",
+    );
+  }
+}
+
+
+/**
  * Write x/commons founding_members from spec accounts flagged `council`.
  * The chain's InitGenesis bootstrap builds the founding councils from this
  * list when it is non-empty, instead of the image's compiled-in founder
  * addresses (GenesisNames), which a launched chain's generated accounts can
- * never match. Runs after applyReferenceGenesis (the vendored reference
- * genesis carries an empty founding_members, so nothing is overwritten). With no
- * council accounts the field is left unset: the compiled-in founders apply,
- * which validateSpec only allows when explicit-address accounts might match
- * them.
+ * never match. Runs after applyReferenceGenesis, which clears the field —
+ * the reference network's own founding members are not a default for a new
+ * chain. With no council accounts it therefore stays empty and the
+ * compiled-in founders apply, which validateSpec only allows when
+ * explicit-address accounts might match them.
  */
 export function applyFoundingMembers(
   genesis: Json,

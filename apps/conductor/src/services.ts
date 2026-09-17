@@ -20,6 +20,18 @@ export interface SshTarget {
     oseq: number;
     service: string;
   };
+  /**
+   * How long to wait for the SSH handshake before giving up and letting the
+   * shellFallback take over (ssh2's readyTimeout). Defaults to 20s, which is
+   * the right patience for a real node behind a provider's forwarded port.
+   *
+   * Overridable because "the connect fails" is not something a caller can
+   * provoke portably: a host that refuses is instant, but one that blackholes
+   * the SYN costs the full timeout, and under WSL2's loopback neither holds --
+   * closed ports accept the connection and port 1 swallows it. Tests set a
+   * small budget so the fallback path is reached the same way everywhere.
+   */
+  readyTimeoutMs?: number;
 }
 
 export interface SshResult {

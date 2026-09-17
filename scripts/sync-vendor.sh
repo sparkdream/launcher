@@ -30,6 +30,24 @@ rsync -a --delete \
 
 COMMIT="$(git -C "$CHAIN_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+# The recorded commit is the only provenance the vendored data carries, and
+# it is what VENDORED_CHAIN_COMMIT reports to anyone debugging a launch. A
+# dirty chain repo makes it a lie: the files copied above are the working
+# tree, not that commit. Refuse rather than record something untrue --
+# SYNC_VENDOR_ALLOW_DIRTY=1 marks it "-dirty" instead, for iterating on chain
+# changes before they are committed.
+if [ "$COMMIT" != "unknown" ] && ! git -C "$CHAIN_REPO" diff --quiet HEAD -- deploy/config deploy/mesh; then
+  if [ "${SYNC_VENDOR_ALLOW_DIRTY:-0}" = "1" ]; then
+    COMMIT="$COMMIT-dirty"
+    echo "warning: chain repo has uncommitted deploy changes; recording $COMMIT" >&2
+  else
+    echo "error: $CHAIN_REPO has uncommitted changes under deploy/config or deploy/mesh." >&2
+    echo "       Vendoring now would record commit $COMMIT for files that are not in it." >&2
+    echo "       Commit the chain repo first, or re-run with SYNC_VENDOR_ALLOW_DIRTY=1." >&2
+    exit 1
+  fi
+fi
+
 {
   echo "# Synced from the SparkDream chain repo — do not edit by hand."
   echo "# Source: deploy/config in the chain repo"

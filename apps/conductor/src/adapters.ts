@@ -214,7 +214,7 @@ export class Ssh2Runner implements SshRunner {
           port: target.port,
           username: target.user,
           privateKey: target.privateKeyPem,
-          readyTimeout: 20_000,
+          readyTimeout: target.readyTimeoutMs ?? 20_000,
         });
     });
   }
