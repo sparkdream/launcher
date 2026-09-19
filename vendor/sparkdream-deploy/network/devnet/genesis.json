@@ -538,7 +538,6 @@
         "operator_reward_inflation_share": "0.050000000000000000",
         "operator_reward_pool_overflow_burn_ratio": "0.500000000000000000",
         "rate_limit_window": "3600s",
-        "trust_discount_rate": "0.500000000000000000",
         "unverified_link_ttl": "3600s",
         "upheld_to_reset_overturns": 3,
         "verification_window": "3600s",
@@ -734,7 +733,7 @@
         "burn_vote_veto": true,
         "expedited_min_deposit": [
           {
-            "amount": "100000000",
+            "amount": "250000000",
             "denom": "usparz.sparkdreamdev"
           }
         ],
