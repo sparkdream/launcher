@@ -71,11 +71,12 @@ async function run(s: LaunchSpec, id: string, services = fakeServices()) {
 function joinServices(genesisBody: string) {
   const services = fakeServices();
   services.rpc.texts.set("origin.example/genesis", genesisBody);
-  // resolveStateSyncTrust: FakeRpc.status yields height 5 → trust height 1,
-  // hash cross-checked across both RPCs
+  // resolveStateSyncTrust picks a trust height 1000 below the chain's head,
+  // so the body is registered for whatever height that lands on — what the
+  // step is asked to prove is that the hash matches across both RPCs
   const block = JSON.stringify({ result: { block_id: { hash: TRUST_HASH } } });
-  services.rpc.texts.set("rpc-a.example/block?height=1", block);
-  services.rpc.texts.set("rpc-b.example/block?height=1", block);
+  services.rpc.texts.set("rpc-a.example/block?height=", block);
+  services.rpc.texts.set("rpc-b.example/block?height=", block);
   return services;
 }
 
@@ -165,7 +166,9 @@ describe("join-mode Phase A golden run — 1 validator × 1 sentry", () => {
     );
     expect(sentryConfig).toContain("enable = true");
     expect(sentryConfig).toContain('rpc_servers = "https://rpc-a.example,https://rpc-b.example"');
-    expect(sentryConfig).toContain("trust_height = 1");
+    // the anchor is resolved from the chain's head, not a fixed height —
+    // what matters is that a real one was pinned, with its hash
+    expect(sentryConfig).toMatch(/trust_height = [1-9]\d*/);
     expect(sentryConfig).toContain(`trust_hash = "${TRUST_HASH}"`);
     expect(sentryConfig).toContain(JOIN_PEER);
     // still fronts its own validator over the local tunnel

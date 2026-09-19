@@ -59,14 +59,18 @@ export interface Coin {
 }
 
 /**
- * A provider's PUT rejection for a manifest identical to the one it already
- * runs. Akash surfaces "no change to apply" as HTTP 422 "manifest version
- * validation failed" — the same text a genuine hash mismatch produces, so
- * callers must only read it as "already deployed" once they've confirmed the
- * on-chain deployment version equals this manifest's hash (a mismatch there
- * is a real fault to raise, not swallow).
+ * A provider's HTTP 422 "manifest version validation failed": the sha256 it
+ * computed over the manifest it received does not equal the deployment
+ * version it holds for that dseq.
+ *
+ * This was long read as the provider's "no change to apply" for a manifest
+ * identical to the one it already runs. It is not: a provider already on this
+ * manifest holds its hash as the version and validates the push cleanly. The
+ * rejection always means the provider's view of the deployment disagrees with
+ * the chain's, whether because it has not caught up yet or because it has
+ * stopped tracking the deployment at all.
  */
-export function isManifestAlreadyDeployed(e: unknown): boolean {
+export function isManifestVersionRejected(e: unknown): boolean {
   const msg = String(e);
   return /HTTP 422/.test(msg) && /manifest version validation failed/i.test(msg);
 }

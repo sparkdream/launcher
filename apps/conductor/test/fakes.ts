@@ -23,6 +23,7 @@ export function fakeProviders(): Map<string, ProviderInfo> {
       isAudited: true,
       uptime7d: 0.999,
       storageClasses: ["beta3"],
+      customDomain: true,
     });
   }
   return map;
@@ -172,8 +173,9 @@ export class FakeProviderGateway {
   /** In-container localhost-RPC height for validator reads (upgrade verify,
    *  health monitor): advances on each /status read so a progress-based gate
    *  passes. dseqs in stalledDseqs report a frozen height, modelling a node
-   *  that answers but is not making blocks. */
-  private statusHeight = 1_000_000;
+   *  that answers but is not making blocks. Shared with {@link FakeRpc} —
+   *  see {@link FakeChainHeight}. */
+  chain = new FakeChainHeight();
   stalledDseqs = new Set<string>();
 
   async sendManifest(
@@ -315,7 +317,7 @@ export class FakeProviderGateway {
     }
     if (script.includes("SELECT count(*) FROM users")) return { stdout: "1", stderr: "" };
     if (script.includes("127.0.0.1:26657/status")) {
-      const height = this.stalledDseqs.has(dseq) ? this.statusHeight : ++this.statusHeight;
+      const height = this.stalledDseqs.has(dseq) ? this.chain.frozen(dseq) : this.chain.next();
       return {
         stdout: `{"result":{"sync_info":{"latest_block_height":"${height}","catching_up":false}}}`,
         stderr: "",
@@ -365,6 +367,16 @@ export class FakeSsh {
    *  check). Unset → the answer carries no validator_info (unknown, never a
    *  mismatch). */
   statusConsensusPubkey: string | null = null;
+
+  /**
+   * ssh id → the height its local RPC reports, for a node that answers every
+   * probe while no longer following the chain (a consensus panic leaves the
+   * RPC up). Anything not listed sits at the fleet's height.
+   */
+  stoppedHeights = new Map<string, number>();
+
+  /** Shared with the other fake RPC paths — see {@link FakeChainHeight}. */
+  chain = new FakeChainHeight();
   /** When true, validators' config.toml still references the pre-rekey IPs
    *  (headscale relaunch's rewire probe). */
   configHasStaleIp = false;
@@ -551,8 +563,9 @@ export class FakeSsh {
       const validatorInfo = this.statusConsensusPubkey
         ? `,"validator_info":{"pub_key":{"value":"${this.statusConsensusPubkey}"}}`
         : "";
+      const height = this.stoppedHeights.get(id) ?? this.chain.next();
       return ok(
-        `{"result":{"sync_info":{"latest_block_height":"1000000","catching_up":false}${validatorInfo}}}`,
+        `{"result":{"sync_info":{"latest_block_height":"${height}","catching_up":false}${validatorInfo}}}`,
       );
     }
     if (command.includes("nc -z 127.0.0.1 26660")) {
@@ -608,8 +621,40 @@ export class FakeSsh {
   }
 }
 
+/**
+ * The one chain height behind every fake RPC path.
+ *
+ * A fleet's nodes all follow the same chain, so the height a sentry serves
+ * on its forwarded port ({@link FakeRpc}) and the one a validator serves to
+ * an in-container read ({@link FakeProviderGateway.shellExec}) have to stay
+ * within a block or two of each other. They used to come from unrelated
+ * counters, which is invisible to a check that reads one node but not to the
+ * health monitor, which compares them: a fleet whose fake sentry sat at 10
+ * while its fake validator sat at a million looked like a dead sentry.
+ *
+ * A dseq frozen through `stalledDseqs` keeps the height of its last read
+ * while the rest of the fleet moves on — a node that answers but has stopped
+ * making blocks.
+ */
+export class FakeChainHeight {
+  private h = 1_000_000;
+  private frozenAt = new Map<string, number>();
+
+  next(): number {
+    return ++this.h;
+  }
+
+  /** Height for a node that has stopped: pinned the first time it is read. */
+  frozen(id: string): number {
+    const at = this.frozenAt.get(id) ?? this.h;
+    this.frozenAt.set(id, at);
+    return at;
+  }
+}
+
 export class FakeRpc {
-  private heights = new Map<string, number>();
+  /** Shared with {@link FakeProviderGateway} — see {@link FakeChainHeight}. */
+  chain = new FakeChainHeight();
   httpOkResult = true;
   /** Docker Hub tag probe — 200 = image exists (validate-spec fail-fast). */
   httpStatusResult = 200;
@@ -622,11 +667,22 @@ export class FakeRpc {
    *  the probe fails outright rather than returning a stale height. */
   chainHalted = false;
 
+  /**
+   * URL fragment → the height that node's RPC is pinned at, and whether it
+   * admits to catching up. Models a node that answers every probe while no
+   * longer following the chain, which is how a consensus panic looks from
+   * outside: the RPC stays up at the height the state machine died on.
+   */
+  stoppedHeights = new Map<string, { height: number; catchingUp: boolean }>();
+
   async status(url: string) {
     if (this.chainHalted) throw new Error(`rpc ${url}/status: connect ECONNREFUSED`);
-    const h = (this.heights.get(url) ?? 0) + 5;
-    this.heights.set(url, h);
-    return { latestBlockHeight: h, catchingUp: false };
+    for (const [fragment, at] of this.stoppedHeights) {
+      if (url.includes(fragment)) {
+        return { latestBlockHeight: at.height, catchingUp: at.catchingUp };
+      }
+    }
+    return { latestBlockHeight: this.chain.next(), catchingUp: false };
   }
 
   /** Hosts that answer false regardless of httpOkResult (dark domains). */
@@ -666,6 +722,9 @@ export function fakeServices(): FakeWorld {
   const provider = new FakeProviderGateway();
   const api = new FakeAkashApi();
   const rpc = new FakeRpc();
+  // one chain behind all three RPC paths: forwarded port, lease shell, SSH
+  rpc.chain = provider.chain;
+  ssh.chain = provider.chain;
   provider.onChainHash = (dseq) => api.deploymentHashes.get(dseq);
   provider.onNodeManifest = (sshId, waitMode) => {
     if (waitMode) {

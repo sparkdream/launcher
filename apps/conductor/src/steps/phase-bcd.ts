@@ -351,6 +351,7 @@ export const deployHeadscaleStep: StepDef = {
         excludeMatchers: exclusionEntries(ctx.spec, "headscale"),
         log: ctx.log,
         requiredStorageClass: artifacts.requiredStorageClass,
+        requiresCustomDomain: artifacts.requiresCustomDomain,
         providers,
       });
       if (ensureBidPickRow(ctx, "headscale")) {
@@ -534,7 +535,12 @@ export const seedHeadscaleBackupStep: StepDef = {
 export interface DeploymentPlan {
   perNode: Record<
     string,
-    { dseq: string; manifestPath: string; requiredStorageClass?: string | undefined }
+    {
+      dseq: string;
+      manifestPath: string;
+      requiredStorageClass?: string | undefined;
+      requiresCustomDomain?: boolean | undefined;
+    }
   >;
 }
 
@@ -605,7 +611,12 @@ export const createDeploymentsStep: StepDef = {
       const dseq = String(height + offset++); // distinct dseq per deployment, one batched tx
       const manifestPath = path.join(ctx.dirs.sdl, `${key}.manifest.json`);
       fs.writeFileSync(manifestPath, artifacts.manifestJson);
-      perNode[key] = { dseq, manifestPath, requiredStorageClass: artifacts.requiredStorageClass };
+      perNode[key] = {
+        dseq,
+        manifestPath,
+        requiredStorageClass: artifacts.requiredStorageClass,
+        requiresCustomDomain: artifacts.requiresCustomDomain,
+      };
       msgs.push(
         createDeploymentMsg({
           owner: addr,
@@ -673,6 +684,7 @@ export const collectBidsStep: StepDef = {
         excludeMatchers: exclusionEntries(ctx.spec, key),
         log: ctx.log,
         requiredStorageClass: entry.requiredStorageClass,
+        requiresCustomDomain: entry.requiresCustomDomain,
         providers,
       });
       if (ensureBidPickRow(ctx, key)) {
@@ -1099,6 +1111,7 @@ async function rebidComponent(
       excludeMatchers: exclusionEntries(ctx.spec, key),
       log: ctx.log,
       requiredStorageClass: entry.requiredStorageClass,
+      requiresCustomDomain: entry.requiresCustomDomain,
       providers,
     });
     if (!decision.chosen && chosen.size > 0 && !stateless.has(key)) {
@@ -1125,6 +1138,7 @@ async function rebidComponent(
         excludeMatchers: exclusionEntries(ctx.spec, key),
         log: ctx.log,
         requiredStorageClass: entry.requiredStorageClass,
+        requiresCustomDomain: entry.requiresCustomDomain,
         providers,
       });
     }

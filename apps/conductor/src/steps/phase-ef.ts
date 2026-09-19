@@ -4,7 +4,7 @@ import path from "node:path";
 import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
-import { isManifestAlreadyDeployed } from "../akash/client.js";
+import { isManifestVersionRejected } from "../akash/client.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
 import type { SshTarget } from "../services.js";
@@ -650,21 +650,62 @@ export const persistStartStep: StepDef = {
     const cert = loadCert(ctx);
     for (const u of updates) {
       const a = assignments.perNode[u.key]!;
-      try {
-        await ctx.services.provider.sendManifest(cert, a.hostUri, u.dseq, u.manifestJson);
-      } catch (e) {
-        // Every deployment here is on this manifest's hash (matched above, or
-        // just updated), so the provider's 422 can only be its "no change to
-        // apply" — the component already runs what we are pushing. Anything
-        // else is a real fault.
-        if (!isManifestAlreadyDeployed(e)) throw e;
-        ctx.log(`${u.key}: already running the persisted manifest — provider reports no change`);
-      }
+      await pushManifest(ctx, cert, u.key, a.hostUri, u.dseq, u.manifestJson);
       persisted.push(u.key);
     }
     return { persisted };
   },
 };
+
+/**
+ * PUT a manifest to its provider, insisting that it lands.
+ *
+ * Every caller arrives here having already confirmed that the on-chain
+ * deployment version equals this manifest's hash, so the provider is obliged
+ * to accept it: one that already runs this manifest holds that same version
+ * and validates the push cleanly, changing nothing. An HTTP 422 "manifest
+ * version validation failed" therefore does not mean "no change to apply",
+ * it means the provider's view of the deployment disagrees with the chain's.
+ * Right after an update tx that is usually the provider still catching up,
+ * which clears on a retry.
+ *
+ * It used to be read as the benign case and passed over, which hid a real
+ * fault: on 2026-09-18 a provider refused every manifest for two deployments
+ * for days, including one pushed an hour after its tx and one sent by a
+ * different client entirely, while three upgrades in a row reported success
+ * and the containers went on serving the image from before the first of them.
+ * A push that never lands is an error now, because the alternative is a fleet
+ * that lies about what it runs.
+ */
+export async function pushManifest(
+  ctx: StepCtx,
+  cert: ReturnType<typeof loadCert>,
+  key: string,
+  hostUri: string,
+  dseq: string,
+  manifestJson: string,
+): Promise<void> {
+  // sendManifest already waits before each PUT, so this spans ~1 minute —
+  // past the lag of a provider that is merely a few blocks behind
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ctx.services.provider.sendManifest(cert, hostUri, dseq, manifestJson);
+      return;
+    } catch (e) {
+      if (!isManifestVersionRejected(e)) throw e;
+      if (attempt >= 4) {
+        throw new Error(
+          `${key}: the provider kept rejecting the manifest for deployment ${dseq} at the version ` +
+            "the chain already carries, so the container would go on running whatever it runs now. " +
+            "The provider is not tracking this deployment: relaunch the component to move it, or " +
+            "retry the step if the provider has recovered",
+        );
+      }
+      ctx.log(`${key}: provider has not caught up to the new version yet, retrying the push`);
+      await ctx.services.sleep(10_000);
+    }
+  }
+}
 
 export const verifyChainStep: StepDef = {
   name: "verify-chain",

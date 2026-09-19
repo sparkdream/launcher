@@ -9,7 +9,7 @@ import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
 import { feeCoin, feeConfig } from "./fee.js";
 import { PRICING_DENOM } from "./render-sdl.js";
-import { isManifestAlreadyDeployed, pollBids } from "./akash/client.js";
+import { pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { gateForFreshVolume } from "./akash/update.js";
@@ -23,7 +23,7 @@ import {
 } from "./steps/phase-a.js";
 import { sparkdreamd } from "./exec.js";
 import { explorerChainEnv, renderComponentSdl, EXPLORER_SENTRY, EXPLORER_TUNNELS } from "./render-component-sdl.js";
-import { deploymentInfoWithRetry, ingressHost } from "./steps/phase-ef.js";
+import { deploymentInfoWithRetry, ingressHost, pushManifest } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
 import {
@@ -33,7 +33,7 @@ import {
   verifySignedDoc,
   type GentxSignResponse,
 } from "./gentx.js";
-import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
+import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, STALLED_BEHIND_BLOCKS, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import { readSecretFile } from "./secrets.js";
 import type { SshTarget } from "./services.js";
@@ -262,53 +262,8 @@ async function updateOnChainAndPush(
       })),
     );
   }
-  const justSigned = new Set(drifted.map((d) => d.row.key));
   for (const it of items) {
-    await pushManifest(ctx, cert, it.row, it.manifestJson, justSigned.has(it.row.key));
-  }
-}
-
-/**
- * PUT a manifest, treating the provider's 422 by what we know rather than by
- * its wording.
- *
- * "manifest version validation failed" is the same answer a provider gives for
- * "already running this" and for a genuine version mismatch, so the message
- * alone proves nothing. It is benign for a deployment that was ALREADY at this
- * version. For one whose version we just moved it is not: swallowing it leaves
- * the chain carrying a manifest the provider never applied, and that split is
- * invisible afterwards — every later convergence check reads chain and
- * launcher as agreeing and skips the component, while its container goes on
- * serving the old env. Retry a few times first, since a provider's own node
- * can still be reading the previous version moments after our tx confirmed.
- */
-async function pushManifest(
-  ctx: StepCtx,
-  cert: ReturnType<typeof loadCert>,
-  row: FleetComponentRow,
-  manifestJson: string,
-  justSigned: boolean,
-): Promise<void> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, manifestJson);
-      return;
-    } catch (e) {
-      if (!isManifestAlreadyDeployed(e)) throw e;
-      if (!justSigned) {
-        ctx.log(`${row.key}: already running this manifest, provider reports no change`);
-        return;
-      }
-      if (attempt >= 3) {
-        throw new Error(
-          `${row.key}: the provider kept rejecting the manifest for deployment ${row.dseq} at the ` +
-            "version just signed: the chain carries that version but the provider is not serving " +
-            "it, so the deployment would keep running the old one. Retry the step",
-        );
-      }
-      ctx.log(`${row.key}: provider has not caught up to the new version yet, retrying the push`);
-      await ctx.services.sleep(5000);
-    }
+    await pushManifest(ctx, cert, it.row.key, it.row.host_uri, it.row.dseq, it.manifestJson);
   }
 }
 
@@ -736,7 +691,11 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         }),
       ];
       await ctx.requireTx(p("deploy"), msgs);
-      return { dseq, requiredStorageClass: artifacts.requiredStorageClass };
+      return {
+        dseq,
+        requiredStorageClass: artifacts.requiredStorageClass,
+        requiresCustomDomain: artifacts.requiresCustomDomain,
+      };
     },
   });
 
@@ -744,7 +703,11 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     name: p("lease"),
     async run(ctx) {
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-      const deploy = ctx.output<{ dseq: string; requiredStorageClass?: string }>(p("deploy"))!;
+      const deploy = ctx.output<{
+        dseq: string;
+        requiredStorageClass?: string;
+        requiresCustomDomain?: boolean | undefined;
+      }>(p("deploy"))!;
       const providers = await ctx.services.api.listProviders();
 
       // A lease already signed on a prior run IS the choice — don't re-poll
@@ -796,6 +759,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         excludeMatchers: exclusionEntries(spec, key),
         log: ctx.log,
         requiredStorageClass: deploy.requiredStorageClass,
+        requiresCustomDomain: deploy.requiresCustomDomain,
         providers,
       });
       // hand-picked: the operator's bid wins over everything above. The
@@ -1598,7 +1562,11 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
           },
         }),
       ]);
-      return { dseq, requiredStorageClass: artifacts.requiredStorageClass };
+      return {
+        dseq,
+        requiredStorageClass: artifacts.requiredStorageClass,
+        requiresCustomDomain: artifacts.requiresCustomDomain,
+      };
     },
   });
 
@@ -1606,7 +1574,11 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
     name: p("lease"),
     async run(ctx) {
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-      const deploy = ctx.output<{ dseq: string; requiredStorageClass?: string }>(p("deploy"))!;
+      const deploy = ctx.output<{
+        dseq: string;
+        requiredStorageClass?: string;
+        requiresCustomDomain?: boolean | undefined;
+      }>(p("deploy"))!;
       const providers = await ctx.services.api.listProviders();
 
       // a lease signed on a prior run IS the choice (same short-circuit as
@@ -1645,6 +1617,7 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         excludeMatchers: exclusionEntries(spec, key),
         log: ctx.log,
         requiredStorageClass: deploy.requiredStorageClass,
+        requiresCustomDomain: deploy.requiresCustomDomain,
         providers,
       });
       const chosen =
@@ -2089,25 +2062,18 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           }
           await ctx.requireTx(p("update"), msgs);
         }
-        const cert = loadCert(ctx);
-        try {
-          await ctx.services.provider.sendManifest(
-            cert,
-            row.host_uri,
-            row.dseq,
-            fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
-          );
-        } catch (e) {
-          // A provider refuses (HTTP 422 "manifest version validation failed")
-          // a PUT whose manifest matches the one it already runs — there is
-          // nothing to redeploy. By this point the on-chain version already
-          // equals this manifest's hash (skipped or just updated above), so
-          // the 422 can only mean the component is already on the target
-          // manifest: treat it as done and move on rather than wedging the
-          // rollout on a re-run of an upgrade that already landed.
-          if (!isManifestAlreadyDeployed(e)) throw e;
-          ctx.log(`${key}: already running the target manifest — provider reports no change`);
-        }
+        // The row is written only once the provider has taken the manifest.
+        // Recording it before the push made the fleet claim an image that was
+        // never deployed, which the upgrade button then read as "already on
+        // that version" and refused to re-send (2026-09-18).
+        await pushManifest(
+          ctx,
+          loadCert(ctx),
+          key,
+          row.host_uri,
+          row.dseq,
+          fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
+        );
         ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
         return { image: params.image, txSkipped: onChain?.hash === wantHash };
       },
@@ -3851,8 +3817,9 @@ export function forceRedeploySteps(
  *     to the whole op, not to one pass. A repair too expensive to state that
  *     plainly should report the problem and let the operator choose the op.
  *
- * Today's passes all serve one failure: a component's mesh address moved and
- * the fleet kept dialing the old one.
+ * Most of today's passes serve one failure: a component's mesh address moved
+ * and the fleet kept dialing the old one. The last one serves another, a
+ * chain node that has stopped following the chain and cannot restart itself.
  *
  * Tailnet IPs move: a component relaunch or a headscale re-key hands out a
  * different address, and everything that dials the old one goes dark. The
@@ -3891,6 +3858,13 @@ export function forceRedeploySteps(
  *    its sentries, sentries dialing each other — those ride the tailnet
  *    directly, not a tunnel). Fixing it is an SSH edit plus a process
  *    restart; nothing on-chain changes, so no hash can drift.
+ *
+ * And one pass that holds no address at all:
+ *
+ *  - **wedged**: a node whose consensus state machine has died. It answers
+ *    every check above — active lease, funded escrow, right address, live
+ *    RPC — while no longer following the chain, and only a restart revives
+ *    it.
  *
  * So: a component already pointing at the current address is left alone, its
  * container is never restarted, and a re-run of a finished op does nothing.
@@ -4092,9 +4066,8 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         if (msgs.length > 0) await ctx.requireTx(p("mesh-env"), msgs);
         else ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
         const cert = loadCert(ctx);
-        const justSigned = new Set(msgs.map((m) => String((m.value as { id: { dseq: string } }).id.dseq)));
         for (const { row, json } of pushes) {
-          await pushManifest(ctx, cert, row, json, justSigned.has(row.dseq));
+          await pushManifest(ctx, cert, row.key, row.host_uri, row.dseq, json);
         }
         return { repointed: pushes.map((x) => x.row.key) };
       },
@@ -4157,8 +4130,68 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           repaired.push(key);
         }
         if (repaired.length === 0) ctx.log("every peer entry already names its node's current address");
-        ctx.db.setFleetOpStatus(opId, "done");
         return { repaired };
+      },
+    },
+    {
+      name: p("wedged"),
+      async run(ctx) {
+        // A chain node can stop following the chain while every check above
+        // it passes: the lease is active, the escrow is funded, the mesh
+        // address is right, the RPC answers. CometBFT's consensus state
+        // machine exits on a panic — a block whose parent is not the one the
+        // node committed, say — and takes nothing else with it. The RPC, the
+        // reactor's gossip routines and the peer connections all stay up, so
+        // the node reports itself caught up at the height it died on, and
+        // because `catching_up` is false it reads as healthy everywhere.
+        //
+        // It cannot recover on its own. Nothing drains the consensus queue
+        // once its reader is gone, so the queue fills, every peer's receive
+        // routine blocks on it, and the node stops reading its sockets
+        // entirely — which its peers see as a ping timeout and answer by
+        // reconnecting, forever. Only a restart rebuilds the state machine,
+        // and on the way back up the node block-syncs from where it stopped.
+        //
+        // Restarting is therefore the whole repair, and the test for who
+        // needs it is the same contradiction the health monitor flags: a
+        // node claiming to be caught up while sitting well below the head.
+        // Nothing to compare against means nothing to do, so a fleet whose
+        // nodes all agree — including one that has genuinely halted — is
+        // left alone.
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const live: { key: string; row: FleetComponentRow; height: number; catchingUp: boolean }[] = [];
+        for (const key of nodes(spec).map((n) => n.key)) {
+          const row = rows.find((c) => c.key === key);
+          if (!row || row.state !== "active" || !row.ssh_host) continue;
+          const got = await ctx.services.ssh
+            .exec(rowTarget(ctx, row), "wget -qO- http://127.0.0.1:26657/status", { quick: true })
+            .catch(() => ({ stdout: "" }));
+          const height = Number(/latest_block_height."?:?"?(\d+)/.exec(got.stdout)?.[1]);
+          if (!Number.isFinite(height)) {
+            ctx.log(`${key}: RPC not answering, leaving it for the health monitor`);
+            continue;
+          }
+          live.push({
+            key,
+            row,
+            height,
+            catchingUp: /catching_up"?:?"?(\w+)/.exec(got.stdout)?.[1] === "true",
+          });
+        }
+        const head = Math.max(0, ...live.map((n) => n.height));
+        const restarted: string[] = [];
+        for (const n of live) {
+          if (n.catchingUp || head - n.height <= STALLED_BEHIND_BLOCKS) continue;
+          ctx.log(
+            `${n.key}: stopped at height ${n.height}, ${head - n.height} behind the fleet ` +
+              `(head ${head}) while reporting itself caught up — restarting it`,
+          );
+          await restartNode(ctx.services.ssh, rowTarget(ctx, n.row));
+          restarted.push(n.key);
+        }
+        if (restarted.length === 0) ctx.log("every chain node is following the chain");
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { restarted };
       },
     },
   ];

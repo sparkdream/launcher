@@ -7,6 +7,7 @@ import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
 import { describePendingTx, FleetService } from "../src/fleet.js";
 import { allSteps, buildServer } from "../src/index.js";
+import { extractForwardedPort } from "../src/steps/phase-bcd.js";
 import { fakeServices, FakeSigner, type FakeWorld } from "./fakes.js";
 
 const tmpDirs: string[] = [];
@@ -18,6 +19,23 @@ function tmp(): string {
 afterAll(() => {
   for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
+
+/**
+ * The forwarded port a component's RPC answers on, resolved from its lease
+ * exactly as the health monitor resolves it — so a test can pin that one
+ * node's RPC without pinning the whole fleet's.
+ */
+async function sentryRpcPort(
+  services: FakeWorld,
+  component: { host_uri: string; dseq: string },
+): Promise<number> {
+  const lease = await services.provider.leaseStatus(
+    { certPem: "", keyPem: "" },
+    component.host_uri,
+    component.dseq,
+  );
+  return extractForwardedPort(lease, 26657).port;
+}
 
 function spec(validators = 1, sentries = 1): LaunchSpec {
   return testnetSpec({
@@ -129,6 +147,46 @@ describe("fleet health monitor", () => {
     expect(db.listComponentHealth("fl").find((h) => h.component === "val-0")!.status).toBe(
       "lease-not-active",
     );
+  }, 120_000);
+
+  it("flags a node that has stopped following the chain while calling itself caught up", async () => {
+    // Seen live on devnet: a foreign node on a colliding chain id fed the
+    // sentry a block whose parent was not the one it had committed, CometBFT
+    // panicked out of its consensus state machine, and everything else in
+    // the process stayed up. The lease was active, the escrow funded, the
+    // mesh address right and the RPC answering — so the fleet read healthy
+    // for 22 hours while the sentry sat 38,000 blocks behind, reporting
+    // itself caught up the whole time.
+    const { db, services, work } = await launched();
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    for (const c of db.listFleetComponents("fl")) {
+      services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+
+    // the sentry's public RPC answers, and says it is caught up — at a height
+    // the rest of the fleet passed long ago
+    const sentry = db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const rpcPort = await sentryRpcPort(services, sentry);
+    services.rpc.stoppedHeights.set(`:${rpcPort}`, { height: 42, catchingUp: false });
+    await fleet.tick("fl");
+    const stalled = db.listComponentHealth("fl").find((h) => h.component === "sentry-0")!;
+    expect(stalled.status).toBe("stalled");
+    expect(stalled.detail).toContain("42");
+    expect(stalled.detail).toContain("repair fleet");
+    // the validator, which is what the head was read from, is untouched
+    expect(db.listComponentHealth("fl").find((h) => h.component === "val-0")!.status).toBe(
+      "healthy",
+    );
+
+    // a node that is genuinely behind says so, and that is not this state:
+    // it is catching up, not stopped, and no restart would help it
+    services.rpc.stoppedHeights.set(`:${rpcPort}`, { height: 42, catchingUp: true });
+    await fleet.tick("fl");
+    expect(db.listComponentHealth("fl").find((h) => h.component === "sentry-0")!.status).toBe(
+      "catching-up",
+    );
+    db.close();
   }, 120_000);
 
   it("warns before an unjail when the validator's vote path is relayed or slow", async () => {

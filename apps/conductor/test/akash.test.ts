@@ -92,6 +92,36 @@ describe("policy engine (§6)", () => {
     expect(decision.rejected[0]!.reason).toBe("no beta3 persistent storage");
   });
 
+  it("rejects providers that do not serve custom domains when the SDL names one", () => {
+    // the bid engine has no reason to pass on the order: nothing in the group
+    // spec says the service names a host, so the capability has to be filtered
+    // here, where the SDL is known
+    const providers = fakeProviders();
+    providers.get("akash1provider1")!.customDomain = false;
+    const decision = selectProvider(
+      [bid("akash1provider1", "100"), bid("akash1provider2", "900")],
+      {
+        policy: { ...basePolicy, maxPriceMultiplier: 10 },
+        chosenProviders: new Set(),
+        requiresCustomDomain: true,
+        providers,
+      },
+    );
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider2");
+    expect(decision.rejected[0]!.reason).toMatch(/custom domains/);
+  });
+
+  it("ignores the custom-domain capability for a deployment without one", () => {
+    const providers = fakeProviders();
+    providers.get("akash1provider1")!.customDomain = false;
+    const decision = selectProvider([bid("akash1provider1", "100")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      providers,
+    });
+    expect(decision.chosen?.bid.id.provider).toBe("akash1provider1");
+  });
+
   it("trusts the bid's resources_offer for storage class when metadata lacks it", () => {
     const providers = fakeProviders();
     providers.get("akash1provider1")!.storageClasses = []; // stale Console metadata

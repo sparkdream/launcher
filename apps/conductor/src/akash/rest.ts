@@ -56,6 +56,9 @@ export class RestAkashApi implements AkashApi {
         isAudited: Boolean(p.isAudited),
         uptime7d: Number(p.uptime7d ?? 0),
         storageClasses: extractStorageClasses(p),
+        // only an explicit false is a refusal: an API that stops sending the
+        // field should disable this filter, not reject every provider
+        customDomain: p.featEndpointCustomDomain !== false,
       });
     }
     return map;

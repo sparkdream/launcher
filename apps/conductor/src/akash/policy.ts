@@ -39,6 +39,9 @@ export interface ProviderInfo {
   uptime7d: number;
   /** Storage classes offered (from provider attributes, e.g. "beta3"). */
   storageClasses: string[];
+  /** Whether the provider will serve a custom host from an SDL's `accept`
+   *  list (featEndpointCustomDomain). Most providers will not. */
+  customDomain: boolean;
 }
 
 export interface Rejection {
@@ -70,6 +73,8 @@ export interface PolicyContext {
   log?: (message: string) => void;
   /** Persistent storage class the deployment needs, if any. */
   requiredStorageClass?: string | undefined;
+  /** Whether this deployment exposes a custom domain (SDL `accept`). */
+  requiresCustomDomain?: boolean | undefined;
   providers: Map<string, ProviderInfo>;
 }
 
@@ -245,6 +250,17 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
       !info.storageClasses.includes(ctx.requiredStorageClass)
     ) {
       return reject(`no ${ctx.requiredStorageClass} persistent storage`);
+    }
+    // A provider that does not do custom domains still bids on the order —
+    // nothing in the group spec says the service names a host, so the bid
+    // engine has no reason to pass. It then serves the workload on its own
+    // generated ingress hostname and the component's domain never reaches
+    // it. (2026-09-18: the frontends sat on a provider advertising
+    // featEndpointCustomDomain=false and stopped taking manifest updates
+    // altogether.) So the capability is filtered here, where the SDL is
+    // known, rather than left to the order.
+    if (ctx.requiresCustomDomain && !info.customDomain) {
+      return reject("does not serve custom domains (featEndpointCustomDomain)");
     }
     return true;
   });

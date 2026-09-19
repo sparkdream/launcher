@@ -8,7 +8,7 @@ import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
 import type { OfferedBid } from "./akash/policy.js";
 import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
-import { NODE_HOME, restartNode, rpcUrl } from "./node-ops.js";
+import { NODE_HOME, restartNode, rpcUrl, stalled } from "./node-ops.js";
 import { sparkdreamd } from "./exec.js";
 import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
 import { valoperAddress } from "./gentx.js";
@@ -28,6 +28,30 @@ import type { RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-o
  * scoping note: until wallet-session auth lands (M6), the owner address
  * arrives as a request parameter — the §2 session rule replaces that.
  */
+
+/**
+ * How far a chain node may sit below the fleet's head while still calling
+ * itself caught up (see {@link FleetService.tick}).
+ *
+ * A node keeping up commits the same blocks as everyone else, so the only
+ * spread between two healthy nodes is the skew between their probes — a
+ * block or two. The margin is set well above that because the state it
+ * catches is not a slow node but a stopped one, which crosses any threshold
+ * within a minute and then never comes back.
+ */
+function stalledDetail(
+  status: { height: number },
+  head: number,
+  details: string[],
+): string {
+  return details
+    .concat(
+      `stopped at height ${status.height}, ${head - status.height} behind the fleet ` +
+        `(head ${head}), while reporting itself caught up — the node answers RPC but is ` +
+        `no longer following the chain. Run repair fleet, which restarts it in place`,
+    )
+    .join("; ");
+}
 
 /**
  * Blocks per day for escrow runway estimation: the spec's commit timeout
@@ -562,6 +586,24 @@ export class FleetService {
       statelessComponents(spec).map((c) => [c.key, c.domain]),
     );
 
+    // Every chain node's height, probed once up front, because no node's
+    // height means anything on its own: the number that says whether one is
+    // keeping up is the fleet's head, and the node reporting it may be any
+    // of them. Sentries read theirs off the forwarded RPC the check below
+    // used to open by hand; validators, which forward no RPC, cost one
+    // lease-shell each and are few.
+    const chainRows = this.db
+      .listFleetComponents(launchId)
+      .filter((c) => c.state !== "closed" && /^(val|sentry)-/.test(c.key));
+    const heights = new Map<string, { height: number; catchingUp: boolean }>();
+    await Promise.all(
+      chainRows.map(async (c) => {
+        const h = await this.componentHeight(launch, c).catch(() => null);
+        if (h) heights.set(c.key, h);
+      }),
+    );
+    const head = Math.max(0, ...[...heights.values()].map((h) => h.height));
+
     // components are independent — probe them concurrently so one slow
     // provider doesn't stretch the whole pass
     await Promise.all(
@@ -587,19 +629,28 @@ export class FleetService {
             }
           }
           if (c.key.startsWith("sentry-")) {
-            // RPC is on a provider-assigned forwarded port, not :26657
-            const lease = await this.services.provider.leaseStatus(
-              this.mtlsCreds(launch), c.host_uri, c.dseq, 1, 1,
-            );
-            const ep = extractForwardedPort(lease, 26657);
-            const status = await this.services.rpc.status(`http://${ep.host}:${ep.port}`);
+            const status = heights.get(c.key);
+            if (!status) throw new Error("RPC not answering");
             // height is shown by the live per-second indicator, not here —
             // this check only flags a stalled/catching-up sentry
             if (status.catchingUp) {
               this.db.setComponentHealth(launchId, c.key, "catching-up", details.join("; "));
               return;
             }
+            if (stalled(status, head)) {
+              this.db.setComponentHealth(
+                launchId, c.key, "stalled", stalledDetail(status, head, details),
+              );
+              return;
+            }
           } else if (c.key.startsWith("val-")) {
+            const status = heights.get(c.key);
+            if (status && !status.catchingUp && stalled(status, head)) {
+              this.db.setComponentHealth(
+                launchId, c.key, "stalled", stalledDetail(status, head, details),
+              );
+              return;
+            }
             // chain-side jailed flag (downtime-jailing is invisible to the
             // lease/escrow checks — the container hums along fine)
             if (await this.validatorJailed(launch, spec, c.key)) {
@@ -1475,6 +1526,11 @@ export class FleetService {
         "correction takes effect: a sentry's public RPC and LCD blink, and a validator restarted " +
         "this way misses the few blocks it is down for. Components already pointing at the right " +
         "address are left alone. Nothing is redeployed, no volume is touched, no escrow is spent.",
+      "A chain node that has stopped following the chain — one sitting well below the fleet's " +
+        "height while still reporting itself caught up, which is how a node whose consensus " +
+        "state machine has died looks from outside — is restarted in the same way, since that " +
+        "is the only thing that revives it. It block-syncs back up from where it stopped. Nodes " +
+        "that are keeping up, and a fleet whose nodes have all halted together, are left alone.",
     ];
   }
 

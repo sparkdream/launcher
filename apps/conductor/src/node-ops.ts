@@ -9,6 +9,41 @@ import type { Services, SshTarget } from "./services.js";
 
 export const NODE_HOME = "/root/.sparkdream";
 
+/**
+ * How far a chain node may sit below the fleet's head while still calling
+ * itself caught up, before {@link stalled} calls it stopped.
+ *
+ * A node keeping up commits the same blocks as everyone else, so the only
+ * spread between two healthy nodes is the skew between their probes — a
+ * block or two. The margin is set well above that because the state it
+ * catches is not a slow node but a stopped one, which crosses any threshold
+ * within a minute and then never comes back.
+ */
+export const STALLED_BEHIND_BLOCKS = 20;
+
+/**
+ * Has this node stopped following the chain, as opposed to merely trailing
+ * it? The health monitor flags what this returns and repair restarts it.
+ *
+ * The pair (caught up, far below the head) is contradictory on its face, and
+ * that is the whole test: a node still syncing says so through `catchingUp`
+ * and a node keeping up is at the head, so only one that has stopped
+ * advancing claims both. Seen live when a consensus panic killed a sentry's
+ * state machine — CometBFT leaves the RPC and the reactor's gossip routines
+ * running, so the node answers every probe, reports itself caught up, and
+ * sits at the height it died on.
+ *
+ * A head no greater than the node's own height yields false, so a fleet with
+ * nothing to compare against, or one that has genuinely halted together, is
+ * never flagged.
+ */
+export function stalled(
+  status: { height: number; catchingUp: boolean },
+  head: number,
+): boolean {
+  return !status.catchingUp && head - status.height > STALLED_BEHIND_BLOCKS;
+}
+
 /** File the node's output is written to (launcher reads it over SSH). */
 export const NODE_LOG = `${NODE_HOME}/sparkdreamd.log`;
 

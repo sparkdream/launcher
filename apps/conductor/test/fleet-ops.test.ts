@@ -612,21 +612,25 @@ describe("rolling upgrade op", () => {
     expect(w.services.provider.manifests.length - manifestsBefore).toBe(4);
   }, 120_000);
 
-  it("moves on when the provider already runs the target manifest (identical-PUT 422)", async () => {
+  it("fails the upgrade, and records no image, when the provider keeps refusing the manifest", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
     const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.28";
-    // the target manifest already landed on sentry-0's provider on an earlier
-    // run: on-chain version matches, and the provider refuses the identical
-    // re-PUT with HTTP 422 "manifest version validation failed"
+    // the provider answers every PUT with HTTP 422 "manifest version
+    // validation failed". The chain is on this manifest's hash by the time we
+    // push, so the provider is the one out of step, and the container goes on
+    // running the old image however many times the op says it succeeded.
     const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const before = sentry.image;
     w.services.provider.manifestUnchangedDseqs.add(sentry.dseq);
 
     w.fleet.requestUpgrade(launch, ["sentry-0"], image);
-    // the 422 must not wedge the rollout: the step reads it as "already
-    // deployed" and records the image, moving on to verify
-    expect((await driveOps(w)).status).toBe("completed");
-    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(image);
+    expect((await driveOps(w)).status).not.toBe("completed");
+    // the row must keep the image actually running: claiming the target here
+    // is what made the UI refuse to re-send it (2026-09-18)
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(row.image).not.toBe(image);
+    expect(row.image).toBe(before);
   }, 120_000);
 
   it("fails a sentry whose height stalls, reporting the last probe result", async () => {
@@ -1718,6 +1722,57 @@ describe("repair op", () => {
     w.db.close();
   }, 120_000);
 
+  it("restarts a node that has stopped following the chain, and only that node", async () => {
+    // The repair that exists because nothing else can do it: a consensus
+    // panic takes out CometBFT's state machine and leaves the rest of the
+    // process up, so the node keeps answering while it stops following the
+    // chain. No address is stale, so every other pass correctly changes
+    // nothing — and the node cannot restart itself.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sentryId = `${sentry.ssh_host}:${sentry.ssh_port}`;
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+    // the sentry answers, at the height its state machine died on
+    w.services.ssh.stoppedHeights.set(sentryId, 71);
+    const from = w.services.ssh.execLog.length;
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const since = w.services.ssh.execLog.slice(from);
+    const restarted = (id: string) =>
+      since.some((e) => e.target === id && e.command.includes("pkill -x sparkdreamd"));
+    expect(restarted(sentryId)).toBe(true);
+    // the validator is keeping up — it is what the head was read from — so
+    // the pass that would fix it leaves it running
+    expect(restarted(valId)).toBe(false);
+    w.db.close();
+  }, 120_000);
+
+  it("leaves a fleet whose nodes agree alone, including one that has halted together", async () => {
+    // The convergent half of the contract. A fleet at one height has nothing
+    // to compare against, and that is just as true of a chain that has
+    // stopped everywhere — every node is at the head, so no node is behind
+    // it, and restarting them would neither be narrow nor help.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    for (const c of w.db.listFleetComponents("fl")) {
+      if (!c.ssh_host) continue;
+      w.services.ssh.stoppedHeights.set(`${c.ssh_host}:${c.ssh_port}`, 4242);
+    }
+    const from = w.services.ssh.execLog.length;
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const since = w.services.ssh.execLog.slice(from);
+    expect(since.some((e) => e.command.includes("pkill -x sparkdreamd"))).toBe(false);
+    w.db.close();
+  }, 120_000);
+
   it("re-reads SSH endpoints from the providers before reaching for anything", async () => {
     // The Console Air case: containers recycled outside the launcher come
     // back on provider-assigned forwarded ports the launcher never saw. Its
@@ -2186,7 +2241,7 @@ describe("force redeploy op", () => {
     const res = await driveOps(w);
     expect(res.status).not.toBe("completed");
     const step = w.db.listSteps("fl").find((s) => s.name.endsWith(":redeploy"));
-    expect(step?.error).toMatch(/not serving it|rejected the manifest/);
+    expect(step?.error).toMatch(/kept rejecting the manifest/);
     w.db.close();
   }, 120_000);
 });

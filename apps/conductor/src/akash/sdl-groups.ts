@@ -37,6 +37,11 @@ export interface SdlArtifacts {
   hash: Uint8Array;
   /** First persistent storage class required, if any. */
   requiredStorageClass?: string | undefined;
+  /** Whether any globally exposed service names a custom host in `accept`.
+   *  Providers advertise this capability separately from storage and most
+   *  do not have it, so a component with a domain can only be placed on one
+   *  that does. */
+  requiresCustomDomain: boolean;
   pricingDenom: string;
 }
 
@@ -47,6 +52,7 @@ export function loadSdl(path: string): Sdl {
 export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
   const groups: any[] = [];
   let requiredStorageClass: string | undefined;
+  let requiresCustomDomain = false;
   let pricingDenom = "uakt";
 
   // SDL deployment section is deployment.<service>.<placement>; group by placement.
@@ -88,6 +94,12 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
         },
       );
 
+      // a host in `accept` is a custom domain, which providers advertise as
+      // a capability of its own (featEndpointCustomDomain) and most lack
+      if ((svc.expose ?? []).some((e: any) => (e.accept ?? []).length > 0)) {
+        requiresCustomDomain = true;
+      }
+
       const resource = {
         id: groupResources.length + 1,
         cpu: { units: { val: String(Math.round(Number(compute.cpu.units) * 1000)) } },
@@ -122,7 +134,15 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
   const canonical = manifestToSortedJSON(generated.value.groups);
   const hash = crypto.createHash("sha256").update(canonical).digest();
   const manifest = JSON.parse(canonical);
-  return { groups, manifest, manifestJson: canonical, hash, requiredStorageClass, pricingDenom };
+  return {
+    groups,
+    manifest,
+    manifestJson: canonical,
+    hash,
+    requiredStorageClass,
+    requiresCustomDomain,
+    pricingDenom,
+  };
 }
 
 function sizeToBytes(size: string): string {
