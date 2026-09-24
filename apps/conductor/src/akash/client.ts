@@ -89,6 +89,10 @@ export interface ProviderClientOpts {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Ceiling on one provider HTTP call, start to last byte. A manifest PUT
+ *  answers in seconds; this only has to outlast a slow gateway. */
+const PROVIDER_REQUEST_DEADLINE_MS = 180_000;
+
 /**
  * Direct-mTLS provider client (§9: no hosted proxy — the conductor holds the
  * cert and talks straight to the provider's hostUri).
@@ -289,6 +293,26 @@ export class ProviderClient {
   private request(method: string, hostUri: string, path: string, body?: string): Promise<string> {
     const base = new URL(hostUri);
     return new Promise((resolve, reject) => {
+      // Settles exactly once, on whichever of these comes first. The socket
+      // `timeout` below only measures idleness, and a response the provider
+      // abandons after its headers emits neither `end` nor a request
+      // `error` — observed live holding a reset's manifest push (and the
+      // whole op) forever. So the response's abort/close and an overall
+      // deadline settle it too.
+      let settled = false;
+      let responded = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        fn();
+      };
+      const fail = (e: Error) => settle(() => reject(e));
+      const deadline = setTimeout(() => {
+        const e = new Error(`provider request timeout: ${method} ${path} exceeded ${PROVIDER_REQUEST_DEADLINE_MS}ms`);
+        req.destroy(e);
+        fail(e);
+      }, PROVIDER_REQUEST_DEADLINE_MS);
       const req = https.request(
         {
           method,
@@ -310,16 +334,31 @@ export class ProviderClient {
           timeout: 60_000,
         },
         (res) => {
+          responded = true;
           const chunks: Buffer[] = [];
           res.on("data", (c) => chunks.push(c));
           res.on("end", () => {
             const text = Buffer.concat(chunks).toString();
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve(text);
-            else reject(new Error(`provider ${method} ${path}: HTTP ${res.statusCode} ${text.slice(0, 500)}`));
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) settle(() => resolve(text));
+            else fail(new Error(`provider ${method} ${path}: HTTP ${res.statusCode} ${text.slice(0, 500)}`));
           });
+          res.on("error", fail);
+          // after `end` this is a no-op; before it, the body was cut off
+          res.on("close", () =>
+            fail(new Error(`provider ${method} ${path}: connection closed before the response finished`)),
+          );
         },
       );
-      req.on("error", reject);
+      req.on("error", fail);
+      req.on("close", () =>
+        fail(
+          new Error(
+            responded
+              ? `provider ${method} ${path}: connection closed before the response finished`
+              : `provider ${method} ${path}: connection closed with no response`,
+          ),
+        ),
+      );
       req.on("timeout", () => req.destroy(new Error("provider request timeout")));
       if (body) req.write(body);
       req.end();
