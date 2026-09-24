@@ -57,7 +57,11 @@ describe("open launch", () => {
     // and what it remembered, so a reload mid-signature comes back to the
     // banner rather than to an empty editor
     expect(openLaunchFor("signing-launch", [], null)).toBe("signing-launch");
-    expect(openLaunchFor(EDITOR, [], "signing-launch")).toBe(null);
+    // the launch the account was switched to sign for outranks whatever it
+    // remembered from an earlier signature, or its own editor choice
+    expect(openLaunchFor("old-signed-launch", [], "signing-launch")).toBe("signing-launch");
+    expect(openLaunchFor(EDITOR, [], "signing-launch")).toBe("signing-launch");
+    expect(openLaunchFor(EDITOR, [], null)).toBe(null);
   });
 
   it("opens nothing for an account with no fleets, or only closed ones", () => {

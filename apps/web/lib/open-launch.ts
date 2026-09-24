@@ -44,8 +44,12 @@ export function openLaunchFor(
   // it was needed. What it remembered counts too, so a reload mid-signature
   // comes back to the banner: nothing here can check that id against fleets
   // that do not exist, so the panel's own poll clears it if the launch is
-  // gone (404) or not this account's to read (403).
-  if (fleets.length === 0) return stored === EDITOR ? null : (stored ?? current);
+  // gone (404) or not this account's to read (403). The open launch outranks
+  // the remembered one: an operator account remembers the last launch it
+  // signed for, and preferring that swapped the banner it was switched to for
+  // an older chain's finished launch (the reported case: a devnet reset's
+  // gentx replaced by the testnet launch the same operator signed weeks ago).
+  if (fleets.length === 0) return current ?? (stored === EDITOR ? null : stored);
   // a remembered launch the account still has stays open
   if (stored && fleets.some((f) => f.launchId === stored)) return stored;
   // a launch just created is stored and open before the next sweep sees it:
