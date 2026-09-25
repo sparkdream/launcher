@@ -3,7 +3,14 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
-import { checkSpec, type LaunchSpec, type SpecCheck } from "@sparkdream/launch-spec";
+import {
+  checkSpec,
+  COMPONENT_KEYS,
+  COMPONENT_KINDS,
+  isComponentKey,
+  type LaunchSpec,
+  type SpecCheck,
+} from "@sparkdream/launch-spec";
 import yaml from "js-yaml";
 import { EDITOR, openLaunchFor } from "../lib/open-launch";
 import { resetSource } from "../lib/reset-spec";
@@ -118,6 +125,23 @@ topology:
     explorer: { enabled: false, domain: explorer.example.com, route: sparkdream }
     frontend: { enabled: false, domain: app.example.com }
     hub: { enabled: false }
+    # IBC relayer (Hermes): one process, any number of paths. kind transfer
+    # moves tokens (ICS-20); kind federation carries x/federation content to
+    # a sister Spark Dream chain. A counterparty is another fleet on this
+    # launcher (sharing this fleet's mesh) or any chain by its endpoints.
+    # relayer:
+    #   enabled: true
+    #   paths:
+    #     - { id: sister, kind: federation, counterparty: { fleet: <launch id or network name> } }
+    #     - id: osmosis
+    #       kind: transfer
+    #       counterparty:
+    #         chainId: osmo-test-5
+    #         rpc: https://rpc.osmotest5.example.com
+    #         grpc: http://grpc.osmotest5.example.com:9090
+    #         bech32Prefix: osmo
+    #         gasDenom: uosmo
+    #         gasPrice: 0.025
   # required when frontend is enabled — sentry-0 serves these domains:
   # publicEndpoints:
   #   api: api.example.com
@@ -163,8 +187,7 @@ const ROLE_LABELS: Array<[RegExp, string]> = [
   [/^val-/, "Validator"],
   [/^sentry-/, "Sentry node"],
   [/^headscale$/, "VPN mesh"],
-  [/^explorer$/, "Block explorer"],
-  [/^frontend$/, "Web app"],
+  ...COMPONENT_KEYS.map((k): [RegExp, string] => [new RegExp(`^${k}$`), COMPONENT_KINDS[k].label]),
   [/^hub$/, "Hub"],
 ];
 const roleLabel = (key: string) =>
@@ -882,7 +905,7 @@ export default function Page() {
         (spec?.topology?.validators?.count ?? 0) + (spec?.topology?.sentries?.count ?? 0);
       if (nodeCount <= 0) return null;
       const comps = spec?.topology?.components ?? {};
-      const componentCount = ["explorer", "frontend"].filter((k) => comps[k]?.enabled).length;
+      const componentCount = COMPONENT_KEYS.filter((k) => comps[k]?.enabled).length;
       return (nodeCount + 1 + componentCount) * DEPOSIT_PER_DEPLOYMENT;
     } catch {
       return null; // spec doesn't parse — validation will complain elsewhere
@@ -1106,11 +1129,9 @@ export default function Page() {
     if (!spec.topology.headscale.reuseFleet) {
       rows.push({ role: "headscale", count: 1, image: spec.images.headscale });
     }
-    if (spec.topology.components.explorer.enabled && spec.images.explorer) {
-      rows.push({ role: "explorer", count: 1, image: spec.images.explorer });
-    }
-    if (spec.topology.components.frontend.enabled && spec.images.frontend) {
-      rows.push({ role: "frontend", count: 1, image: spec.images.frontend });
+    for (const key of COMPONENT_KEYS) {
+      const image = spec.images[key];
+      if (spec.topology.components[key]?.enabled && image) rows.push({ role: key, count: 1, image });
     }
     return rows;
   }, [specCheck]);
@@ -3328,6 +3349,62 @@ export default function Page() {
                         >
                           halt-height upgrade…
                         </button>
+                        {(() => {
+                          const addable = COMPONENT_KEYS.filter(
+                            (k) => !f.components.some((c) => c.key === k && c.state !== "closed"),
+                          );
+                          if (addable.length === 0) return null;
+                          return (
+                            <button
+                              className="btn"
+                              title={`Deploy a service component beside this chain (${addable
+                                .map((k) => COMPONENT_KINDS[k].label)
+                                .join(", ")}): one deployment and one lease signature`}
+                              onClick={async () => {
+                                const key =
+                                  addable.length === 1
+                                    ? addable[0]!
+                                    : window.prompt(`Component to add (${addable.join(", ")}):`, addable[0])?.trim();
+                                if (!key) return;
+                                if (!isComponentKey(key) || !addable.includes(key)) {
+                                  setError(`"${key}" is not one of: ${addable.join(", ")}`);
+                                  return;
+                                }
+                                let domain: string | undefined;
+                                if (COMPONENT_KINDS[key].domain) {
+                                  domain = window.prompt(`Public domain for the ${COMPONENT_KINDS[key].label}:`)?.trim();
+                                  if (!domain) return;
+                                }
+                                // the relayer's paths are structured: take them from
+                                // the spec editor, as the domains button takes domains
+                                let paths: unknown[] | undefined;
+                                if (key === "relayer") {
+                                  const edited = yaml.load(specText) as any;
+                                  paths = edited?.topology?.components?.relayer?.paths;
+                                  if (!Array.isArray(paths) || paths.length === 0) {
+                                    setError(
+                                      "add topology.components.relayer.paths in the spec editor first (see the example spec), then add the relayer",
+                                    );
+                                    return;
+                                  }
+                                }
+                                try {
+                                  const { postAddComponent } = await import("../lib/api");
+                                  await postAddComponent(f.launchId, {
+                                    key,
+                                    ...(domain ? { domain } : {}),
+                                    ...(paths ? { paths } : {}),
+                                  });
+                                  openLaunch(f.launchId); // surfaces the signing banner
+                                } catch (e) {
+                                  setError(String(e));
+                                }
+                              }}
+                            >
+                              add component…
+                            </button>
+                          );
+                        })()}
                         <button
                           className="btn"
                           title="Apply the domains from the spec editor to this fleet: one deployment-update signature, then repoint DNS"
@@ -3871,9 +3948,10 @@ export default function Page() {
                                       title={
                                         uploading[c.key]
                                           ? undefined
-                                          : c.key === "explorer"
-                                            ? "Push a file into this container. It lands in /data as-is; move or extract it from the shell afterwards."
-                                            : "Push a file into this container. It lands in /root/.sparkdream (the chain home) as-is; move or extract it from the shell afterwards."
+                                          : `Push a file into this container. It lands in ${
+                                              (isComponentKey(c.key) && COMPONENT_KINDS[c.key].uploadDir) ||
+                                              "/root/.sparkdream (the chain home)"
+                                            } as-is; move or extract it from the shell afterwards.`
                                       }
                                       style={
                                         uploading[c.key]
@@ -3942,7 +4020,7 @@ export default function Page() {
                                   >
                                     top-up
                                   </button>
-                                  {(c.key === "explorer" || c.key === "frontend") && (
+                                  {isComponentKey(c.key) && (
                                     <button
                                       className="btn"
                                       title={`Swap just this component's image (current: ${c.image}). One deployment update; the service fee is added.`}
@@ -3964,6 +4042,53 @@ export default function Page() {
                                     >
                                       upgrade…
                                     </button>
+                                  )}
+                                  {c.key === "relayer" && (
+                                    <>
+                                      <button
+                                        className="btn"
+                                        title="The relayer's address on each chain (fund these to pay gas) and the channels it relays"
+                                        onClick={async () => {
+                                          try {
+                                            const { getRelayerState } = await import("../lib/api");
+                                            const st = await getRelayerState(f.launchId);
+                                            window.alert(
+                                              [
+                                                "Relayer addresses (each pays gas on its chain):",
+                                                ...st.chains.map((ch) => `  ${ch.chainId}: ${ch.address}`),
+                                                "",
+                                                "Channels:",
+                                                ...st.channels.map(
+                                                  (ch) =>
+                                                    `  ${ch.id} (${ch.port}): ${ch.a.chain}/${ch.a.channel} <-> ${ch.b.chain}/${ch.b.channel}`,
+                                                ),
+                                                "",
+                                                `Linked ${st.linkedAt}`,
+                                              ].join("\n"),
+                                            );
+                                          } catch (e) {
+                                            setError(String(e));
+                                          }
+                                        }}
+                                      >
+                                        channels
+                                      </button>
+                                      <button
+                                        className="btn"
+                                        title="Re-open whatever a chain reset on either end closed and restart Hermes on the current channels. Open channels are reused; no signature."
+                                        onClick={async () => {
+                                          try {
+                                            const { postRelink } = await import("../lib/api");
+                                            await postRelink(f.launchId);
+                                            openLaunch(f.launchId);
+                                          } catch (e) {
+                                            setError(String(e));
+                                          }
+                                        }}
+                                      >
+                                        relink
+                                      </button>
+                                    </>
                                   )}
                                   <button
                                     className="btn"

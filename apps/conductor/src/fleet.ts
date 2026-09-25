@@ -1,7 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { chainId, frozenResetViolations, resolveTopology, statelessComponents, validateSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  chainId,
+  COMPONENT_KEYS,
+  COMPONENT_KINDS,
+  frozenResetViolations,
+  isComponentKey,
+  resolveTopology,
+  serviceComponents,
+  validateSpec,
+  withDefaults,
+  type LaunchSpec,
+  type LaunchSpecInput,
+  type RelayerPath,
+} from "@sparkdream/launch-spec";
+import { descriptorFor } from "./components/index.js";
+import { RELAYER_ACCOUNT, resolveRelayFleet } from "./relayer.js";
+import { relayerStatePath, type RelayerLinkOutput } from "./steps/relayer-link.js";
 import type { ConductorDb, FleetComponentRow, FleetOpProgress, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -20,7 +36,7 @@ import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type Head
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import type { RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
+import type { AddComponentParams, RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -64,20 +80,22 @@ function blocksPerDay(spec: LaunchSpec): number {
 }
 
 /** Lease-shell service name for a component: chain nodes run the `sparkdreamd`
- *  service, while the stateless components run a service named after their key
- *  (the SDL is built as `services: { [key]: ... }`). Node keys look like
- *  `val-0` / `sentry-0`; everything else is a stateless key. */
+ *  service, a service component names its own (descriptor.shellService), and
+ *  headscale's service is named after its key. */
 function leaseServiceName(key: string): string {
-  return key.startsWith("val-") || key.startsWith("sentry-") ? "sparkdreamd" : key;
+  if (key.startsWith("val-") || key.startsWith("sentry-")) return "sparkdreamd";
+  return descriptorFor(key)?.shellService ?? key;
 }
 
 /** Directory an uploaded file lands in, per component. Node uploads go into
  *  the chain home (where `config/` and `data/` live, so a dropped snapshot or
- *  config file is already beside what reads it); the explorer's go into its
- *  persistent `/data` volume, the only path that survives a container
- *  restart. Throws for components that accept no uploads at all. */
+ *  config file is already beside what reads it); a service component's go
+ *  where its kind says (COMPONENT_KINDS uploadDir — a persistent volume, the only
+ *  path that survives a container restart). Throws for components that
+ *  accept no uploads at all. */
 export function uploadDirFor(key: string): string {
-  if (key === "explorer") return "/data";
+  const dir = isComponentKey(key) ? COMPONENT_KINDS[key].uploadDir : undefined;
+  if (dir) return dir;
   if (key.startsWith("val-") || key.startsWith("sentry-")) return NODE_HOME;
   throw new Error(`${key} runs no sshd; cannot accept file uploads`);
 }
@@ -260,7 +278,7 @@ export class FleetService {
       // stateless components deploy in the same batch as the nodes but run
       // their own images
       const componentImages = new Map<string, string>(
-        spec ? statelessComponents(spec).map((c) => [c.key, c.image]) : [],
+        spec ? serviceComponents(spec).map((c) => [c.key, c.image]) : [],
       );
       const existing = new Map(
         this.db.listFleetComponents(launchId).map((c) => [c.key, c]),
@@ -583,7 +601,7 @@ export class FleetService {
     const spec = this.spec(launch);
     const perDay = blocksPerDay(spec);
     const componentDomains = new Map<string, string>(
-      statelessComponents(spec).map((c) => [c.key, c.domain]),
+      serviceComponents(spec).flatMap((c) => (c.domain ? [[c.key, c.domain] as const] : [])),
     );
 
     // Every chain node's height, probed once up front, because no node's
@@ -897,7 +915,14 @@ export class FleetService {
     );
     if (!keys) throw new Error("launch has no generated keys yet");
     const mnemonics = this.mnemonics(launch);
-    return Object.entries(keys.accounts).map(([name, address]) => ({
+    const accounts = { ...keys.accounts };
+    // a relayer added after launch is not among generate-keys' accounts; its
+    // own-chain address comes from its last link (the first chain listed)
+    const relayer = this.relayerState(launch)?.chains[0];
+    if (!(RELAYER_ACCOUNT in accounts) && RELAYER_ACCOUNT in mnemonics && relayer) {
+      accounts[RELAYER_ACCOUNT] = relayer.address;
+    }
+    return Object.entries(accounts).map(([name, address]) => ({
       name,
       address,
       hasMnemonic: name in mnemonics,
@@ -971,10 +996,10 @@ export class FleetService {
    *  provider lease-shell — killing PID 1 makes the provider recreate the
    *  container, which re-reads its env (tunnels included) at boot. */
   async restart(launch: LaunchRow, component: FleetComponentRow): Promise<void> {
-    if (["headscale", "explorer", "frontend"].includes(component.key)) {
+    if (component.key === "headscale" || descriptorFor(component.key)) {
       await this.services.provider
         .shellExec(
-          this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, component.key,
+          this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, leaseServiceName(component.key),
           ["sh", "-c", "kill 1"],
         )
         .catch(() => {
@@ -1255,23 +1280,10 @@ export class FleetService {
           `this fleet rides fleet ${reuse}'s mesh — relaunch the headscale from that fleet's panel`,
         );
       }
-    } else if (component.key !== "frontend") {
-      // everything except the frontend joins the mesh, and a relaunch mints its
-      // preauth key via headscale — impossible once the mesh is gone. A shared
-      // mesh (reuseFleet) has no headscale row here; check the owning fleet's.
-      const reuse = this.spec(launch).topology.headscale.reuseFleet;
-      const hs = this.db
-        .listFleetComponents(reuse ?? launch.id)
-        .find((c) => c.key === "headscale");
-      if (hs?.state === "closed" || (reuse && !hs)) {
-        throw new Error(
-          `${component.key} cannot relaunch: ` +
-            (reuse
-              ? `the shared headscale (fleet ${reuse}) is closed or gone`
-              : "headscale is closed (fleet shut down)") +
-            " — a relaunch needs the mesh to mint a preauth key",
-        );
-      }
+    } else if (!isComponentKey(component.key) || COMPONENT_KINDS[component.key].mesh) {
+      // mesh members (nodes, and service components whose kind joins the
+      // mesh) mint a preauth key via headscale on relaunch
+      this.assertMeshAlive(launch, `${component.key} cannot relaunch`);
     }
     const prefs = this.db.providerPrefs(launch.owner);
     // always move OFF the current provider (that's the point of a relaunch),
@@ -1290,6 +1302,97 @@ export class FleetService {
       preferProviders: prefs.prefer,
       ...(opts.manualBid ? { manualBid: true } : {}),
     });
+  }
+
+  /** Joining the mesh mints a preauth key via headscale — impossible once the
+   *  mesh is gone. A shared mesh (reuseFleet) has no headscale row here;
+   *  check the owning fleet's. */
+  private assertMeshAlive(launch: LaunchRow, what: string): void {
+    const reuse = this.spec(launch).topology.headscale.reuseFleet;
+    const hs = this.db
+      .listFleetComponents(reuse ?? launch.id)
+      .find((c) => c.key === "headscale");
+    if (hs?.state === "closed" || (reuse && !hs)) {
+      throw new Error(
+        `${what}: ` +
+          (reuse
+            ? `the shared headscale (fleet ${reuse}) is closed or gone`
+            : "headscale is closed (fleet shut down)") +
+          " — joining the mesh needs it to mint a preauth key",
+      );
+    }
+  }
+
+  /** The relayer's addresses and channels from its last link, if any. */
+  relayerState(launch: LaunchRow): RelayerLinkOutput | undefined {
+    const file = relayerStatePath(this.workRoot, launch.id);
+    return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as RelayerLinkOutput) : undefined;
+  }
+
+  /** Re-link an active relayer: reopen whatever a chain reset closed and
+   *  restart Hermes on the current channels. */
+  requestRelink(launch: LaunchRow): number {
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "relayer");
+    if (!row || row.state !== "active") throw new Error("this fleet has no active relayer");
+    if (this.db.listFleetOps(launch.id, "active").some((o) => o.kind === "relink")) {
+      throw new Error("a relink is already in progress");
+    }
+    return this.db.createFleetOp(launch.id, "relink", {});
+  }
+
+  /**
+   * Add a service component to a running fleet (or bring back a closed one):
+   * enable it in the stored spec, re-validate, and start an add-component op
+   * that renders, opens the sentries for it and places it. The component is
+   * deployed with the image the spec names — the profile default unless
+   * `image` overrides it.
+   */
+  requestAddComponent(
+    launch: LaunchRow,
+    key: string,
+    opts: { domain?: string; image?: string; paths?: RelayerPath[] } = {},
+  ): number {
+    if (!isComponentKey(key)) throw new Error(`${key} is not a component kind this launcher can add`);
+    // the launch's own steps must be through: a paused fleet op also takes the
+    // launch off "completed", so its status cannot answer this
+    if (this.db.getStep(launch.id, "finalize")?.status !== "done") {
+      throw new Error("the launch has not finished — add components once it has");
+    }
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+    if (row && row.state !== "closed") throw new Error(`${key} is already deployed in this fleet`);
+    if (this.db.listFleetOps(launch.id, "active").some((o) => o.kind === "add-component")) {
+      throw new Error("a component is already being added — finish or abort that first");
+    }
+    const kind = COMPONENT_KINDS[key];
+    if (kind.mesh) this.assertMeshAlive(launch, `${key} cannot be added`);
+    const spec = this.spec(launch);
+    const comps = spec.topology.components as Record<string, Record<string, unknown> | undefined>;
+    comps[key] = {
+      ...comps[key],
+      enabled: true,
+      ...(opts.domain ? { domain: opts.domain } : {}),
+      ...(opts.paths ? { paths: opts.paths } : {}),
+    };
+    if (opts.image) spec.images[key] = opts.image;
+    // parse through the schema again: fills the relayer's defaults and
+    // rejects a malformed path before anything is stored
+    const parsed = withDefaults(spec as unknown as LaunchSpecInput);
+    Object.assign(spec, parsed);
+    // fleet counterparties become launch ids, checked for reachability
+    for (const p of spec.topology.components.relayer?.enabled ? spec.topology.components.relayer.paths : []) {
+      if ("fleet" in p.counterparty) {
+        p.counterparty.fleet = resolveRelayFleet(this.db, spec, launch.owner, p.counterparty.fleet, launch.id);
+      }
+    }
+    const { errors } = validateSpec(spec);
+    if (errors.length > 0) {
+      throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    }
+    this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    return this.db.createFleetOp(launch.id, "add-component", {
+      key,
+      generation: row ? row.generation + 1 : 0,
+    } satisfies AddComponentParams);
   }
 
   /**
@@ -1599,6 +1702,13 @@ export class FleetService {
           "broadcast before the abort and may still take effect on-chain"
         : undefined;
     this.db.setFleetOpStatus(opId, "aborted");
+    // an abandoned add leaves its row mid-placement; close it so the
+    // component can be added again (requestAddComponent takes closed rows)
+    if (op.kind === "add-component") {
+      const key = (JSON.parse(op.params_json) as AddComponentParams).key;
+      const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+      if (row && row.state !== "active") this.db.setComponentState(launch.id, key, "closed");
+    }
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error
     const deploy = this.db.stepOutput<{ dseq: string }>(launch.id, `op${opId}:deploy`);
@@ -1656,7 +1766,7 @@ export class FleetService {
     const spec = this.spec(launch);
     for (const key of components) {
       if (/^(val|sentry)-/.test(key)) spec.images.sparkdreamd = image;
-      else if (key === "explorer" || key === "frontend" || key === "hub") spec.images[key] = image;
+      else if (isComponentKey(key)) spec.images[key] = image;
     }
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
   }
@@ -1776,7 +1886,7 @@ export class FleetService {
     const rawImages =
       ((proposedInput ?? {}) as { images?: Record<string, string | undefined> }).images ?? {};
     const images = proposed.images as Record<string, string | undefined>;
-    for (const key of ["sparkdreamd", "headscale", "explorer", "frontend", "hub"]) {
+    for (const key of ["sparkdreamd", "headscale", ...COMPONENT_KEYS, "hub"]) {
       if (rawImages[key] === undefined) {
         const cur = (current.images as Record<string, string | undefined>)[key];
         if (cur === undefined) delete images[key];

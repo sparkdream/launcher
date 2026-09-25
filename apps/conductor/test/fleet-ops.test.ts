@@ -492,6 +492,118 @@ describe("stateless component relaunch", () => {
   }, 120_000);
 });
 
+function spec1x1(): LaunchSpec {
+  return testnetSpec({
+    network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
+    providers: { policy: { antiAffinity: "strict" } },
+    topology: {
+      validators: { count: 1 },
+      sentries: { count: 1 },
+      components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
+      headscale: { domain: "headscale.sparkdream.io" },
+    },
+  });
+}
+
+describe("add-component op", () => {
+  it("adds the explorer to a running fleet: sentry LCD opened, tunnels aimed, placed like a relaunch", async () => {
+    const w = await launched(spec1x1());
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sentryId = `${sentry.ssh_host}:${sentry.ssh_port}`;
+    w.fleet.requestAddComponent(w.db.getLaunch("fl")!, "explorer", { domain: "explorer.sparkdream.io" });
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    expect(row.state).toBe("active");
+    expect(row.dseq).not.toBe("0");
+    expect(row.ssh_host).not.toBeNull();
+    const stored = JSON.parse(w.db.getLaunch("fl")!.spec_json) as LaunchSpec;
+    expect(stored.topology.components.explorer).toMatchObject({ enabled: true, domain: "explorer.sparkdream.io" });
+
+    // the fleet was launched with the LCD off; the op opened it and bounced the sentry
+    const app = w.services.ssh.appToml.get(sentryId)!;
+    expect(app).toMatch(/\[api\][\s\S]*?\nenable = true/);
+    expect(app).toContain('address = "tcp://0.0.0.0:1317"');
+    expect(w.services.ssh.execLog.some((e) => e.target === sentryId && /pkill -x sparkdreamd/.test(e.command))).toBe(true);
+
+    // placeholders resolved to the sentry's live tailnet IP at deploy
+    const sdl = fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "explorer.yaml"), "utf8");
+    expect(sdl).toContain(`TS_TUNNEL_1=11317:${sentry.tailnet_ip}:1317`);
+    expect(sdl).not.toContain("{{");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("a sentry relaunched after the add still serves the LCD its bundle predates", async () => {
+    const w = await launched(spec1x1());
+    w.fleet.requestAddComponent(w.db.getLaunch("fl")!, "explorer", { domain: "explorer.sparkdream.io" });
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.dseq).not.toBe(before.dseq);
+    const app = w.services.ssh.appToml.get(`${after.ssh_host}:${after.ssh_port}`)!;
+    expect(app).toContain('address = "tcp://0.0.0.0:1317"');
+  }, 120_000);
+
+  it("does not bounce a sentry that already serves the LCD", async () => {
+    const w = await launched(specWithComponents());
+    const explorer = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    // close the explorer, then add it back: the sentry was rendered with the LCD on
+    w.db.setComponentState("fl", "explorer", "closed");
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const sentryId = `${sentry.ssh_host}:${sentry.ssh_port}`;
+    w.services.ssh.appToml.set(
+      sentryId,
+      fs.readFileSync(path.join(w.work, "launches", "fl", "nodes", "sentry-0", "config", "app.toml"), "utf8"),
+    );
+    w.fleet.requestAddComponent(w.db.getLaunch("fl")!, "explorer");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    expect(row.state).toBe("active");
+    expect(row.generation).toBe(explorer.generation + 1);
+    expect(w.services.ssh.execLog.some((e) => e.target === sentryId && /pkill -x sparkdreamd/.test(e.command))).toBe(false);
+  }, 120_000);
+
+  it("refuses what it cannot add", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    expect(() => w.fleet.requestAddComponent(launch, "explorer")).toThrow(/already deployed/);
+    expect(() => w.fleet.requestAddComponent(launch, "hub")).toThrow(/not a component kind/);
+    const bare = await launched(spec1x1());
+    // no domain: validation names the field
+    expect(() => bare.fleet.requestAddComponent(bare.db.getLaunch("fl")!, "explorer")).toThrow(
+      /topology\.components\.explorer\.domain/,
+    );
+    // nothing was enabled by the refused request
+    const stored = JSON.parse(bare.db.getLaunch("fl")!.spec_json) as LaunchSpec;
+    expect(stored.topology.components.explorer.enabled).toBe(false);
+  }, 120_000);
+
+  it("an abandoned add closes its row, so the component can be added again", async () => {
+    const w = await launched(spec1x1());
+    const opId = w.fleet.requestAddComponent(w.db.getLaunch("fl")!, "explorer", { domain: "explorer.sparkdream.io" });
+    // the add's order draws only expired bids, so its lease step parks
+    w.services.api.staleFirstOrder = true;
+    const paused = await driveOps(w);
+    expect(paused.status).not.toBe("completed");
+    await w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!.state).toBe("closed");
+    w.fleet.requestAddComponent(w.db.getLaunch("fl")!, "explorer");
+    const done = await driveOps(w);
+    expect(done.status).toBe("completed");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!.state).toBe("active");
+  }, 120_000);
+});
+
 describe("rolling upgrade op", () => {
   it("upgrades sentries before validators, one MsgUpdateDeployment each", async () => {
     const w = await launched();

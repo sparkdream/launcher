@@ -2,12 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   chainId,
-  lcdRequired,
   tunnelPort,
   type LaunchSpec,
   type NodeRef,
   type Topology,
 } from "@sparkdream/launch-spec";
+import { applySentryServe, sentryServe } from "./sentry-serve.js";
 import { templatePath } from "./vendor.js";
 
 /**
@@ -96,15 +96,6 @@ function setTomlLine(content: string, key: string, rendered: string, section?: s
     );
   }
   return content.slice(0, start) + scope.replace(lineRe, rendered) + content.slice(end);
-}
-
-/** Replace an exact string, asserting it appears exactly once. */
-function replaceOnce(content: string, from: string, to: string): string {
-  const first = content.indexOf(from);
-  if (first < 0 || content.includes(from, first + from.length)) {
-    throw new Error(`expected exactly one "${from}" in template`);
-  }
-  return content.replace(from, to);
 }
 
 /**
@@ -230,25 +221,10 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
   // not treated as keep-template.
   if (role === "sentry") {
     app = setTomlLine(app, "pruning", `pruning = "${spec.infra.sentrySettings.pruning}"`);
-    // The template ships the LCD off and bound to localhost. The explorer
-    // (tailnet tunnel to 1317) and the public api domain (ingress → pod
-    // 1317) both need it on and reachable from outside the container.
-    if (lcdRequired(spec)) {
-      app = replaceOnce(app, "enable = false", "enable = true");
-      app = replaceOnce(
-        app,
-        'address = "tcp://localhost:1317"',
-        'address = "tcp://0.0.0.0:1317"',
-      );
-      // Keplr fetches balances straight from the browser against the public
-      // api domain, so the LCD must answer with CORS headers (the RPC side
-      // already ships cors_allowed_origins = ["*"] in config.toml.sentry).
-      app = replaceOnce(
-        app,
-        "enabled-unsafe-cors = false",
-        "enabled-unsafe-cors = true",
-      );
-    }
+    // open what the fleet's components and public endpoints need (the LCD,
+    // for the explorer's tunnel and the public api); the same transform
+    // re-applies to a live sentry when a component is added after launch
+    app = applySentryServe(app, sentryServe(spec));
   }
   fs.writeFileSync(path.join(configDir, "app.toml"), app);
 

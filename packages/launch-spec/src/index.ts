@@ -4,6 +4,8 @@ export {
   type LaunchSpec,
   type LaunchSpecInput,
   type NetworkType,
+  type RelayerEndpointCounterparty,
+  type RelayerPath,
 } from "./schema.js";
 export { profiles, type Profile } from "./profiles.js";
 export {
@@ -33,11 +35,21 @@ export {
   tunnelPort,
   resolveTopology,
   nodes,
-  statelessComponents,
+  serviceComponents,
   lcdRequired,
+  grpcRequired,
+  relayerPaths,
+  RELAY_CHANNELS,
   type Topology,
   type NodeRef,
   type NodeRole,
-  type ComponentKey,
   type ComponentRef,
 } from "./derive.js";
+export {
+  COMPONENT_KEYS,
+  COMPONENT_KINDS,
+  componentDomain,
+  isComponentKey,
+  type ComponentKey,
+  type ComponentKind,
+} from "./components.js";

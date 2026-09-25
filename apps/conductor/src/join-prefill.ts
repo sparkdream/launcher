@@ -1,4 +1,4 @@
-import type { LaunchSpec, LaunchSpecInput } from "@sparkdream/launch-spec";
+import { COMPONENT_KEYS, type LaunchSpec, type LaunchSpecInput } from "@sparkdream/launch-spec";
 
 /**
  * "Prefill spec from join bundle" (§5 "Public peering & the join bundle"):
@@ -158,10 +158,9 @@ function stripOrigin(base: LaunchSpec, notes: string[], colocated: string[]): Js
         "Give the new sentry its own api/rpc names to serve them, or leave it off the public web",
     );
   }
-  const enabled = (["explorer", "frontend", "hub"] as const).filter(
-    (c) => (spec.topology.components as Json)[c]?.enabled,
-  );
-  for (const c of ["explorer", "frontend", "hub"] as const) {
+  const toggles = [...COMPONENT_KEYS, "hub"];
+  const enabled = toggles.filter((c) => (spec.topology.components as Json)[c]?.enabled);
+  for (const c of toggles) {
     const comp = (spec.topology.components as Json)[c];
     if (!comp) continue;
     comp.enabled = false;

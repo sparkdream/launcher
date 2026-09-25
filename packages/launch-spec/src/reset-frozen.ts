@@ -34,6 +34,7 @@ export const RESET_FROZEN_PATHS = [
   "images.explorer",
   "images.frontend",
   "images.hub",
+  "images.relayer",
 ] as const;
 
 type Obj = Record<string, unknown>;

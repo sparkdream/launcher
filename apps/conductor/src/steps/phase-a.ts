@@ -4,7 +4,7 @@ import {
   chainId,
   nodes,
   resolveTopology,
-  statelessComponents,
+  serviceComponents,
   tunnelPort,
   validateSpec,
   validatorMoniker,
@@ -38,6 +38,7 @@ import { fetchJoinGenesis, resolveStateSyncTrust } from "./join.js";
 import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
+import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress } from "../relayer.js";
 import {
   bakedModeError,
   chainAssetMode,
@@ -96,8 +97,14 @@ export const validateSpecStep: StepDef = {
       }
       return result;
     }
-    const { chainRepoCommit: _pin, ...imageRefs } = ctx.spec.images;
-    const images = Object.values(imageRefs).filter((i): i is string => Boolean(i));
+    // only what this launch deploys: a profile default for a component the
+    // spec leaves off (the relayer's image before its first release, say)
+    // must not block the launch
+    const images = [
+      ctx.spec.images.sparkdreamd,
+      ...(ctx.spec.topology.headscale.reuseFleet ? [] : [ctx.spec.images.headscale]),
+      ...serviceComponents(ctx.spec).map((c) => c.image),
+    ];
     const missing = (
       await Promise.all(
         images.map(async (image) => ((await dockerHubTagMissing(ctx, image)) ? image : null)),
@@ -275,6 +282,15 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
   }
   // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
   writeSecretFile(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2));
+  // the relayer's key (cosmjs-derived: other chains need other prefixes, so
+  // the keyring's single prefix cannot make it); funded in genesis
+  if (spec.topology.components.relayer?.enabled) {
+    const mnemonic = await ensureRelayerMnemonic(dirs.secrets);
+    accounts[RELAYER_ACCOUNT] = await relayerAddress(mnemonic, {
+      bech32Prefix: spec.network.bech32Prefix,
+      hdPath: "m/44'/118'/0'/0/0",
+    });
+  }
   return accounts;
 }
 
@@ -355,6 +371,11 @@ export async function buildGenesisFiles(
       keys.accounts[`op-val-${v}`]!,
       spec.accounts.validatorSelfDelegation,
     );
+  }
+  // the relayer pays gas for every packet this chain's side submits
+  const relayerAccount = keys.accounts[RELAYER_ACCOUNT];
+  if (relayerAccount && spec.topology.components.relayer?.enabled) {
+    await addGenesisAccount(relayerAccount, spec.topology.components.relayer.genesisBalance);
   }
 
   // 2b. community pool — after accounts (it appends the distribution
@@ -564,7 +585,7 @@ export const renderSdlsStep: StepDef = {
       });
       written.push(outPath);
     }
-    for (const component of statelessComponents(ctx.spec)) {
+    for (const component of serviceComponents(ctx.spec)) {
       const outPath = path.join(ctx.dirs.sdl, `${component.key}.yaml`);
       renderComponentSdl({
         spec: ctx.spec,
@@ -572,6 +593,7 @@ export const renderSdlsStep: StepDef = {
         sshPublicKey: keys.sshPublicKey,
         outPath,
         placeholder,
+        peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
       });
       written.push(outPath);
     }

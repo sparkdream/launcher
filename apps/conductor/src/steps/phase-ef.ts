@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
+import { chainId, headscaleDomain, nodes, resolveTopology, serviceComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
+import { linkRelayerStep } from "./relayer-link.js";
 import { isManifestVersionRejected } from "../akash/client.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
@@ -757,7 +758,8 @@ export const verifyChainStep: StepDef = {
     // pauses with the exact record needed (headscale DNS-gate pattern).
     const http: Record<string, string> = {};
     const targets: Array<{ name: string; domain: string; url: string; behind: string }> = [];
-    for (const c of statelessComponents(ctx.spec)) {
+    for (const c of serviceComponents(ctx.spec)) {
+      if (!c.domain) continue;
       targets.push({ name: c.key, domain: c.domain, url: `https://${c.domain}/`, behind: c.key });
     }
     const pub = ctx.spec.topology.publicEndpoints;
@@ -868,6 +870,9 @@ export function phaseEFSteps(): StepDef[] {
     // Phase G (§5 "Join mode"): promote the joined pair to a bonded
     // validator — no-ops outside join mode, runs before the dashboard flip
     ...phaseGSteps(),
+    // relayer (no-op without one): after the chain is verified and joined,
+    // since opening channels needs blocks on both ends
+    linkRelayerStep,
     finalizeStep,
   ];
 }

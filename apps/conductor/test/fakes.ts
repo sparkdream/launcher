@@ -12,6 +12,7 @@ import type {
   SshTarget,
 } from "../src/services.js";
 import type { Signer } from "../src/engine.js";
+import { templatePath } from "../src/vendor.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -383,6 +384,21 @@ export class FakeSsh {
   /** persistent_peers value in a node's config.toml, per host:port. Unset →
    *  the node has no such line (probes that read it simply find nothing). */
   configPeers = new Map<string, string>();
+  /** A node's app.toml, per host:port, once something uploads one. Unset →
+   *  the node serves the vendored sentry template (LCD off), which is what a
+   *  fleet launched without LCD consumers carries. */
+  appToml = new Map<string, string>();
+  /** Text files uploaded to each container, by `host:port|remotePath`. */
+  files = new Map<string, string>();
+  /** Relayer: chain ids whose key relayer-fundcheck reports as unfunded. */
+  unfundedChains = new Set<string>();
+  /** Relayer: containers holding the ready marker (hermes running). */
+  relayerReady = new Set<string>();
+  /** Relayer: channel ids per path id per container — stable across
+   *  re-runs, since bringup reuses what is open. */
+  private relayChannels = new Map<string, unknown>();
+  /** Relayer: how many times bringup opened a path afresh. */
+  relayOpens = 0;
   /** Block archive files sitting on a node (restore op), per host:port. */
   archiveFiles = new Map<string, number>();
   /** Nodes holding an uploaded tarball the restore op can unpack. */
@@ -459,6 +475,53 @@ export class FakeSsh {
     }
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
+
+    // --- relayer container (deploy/docker/hermes in the chain repo) ---
+    const manifest = () =>
+      JSON.parse(this.files.get(`${id}|/data/relayer/relayer.json`) ?? '{"chains":[],"paths":[]}') as {
+        chains: Array<{ id: string }>;
+        paths: Array<{ id: string; a: string; b: string; port: string; version: string }>;
+      };
+    if (command === "relayer-bringup --keys-only") return ok();
+    if (command === "relayer-fundcheck || true") {
+      return ok(
+        JSON.stringify(
+          manifest().chains.map((c) => {
+            const funded = !this.unfundedChains.has(c.id);
+            return { chain: c.id, address: "", balance: funded ? "1000000" : "0", denom: "", account: null, ready: funded };
+          }),
+        ),
+      );
+    }
+    if (command === "relayer-bringup") {
+      const m = manifest();
+      const out = m.paths.map((p, i) => {
+        const key = `${id}|${p.id}`;
+        if (!this.relayChannels.has(key)) {
+          this.relayOpens++;
+          this.relayChannels.set(key, {
+            id: p.id,
+            port: p.port,
+            version: p.version,
+            a: { chain: p.a, client: "07-tendermint-0", connection: "connection-0", channel: `channel-${i}` },
+            b: { chain: p.b, client: "07-tendermint-0", connection: "connection-0", channel: `channel-${i}` },
+          });
+        }
+        return this.relayChannels.get(key);
+      });
+      return ok(JSON.stringify(out));
+    }
+    if (command === "test -f /data/relayer/ready && echo running || true") {
+      return ok(this.relayerReady.has(id) ? "running" : "");
+    }
+    if (command === "touch /data/relayer/ready") {
+      this.relayerReady.add(id);
+      return ok();
+    }
+
+    if (/^cat \S+\/config\/app\.toml$/.test(command)) {
+      return ok(this.appToml.get(id) ?? fs.readFileSync(templatePath("app.toml.sentry"), "utf8"));
+    }
 
     // --- restore op: archive discovery, the detached replay, its poll ---
     if (command.includes("echo NONE")) {
@@ -612,8 +675,14 @@ export class FakeSsh {
     return ok();
   }
 
-  async upload(target: SshTarget, localPath: string): Promise<void> {
+  async upload(target: SshTarget, localPath: string, remotePath?: string): Promise<void> {
     if (!fs.existsSync(localPath)) throw new Error(`upload source missing: ${localPath}`);
+    if (remotePath?.endsWith("/config/app.toml")) {
+      this.appToml.set(this.id(target), fs.readFileSync(localPath, "utf8"));
+    }
+    if (remotePath && /\.(toml|json|mnemonic)$/.test(remotePath)) {
+      this.files.set(`${this.id(target)}|${remotePath}`, fs.readFileSync(localPath, "utf8"));
+    }
   }
 
   async download(_target: SshTarget, _remote: string, localPath: string): Promise<void> {

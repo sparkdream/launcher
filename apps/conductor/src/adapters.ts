@@ -19,7 +19,9 @@ import { RestAkashApi, type RestEndpoints } from "./akash/rest.js";
 /** Connection-level failures — the cases the lease-shell fallback can rescue. */
 function isConnectFailure(e: unknown): boolean {
   const s = String((e as any)?.message ?? e);
-  return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|Timed out while waiting for handshake/i.test(s);
+  return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|Timed out while waiting for handshake|Connection lost before handshake|closed before the SSH handshake/i.test(
+    s,
+  );
 }
 
 /**
@@ -196,8 +198,10 @@ export class Ssh2Runner implements SshRunner {
   private withConnection<T>(target: SshTarget, fn: (conn: Client) => Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
       const conn = new Client();
+      let ready = false;
       conn
         .on("ready", () => {
+          ready = true;
           fn(conn)
             .then((v) => {
               conn.end();
@@ -209,6 +213,18 @@ export class Ssh2Runner implements SshRunner {
             });
         })
         .on("error", reject)
+        // A peer that sends its version banner and then drops the socket
+        // gets no error from ssh2: seeing the banner disarms its "lost
+        // before handshake" error, and the close clears readyTimeout. With
+        // only ready/error listened for, that left this promise pending
+        // with no timer anywhere, and a reset's start step waiting on it
+        // forever while the chain was producing blocks (2026-09-25). A
+        // close after ready is fn's to report: the command may have run.
+        .on("close", () => {
+          if (!ready) {
+            reject(new Error(`ssh ${target.host}:${target.port}: connection closed before the SSH handshake finished`));
+          }
+        })
         .connect({
           host: target.host,
           port: target.port,

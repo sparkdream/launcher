@@ -2,9 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   chainId,
   checkSpec,
+  grpcRequired,
   lcdRequired,
   resolveTopology,
-  statelessComponents,
+  serviceComponents,
   tunnelPort,
   validateSpec,
   withDefaults,
@@ -669,9 +670,9 @@ describe("stateless components", () => {
     expect(spec.images.explorer).toContain("sparkdream-explorer");
     expect(spec.images.frontend).toContain("sparkdream-ui");
     expect(validateSpec(spec).errors).toEqual([]);
-    expect(statelessComponents(spec)).toEqual([
-      { key: "explorer", domain: "explorer.sparkdream.io", image: spec.images.explorer, mesh: true },
-      { key: "frontend", domain: "app.sparkdream.io", image: spec.images.frontend, mesh: false },
+    expect(serviceComponents(spec)).toEqual([
+      { key: "explorer", domain: "explorer.sparkdream.io", image: spec.images.explorer, mesh: true, ssh: true },
+      { key: "frontend", domain: "app.sparkdream.io", image: spec.images.frontend, mesh: false, ssh: false },
     ]);
     expect(lcdRequired(spec)).toBe(true);
   });
@@ -703,9 +704,58 @@ describe("stateless components", () => {
     expect(res.errors.some((e) => e.path === "topology.publicEndpoints")).toBe(true);
   });
 
+  it("a relayer derives with no domain, needs gRPC not the LCD, and validates its paths", () => {
+    const osmo = {
+      chainId: "osmo-test-5",
+      rpc: "https://rpc.example",
+      grpc: "http://grpc.example:9090",
+      bech32Prefix: "osmo",
+      gasDenom: "uosmo",
+      gasPrice: 0.025,
+    };
+    const withRelayer = (paths: unknown[]) =>
+      testnetSpec({
+        topology: componentsOn({
+          components: {
+            explorer: { enabled: false },
+            frontend: { enabled: false },
+            hub: { enabled: false },
+            relayer: { enabled: true, paths },
+          },
+          publicEndpoints: undefined,
+        }),
+      } as any);
+    const spec = withRelayer([{ id: "osmo", kind: "transfer", counterparty: osmo }]);
+    expect(serviceComponents(spec)).toEqual([
+      { key: "relayer", image: spec.images.relayer, mesh: true, ssh: true },
+    ]);
+    expect(spec.images.relayer).toContain("sparkdreamnft/hermes:");
+    expect(grpcRequired(spec)).toBe(true);
+    expect(lcdRequired(spec)).toBe(false);
+    const ok = validateSpec(spec);
+    expect(ok.errors).toEqual([]);
+    expect(ok.warnings.some((w) => w.path.endsWith("counterparty.grpc"))).toBe(true);
+
+    const bad = validateSpec(
+      withRelayer([
+        { id: "osmo", kind: "transfer", counterparty: osmo },
+        { id: "osmo", kind: "transfer", counterparty: osmo },
+        { id: "back", kind: "transfer", counterparty: { ...osmo, chainId: chainId(spec) } },
+      ]),
+    );
+    expect(bad.errors.map((e) => e.path)).toEqual(
+      expect.arrayContaining([
+        "topology.components.relayer.paths.1.id",
+        "topology.components.relayer.paths.1",
+        "topology.components.relayer.paths.2.counterparty.chainId",
+      ]),
+    );
+    expect(validateSpec(withRelayer([])).errors.some((e) => e.path === "topology.components.relayer.paths")).toBe(true);
+  });
+
   it("disabled components derive to nothing and need no LCD", () => {
     const spec = testnetSpec();
-    expect(statelessComponents(spec)).toEqual([]);
+    expect(serviceComponents(spec)).toEqual([]);
     expect(lcdRequired(spec)).toBe(false);
   });
 });

@@ -101,6 +101,68 @@ const componentToggle = z.object({
 });
 
 /**
+ * The far end of a relay path: another fleet on this launcher (resolved at
+ * launch creation to its chain id, prefix, gas denom and sentry-0, and
+ * reached over the shared mesh), or any chain named by its endpoints.
+ */
+const relayerFleetCounterparty = z
+  .object({
+    /** Launch id or unique network name of a fleet on this launcher. It must
+     *  share this fleet's mesh (one of the two reuses the other's headscale),
+     *  since its sentry's gRPC is only reachable over the tailnet. */
+    fleet: z.string().min(1),
+  })
+  .strict();
+
+const relayerEndpointCounterparty = z
+  .object({
+    chainId: z.string().min(1),
+    /** CometBFT RPC; the websocket event source is <rpc>/websocket unless `ws` says otherwise. */
+    rpc: z.string().url(),
+    /** gRPC, publicly reachable (e.g. http://grpc.example.org:9090). */
+    grpc: z.string().url(),
+    ws: z.string().url().optional(),
+    /** LCD, optional: lets the launcher check the relayer key's balance. */
+    lcd: z.string().url().optional(),
+    bech32Prefix: z.string().regex(/^[a-z][a-z0-9]{0,15}$/),
+    gasDenom: z.string().min(1),
+    /** Price per gas unit, at least the chain's minimum-gas-prices. */
+    gasPrice: z.number().positive(),
+    /** BIP44 path for the relayer key on this chain (coin type 118 by default). */
+    hdPath: z.string().regex(/^m(\/[0-9]+'?)+$/).default("m/44'/118'/0'/0/0"),
+    /** Light-client trusting period, below the chain's unbonding time. Unset,
+     *  Hermes derives 2/3 of the unbonding time from the chain itself. */
+    trustingPeriod: z.string().regex(/^[0-9]+(s|m|h|days)$/).optional(),
+  })
+  .strict();
+
+const relayerPath = z.object({
+  /** Stable name for the path: shown in the fleet panel, keys the channel ids. */
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,30}$/),
+  /**
+   * transfer — ICS-20 token transfers (port transfer, version ics20-1).
+   * federation — x/federation content packets (port federation, version
+   * federation-1); the counterparty must be a Spark Dream chain, and content
+   * flows only once both chains have registered and activated each other
+   * as peers.
+   */
+  kind: z.enum(["transfer", "federation"]),
+  counterparty: z.union([relayerFleetCounterparty, relayerEndpointCounterparty]),
+});
+
+/**
+ * One Hermes process relaying every path. Joins the mesh and reaches this
+ * fleet's sentry-0 (gRPC + RPC) and each fleet counterparty's over it.
+ */
+const relayerComponent = z.object({
+  enabled: z.boolean(),
+  paths: z.array(relayerPath).default([]),
+  /** Genesis balance for the relayer's key on this chain, in the base denom
+   *  (it pays gas for every packet this side submits). Ignored in join mode. */
+  genesisBalance: z.string().regex(/^[0-9]+$/).default("100000000"),
+});
+
+/**
  * Per component group provider rules (§6). `exclude` entries are either an
  * akash1... provider owner address (exact match) or a case-insensitive
  * substring of the provider's hostname (parsed from its hostUri). Matching is
@@ -270,6 +332,7 @@ export const launchSpecSchema = z.object({
       }),
       frontend: componentToggle,
       hub: componentToggle,
+      relayer: relayerComponent.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress
@@ -330,6 +393,7 @@ export const launchSpecSchema = z.object({
         explorer: componentProviderRules.optional(),
         frontend: componentProviderRules.optional(),
         hub: componentProviderRules.optional(),
+        relayer: componentProviderRules.optional(),
       })
       .strict()
       .default({}),
@@ -392,6 +456,7 @@ export const launchSpecSchema = z.object({
     explorer: z.string().optional(),
     frontend: z.string().optional(),
     hub: z.string().optional(),
+    relayer: z.string().optional(),
   }),
 
   security: z.object({
@@ -423,4 +488,6 @@ export const launchSpecSchema = z.object({
 });
 
 export type LaunchSpec = z.infer<typeof launchSpecSchema>;
+export type RelayerPath = z.infer<typeof relayerPath>;
+export type RelayerEndpointCounterparty = z.infer<typeof relayerEndpointCounterparty>;
 export type LaunchSpecInput = z.input<typeof launchSpecSchema>;

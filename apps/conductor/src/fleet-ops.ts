@@ -2,9 +2,21 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { chainId, headscaleDomain, nodes, resolveTopology, statelessComponents, tunnelPort, withDefaults, type ComponentRef, type LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  chainId,
+  COMPONENT_KINDS,
+  headscaleDomain,
+  nodes,
+  resolveTopology,
+  serviceComponents,
+  tunnelPort,
+  withDefaults,
+  type ComponentKey,
+  type ComponentRef,
+  type LaunchSpec,
+} from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
-import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
+import { AwaitUser, launchDirs, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
 import { feeCoin, feeConfig } from "./fee.js";
@@ -22,7 +34,11 @@ import {
   type GenerateKeysOutput,
 } from "./steps/phase-a.js";
 import { sparkdreamd } from "./exec.js";
-import { explorerChainEnv, renderComponentSdl, EXPLORER_SENTRY, EXPLORER_TUNNELS } from "./render-component-sdl.js";
+import { renderComponentSdl } from "./render-component-sdl.js";
+import { descriptorFor, setServiceEnv } from "./components/index.js";
+import { patchSentryAppToml, sentryServe } from "./sentry-serve.js";
+import { fleetPeer, peerRow, relayedBy } from "./relayer.js";
+import { linkRelayer } from "./steps/relayer-link.js";
 import { deploymentInfoWithRetry, ingressHost, pushManifest } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
@@ -122,8 +138,8 @@ function tunnelPeers(spec: LaunchSpec, key: string): Map<number, string> {
     for (const v of topo.sentryValidators[Number(key.split("-")[1])] ?? []) {
       peers.set(tunnelPort(v), `val-${v}`);
     }
-  } else if (key === "explorer") {
-    for (const t of EXPLORER_TUNNELS) peers.set(t.local, EXPLORER_SENTRY);
+  } else {
+    for (const t of descriptorFor(key)?.tunnels(spec) ?? []) peers.set(t.local, t.peer);
   }
   return peers;
 }
@@ -145,17 +161,24 @@ function retargetTunnelEnv(
   spec: LaunchSpec,
   key: string,
   text: string,
+  /** The fleet whose SDL this is (another fleet's, for a relayer dialing
+   *  this one); its own peers resolve against its rows. */
+  fleetId: string = ctx.launchId,
 ): { text: string; changes: string[] } {
   const peers = tunnelPeers(spec, key);
   if (peers.size === 0) return { text, changes: [] };
-  const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+  const rows = ctx.db.listFleetComponents(fleetId) as FleetComponentRow[];
   const changes: string[] = [];
   const out = text.replace(
     /TS_TUNNEL_([A-Za-z0-9_]+)=(\d+):(.+?):(\d+)(?=["'\s]|$)/g,
     (whole, name: string, local: string, target: string, remote: string) => {
       const peerKey = peers.get(Number(local));
       if (!peerKey) return whole;
-      const ip = rows.find((c) => c.key === peerKey)?.tailnet_ip;
+      // `key@launch` names a component in another fleet (a relayer's
+      // counterparty sentry): its address lives in that fleet's rows
+      const ip = peerKey.includes("@")
+        ? peerRow(ctx.db, fleetId, peerKey)?.tailnet_ip
+        : rows.find((c) => c.key === peerKey)?.tailnet_ip;
       if (!ip || ip === target) return whole;
       changes.push(`${peerKey} ${target} → ${ip}`);
       return `TS_TUNNEL_${name}=${local}:${ip}:${remote}`;
@@ -166,9 +189,43 @@ function retargetTunnelEnv(
 
 /** Mesh components whose tunnel env dials `key` (the explorer, for a sentry). */
 function meshDependents(spec: LaunchSpec, key: string): string[] {
-  return statelessComponents(spec)
+  return serviceComponents(spec)
     .filter((c) => c.mesh && [...tunnelPeers(spec, c.key).values()].includes(key))
     .map((c) => c.key);
+}
+
+/** A mesh component that dials `key`, in this fleet or (a relayer) another. */
+interface MeshDependent {
+  fleetId: string;
+  key: string;
+  spec: LaunchSpec;
+  sdlDir: string;
+}
+
+/**
+ * Every mesh component dialing this fleet's `key`: meshDependents here, plus
+ * — for sentry-0 — any other fleet's relayer that tunnels to it. Resolved at
+ * run time, since other fleets can start relaying after this op was built.
+ */
+function allMeshDependents(ctx: StepCtx, spec: LaunchSpec, key: string): MeshDependent[] {
+  const out: MeshDependent[] = meshDependents(spec, key).map((k) => ({
+    fleetId: ctx.launchId,
+    key: k,
+    spec,
+    sdlDir: ctx.dirs.sdl,
+  }));
+  if (key !== "sentry-0") return out;
+  const peer = fleetPeer("sentry-0", ctx.launchId);
+  for (const other of relayedBy(ctx.db, ctx.launchId)) {
+    const launch = ctx.db.getLaunch(other);
+    if (!launch) continue;
+    const otherSpec = withDefaults(JSON.parse(launch.spec_json));
+    for (const c of serviceComponents(otherSpec)) {
+      if (!c.mesh || !descriptorFor(c.key)?.tunnels(otherSpec).some((t) => t.peer === peer)) continue;
+      out.push({ fleetId: other, key: c.key, spec: otherSpec, sdlDir: launchDirs(ctx.workRoot, other).sdl });
+    }
+  }
+  return out;
 }
 
 function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
@@ -560,6 +617,114 @@ async function manualBidChoice(
   );
 }
 
+export interface AddComponentParams {
+  key: ComponentKey;
+  /** Continues the row's move count when a closed component comes back. */
+  generation: number;
+}
+
+/** Open what the current spec needs on one of this fleet's sentries — plus
+ *  gRPC when another fleet's relayer dials it. Returns whether it changed. */
+function ensureSentryServes(ctx: StepCtx, spec: LaunchSpec, key: string, target: SshTarget): Promise<boolean> {
+  return patchSentryAppToml(ctx, key, target, sentryServe(spec, relayedBy(ctx.db, ctx.launchId).length > 0));
+}
+
+/**
+ * Add a service component to a running fleet (§5 day-2): render its SDL,
+ * open what it needs on the sentries, then place it exactly as a relaunch
+ * places a component — fresh deployment, bids, lease, manifest, health gate —
+ * minus the close, since there is nothing to close. requestAddComponent has
+ * already enabled it in the stored spec.
+ */
+export function addComponentSteps(opId: number, params: AddComponentParams, spec: LaunchSpec): StepDef[] {
+  const { key } = params;
+  const p = (s: string) => `op${opId}:${s}`;
+  const steps: StepDef[] = [];
+
+  steps.push({
+    name: p("render"),
+    async run(ctx) {
+      const component = serviceComponents(spec).find((c) => c.key === key);
+      if (!component) throw new Error(`${key} is not enabled in the spec`);
+      const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+      if (!keys) throw new Error("generate-keys output missing");
+      renderComponentSdl({
+        spec,
+        component,
+        sshPublicKey: keys.sshPublicKey,
+        outPath: sdlPathFor(ctx, key),
+        placeholder,
+        peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+      });
+      // the row exists from here on so the fleet shows the component while
+      // it is being placed; relaunch's manifest step fills in the placement
+      ctx.db.upsertFleetComponent({
+        launch_id: ctx.launchId,
+        key,
+        dseq: "0",
+        provider: "",
+        host_uri: "",
+        price: "0",
+        state: "relaunching",
+        image: component.image,
+      });
+      ctx.db.setComponentState(ctx.launchId, key, "relaunching");
+      return {};
+    },
+  });
+
+  // a kind that reads the sentries' LCD, on a fleet launched without one:
+  // open it on every live sentry (restarting only the ones that changed)
+  if (COMPONENT_KINDS[key].needsLcd) {
+    steps.push({
+      name: p("sentries"),
+      async run(ctx) {
+        const changed: string[] = [];
+        const rows = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
+          (c) => c.key.startsWith("sentry-") && c.state === "active",
+        );
+        for (const row of rows) {
+          const target = rowTarget(ctx, row);
+          if (await ensureSentryServes(ctx, spec, row.key, target)) {
+            await restartNode(ctx.services.ssh, target);
+            changed.push(row.key);
+          }
+        }
+        return { restarted: changed };
+      },
+    });
+  }
+
+  steps.push(
+    ...relaunchSteps(opId, { key, generation: params.generation }, spec).filter(
+      (s) => s.name !== p("close"),
+    ),
+  );
+  return steps;
+}
+
+/**
+ * Link (or re-link) the fleet's relayer to its chains: configure and key it,
+ * wait for funding, open or reuse every path's channel, start Hermes. The
+ * trailing step of adding a relayer, and its own op after anything that
+ * wipes IBC state — a chain reset here or on a counterparty, or a relaunched
+ * relayer's fresh volume. Marks the op done itself, since it may follow
+ * steps that would otherwise have done so.
+ */
+export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
+  const name = `op${opId}:link-relayer`;
+  return [
+    {
+      name,
+      async run(ctx) {
+        const out = await linkRelayer(ctx, name, spec);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return out;
+      },
+    },
+  ];
+}
+
 /** Relaunch: close → fresh deploy on a new provider → rewire → guarded start.
  *  Stateless components (§5): no volume, keys, peers, or double-sign risk —
  *  the rewiring and guarded-start steps are replaced by an HTTP health gate. */
@@ -568,13 +733,16 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
   const p = (s: string) => `op${opId}:${s}`;
   const isValidator = key.startsWith("val-");
   const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
-  const stateless = statelessComponents(spec).find((c) => c.key === key);
+  const stateless = serviceComponents(spec).find((c) => c.key === key);
   // Trailing steps are conditional (a tmkms validator gets a signer gate, a
   // node the explorer dials gets a mesh-client repoint), so which one closes
   // the op out varies — name it once instead of guessing in each step.
   const signerGate = isValidator && spec.security.keyMode === "tmkms";
+  // sentry-0 always gets the mesh-client pass: another fleet's relayer may
+  // dial it, which only the db (at run time) can tell
+  const meshClients = key === "sentry-0" || meshDependents(spec, key).length > 0;
   const lastStep = p(
-    meshDependents(spec, key).length > 0
+    meshClients
       ? "mesh-clients"
       : signerGate
         ? "await-signer"
@@ -825,8 +993,9 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         ]);
       }
       await ctx.services.provider.sendManifest(cert, lease.hostUri, deploy.dseq, manifest);
-      // the frontend image runs no sshd — just wait for the workload
-      const wantSsh = !stateless || stateless.mesh;
+      // a component whose image runs no sshd (the frontend) — just wait for
+      // the workload
+      const wantSsh = !stateless || stateless.ssh;
       const status = await waitLeaseStatus(
         ctx,
         cert,
@@ -853,6 +1022,11 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     },
   });
 
+  // steps the kind runs once it is placed (the relayer's link); when there
+  // are some, the op is done after them rather than at the health gate
+  const configure = stateless ? (descriptorFor(key)?.configureSteps?.(p, spec) ?? []) : [];
+  const finishAtGate = configure.length === 0;
+
   if (stateless) {
     // §5: stateless components skip the node rewiring and guarded start —
     // the container is live once it answers on its domain. Its tunnels come
@@ -861,11 +1035,18 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     steps.push({
       name: p("verify"),
       async run(ctx) {
-        const url = `https://${stateless!.domain}/`;
+        const domain = stateless!.domain;
+        if (!domain) {
+          // no public domain to probe: the lease being up is the gate
+          ctx.db.setComponentState(ctx.launchId, key, "active");
+          if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
+          return { healthy: true };
+        }
+        const url = `https://${domain}/`;
         for (let i = 0; i < 36; i++) {
           if (await ctx.services.rpc.httpOk(url)) {
             ctx.db.setComponentState(ctx.launchId, key, "active");
-            ctx.db.setFleetOpStatus(opId, "done");
+            if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
             return { healthy: true, url };
           }
           await ctx.services.sleep(5000);
@@ -875,15 +1056,24 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
         const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
         const ingress = await ingressHost(
-          ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, stateless!.domain,
+          ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain,
         );
         throw new AwaitUser(
           p("verify"),
-          `${key} not answering at ${url} — update the DNS record for ${stateless!.domain} → ` +
+          `${key} not answering at ${url} — update the DNS record for ${domain} → ` +
             `CNAME ${ingress} (the relaunch moved providers), then resume`,
         );
       },
     });
+    if (!finishAtGate) {
+      steps.push(...configure, {
+        name: p("done"),
+        async run(ctx) {
+          ctx.db.setFleetOpStatus(opId, "done");
+          return {};
+        },
+      });
+    }
     return steps;
   }
 
@@ -899,6 +1089,10 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         target,
         `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME} && touch ${NODE_HOME}/.node-data-uploaded`,
       );
+      // the bundle was rendered at launch; a component added since may need
+      // the sentry to open more (its LCD) — converge on the current spec
+      // before the node first starts
+      if (key.startsWith("sentry-")) await ensureSentryServes(ctx, spec, key, target);
       if (spec.join) {
         // join fleets: the bundle's [statesync] block still carries the
         // launch-time trust anchor, long outside the light-client trust
@@ -1378,7 +1572,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     });
   }
 
-  if (meshDependents(spec, key).length > 0) {
+  if (meshClients) {
     steps.push({
       name: p("mesh-clients"),
       async run(ctx) {
@@ -1392,15 +1586,20 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         const cert = loadCert(ctx);
         const msgs: Msg[] = [];
         const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
-        for (const depKey of meshDependents(spec, key)) {
-          const row = componentRow(ctx, depKey);
-          const sdlPath = sdlPathFor(ctx, depKey);
-          const retarget = retargetTunnelEnv(ctx, spec, depKey, fs.readFileSync(sdlPath, "utf8"));
+        for (const dep of allMeshDependents(ctx, spec, key)) {
+          const depKey = dep.key;
+          const row = (ctx.db.listFleetComponents(dep.fleetId) as FleetComponentRow[]).find(
+            (c) => c.key === depKey && c.state !== "closed",
+          );
+          if (!row) continue;
+          const sdlPath = path.join(dep.sdlDir, `${depKey}.yaml`);
+          const retarget = retargetTunnelEnv(ctx, dep.spec, depKey, fs.readFileSync(sdlPath, "utf8"), dep.fleetId);
           if (retarget.changes.length === 0) continue;
-          for (const c of retarget.changes) ctx.log(`${depKey}: tunnel re-aimed at ${c}`);
+          const label = dep.fleetId === ctx.launchId ? depKey : fleetPeer(depKey, dep.fleetId);
+          for (const c of retarget.changes) ctx.log(`${label}: tunnel re-aimed at ${c}`);
           fs.writeFileSync(sdlPath, retarget.text);
           const artifacts = sdlArtifacts(loadSdl(sdlPath));
-          fs.writeFileSync(path.join(ctx.dirs.sdl, `${depKey}.manifest.json`), artifacts.manifestJson);
+          fs.writeFileSync(path.join(dep.sdlDir, `${depKey}.manifest.json`), artifacts.manifestJson);
           pushes.push({ row, json: artifacts.manifestJson });
           // convergent like retarget: a re-run finds the version already on
           // chain and only re-sends the manifest
@@ -1464,7 +1663,7 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
   const backup = spec.topology.headscale.backup;
   const meshKeys = [
     ...nodes(spec).map((n) => n.key),
-    ...statelessComponents(spec).filter((c) => c.mesh).map((c) => c.key),
+    ...serviceComponents(spec).filter((c) => c.mesh).map((c) => c.key),
   ];
   const valKeys = nodes(spec).filter((n) => n.key.startsWith("val-")).map((n) => n.key);
 
@@ -1985,7 +2184,7 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
 export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSpec): StepDef[] {
   const steps: StepDef[] = [];
   const stateless = new Map<string, ComponentRef>(
-    statelessComponents(spec).map((c) => [c.key, c]),
+    serviceComponents(spec).map((c) => [c.key, c]),
   );
   const ordered = [...params.components].sort((a, b) => {
     // stateless components upgrade freely, then sentries, validators last
@@ -2004,25 +2203,20 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         const row = componentRow(ctx, key);
         const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
         const sdlPath = sdlPathFor(ctx, key);
-        let sdl = fs.readFileSync(sdlPath, "utf8");
+        const sdl = fs.readFileSync(sdlPath, "utf8");
         // precondition (§5): a gated container would come back down
         if (sdl.includes("WAIT_FOR_CONFIG=true")) {
           throw new Error(`${key}: WAIT_FOR_CONFIG still true — run persist-start (step 20b) first`);
         }
-        // both web components read their chain identity from env (the
+        // service components read their chain identity from env (the
         // explorer renders /chain-config.json from it, the frontend serves
         // /api/config from it) — refresh the current values on upgrade so
         // installing an image that reads a newly added var also delivers
-        // the var, without needing a chain reset. The explorer is patched
-        // in place, so persist-start's resolved tunnel targets survive; the
-        // frontend re-renders wholesale, then takes the new image below.
-        if (key === "frontend") {
-          rerenderFrontendSdl(ctx, spec, sdlPath);
-          sdl = fs.readFileSync(sdlPath, "utf8");
-        }
-        sdl = sdl.replace(/image: .*/g, `image: ${params.image}`);
-        fs.writeFileSync(sdlPath, sdl);
-        if (key === "explorer") setExplorerChainEnv(sdlPath, spec);
+        // the var, without needing a chain reset. How is per kind
+        // (descriptor.envRefresh): patched in place so persist-start's
+        // resolved tunnel targets survive, or re-rendered wholesale.
+        refreshComponentEnv(ctx, spec, key, sdlPath);
+        setComponentImage(sdlPath, key, params.image);
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(
           path.join(ctx.dirs.sdl, `${key}.manifest.json`),
@@ -2082,9 +2276,10 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
     steps.push({
       name: p("verify"),
       async run(ctx) {
-        // stateless (§5): ephemeral filesystem, so the update is just the
-        // image swap plus an HTTP health gate on the public domain
+        // service components (§5): the update is just the image swap plus
+        // an HTTP health gate on the public domain, when the kind has one
         const comp = stateless.get(key);
+        if (comp && !comp.domain) return { healthy: true };
         if (comp) {
           const url = `https://${comp.domain}/`;
           for (let i = 0; i < 60; i++) {
@@ -2353,33 +2548,17 @@ export interface RetargetParams {
  */
 export function retargetSdl(sdlPath: string, key: string, spec: LaunchSpec): void {
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  const comps = spec.topology.components;
   const pub = spec.topology.publicEndpoints;
-  if (key === "explorer" || key === "frontend") {
-    const svc = doc.services?.[key];
-    if (!svc) throw new Error(`${key}.yaml has no services.${key}`);
-    const domain = comps[key].domain;
+  const d = descriptorFor(key);
+  if (d) {
+    const domain = serviceComponents(spec).find((c) => c.key === key)?.domain;
     if (!domain) throw new Error(`${key} has no domain in the spec`);
-    for (const e of svc.expose ?? []) if (e.accept) e.accept = [domain];
-    if (key === "frontend") {
-      const env: string[] = svc.env ?? [];
-      const set = (k: string, v: string | undefined) => {
-        const i = env.findIndex((x) => x.startsWith(k + "="));
-        if (v === undefined) {
-          if (i >= 0) env.splice(i, 1);
-        } else if (i >= 0) env[i] = `${k}=${v}`;
-        else env.push(`${k}=${v}`);
-      };
-      if (pub?.api) set("LCD_ENDPOINT", `https://${pub.api}`);
-      if (pub?.rpc) set("RPC_ENDPOINT", `https://${pub.rpc}`);
-      set(
-        "EXPLORER_URL",
-        comps.explorer.enabled && comps.explorer.domain
-          ? `https://${comps.explorer.domain}/${comps.explorer.route ?? spec.network.name}`
-          : undefined,
-      );
-      svc.env = env;
+    for (const name of d.imageServices) {
+      const svc = doc.services?.[name];
+      if (!svc) throw new Error(`${key}.yaml has no services.${name}`);
+      for (const e of svc.expose ?? []) if (e.accept) e.accept = [domain];
     }
+    if (d.retargetEnv) setServiceEnv(doc, d.imageServices, d.retargetEnv(spec));
   } else {
     // sentry-0: LCD accept rides the 1317 expose, RPC accept the 26657 one
     const svc = doc.services?.sparkdreamd;
@@ -2445,11 +2624,11 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
     {
       name: p("verify"),
       async run(ctx) {
-        const comps = spec.topology.components;
         const pub = spec.topology.publicEndpoints;
         const urls: string[] = [];
         for (const key of params.components) {
-          if (key === "explorer" || key === "frontend") urls.push(`https://${comps[key].domain}/`);
+          const domain = serviceComponents(spec).find((c) => c.key === key)?.domain;
+          if (domain) urls.push(`https://${domain}/`);
         }
         if (params.components.some((k) => k.startsWith("sentry-"))) {
           if (pub?.api) urls.push(`https://${pub.api}/cosmos/base/tendermint/v1beta1/node_info`);
@@ -2485,46 +2664,61 @@ export interface ResetChainParams {
 }
 
 /**
- * Patch the explorer's chain-identity env into its deployed SDL in place —
- * everything else (baked tunnel IPs, auth keys, image) is preserved, same
- * rationale as retargetSdl.
+ * Refresh a service component's chain-identity env in its deployed SDL, the
+ * way its kind asks (descriptor.envRefresh): "patch" sets chainEnv(spec) in
+ * place, preserving the baked tunnel IPs and auth keys (same rationale as
+ * retargetSdl); "rerender" renders the SDL again from the spec, for a kind
+ * whose deployed SDL holds nothing the spec doesn't. No-op for chain nodes.
  */
-function setExplorerChainEnv(sdlPath: string, spec: LaunchSpec): void {
-  const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  const svc = doc.services?.explorer;
-  if (!svc) throw new Error("explorer.yaml has no services.explorer");
-  const env: string[] = svc.env ?? [];
-  for (const [k, v] of Object.entries(explorerChainEnv(spec))) {
-    const i = env.findIndex((x) => x.startsWith(k + "="));
-    if (i >= 0) env[i] = `${k}=${v}`;
-    else env.push(`${k}=${v}`);
+function refreshComponentEnv(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPath: string): void {
+  const d = descriptorFor(key);
+  if (!d || d.envRefresh === "none") return;
+  if (d.envRefresh === "rerender") {
+    rerenderComponentSdl(ctx, spec, key, sdlPath);
+    return;
   }
-  svc.env = env;
+  const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+  setServiceEnv(doc, d.imageServices, d.chainEnv?.(spec) ?? {});
   fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
 }
 
-/**
- * Re-render the frontend's SDL from the spec. The frontend is the one
- * component whose deployed SDL holds nothing the spec doesn't — it never
- * joins the mesh, so there are no resolved tunnel targets or auth keys to
- * preserve — so refreshing its runtime env (chain identity, denoms and
- * display symbols, endpoints) is a wholesale re-render rather than the
- * in-place patching setExplorerChainEnv has to do.
- */
-function rerenderFrontendSdl(ctx: StepCtx, spec: LaunchSpec, sdlPath: string): void {
+/** Re-render a service component's SDL from the spec. */
+function rerenderComponentSdl(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPath: string): void {
   const keys = ctx.output<GenerateKeysOutput>("generate-keys");
   if (!keys) throw new Error("generate-keys output missing");
   // an upgrade/reset op can name a component the edited spec has since
   // turned off: say so rather than crashing inside the renderer
-  const component = statelessComponents(spec).find((c) => c.key === "frontend");
-  if (!component) throw new Error("frontend is disabled in the spec — cannot re-render its SDL");
+  const component = serviceComponents(spec).find((c) => c.key === key);
+  if (!component) throw new Error(`${key} is disabled in the spec — cannot re-render its SDL`);
   renderComponentSdl({
     spec,
     component,
     sshPublicKey: keys.sshPublicKey,
     outPath: sdlPath,
     placeholder,
+    peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
   });
+}
+
+/**
+ * Point a deployed SDL at a new image. Node SDLs run one service, so every
+ * image line is it; a service component swaps only its image services, so a
+ * sidecar (a database, say) keeps its own image.
+ */
+function setComponentImage(sdlPath: string, key: string, image: string): void {
+  const d = descriptorFor(key);
+  if (!d) {
+    const sdl = fs.readFileSync(sdlPath, "utf8");
+    fs.writeFileSync(sdlPath, sdl.replace(/image: .*/g, `image: ${image}`));
+    return;
+  }
+  const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+  for (const name of d.imageServices) {
+    const svc = doc.services?.[name];
+    if (!svc) throw new Error(`${key}.yaml has no services.${name}`);
+    svc.image = image;
+  }
+  fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
 }
 
 /**
@@ -2820,24 +3014,19 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
         // resume: flip wait mode off — the entrypoint execs sparkdreamd on
         // the new genesis when the containers restart
         const { msgs, manifests } = await flipWaitMode(ctx, nodeRows(ctx), "false");
-        // the frontend and explorer embed chain identity in their env
-        // (CHAIN_ID/CHAIN_NAME, denoms, display symbols — the Keplr
-        // suggest-chain payload and the explorer's runtime chain config) —
-        // refresh both on the resume tx, or they keep advertising the
-        // pre-reset chain. The frontend re-renders wholesale (no
-        // placeholders); the explorer's env is patched in place, because a
-        // re-render would reintroduce the {{TS_AUTHKEY}}/tunnel
-        // placeholders that persist-start already resolved.
+        // service components embed chain identity in their env (CHAIN_ID/
+        // CHAIN_NAME, denoms, display symbols — the Keplr suggest-chain
+        // payload and the explorer's runtime chain config) — refresh them on
+        // the resume tx, or they keep advertising the pre-reset chain. Each
+        // kind refreshes its own way (descriptor.envRefresh): a patch keeps
+        // the {{TS_AUTHKEY}}/tunnel values persist-start resolved, which a
+        // re-render would turn back into placeholders.
         const componentRows = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
-          (c) => (c.key === "frontend" || c.key === "explorer") && c.state === "active",
+          (c) => c.state === "active" && (descriptorFor(c.key)?.envRefresh ?? "none") !== "none",
         );
         for (const row of componentRows) {
           const sdlPath = sdlPathFor(ctx, row.key);
-          if (row.key === "frontend") {
-            rerenderFrontendSdl(ctx, spec, sdlPath);
-          } else {
-            setExplorerChainEnv(sdlPath, spec);
-          }
+          refreshComponentEnv(ctx, spec, row.key, sdlPath);
           const artifacts = sdlArtifacts(loadSdl(sdlPath));
           fs.writeFileSync(
             path.join(ctx.dirs.sdl, `${row.key}.manifest.json`),
@@ -3034,14 +3223,14 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
                 : ""),
           );
         }
-        // the frontend and explorer restarted with the new chain env — gate
-        // on both answering again
+        // the service components restarted with the new chain env — gate on
+        // each one with a domain answering again
         const active = new Set(
           (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[])
             .filter((c) => c.state === "active")
             .map((c) => c.key),
         );
-        for (const comp of statelessComponents(spec).filter((c) => active.has(c.key))) {
+        for (const comp of serviceComponents(spec).filter((c) => active.has(c.key) && c.domain)) {
           let ok = false;
           for (let i = 0; i < 24 && !ok; i++) {
             if (i > 0) await ctx.services.sleep(5000);
@@ -3873,7 +4062,7 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
   const p = (s: string) => `op${opId}:${s}`;
   const meshKeys = [
     ...nodes(spec).map((n) => n.key),
-    ...statelessComponents(spec)
+    ...serviceComponents(spec)
       .filter((c) => c.mesh)
       .map((c) => c.key),
   ];
@@ -4253,6 +4442,8 @@ function buildSteps(
           : relaunchSteps(op.id, params, spec)),
       );
     }
+    if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
+    if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));

@@ -541,6 +541,42 @@ export async function postDomainUpdate(
   );
 }
 
+/** Add a service component to a running fleet (add-component op). */
+export async function postAddComponent(
+  launchId: string,
+  body: { key: string; domain?: string; image?: string; paths?: unknown[] },
+): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/components`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** The relayer's address per chain and the channels its last link opened. */
+export interface RelayerState {
+  chains: Array<{ chainId: string; address: string; launchId?: string }>;
+  channels: Array<{
+    id: string;
+    port: string;
+    version: string;
+    a: { chain: string; channel: string };
+    b: { chain: string; channel: string };
+  }>;
+  linkedAt: string;
+}
+
+export async function getRelayerState(launchId: string): Promise<RelayerState> {
+  return json(await afetch(`/api/fleet/${launchId}/relayer`));
+}
+
+/** Re-link the relayer (relink op), after a chain reset on either end. */
+export async function postRelink(launchId: string): Promise<{ status: string; opId: number }> {
+  return json(await afetch(`/api/fleet/${launchId}/relink`, { method: "POST" }));
+}
+
 /** Wipe the chain and restart from a rebuilt genesis on the same
  *  deployments (reset-chain op): the posted spec replaces the stored one. */
 export async function postChainReset(

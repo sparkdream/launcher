@@ -1,8 +1,8 @@
 import path from "node:path";
-import { statelessComponents, type LaunchSpec } from "@sparkdream/launch-spec";
+import { serviceComponents, type LaunchSpec } from "@sparkdream/launch-spec";
 import { loadSdl } from "./akash/sdl-groups.js";
 import { feeConfig } from "./fee.js";
-import { componentResources } from "./render-component-sdl.js";
+import { descriptor } from "./components/index.js";
 import { vendorDir } from "./vendor.js";
 
 /**
@@ -127,10 +127,10 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
     ...(spec.topology.headscale.reuseFleet
       ? []
       : [{ role: "headscale", count: 1, workloads: headscaleWorkloads }]),
-    ...statelessComponents(spec).map((c) => ({
+    ...serviceComponents(spec).map((c) => ({
       role: c.key,
       count: 1,
-      workloads: [sdlResourcesToWorkload(componentResources(c.key))],
+      workloads: descriptor(c.key).resources().map(sdlResourcesToWorkload),
     })),
   ];
 

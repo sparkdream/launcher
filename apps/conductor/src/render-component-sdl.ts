@@ -1,178 +1,35 @@
 import fs from "node:fs";
 import yaml from "js-yaml";
-import {
-  chainId,
-  deriveDreamDenom,
-  headscaleDomain,
-  type ComponentKey,
-  type ComponentRef,
-  type LaunchSpec,
-} from "@sparkdream/launch-spec";
+import { descriptor, type RenderInput } from "./components/index.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 
-/**
- * Chain-identity env for the explorer (ping-pub) image. Images from
- * v1.0.6 render their runtime chain config from these (same contract as
- * the frontend); older images ignore them and serve their baked config.
- * CHAIN_NAME doubles as the ping-pub route path, so it must agree with the
- * frontend's EXPLORER_URL — both derive it as route ?? network.name.
- */
-export function explorerChainEnv(spec: LaunchSpec): Record<string, string> {
-  const explorer = spec.topology.components.explorer;
-  const dreamDenom = deriveDreamDenom(spec.token);
-  return {
-    CHAIN_NAME: explorer.route ?? spec.network.name,
-    CHAIN_DENOM: spec.token.baseDenom,
-    DISPLAY_DENOM: spec.token.displayDenom,
-    ...(dreamDenom ? { DREAM_DENOM: dreamDenom } : {}),
-    DREAM_DISPLAY_DENOM: spec.token.dreamDisplayDenom,
-    COIN_DECIMALS: String(spec.token.exponent),
-    BECH32_PREFIX: spec.network.bech32Prefix,
-  };
-}
+export { explorerChainEnv } from "./components/index.js";
 
-/** SDL compute resources per component — also feeds the cost estimator. */
-export function componentResources(key: ComponentKey) {
-  return key === "explorer"
-    ? {
-        cpu: { units: 0.5 },
-        memory: { size: "512Mi" },
-        storage: [
-          { size: "512Mi" },
-          { name: "data", size: "1Gi", attributes: { persistent: true, class: "beta3" } },
-        ],
-      }
-    : {
-        cpu: { units: 0.5 },
-        memory: { size: "512Mi" },
-        storage: [{ size: "1Gi" }],
-      };
-}
-
-/**
- * The explorer's mesh tunnels: local port → the port it dials on its sentry.
- * The sentry it dials is EXPLORER_SENTRY. Fleet ops read these to re-aim the
- * env at the sentry's current tailnet IP, so keep the SDL below built from
- * them rather than from repeated literals.
- */
-export const EXPLORER_SENTRY = "sentry-0";
-export const EXPLORER_TUNNELS: Array<{ local: number; remote: number }> = [
-  { local: 11317, remote: 1317 },
-  { local: 26657, remote: 26657 },
-];
-
-export interface RenderComponentSdlInput {
-  spec: LaunchSpec;
-  component: ComponentRef;
-  sshPublicKey: string;
+export interface RenderComponentSdlInput extends RenderInput {
   outPath: string;
-  placeholder: {
-    tailnetIp: (nodeKey: string) => string;
-    tsAuthkey: (nodeKey: string) => string;
-  };
 }
 
 /**
- * SDLs for the stateless components. Unlike the node/headscale SDLs these
- * are launcher-authored, not vendored — their upstream shapes (the manual
- * testnet's explorer SDL and sparkdream-ui's deploy.sdl.yml) are baked in
- * here with every value taken from the spec.
- *
- * - explorer: ping-pub image; joins the tailnet and socat-tunnels to
- *   sentry-0's LCD (11317→1317) and RPC (26657); nginx serves the UI plus
- *   same-origin /api and /rpc proxies, so no CORS and no public LCD needed.
- *   The tunnel target is a {{TAILNET_IP:sentry-0}} placeholder until
- *   persist-start bakes the real IP into the env (§5 step 20b).
- * - frontend: sparkdream-ui Next.js server, env-configured at runtime; it
- *   needs the public api/rpc domains (spec.topology.publicEndpoints).
+ * SDLs for the service components. Unlike the node/headscale SDLs these are
+ * launcher-authored, not vendored: each kind's services come from its
+ * descriptor (components/), with every value taken from the spec. This
+ * wraps them into one deployment: a compute profile, a price and a
+ * deployment entry per service, each named after its service — fleet ops
+ * address lease-shell by those names.
  */
 export function renderComponentSdl(input: RenderComponentSdlInput): void {
   const { spec, component } = input;
-  const doc =
-    component.key === "explorer" ? explorerSdl(input) : frontendSdl(input);
-
+  const rendered = descriptor(component.key).render(input);
   const pricing = { denom: PRICING_DENOM[spec.infra.akashNetwork], amount: 1000 };
+  const names = Object.keys(rendered);
   const sdl = {
     version: "2.0",
-    services: { [component.key]: doc.service },
+    services: Object.fromEntries(names.map((n) => [n, rendered[n]!.service])),
     profiles: {
-      compute: { [component.key]: { resources: doc.resources } },
-      placement: { dcloud: { pricing: { [component.key]: pricing } } },
+      compute: Object.fromEntries(names.map((n) => [n, { resources: rendered[n]!.resources }])),
+      placement: { dcloud: { pricing: Object.fromEntries(names.map((n) => [n, pricing])) } },
     },
-    deployment: { [component.key]: { dcloud: { profile: component.key, count: 1 } } },
+    deployment: Object.fromEntries(names.map((n) => [n, { dcloud: { profile: n, count: 1 } }])),
   };
   fs.writeFileSync(input.outPath, yaml.dump(sdl, { lineWidth: 120 }));
-}
-
-function explorerSdl(input: RenderComponentSdlInput) {
-  const { spec, component } = input;
-  return {
-    service: {
-      image: component.image,
-      expose: [
-        // nginx: explorer UI + same-origin /api (LCD) and /rpc proxies
-        { port: 80, as: 80, accept: [component.domain], proto: "tcp", to: [{ global: true }] },
-        // sshd for management
-        { port: 2222, as: 2222, proto: "tcp", to: [{ global: true }] },
-      ],
-      env: [
-        `SSH_PUBLIC_KEY=${input.sshPublicKey}`,
-        `HEADSCALE_URL=https://${headscaleDomain(spec)}`,
-        `TS_AUTHKEY=${input.placeholder.tsAuthkey(component.key)}`,
-        `TS_HOSTNAME=${component.key}`,
-        // on the persistent volume so the tailnet identity survives restarts
-        "TS_STATE_DIR=/data/tailscale",
-        ...EXPLORER_TUNNELS.map(
-          (t, i) =>
-            `TS_TUNNEL_${i + 1}=${t.local}:${input.placeholder.tailnetIp(EXPLORER_SENTRY)}:${t.remote}`,
-        ),
-        // entrypoint seds these over the baked chain config; relative paths
-        // hit the nginx proxies above
-        "NODE_API_ENDPOINT=/api",
-        "NODE_RPC_ENDPOINT=/rpc",
-        ...Object.entries(explorerChainEnv(spec)).map(([k, v]) => `${k}=${v}`),
-      ],
-      params: { storage: { data: { mount: "/data", readOnly: false } } },
-    },
-    resources: componentResources("explorer"),
-  };
-}
-
-function frontendSdl(input: RenderComponentSdlInput) {
-  const { spec, component } = input;
-  const pub = spec.topology.publicEndpoints;
-  if (!pub?.api || !pub?.rpc) {
-    throw new Error("frontend needs topology.publicEndpoints.api and .rpc — validate-spec should have caught this");
-  }
-  const explorer = spec.topology.components.explorer;
-  const env = [
-    // runtime config — read by /api/config and the UI's LCD proxy at request
-    // time, so endpoint changes only need a deployment update, not a rebuild
-    `CHAIN_ID=${chainId(spec)}`,
-    `CHAIN_NAME=${spec.network.displayName ?? spec.network.name}`,
-    `LCD_ENDPOINT=https://${pub.api}`,
-    `RPC_ENDPOINT=https://${pub.rpc}`,
-    `CHAIN_DENOM=${spec.token.baseDenom}`,
-    `DISPLAY_DENOM=${spec.token.displayDenom}`,
-    // The frontend names the dream token in its own copy (stake/bond/budget
-    // amounts, param labels), so it needs the ticker the same way the explorer
-    // does. Without it the UI falls back to a hardcoded "DREAM" and disagrees
-    // with the explorer beside it on any chain that renamed the token.
-    `DREAM_DISPLAY_DENOM=${spec.token.dreamDisplayDenom}`,
-    `BECH32_PREFIX=${spec.network.bech32Prefix}`,
-  ];
-  if (explorer.enabled && explorer.domain) {
-    // ping-pub routes are /<chain-name-in-baked-config>; network.name
-    // matches when the image was built for this chain — explorer.route
-    // overrides it (e.g. a devnet running the stock chain's explorer image)
-    env.push(`EXPLORER_URL=https://${explorer.domain}/${explorer.route ?? spec.network.name}`);
-  }
-  return {
-    service: {
-      image: component.image,
-      expose: [{ port: 3000, as: 80, accept: [component.domain], to: [{ global: true }] }],
-      env,
-    },
-    resources: componentResources("frontend"),
-  };
 }

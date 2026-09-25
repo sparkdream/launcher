@@ -1,4 +1,5 @@
-import type { LaunchSpec } from "./schema.js";
+import type { LaunchSpec, RelayerPath } from "./schema.js";
+import { COMPONENT_KEYS, COMPONENT_KINDS, componentDomain, type ComponentKey } from "./components.js";
 
 /**
  * sparkdream + suffix 1 → "sparkdream-1" (§4). In join mode the chain
@@ -102,41 +103,64 @@ export function nodes(spec: LaunchSpec): NodeRef[] {
   return out;
 }
 
-export type ComponentKey = "explorer" | "frontend";
-
 export interface ComponentRef {
   key: ComponentKey;
-  domain: string;
+  /** Public HTTPS domain; set exactly when the kind serves one (COMPONENT_KINDS). */
+  domain?: string;
   image: string;
   /** Joins the headscale mesh (needs a preauth key + tunnel wiring). */
   mesh: boolean;
+  /** Runs sshd on 2222 (uploads, SSH-driven configuration). */
+  ssh: boolean;
 }
 
 /**
- * Enabled stateless components (§5 "Component relaunch & close"): the
- * explorer joins the mesh and tunnels to sentry-0's LCD/RPC; the frontend
- * is env-configured only and talks to the public endpoints. Both are
- * deployed in the Phase D batch alongside the nodes.
+ * Enabled service components, in COMPONENT_KEYS order. They are deployed in
+ * the Phase D batch alongside the nodes; what each one needs (mesh, SSH, a
+ * domain, a sentry) comes from its entry in COMPONENT_KINDS.
  */
-export function statelessComponents(spec: LaunchSpec): ComponentRef[] {
+export function serviceComponents(spec: LaunchSpec): ComponentRef[] {
   const out: ComponentRef[] = [];
-  for (const [key, mesh] of [["explorer", true], ["frontend", false]] as const) {
+  for (const key of COMPONENT_KEYS) {
+    const kind = COMPONENT_KINDS[key];
     const toggle = spec.topology.components[key];
-    if (!toggle.enabled) continue;
+    if (!toggle?.enabled) continue;
     const image = spec.images[key];
-    if (!toggle.domain || !image) {
-      throw new Error(`${key} enabled but domain or image missing — validate-spec should have caught this`);
+    const domain = kind.domain ? componentDomain(spec, key) : undefined;
+    if (!image || (kind.domain && !domain)) {
+      throw new Error(`${key} enabled but ${image ? "domain" : "image"} missing — validate-spec should have caught this`);
     }
-    out.push({ key, domain: toggle.domain, image, mesh });
+    out.push({ key, ...(domain ? { domain } : {}), image, mesh: kind.mesh, ssh: kind.ssh });
   }
   return out;
+}
+
+/**
+ * The IBC port and channel version each relay path kind opens. They must
+ * match the modules on both chains: ICS-20 for transfer, x/federation's
+ * params (ibc_port, ibc_channel_version) for federation — its
+ * OnChanOpenInit/Try refuse any other version.
+ */
+export const RELAY_CHANNELS = {
+  transfer: { port: "transfer", version: "ics20-1" },
+  federation: { port: "federation", version: "federation-1" },
+} as const;
+
+/** The enabled relayer's paths, or none. */
+export function relayerPaths(spec: LaunchSpec): RelayerPath[] {
+  const relayer = spec.topology.components.relayer;
+  return relayer?.enabled ? relayer.paths : [];
+}
+
+/** True when some enabled workload consumes sentry-0's gRPC (9090). */
+export function grpcRequired(spec: LaunchSpec): boolean {
+  return serviceComponents(spec).some((c) => COMPONENT_KINDS[c.key].needsGrpc);
 }
 
 /** True when some enabled workload consumes the sentries' LCD (1317). */
 export function lcdRequired(spec: LaunchSpec): boolean {
   return (
-    spec.topology.components.explorer.enabled ||
-    spec.topology.components.frontend.enabled ||
+    serviceComponents(spec).some((c) => COMPONENT_KINDS[c.key].needsLcd) ||
     Boolean(spec.topology.publicEndpoints?.api)
   );
 }

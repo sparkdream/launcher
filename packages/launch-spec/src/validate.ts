@@ -1,7 +1,8 @@
 import { z, ZodError } from "zod";
 import { fromBase64, fromBech32 } from "@cosmjs/encoding";
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
-import { deriveDreamDenom } from "./derive.js";
+import { chainId, deriveDreamDenom } from "./derive.js";
+import { COMPONENT_KEYS, COMPONENT_KINDS, componentDomain } from "./components.js";
 import { profiles } from "./profiles.js";
 import { VENDORED_CHAIN_VERSION } from "./vendor-info.js";
 
@@ -597,17 +598,18 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     );
   }
 
-  // Stateless components (§5 step 12): both serve chain data from a sentry
+  // Service components (§5 step 12): what each kind needs is in COMPONENT_KINDS
   const comps = spec.topology.components;
-  for (const key of ["explorer", "frontend"] as const) {
-    if (!comps[key].enabled) continue;
-    if (!comps[key].domain) {
+  for (const key of COMPONENT_KEYS) {
+    const kind = COMPONENT_KINDS[key];
+    if (!comps[key]?.enabled) continue;
+    if (kind.domain && !componentDomain(spec, key)) {
       err(`topology.components.${key}.domain`, "domain is required when enabled");
     }
     if (!spec.images[key]) {
       err(`images.${key}`, "image is required when enabled");
     }
-    if (S === 0) {
+    if (kind.needsSentry && S === 0) {
       err(
         `topology.components.${key}.enabled`,
         "requires at least one sentry — components read chain data from sentry-0",
@@ -624,6 +626,51 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       "frontend needs public api + rpc domains (LCD/RPC served by sentry-0 via accept-domain ingress)",
     );
   }
+  // Relayer (one Hermes process, many paths). Fleet counterparties are
+  // resolved and mesh-checked by the conductor at launch creation, where the
+  // other launch is visible; everything checkable from the spec alone is here.
+  const relayer = comps.relayer;
+  if (relayer?.enabled) {
+    if (relayer.paths.length === 0) {
+      err("topology.components.relayer.paths", "an enabled relayer needs at least one path");
+    }
+    const ids = new Set<string>();
+    const ends = new Set<string>();
+    relayer.paths.forEach((p, i) => {
+      const at = `topology.components.relayer.paths.${i}`;
+      if (ids.has(p.id)) err(`${at}.id`, `path id "${p.id}" is used twice`);
+      ids.add(p.id);
+      const cp = p.counterparty;
+      const end = "fleet" in cp ? `fleet:${cp.fleet}` : `chain:${cp.chainId}`;
+      if (ends.has(`${p.kind}/${end}`)) {
+        err(at, `a ${p.kind} path to ${end.replace(/^[a-z]+:/, "")} is already listed`);
+      }
+      ends.add(`${p.kind}/${end}`);
+      if (!("fleet" in cp)) {
+        if (cp.chainId === chainId(spec)) {
+          err(`${at}.counterparty.chainId`, "a path cannot lead back to this chain");
+        }
+        warn(
+          `${at}.counterparty.grpc`,
+          "the relayer dials this gRPC directly: it must be reachable from the provider, not just from your network",
+        );
+        if (p.kind === "federation") {
+          warn(
+            `${at}.kind`,
+            "federation relays x/federation packets, so the counterparty must be a Spark Dream chain; " +
+              "content moves only once both chains register and activate each other as peers",
+          );
+        }
+      }
+    });
+    if (mainnet) {
+      warn(
+        "topology.components.relayer",
+        "the relayer's key is a hot key held by the launcher and the relayer container — fund it with gas money only",
+      );
+    }
+  }
+
   if ((pub?.api || pub?.rpc) && S === 0) {
     err("topology.publicEndpoints", "public endpoints are served by sentry-0 — add a sentry");
   }
@@ -649,8 +696,10 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   // Every ingress hostname routes to a different service, so a domain can
   // appear only once across the fleet
   const domainUses: [string, string | undefined][] = [
-    ["topology.components.explorer.domain", comps.explorer.enabled ? comps.explorer.domain : undefined],
-    ["topology.components.frontend.domain", comps.frontend.enabled ? comps.frontend.domain : undefined],
+    ...COMPONENT_KEYS.map((key): [string, string | undefined] => [
+      `topology.components.${key}.domain`,
+      comps[key]?.enabled ? componentDomain(spec, key) : undefined,
+    ]),
     ["topology.components.hub.domain", comps.hub.enabled ? comps.hub.domain : undefined],
     ["topology.publicEndpoints.api", pub?.api],
     ["topology.publicEndpoints.rpc", pub?.rpc],

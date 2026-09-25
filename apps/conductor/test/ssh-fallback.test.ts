@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -162,6 +163,29 @@ describe("lease-shell SSH fallback", () => {
       server.close();
     }
   }, 30_000);
+
+  it("reroutes exec when the endpoint sends its banner and then closes", async () => {
+    // the live shape (2026-09-25): a re-created container's forwarded port
+    // answers with an SSH version line and drops the socket. ssh2 raises no
+    // error for that and clears its own readyTimeout, so the probe never
+    // settled and held a reset's start step with no timer left to end it
+    const server = net.createServer((s) => {
+      s.on("error", () => {}); // the client resets it after the close
+      s.write("SSH-2.0-OpenSSH_9.6\r\n");
+      setTimeout(() => s.end(), 50);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as net.AddressInfo).port;
+    try {
+      const stub = stubShell();
+      const runner = new Ssh2Runner(() => stub.client);
+      const target = { ...deadTarget(), port, readyTimeoutMs: 10_000 };
+      const r = await runner.exec(target, "pgrep -x sparkdreamd", { quick: true });
+      expect(r.stdout).toBe("ran:pgrep -x sparkdreamd");
+    } finally {
+      server.close();
+    }
+  }, 5_000);
 
   it("does not retry command failures, only handshake errors", async () => {
     let attempts = 0;

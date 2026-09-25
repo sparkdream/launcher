@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { nodes, statelessComponents, type LaunchSpec } from "@sparkdream/launch-spec";
+import { nodes, serviceComponents, type LaunchSpec } from "@sparkdream/launch-spec";
 import { TypeUrl, type Msg } from "./messages.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./sdl-groups.js";
 import type { DeploymentPlan } from "../steps/phase-bcd.js";
@@ -44,7 +44,7 @@ export function updateDeploymentMsgs(input: UpdateInput): PersistUpdate[] {
   const updates: PersistUpdate[] = [];
   const keys = [
     ...nodes(input.spec).map((n) => n.key),
-    ...statelessComponents(input.spec)
+    ...serviceComponents(input.spec)
       .filter((c) => c.mesh)
       .map((c) => c.key),
   ];

@@ -97,6 +97,32 @@ describe("API server (§8)", () => {
     db.close();
   }, 120_000);
 
+  it("add-component route: 404 unknown launch, 400 without a key, 409 with the fleet's reason", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const app = buildServer({ db, services: fakeServices(), workRoot: work, steps: allSteps() });
+    const missing = await app.inject({ method: "POST", url: "/api/fleet/nope/components", payload: { key: "explorer" } });
+    expect(missing.statusCode).toBe(404);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/launches",
+      payload: { spec: specInput(), owner: "akash1owner" },
+    });
+    const { id } = created.json() as { id: string };
+    const noKey = await app.inject({ method: "POST", url: `/api/fleet/${id}/components`, payload: {} });
+    expect(noKey.statusCode).toBe(400);
+    // created but never run: nothing to add to yet
+    const early = await app.inject({
+      method: "POST",
+      url: `/api/fleet/${id}/components`,
+      payload: { key: "explorer", domain: "explorer.sparkdream.io" },
+    });
+    expect(early.statusCode).toBe(409);
+    expect((early.json() as { error: string }).error).toContain("has not finished");
+    db.close();
+  });
+
   it("resumes an orphaned running launch on boot", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));

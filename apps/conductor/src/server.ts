@@ -9,11 +9,12 @@ import {
   findChainRelease,
   knownChainVersions,
   nodes,
-  statelessComponents,
+  serviceComponents,
   withDefaults,
   VENDORED_CHAIN_VERSION,
   type LaunchSpec,
   type LaunchSpecInput,
+  type RelayerPath,
 } from "@sparkdream/launch-spec";
 import {
   bakedSatisfies,
@@ -62,6 +63,7 @@ import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
+import { resolveRelayFleet } from "./relayer.js";
 import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
 import { prefillSpecFromGenesis } from "./genesis-prefill.js";
 import { joinSpecFromBundle } from "./join-prefill.js";
@@ -400,6 +402,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           issues: [
             {
               path: "topology.headscale.reuseFleet",
+              message: String(e instanceof Error ? e.message : e),
+            },
+          ],
+        });
+      }
+    }
+    // relayer paths to other fleets: resolve each reference to its launch id
+    // (the relayer's tunnels and funding are keyed by it) and check the
+    // fleet is reachable — same wallet, launched, on this fleet's mesh
+    const relayer = spec.topology.components.relayer;
+    for (const [i, p] of (relayer?.enabled ? relayer.paths : []).entries()) {
+      if (!("fleet" in p.counterparty)) continue;
+      try {
+        p.counterparty.fleet = resolveRelayFleet(
+          deps.db,
+          spec,
+          requestOwner(req, body.owner) ?? "",
+          p.counterparty.fleet,
+        );
+      } catch (e) {
+        return reply.status(400).send({
+          error: "validation",
+          issues: [
+            {
+              path: `topology.components.relayer.paths.${i}.counterparty.fleet`,
               message: String(e instanceof Error ? e.message : e),
             },
           ],
@@ -1055,6 +1082,58 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // add a service component to a running fleet (add-component op): enables
+  // it in the stored spec, then renders, opens the sentries for it, deploys,
+  // leases and health-gates it the way a relaunch places a component
+  app.post("/api/fleet/:launchId/components", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { key?: string; domain?: string; image?: string; paths?: RelayerPath[] };
+    if (!body.key) return reply.status(400).send({ error: "key is required" });
+    try {
+      const opId = fleet.requestAddComponent(launch, body.key, {
+        ...(body.domain ? { domain: body.domain } : {}),
+        ...(body.image ? { image: body.image } : {}),
+        ...(body.paths ? { paths: body.paths } : {}),
+      });
+      // drive with the UPDATED spec — requestAddComponent just rewrote it
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "add-component-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // the relayer's addresses per chain and the channels it opened (from its
+  // last link); 404 when the fleet has never linked one
+  app.get("/api/fleet/:launchId/relayer", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const state = fleet.relayerState(launch);
+    if (!state) return reply.status(404).send({ error: "no relayer linked in this fleet" });
+    return state;
+  });
+
+  // re-link the relayer (relink op): after anything that wiped IBC state on
+  // either end — a chain reset here or on a counterparty fleet
+  app.post("/api/fleet/:launchId/relink", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      const opId = fleet.requestRelink(launch);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "relink-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   // wipe the chain and restart from a rebuilt genesis on the same
   // deployments (reset-chain op, for state-breaking upgrades): the posted
   // spec replaces the stored one — accounts/members/chainParams/token
@@ -1177,7 +1256,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // of the fleet's components (the tmkms host, the operator's laptop, ...)
     const fleetKeys = new Set([
       ...nodes(spec).map((n) => n.key),
-      ...statelessComponents(spec).map((c) => c.key),
+      ...serviceComponents(spec).map((c) => c.key),
     ]);
     const externalNodes: { name: string; ip: string; online: boolean }[] = [];
     const hs = deps.db.stepOutput<HeadscaleOutput>(id, "deploy-headscale");

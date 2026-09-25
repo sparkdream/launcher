@@ -832,6 +832,108 @@ confirm dialog):
 Both actions record into `launch_steps` like any other step, so they're
 resumable and their provider decisions are explainable in the UI.
 
+### Service component kinds and adding one to a running fleet (day-2)
+
+Everything a fleet runs beside its chain nodes is a *service component*, and
+each kind is declared once, in two halves:
+
+- **`COMPONENT_KINDS`** (`packages/launch-spec/src/components.ts`) holds the
+  facts the spec layer, the conductor and the UI all read: label, whether the
+  kind joins the mesh, runs sshd, serves a public domain, needs a sentry or the
+  sentries' LCD, and where uploads land. `serviceComponents(spec)` derives the
+  enabled ones from it; validate-spec, `lcdRequired`, the cost table and the
+  fleet card read it instead of comparing keys.
+- **The conductor descriptor** (`apps/conductor/src/components/<kind>.ts`)
+  holds the rest: the SDL services it renders (a kind may run several in one
+  deployment; they share a provider and reach each other by service name),
+  which of those carry the kind's own image (an upgrade swaps only those, so
+  a sidecar keeps its image), the lease-shell service, the mesh tunnels its
+  env bakes (re-aimed when a peer moves), how an upgrade or chain reset
+  refreshes its chain identity (`patch` in place so resolved tunnel IPs and
+  auth keys survive, `rerender` wholesale, or `none`), and any env derived
+  from domains for a retarget.
+
+Adding a kind is an entry in each half plus a schema toggle; there is no
+sweep for `key === "explorer"`. Health, relaunch and upgrade gate on HTTP 200
+only for a kind with a domain; a domainless kind is healthy when its lease is.
+
+**Add component** (`POST /api/fleet/:id/components`, op `add-component`)
+places a kind on a fleet that launched without it, or brings back a closed
+one: enable it in the stored spec and re-validate (a refusal changes
+nothing) → render its SDL and create the row → open what it needs on the
+sentries → the relaunch placement steps minus the close (fresh deployment,
+bids, lease, manifest, health gate: 2 signatures). Abandoning it closes its
+row so it can be added again.
+
+Opening the sentries is `applySentryServe` (`apps/conductor/src/sentry-serve.ts`),
+a section-scoped, idempotent app.toml transform. It runs in three places so a
+sentry never serves less than the current spec needs: at render time, over
+SSH on each live sentry when a component is added (restarting only the ones
+it changed), and after a relaunched sentry unpacks its launch-time bundle,
+which predates any component added since.
+
+### IBC relayer (component `relayer`)
+
+One Hermes process per fleet relays every path in
+`topology.components.relayer.paths`. A path is `transfer` (ICS-20, port
+`transfer`, version `ics20-1`) or `federation` (x/federation packets, port
+`federation`, version `federation-1`). The two differ only in port, version
+and what has to happen on-chain afterwards, so they share one component. Its
+counterparty is either another fleet on this launcher (`{ fleet }`) or any
+chain given by its endpoints.
+
+- **Image and contract.** The chain repo's `Dockerfile-hermes`, tagged with
+  the chain version. The launcher uploads a Hermes config, a path manifest and
+  the key mnemonics over SSH. The image's `relayer-bringup` imports the keys
+  and opens clients, connection and channel per path, reusing whatever is
+  already open. Its `relayer-run` starts Hermes once a ready marker exists, and
+  restarts it across container restarts.
+- **Reaching the chains.** A Spark Dream chain is reached through mesh tunnels
+  to its sentry-0: gRPC on local 9090+i and RPC/websocket on 26657+i, where 0
+  is this fleet and 1..n are the fleet counterparties in path order. Sentries
+  bind gRPC to localhost, so `applySentryServe` opens `[grpc]` on
+  `0.0.0.0:9090`:
+  - on this fleet's sentries, at render time;
+  - on a counterparty fleet's sentry, over SSH with that fleet's key, when
+    linking;
+  - on any sentry another fleet's relayer dials, at relaunch (`relayedBy`).
+- **Same mesh.** The tunnels only work over one tailnet, so a fleet
+  counterparty must share this fleet's mesh (`reuseFleet` in either direction,
+  or both borrowing a third fleet's). `resolveRelayFleet` checks this at launch
+  creation and at add-component, together with same wallet, same Akash network
+  and "finished launching". It then rewrites the reference to the launch id.
+  Endpoint counterparties are dialed directly, so their gRPC must be public.
+- **Keys and gas.** One mnemonic (`relayer` in `mnemonics.json`) gives an
+  address on every chain, each with its own prefix and HD path. The own-chain
+  address is funded in genesis (`genesisBalance`). Any other chain's key is
+  funded by the operator: the link step pauses (AwaitUser) and names each
+  unfunded chain's address and gas denom, then resumes.
+- **Link** (launch step `link-relayer`, the relayer's `configureSteps` after
+  every placement, and op `relink`). The steps:
+  1. Open the counterparty sentries' gRPC.
+  2. Upload the config and manifest.
+  3. Import the keys.
+  4. Run the fund check.
+  5. Run bringup.
+  6. Pin each chain's packet filter to exactly the opened channels, so a
+     stranger's channel on the same connection is not relayed on this fleet's
+     gas.
+  7. Start or restart Hermes.
+
+  Each run records the addresses and channels in `<launch>/relayer/state.json`
+  (`GET /api/fleet/:id/relayer`). Linking is idempotent: a relaunched relayer
+  or a relink reopens nothing that is still open. After a chain reset on
+  either end, run `relink`.
+- **Counterparty moves.** When a fleet relaunches its sentry-0, relaunch's
+  mesh-client pass also re-aims every other fleet's relayer that tunnels to it:
+  env rewrite, update tx and manifest push, as for this fleet's own mesh
+  components.
+- **Not done here: federation governance.** A federation channel carries
+  nothing until both chains register each other as peers (with
+  `ibc_transfer_channel_id` naming the transfer channel for voucher metadata)
+  and activate them by Operations Committee vote. That is a separate
+  peer-link step.
+
 ### Node upgrades (day-2)
 
 Mechanism: `MsgUpdateDeployment` with the new image tag (1 signature) +

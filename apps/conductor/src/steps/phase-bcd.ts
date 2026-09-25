@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { headscaleDomain, nodes, statelessComponents } from "@sparkdream/launch-spec";
+import { headscaleDomain, nodes, serviceComponents } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import {
@@ -492,7 +492,7 @@ export const configureHeadscaleStep: StepDef = {
 
     const perNode: Record<string, string> = {};
     for (const node of nodes(ctx.spec)) perNode[node.key] = await mint(node.key);
-    for (const c of statelessComponents(ctx.spec)) {
+    for (const c of serviceComponents(ctx.spec)) {
       if (c.mesh) perNode[c.key] = await mint(c.key);
     }
     const home = await mint("home");
@@ -590,7 +590,7 @@ export const createDeploymentsStep: StepDef = {
     // nodes + stateless components share the one batched tx (§5 step 12)
     const deployKeys = [
       ...nodes(ctx.spec).map((n) => n.key),
-      ...statelessComponents(ctx.spec).map((c) => c.key),
+      ...serviceComponents(ctx.spec).map((c) => c.key),
     ];
     for (const key of deployKeys) {
       // inject the real preauth key over the Phase A placeholder (the
@@ -655,7 +655,7 @@ export const collectBidsStep: StepDef = {
     // anti-affinity covers headscale/validators/sentries (§6); the stateless
     // components can share providers freely — requiring N more distinct
     // providers for them would only shrink the viable bid set
-    const stateless = new Set<string>(statelessComponents(ctx.spec).map((c) => c.key));
+    const stateless = new Set<string>(serviceComponents(ctx.spec).map((c) => c.key));
     // wallet-wide provider prefs apply to the initial pick, not just
     // relaunches — avoid is a hard filter, prefer outranks the spec's list
     const prefs = ctx.db.providerPrefs(addr);
@@ -1081,7 +1081,7 @@ async function rebidComponent(
     decision = { chosen: won ?? null, rejected: [] };
   } else {
     const prefs = ctx.db.providerPrefs(addr);
-    const stateless = new Set<string>(statelessComponents(ctx.spec).map((c) => c.key));
+    const stateless = new Set<string>(serviceComponents(ctx.spec).map((c) => c.key));
     // Anti-affinity covers headscale/validators/sentries (§6) — headscale
     // included, exactly as collect-bids seeds it. Omitting it here let a
     // re-bid co-locate a node with the mesh coordinator: one provider outage
@@ -1206,7 +1206,7 @@ export const sendManifestsStep: StepDef = {
     // the frontend image runs no sshd — wait for the workload, but skip the
     // forwarded-port extraction (nothing ever SSHes into it)
     const noSsh = new Set<string>(
-      statelessComponents(ctx.spec)
+      serviceComponents(ctx.spec)
         .filter((c) => !c.mesh)
         .map((c) => c.key),
     );
