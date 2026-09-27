@@ -14,8 +14,10 @@ import {
   type ComponentKey,
   type ComponentRef,
   type LaunchSpec,
+  type LaunchSpecInput,
 } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
+import { backupMastodon, restoreMastodon, type MastodonBackup } from "./steps/mastodon-migrate.js";
 import { AwaitUser, launchDirs, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
@@ -38,7 +40,10 @@ import { renderComponentSdl } from "./render-component-sdl.js";
 import { descriptorFor, setServiceEnv } from "./components/index.js";
 import { patchSentryAppToml, sentryServe } from "./sentry-serve.js";
 import { fleetPeer, peerRow, relayedBy } from "./relayer.js";
-import { linkRelayer } from "./steps/relayer-link.js";
+import { linkFederationPeers, linkRelayer } from "./steps/relayer-link.js";
+import { reconcileSessions, type SessionRole } from "./sessions.js";
+import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
+import { fleetResolver } from "./verifier.js";
 import { deploymentInfoWithRetry, ingressHost, pushManifest } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
@@ -648,6 +653,11 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
       if (!component) throw new Error(`${key} is not enabled in the spec`);
       const keys = ctx.output<GenerateKeysOutput>("generate-keys");
       if (!keys) throw new Error("generate-keys output missing");
+      // a bridge added after launch: its operator key has to exist before
+      // the SDL that carries its mnemonic can render
+      if (key === "mastodon" && spec.topology.components.mastodon?.bridge?.enabled) {
+        await ensureBridgeOperatorKey(ctx.dirs.secrets, ctx.dirs.node("val-0"));
+      }
       renderComponentSdl({
         spec,
         component,
@@ -655,6 +665,9 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
         outPath: sdlPathFor(ctx, key),
         placeholder,
         peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+        secretsDir: ctx.dirs.secrets,
+        resolveFleet: fleetResolver({ ...ctx, spec }),
+        launchId: ctx.launchId,
       });
       // the row exists from here on so the fleet shows the component while
       // it is being placed; relaunch's manifest step fills in the placement
@@ -712,12 +725,135 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
  * steps that would otherwise have done so.
  */
 export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
-  const name = `op${opId}:link-relayer`;
+  const link = `op${opId}:link-relayer`;
+  const peers = `op${opId}:link-peers`;
+  return [
+    { name: link, run: (ctx) => linkRelayer(ctx, link, spec) },
+    {
+      name: peers,
+      async run(ctx) {
+        const out = await linkFederationPeers(ctx, peers, spec);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return out;
+      },
+    },
+  ];
+}
+
+/** Params of a "mastodon-resize" op: the relaunch's, plus the new size. */
+export interface MastodonResizeParams extends RelaunchParams {
+  size: "small" | "standard";
+}
+
+/**
+ * Resize the Mastodon instance: Akash fixes a deployment's resources, so a
+ * new size is a new deployment, and the data has to move with it. Backup
+ * (database and uploaded media, over lease-shell, kept encrypted) → render
+ * the SDL at the new size → the relaunch (close, deploy, lease, manifest) →
+ * restore into the new deployment before anything configures it → the
+ * domain gate and Mastodon's configure steps (the bridge's token, peer and
+ * session). The instance is down from the close until the restore's restart.
+ * The current provider is preferred, not avoided: staying on it keeps the
+ * domains' DNS target.
+ */
+export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, spec: LaunchSpec): StepDef[] {
+  const key = "mastodon";
+  const p = (s: string) => `op${opId}:${s}`;
+  const sized = withDefaults({
+    ...spec,
+    topology: {
+      ...spec.topology,
+      components: { ...spec.topology.components, mastodon: { ...spec.topology.components.mastodon!, size: params.size } },
+    },
+  } as unknown as LaunchSpecInput);
+  const relaunch = relaunchSteps(opId, params, sized);
+  const at = relaunch.findIndex((s) => s.name === p("manifest"));
+  if (at < 0) throw new Error("relaunch steps have no manifest step");
+  return [
+    { name: p("backup"), run: (ctx) => backupMastodon(ctx, p("backup")) },
+    {
+      name: p("render"),
+      async run(ctx) {
+        const component = serviceComponents(sized).find((c) => c.key === key);
+        if (!component) throw new Error("mastodon is not enabled in the spec");
+        const keys = ctx.output<GenerateKeysOutput>("generate-keys");
+        if (!keys) throw new Error("generate-keys output missing");
+        renderComponentSdl({
+          spec: sized,
+          component,
+          sshPublicKey: keys.sshPublicKey,
+          outPath: sdlPathFor(ctx, key),
+          placeholder,
+          peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+          secretsDir: ctx.dirs.secrets,
+          resolveFleet: fleetResolver({ ...ctx, spec: sized }),
+          launchId: ctx.launchId,
+        });
+        return { size: params.size };
+      },
+    },
+    ...relaunch.slice(0, at + 1),
+    {
+      name: p("restore"),
+      async run(ctx) {
+        const out = await restoreMastodon(ctx, p("restore"), ctx.output<MastodonBackup>(p("backup"))!);
+        // the new deployment holds the data at the new size: from here on
+        // the spec renders it that way (upgrades, a later relaunch)
+        const launch = ctx.db.getLaunch(ctx.launchId)!;
+        const stored = JSON.parse(launch.spec_json);
+        stored.topology.components.mastodon.size = params.size;
+        ctx.db.setLaunchSpec(ctx.launchId, JSON.stringify(stored));
+        return out;
+      },
+    },
+    ...relaunch.slice(at + 1),
+  ];
+}
+
+/** Params of a "reconfigure" op: the components whose chain setup to redo. */
+export interface ReconfigureParams {
+  keys: string[];
+}
+
+/**
+ * Redo the chain-side setup of components that stay where they are (their
+ * kinds' configureSteps: Mastodon's peer, bridge bond and session, the
+ * verifier's bond and session), on their existing deployments. Queued behind
+ * a chain reset, which wipes that state but leaves the deployments, their
+ * volumes and their data alone; a relaunch would move them and lose it.
+ */
+export function reconfigureSteps(opId: number, params: ReconfigureParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const steps = params.keys.flatMap((key) => descriptorFor(key)?.configureSteps?.(p, spec) ?? []);
+  return [
+    ...steps,
+    {
+      name: p("reconfigured"),
+      async run(ctx) {
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { components: params.keys };
+      },
+    },
+  ];
+}
+
+/** Params of a "sessions" op: the roles to rotate even if their key holds. */
+export interface SessionsParams {
+  force?: SessionRole[];
+}
+
+/**
+ * Renew the daemons' session keys (§5 session keys): what is due, what the
+ * chain lost (a reset), what `force` names; retire the grants of daemons
+ * that are gone. Local signing only, so the monitor starts it unattended.
+ */
+export function sessionsSteps(opId: number, params: SessionsParams, spec: LaunchSpec): StepDef[] {
+  const name = `op${opId}:sessions`;
   return [
     {
       name,
       async run(ctx) {
-        const out = await linkRelayer(ctx, name, spec);
+        const out = await reconcileSessions(ctx, spec, params.force ?? []);
         ctx.db.setFleetOpStatus(opId, "done");
         return out;
       },
@@ -902,7 +1038,12 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // provider defeats the purpose. exclude (per the policy's anti-affinity
       // mode): other active components' providers. Stateless components are
       // exempt from anti-affinity (§6) — only the avoid list constrains them.
-      const avoidProviders = new Set<string>(params.avoidProviders ?? []);
+      const avoidProviders = new Set<string>([
+        ...(params.avoidProviders ?? []),
+        // a kind that must keep off a host decided elsewhere (the verifier
+        // off the Mastodon it checks)
+        ...(descriptorFor(key)?.avoidProviders?.({ db: ctx.db, launchId: ctx.launchId, spec, assigned: {} }) ?? []),
+      ]);
       const exclude = new Set<string>();
       if (!stateless) {
         for (const c of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
@@ -1058,10 +1199,13 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         const ingress = await ingressHost(
           ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain,
         );
+        // every domain the component serves moved with it (Mastodon's
+        // streaming host too), all to the same ingress
+        const domains = descriptorFor(key)?.ingress?.(spec).map((i) => i.domain) ?? [domain];
         throw new AwaitUser(
           p("verify"),
-          `${key} not answering at ${url} — update the DNS record for ${domain} → ` +
-            `CNAME ${ingress} (the relaunch moved providers), then resume`,
+          `${key} not answering at ${url} — update the DNS record${domains.length > 1 ? "s" : ""} for ` +
+            `${domains.join(" and ")} → CNAME ${ingress} (the relaunch moved providers), then resume`,
         );
       },
     });
@@ -2697,6 +2841,9 @@ function rerenderComponentSdl(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPa
     outPath: sdlPath,
     placeholder,
     peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+    secretsDir: ctx.dirs.secrets,
+    resolveFleet: fleetResolver({ ...ctx, spec }),
+    launchId: ctx.launchId,
   });
 }
 
@@ -4444,6 +4591,9 @@ function buildSteps(
     }
     if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
     if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
+    if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
+    if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
+    if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));

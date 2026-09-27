@@ -99,7 +99,8 @@ export interface ProviderGateway {
     gseq: number,
     oseq: number,
   ): Promise<unknown>;
-  /** One-shot command in a lease container without sshd (headscale). */
+  /** One-shot command in a lease container without sshd (headscale).
+   *  `timeoutMs` for the long ones (a database dump); 60 s otherwise. */
   shellExec(
     creds: MtlsCredentials,
     hostUri: string,
@@ -108,6 +109,7 @@ export interface ProviderGateway {
     oseq: number,
     service: string,
     cmd: string[],
+    opts?: { timeoutMs?: number },
   ): Promise<{ stdout: string; stderr: string }>;
   /** Recent service logs (non-follow) for the fleet logs viewer (M5). */
   leaseLogs(

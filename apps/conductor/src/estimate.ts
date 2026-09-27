@@ -130,7 +130,7 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
     ...serviceComponents(spec).map((c) => ({
       role: c.key,
       count: 1,
-      workloads: descriptor(c.key).resources().map(sdlResourcesToWorkload),
+      workloads: descriptor(c.key).resources(spec).map(sdlResourcesToWorkload),
     })),
   ];
 

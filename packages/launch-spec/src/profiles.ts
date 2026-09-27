@@ -18,7 +18,17 @@ export interface Profile {
     escrow: { targetRunwayDays: number };
   };
   chainParams: Record<string, Record<string, unknown>>;
-  images: { sparkdreamd: string; headscale: string; explorer: string; frontend: string; relayer: string };
+  images: {
+    sparkdreamd: string;
+    headscale: string;
+    explorer: string;
+    frontend: string;
+    relayer: string;
+    mastodon: string;
+    mastodonStreaming: string;
+    sdap: string;
+    verifier: string;
+  };
   security: { keyMode: "softsign" | "tmkms" };
   infra: {
     akashNetwork: "mainnet" | "sandbox";
@@ -60,6 +70,12 @@ const FRONTEND_IMAGE = "sparkdreamnft/sparkdream-ui:v1.0.48";
 // (make docker-build-hermes VERSION=<tag>): its bringup scripts are the
 // contract the relayer component drives
 const RELAYER_IMAGE = `sparkdreamnft/hermes:${VENDORED_CHAIN_VERSION}`;
+// Dockerfile-mastodon (upstream v4.7.2 made runnable on Akash) and the
+// upstream streaming server of the same Mastodon release; sdap carries
+// sdapbridge. The first and last ship with each chain release.
+const MASTODON_IMAGE = `sparkdreamnft/mastodon:${VENDORED_CHAIN_VERSION}`;
+const MASTODON_STREAMING_IMAGE = "ghcr.io/mastodon/mastodon-streaming:v4.7.2";
+const SDAP_IMAGE = `sparkdreamnft/sdap:${VENDORED_CHAIN_VERSION}`;
 
 const nodeResources = {
   validator: {
@@ -112,6 +128,10 @@ export const profiles: Record<NetworkType, Profile> = {
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,
       relayer: RELAYER_IMAGE,
+      mastodon: MASTODON_IMAGE,
+      mastodonStreaming: MASTODON_STREAMING_IMAGE,
+      sdap: SDAP_IMAGE,
+      verifier: SDAP_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -129,7 +149,10 @@ export const profiles: Record<NetworkType, Profile> = {
   },
 
   testnet: {
-    token: { exponent: 6, minGasPrice: "25000" },
+    // per gas unit, as the chain repo's chain.env sets it: "25000" there was a
+    // flat fee copied into a per-gas field (7,500 SPARK per 300k-gas tx), and
+    // relayer and bridge keys price every packet from this value
+    token: { exponent: 6, minGasPrice: "0.025" },
     providers: {
       policy: {
         auditedOnly: true,
@@ -146,6 +169,10 @@ export const profiles: Record<NetworkType, Profile> = {
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,
       relayer: RELAYER_IMAGE,
+      mastodon: MASTODON_IMAGE,
+      mastodonStreaming: MASTODON_STREAMING_IMAGE,
+      sdap: SDAP_IMAGE,
+      verifier: SDAP_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -161,7 +188,10 @@ export const profiles: Record<NetworkType, Profile> = {
   },
 
   mainnet: {
-    token: { exponent: 6, minGasPrice: "25000" },
+    // per gas unit, as the chain repo's chain.env sets it: "25000" there was a
+    // flat fee copied into a per-gas field (7,500 SPARK per 300k-gas tx), and
+    // relayer and bridge keys price every packet from this value
+    token: { exponent: 6, minGasPrice: "0.025" },
     providers: {
       policy: {
         auditedOnly: true,
@@ -178,6 +208,10 @@ export const profiles: Record<NetworkType, Profile> = {
       explorer: EXPLORER_IMAGE,
       frontend: FRONTEND_IMAGE,
       relayer: RELAYER_IMAGE,
+      mastodon: MASTODON_IMAGE,
+      mastodonStreaming: MASTODON_STREAMING_IMAGE,
+      sdap: SDAP_IMAGE,
+      verifier: SDAP_IMAGE,
     },
     security: { keyMode: "tmkms" },
     infra: {

@@ -152,6 +152,13 @@ export function relayerPaths(spec: LaunchSpec): RelayerPath[] {
   return relayer?.enabled ? relayer.paths : [];
 }
 
+/** The Mastodon streaming API's domain: its own, or streaming.<domain>. */
+export function mastodonStreamingDomain(spec: LaunchSpec): string | undefined {
+  const m = spec.topology.components.mastodon;
+  if (!m?.enabled || !m.domain) return undefined;
+  return m.streamingDomain ?? `streaming.${m.domain}`;
+}
+
 /** True when some enabled workload consumes sentry-0's gRPC (9090). */
 export function grpcRequired(spec: LaunchSpec): boolean {
   return serviceComponents(spec).some((c) => COMPONENT_KINDS[c.key].needsGrpc);
@@ -163,4 +170,14 @@ export function lcdRequired(spec: LaunchSpec): boolean {
     serviceComponents(spec).some((c) => COMPONENT_KINDS[c.key].needsLcd) ||
     Boolean(spec.topology.publicEndpoints?.api)
   );
+}
+
+/** Genesis session.max_expiration, in days (§5 session keys). */
+export function sessionMaxDays(spec: LaunchSpec): number {
+  return spec.chainParams.session?.maxExpirationDays ?? (spec.network.type === "mainnet" ? 30 : 90);
+}
+
+/** A daemon's session-key lifetime, before the chain's own cap applies. */
+export function sessionDays(spec: LaunchSpec, session: { days?: number | undefined } | undefined): number {
+  return session?.days ?? (spec.network.type === "mainnet" ? 30 : 90);
 }

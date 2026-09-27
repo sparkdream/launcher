@@ -4,7 +4,10 @@ import path from "node:path";
 import { chainId, headscaleDomain, nodes, resolveTopology, serviceComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
-import { linkRelayerStep } from "./relayer-link.js";
+import { linkPeersStep, linkRelayerStep } from "./relayer-link.js";
+import { configureMastodonStep } from "./mastodon.js";
+import { configureVerifierStep } from "./verifier.js";
+import { descriptorFor } from "../components/index.js";
 import { isManifestVersionRejected } from "../akash/client.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
 import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
@@ -759,6 +762,14 @@ export const verifyChainStep: StepDef = {
     const http: Record<string, string> = {};
     const targets: Array<{ name: string; domain: string; url: string; behind: string }> = [];
     for (const c of serviceComponents(ctx.spec)) {
+      const ingress = descriptorFor(c.key)?.ingress?.(ctx.spec);
+      if (ingress) {
+        // a kind with several public domains (mastodon's web + streaming)
+        ingress.forEach((i, n) =>
+          targets.push({ name: n === 0 ? c.key : `${c.key}:${i.domain}`, domain: i.domain, url: i.healthUrl, behind: c.key }),
+        );
+        continue;
+      }
       if (!c.domain) continue;
       targets.push({ name: c.key, domain: c.domain, url: `https://${c.domain}/`, behind: c.key });
     }
@@ -873,6 +884,11 @@ export function phaseEFSteps(): StepDef[] {
     // relayer (no-op without one): after the chain is verified and joined,
     // since opening channels needs blocks on both ends
     linkRelayerStep,
+    linkPeersStep,
+    // mastodon (no-op without one): owner, registrations, and its bridge
+    configureMastodonStep,
+    // verifier (no-op without one): its federation-verifier bond
+    configureVerifierStep,
     finalizeStep,
   ];
 }

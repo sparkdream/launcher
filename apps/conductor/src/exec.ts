@@ -30,10 +30,10 @@ export function cobraError(output: string): string | undefined {
 export function run(
   cmd: string,
   args: string[],
-  opts: { env?: Record<string, string> } = {},
+  opts: { env?: Record<string, string>; input?: string } = {},
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       cmd,
       args,
       { maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...opts.env } },
@@ -55,6 +55,9 @@ export function run(
         }
       },
     );
+    // stdin, for what must not appear in argv or in an error message (a
+    // mnemonic to recover): never echoed into the rejection above
+    if (opts.input !== undefined) child.stdin?.end(opts.input);
   });
 }
 
@@ -64,7 +67,7 @@ import { currentAssets } from "./chain-assets/context.js";
  * Binary resolution (§13): the running launch's assets context first (set
  * by runLaunch per launch), then the env override, then PATH.
  */
-export function sparkdreamd(args: string[]): Promise<ExecResult> {
+export function sparkdreamd(args: string[], opts: { input?: string } = {}): Promise<ExecResult> {
   const bin = currentAssets()?.bin ?? process.env.SPARKDREAMD_BIN ?? "sparkdreamd";
-  return run(bin, args);
+  return run(bin, args, opts);
 }

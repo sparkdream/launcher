@@ -249,6 +249,9 @@ export class FakeProviderGateway {
   }
 
   async leaseStatus(_creds: MtlsCredentials, hostUri: string, dseq: string): Promise<unknown> {
+    if (this.apiDownDseqs.has(dseq)) {
+      throw new Error(`provider GET /lease/${dseq}/1/1/status: HTTP 503 dial tcp 10.233.0.1:443: connect: connection refused`);
+    }
     const key = `${hostUri}/${dseq}`;
     if (!this.assigned.has(key)) {
       this.assigned.set(key, {
@@ -277,12 +280,113 @@ export class FakeProviderGateway {
 
   /** Lease-shell exec — the headscale image has no sshd (mirrors FakeSsh). */
   shellLog: Array<{ dseq: string; script: string }> = [];
+  /** Session keys delivered to daemons, keyed "<dseq>/<service>". */
+  sessionKeys = new Map<string, string>();
   /** headscale users created via lease-shell ("sparkdream" pre-seeded for
    *  tests that mint keys without running configure-headscale first). */
   private hsUsers: string[] = ["sparkdream"];
   /** External (non-fleet) nodes reported by "headscale nodes list": the
    *  tmkms host, operator laptops. Tests set this to simulate a mesh join. */
   externalMeshNodes: { name: string; ipAddresses: string[]; online: boolean }[] = [];
+  /** Mastodon instances by dseq: accounts created, registrations mode,
+   *  bridge token (the image's mastodon-bootstrap, answered in memory). */
+  mastodon = new Map<string, { accounts: Set<string>; registrations?: string; token?: string }>();
+  /** Bootstrap calls that fail before one succeeds (instance still starting). */
+  mastodonNotReady = 0;
+
+  private mastodonBootstrap(dseq: string, args: string[]): { stdout: string; stderr: string } {
+    if (this.mastodonNotReady > 0) {
+      this.mastodonNotReady--;
+      throw new Error("lease shell: exit 1: ActiveRecord::ConnectionNotEstablished");
+    }
+    const inst = this.mastodon.get(dseq) ?? { accounts: new Set<string>() };
+    this.mastodon.set(dseq, inst);
+    const [action, name] = args;
+    const out = (o: unknown) => ({ stdout: `progress\n${JSON.stringify(o)}\n`, stderr: "" });
+    if (action === "owner") {
+      if (inst.accounts.has(name!)) return out({ created: false });
+      inst.accounts.add(name!);
+      return out({ created: true, password: `pw-${name}-${dseq}` });
+    }
+    if (action === "registrations") {
+      inst.registrations = name;
+      return out({ registrations: name });
+    }
+    if (action === "bridge-token") {
+      inst.accounts.add(name!);
+      inst.token ??= `token-${dseq}`;
+      return out({ token: inst.token });
+    }
+    throw new Error(`lease shell: exit 2: mastodon-bootstrap ${action}`);
+  }
+
+  /** Deployments whose provider's API is down (status and lease-shell both
+   *  fail) while the workload keeps running. */
+  apiDownDseqs = new Set<string>();
+
+  /** Uploaded media under public/system, by dseq (a resize carries it). */
+  mastodonMedia = new Map<string, Buffer>();
+  /** Files written through lease-shell, "<dseq>:<path>" -> contents. */
+  private shellFiles = new Map<string, Buffer>();
+  /** The restore's scratch database, by dseq. */
+  private scratchDb = new Map<string, { accounts: string[]; token?: string } | null>();
+
+  /**
+   * Mastodon's data as the resize moves it (steps/mastodon-migrate.ts): a
+   * dump is the instance's accounts and token as JSON, restored into a
+   * scratch database and swapped in by the rename. Undefined when the
+   * script is not one of these.
+   */
+  private mastodonData(dseq: string, script: string): { stdout: string; stderr: string } | undefined {
+    const ok = (stdout = "") => ({ stdout, stderr: "" });
+    const file = (p: string) => `${dseq}:${p}`;
+    let m: RegExpExecArray | null;
+    if (/du -sb .*\/opt\/mastodon\/public\/system/.test(script)) return ok(String(this.mastodonMedia.get(dseq)?.length ?? 0));
+    if (script.includes("pg_database_size")) return ok("16502107");
+    if (/pg_dump .*\| base64 -w0/.test(script)) {
+      const inst = this.mastodon.get(dseq);
+      const dump = JSON.stringify({ accounts: [...(inst?.accounts ?? [])], token: inst?.token });
+      return ok(Buffer.from(dump).toString("base64"));
+    }
+    if (/tar .*-czf - \. \| base64 -w0/.test(script)) return ok((this.mastodonMedia.get(dseq) ?? Buffer.alloc(0)).toString("base64"));
+    if ((m = /^: > (\S+)$/.exec(script))) {
+      this.shellFiles.set(file(m[1]!), Buffer.alloc(0));
+      return ok();
+    }
+    if ((m = /^printf '%s' '([A-Za-z0-9+/=]*)' >> (\S+)$/.exec(script))) {
+      const prev = this.shellFiles.get(file(m[2]!)) ?? Buffer.alloc(0);
+      this.shellFiles.set(file(m[2]!), Buffer.concat([prev, Buffer.from(m[1]!)]));
+      return ok();
+    }
+    if ((m = /^base64 -d (\S+) > (\S+) && rm -f \S+ && sha256sum \S+/.exec(script))) {
+      const decoded = Buffer.from((this.shellFiles.get(file(m[1]!)) ?? Buffer.alloc(0)).toString(), "base64");
+      this.shellFiles.set(file(m[2]!), decoded);
+      return ok(crypto.createHash("sha256").update(decoded).digest("hex"));
+    }
+    if (script.includes("pg_isready")) return ok("ok");
+    if (script.includes("CREATE DATABASE")) {
+      this.scratchDb.set(dseq, null);
+      return ok();
+    }
+    if ((m = /pg_restore .* -d \w+ (\S+)/.exec(script))) {
+      const dump = this.shellFiles.get(file(m[1]!));
+      this.scratchDb.set(dseq, dump ? JSON.parse(dump.toString()) : null);
+      return ok();
+    }
+    if (script.includes("select count(*) from accounts")) return ok(String(this.scratchDb.get(dseq)?.accounts.length ?? 0));
+    if (script.includes("RENAME TO")) {
+      const restored = this.scratchDb.get(dseq);
+      if (restored) this.mastodon.set(dseq, { accounts: new Set(restored.accounts), ...(restored.token ? { token: restored.token } : {}) });
+      return ok();
+    }
+    if (/^test -d \/opt\/mastodon\/public\/system/.test(script)) return ok("ok");
+    if ((m = /^tar -xzf (\S+) -C \/opt\/mastodon\/public\/system/.exec(script))) {
+      this.mastodonMedia.set(dseq, this.shellFiles.get(file(m[1]!)) ?? Buffer.alloc(0));
+      return ok();
+    }
+    return undefined;
+  }
+
   async shellExec(
     _creds: MtlsCredentials,
     _hostUri: string,
@@ -294,6 +398,17 @@ export class FakeProviderGateway {
   ): Promise<{ stdout: string; stderr: string }> {
     const script = cmd[cmd.length - 1] ?? "";
     this.shellLog.push({ dseq, script });
+    if (this.apiDownDseqs.has(dseq)) throw new Error("lease shell: provider reported a failure (pod restarting?)");
+    if (cmd[0] === "mastodon-bootstrap") return this.mastodonBootstrap(dseq, cmd.slice(1));
+    const data = this.mastodonData(dseq, script);
+    if (data) return data;
+    if (script.includes("/data/session-key")) {
+      // a daemon's session key, delivered (sessions.ts)
+      const mnemonic = /printf '%s\\n' '([a-z ]+)'/.exec(script)?.[1];
+      if (!mnemonic) throw new Error(`unexpected session-key script: ${script}`);
+      this.sessionKeys.set(`${dseq}/${_service}`, mnemonic);
+      return { stdout: "", stderr: "" };
+    }
     if (script.includes("kill 1")) throw new Error("lease shell: connection closed before result");
     if (script.includes("users create")) {
       const name = /users create (\S+)/.exec(script)?.[1];

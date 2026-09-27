@@ -47,6 +47,10 @@ interface KeplrWindow {
     enable(chainId: string): Promise<void>;
     experimentalSuggestChain(info: unknown): Promise<void>;
     getOfflineSigner(chainId: string): OfflineSigner;
+    /** Amino signer for a Ledger account, direct otherwise. */
+    getOfflineSignerAuto(chainId: string): Promise<OfflineSigner>;
+    /** Signing defaults Keplr applies to every sign request. */
+    defaultOptions?: { sign?: { preferNoSetFee?: boolean; preferNoSetMemo?: boolean } };
     getKey(chainId: string): Promise<{ bech32Address: string; name: string }>;
     /** Amino signing — the Ledger-compatible path used for gentxs (§5 3b). */
     signAmino(
@@ -194,4 +198,64 @@ export async function connectKeplr(config: ChainConfig): Promise<ConnectedWallet
     name: key.name,
     signer: k.getOfflineSigner(config.chainId),
   };
+}
+
+/**
+ * Connect the wallet to a launcher fleet's chain for a wallet-signed pause:
+ * suggest it with the fleet's public endpoints, then the account the user
+ * selects. The auto signer uses amino-JSON for a Ledger account, which every
+ * Spark Dream signer Msg supports.
+ */
+export async function connectFleetChain(chain: {
+  chainId: string;
+  chainName: string;
+  rpc: string;
+  rest?: string;
+  bech32Prefix: string;
+  denom: string;
+  displayDenom: string;
+  decimals: number;
+  gasPrice: number;
+}): Promise<{ address: string; name: string; signer: OfflineSigner }> {
+  const k = keplr();
+  const currency = { coinDenom: chain.displayDenom, coinMinimalDenom: chain.denom, coinDecimals: chain.decimals };
+  const prefix = chain.bech32Prefix;
+  await k.experimentalSuggestChain({
+    chainId: chain.chainId,
+    chainName: chain.chainName,
+    rpc: chain.rpc,
+    rest: chain.rest ?? chain.rpc,
+    bip44: { coinType: 118 },
+    bech32Config: {
+      bech32PrefixAccAddr: prefix,
+      bech32PrefixAccPub: `${prefix}pub`,
+      bech32PrefixValAddr: `${prefix}valoper`,
+      bech32PrefixValPub: `${prefix}valoperpub`,
+      bech32PrefixConsAddr: `${prefix}valcons`,
+      bech32PrefixConsPub: `${prefix}valconspub`,
+    },
+    currencies: [currency],
+    feeCurrencies: [{ ...currency, gasPriceStep: { low: chain.gasPrice, average: chain.gasPrice, high: chain.gasPrice } }],
+    stakeCurrency: currency,
+  });
+  await k.enable(chain.chainId);
+  const key = await k.getKey(chain.chainId);
+  return { address: key.bech32Address, name: key.name, signer: await k.getOfflineSignerAuto(chain.chainId) };
+}
+
+/**
+ * Run `fn` with Keplr keeping the fee the app set instead of substituting
+ * its own estimate. A chain-enforced fee floor (commons proposal_fee on a
+ * zero-gas-price devnet) otherwise becomes a zero fee and the chain rejects
+ * the tx. Scoped: the Akash signing flow keeps Keplr's fee handling.
+ */
+export async function withAppFee<T>(fn: () => Promise<T>): Promise<T> {
+  const k = keplr();
+  const prev = k.defaultOptions;
+  k.defaultOptions = { ...prev, sign: { ...prev?.sign, preferNoSetFee: true } };
+  try {
+    return await fn();
+  } finally {
+    k.defaultOptions = prev;
+  }
 }

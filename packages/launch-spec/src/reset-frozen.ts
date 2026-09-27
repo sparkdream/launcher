@@ -35,6 +35,10 @@ export const RESET_FROZEN_PATHS = [
   "images.frontend",
   "images.hub",
   "images.relayer",
+  "images.mastodon",
+  "images.mastodonStreaming",
+  "images.sdap",
+  "images.verifier",
 ] as const;
 
 type Obj = Record<string, unknown>;

@@ -133,6 +133,10 @@ const relayerEndpointCounterparty = z
     /** Light-client trusting period, below the chain's unbonding time. Unset,
      *  Hermes derives 2/3 of the unbonding time from the chain itself. */
     trustingPeriod: z.string().regex(/^[0-9]+(s|m|h|days)$/).optional(),
+    /** Most the relayer key should hold here, in gasDenom: the launcher
+     *  never asks for more and flags a balance above it. The key sits on the
+     *  relayer's provider, so whatever it holds is at that provider's mercy. */
+    maxBalance: z.string().regex(/^[1-9][0-9]*$/).optional(),
   })
   .strict();
 
@@ -158,8 +162,160 @@ const relayerComponent = z.object({
   enabled: z.boolean(),
   paths: z.array(relayerPath).default([]),
   /** Genesis balance for the relayer's key on this chain, in the base denom
-   *  (it pays gas for every packet this side submits). Ignored in join mode. */
-  genesisBalance: z.string().regex(/^[0-9]+$/).default("100000000"),
+   *  (it pays gas for every packet this side submits). Ignored in join mode.
+   *  Keep it small: the key lives on the relayer's provider. */
+  genesisBalance: z.string().regex(/^[0-9]+$/).default("25000000"),
+  /** Most the relayer key should hold on any Spark Dream chain it relays
+   *  for, in that chain's base denom. genesisBalance may not exceed it, the
+   *  launcher's funding prompts never ask for more, and a balance above it
+   *  is flagged. Endpoint counterparties set their own maxBalance. */
+  maxBalance: z.string().regex(/^[1-9][0-9]*$/).default("100000000"),
+});
+
+/**
+ * The x/session key a daemon signs with, in place of its account's own key
+ * (which never leaves the launcher). The launcher grants it, delivers it to
+ * the daemon, renews it with a third of its lifetime left, rotates it
+ * whenever the daemon moves to another deployment, and revokes the old one.
+ */
+const sessionKey = z
+  .object({
+    /** Grant lifetime in days, capped by the chain's session max_expiration.
+     *  Defaults to 30 on mainnet and 90 elsewhere. */
+    days: z.number().int().min(1).max(365).optional(),
+    /** Fee budget of each grant, in the chain's base denom: the account pays
+     *  the daemon's fees out of it, and no more. Capped by the chain's
+     *  session max_spend_limit_amount. */
+    spendLimit: z.string().regex(/^[1-9][0-9]*$/).default("25000000"),
+  })
+  .strict();
+
+/**
+ * A Mastodon instance (the chain repo's Dockerfile-mastodon: web + sidekiq,
+ * upstream streaming, postgres, redis in one deployment). Its domain is the
+ * instance's identity for good -- ActivityPub ids embed it -- so it cannot be
+ * retargeted later.
+ */
+const mastodonComponent = z.object({
+  enabled: z.boolean(),
+  /** LOCAL_DOMAIN: https://<domain> is the instance, @user@<domain> its accounts. */
+  domain: domain.optional(),
+  /** The streaming API's own ingress; defaults to streaming.<domain>. */
+  streamingDomain: domain.optional(),
+  /** The Owner account the launcher creates; its password is shown once in
+   *  the fleet's accounts panel. */
+  owner: z
+    .object({
+      username: z.string().regex(/^[a-z0-9_]{1,30}$/i).default("admin"),
+      email: z.string().email(),
+    })
+    .optional(),
+  /** Who may sign up: anyone, anyone with the owner's approval, or nobody. */
+  registrations: z.enum(["open", "approved", "none"]).default("approved"),
+  /**
+   * Resources: "small" (~2 CPU, ~3.6 GB RAM, 10 GiB media; a new community)
+   * or "standard" (~4 CPU, ~8 GB, 20 GiB media). A deployment's resources
+   * are fixed on Akash, so changing it means a fresh instance: size up
+   * before the community depends on it.
+   */
+  size: z.enum(["small", "standard"]).default("small"),
+  /**
+   * Outgoing mail (sign-up confirmations, password resets, notifications),
+   * through any SMTP relay. Without it mail is written to disk and never
+   * sent, so new users cannot confirm their address. The password is kept
+   * in the launcher's secret store, never in the spec.
+   */
+  smtp: z
+    .object({
+      server: z.string().min(1),
+      port: z.number().int().min(1).max(65535).default(587),
+      login: z.string().min(1).optional(),
+      /** Accepted when adding the component; moved to the secret store. */
+      password: z.string().min(1).optional(),
+      /** The sender, e.g. "Mastodon <notifications@example.com>". */
+      fromAddress: z.string().min(3),
+      /** starttls (587), tls (implicit, 465) or none. */
+      security: z.enum(["starttls", "tls", "none"]).default("starttls"),
+      authMethod: z.enum(["plain", "login", "cram_md5", "none"]).default("plain"),
+    })
+    .strict()
+    .optional(),
+  /**
+   * The ActivityPub live link (sdapbridge beside the instance): registers the
+   * instance as an x/federation ActivityPub peer, bonds a bridge operator for
+   * it, and anchors posts of authors who opt in by following @bridge. Needs
+   * topology.publicEndpoints.api (the bridge broadcasts through the LCD).
+   * Anchored posts only verify once an independent verifier (sdapverify, on
+   * another host and account) runs against the chain.
+   */
+  bridge: z
+    .object({
+      enabled: z.boolean(),
+      /** Genesis balance for the bridge operator, in the base denom: the
+       *  operator bond (x/service min_bond, 1000 SPARK by default) plus gas. */
+      genesisBalance: z.string().regex(/^[0-9]+$/).default("1100000000"),
+      /** sdapbridge signs through this session key; the operator's own key
+       *  (it controls the bond) stays with the launcher. */
+      session: sessionKey.default({}),
+      /**
+       * Which of the instance's authors the chain anchors (the peer policy's
+       * author curation; both gates must pass, and authors still opt in by
+       * following @bridge). `allow` lists admitted authors ("@user@<domain>")
+       * or ["*"] for any; `collectionId` names an x/collect collection whose
+       * link items must also list the author, typically owned by the
+       * Operations Committee with members as editors so they curate without
+       * a proposal per author.
+       *
+       * Set, the spec owns these two policy fields: they are rewritten on the
+       * chain whenever the bridge step runs and the stored policy differs.
+       * Unset, a new peer starts at ["*"] and the fields are the
+       * community's from then on (the frontend's peer policy form), never
+       * touched again by the launcher.
+       */
+      authors: z
+        .object({
+          allow: z.array(z.string().min(1)).max(256).default(["*"]),
+          collectionId: z.number().int().min(0).optional(),
+        })
+        .strict()
+        .optional(),
+    })
+    .optional(),
+});
+
+/**
+ * An ActivityPub content verifier (sdapverify): re-fetches every post a
+ * bridge anchors on the target chain and confirms or disputes its hash. Its
+ * worth is its independence from the bridge, so it runs as its own
+ * deployment, never on the provider hosting the target's Mastodon, and signs
+ * as a member of the target chain who is not the bridge operator.
+ */
+const verifierComponent = z.object({
+  enabled: z.boolean(),
+  /** The chain to verify: another fleet on this launcher (launch id or
+   *  network name); this fleet when omitted. Its publicEndpoints.api is
+   *  where the verifier reads and broadcasts. */
+  target: z.object({ fleet: z.string().min(1) }).strict().optional(),
+  /** Who verifies: exactly one of `account` or `wallet`, a member of the
+   *  target chain at ESTABLISHED or above (x/rep requires it for the
+   *  federation-verifier role), never the bridge operator.
+   *
+   *  account  an accounts.initial name the launcher generated: it bonds and
+   *           grants the daemon's session key with that key itself.
+   *  wallet   the address of a member whose key stays in your wallet: the
+   *           launcher pauses for your signature to bond and to grant (and,
+   *           when it renews, re-grant) the session key. */
+  account: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/).optional(),
+  wallet: z.string().regex(/^[a-z]+1[02-9ac-hj-np-z]{38,58}$/).optional(),
+  /** ActivityPub peers to verify; defaults to the target's Mastodon domain. */
+  peers: z.array(domain).optional(),
+  /** DREAM bonded as the federation-verifier role, in micro-DREAM. */
+  bond: z.string().regex(/^[0-9]+$/).default("500000000"),
+  /** Called when an anchored post does not match what the instance serves. */
+  alarmWebhook: z.string().url().optional(),
+  /** sdapverify signs through this session key; the member's own key (it
+   *  controls the DREAM bond) stays with the launcher or your wallet. */
+  session: sessionKey.default({}),
 });
 
 /**
@@ -333,6 +489,8 @@ export const launchSpecSchema = z.object({
       frontend: componentToggle,
       hub: componentToggle,
       relayer: relayerComponent.optional(),
+      mastodon: mastodonComponent.optional(),
+      verifier: verifierComponent.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress
@@ -394,6 +552,8 @@ export const launchSpecSchema = z.object({
         frontend: componentProviderRules.optional(),
         hub: componentProviderRules.optional(),
         relayer: componentProviderRules.optional(),
+        mastodon: componentProviderRules.optional(),
+        verifier: componentProviderRules.optional(),
       })
       .strict()
       .default({}),
@@ -436,6 +596,10 @@ export const launchSpecSchema = z.object({
         })
         .partial()
         .optional(),
+      /** x/session: maxExpirationDays is the longest a session key grant may
+       *  run (the daemons' keys are renewed within it). Defaults to 30 on
+       *  mainnet and 90 elsewhere; the code default is 7. */
+      session: z.object({ maxExpirationDays: z.number().int().min(1).max(365) }).partial().optional(),
     })
     .default({}),
 
@@ -457,6 +621,13 @@ export const launchSpecSchema = z.object({
     frontend: z.string().optional(),
     hub: z.string().optional(),
     relayer: z.string().optional(),
+    /** Web + sidekiq (the derived image); streaming runs mastodonStreaming. */
+    mastodon: z.string().optional(),
+    mastodonStreaming: z.string().optional(),
+    /** sdapbridge (the mastodon component's bridge). */
+    sdap: z.string().optional(),
+    /** sdapverify (the verifier component): the same sdap image by default. */
+    verifier: z.string().optional(),
   }),
 
   security: z.object({

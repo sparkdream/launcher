@@ -214,7 +214,7 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     );
 
     const app = fs.readFileSync(path.join(dirs.node("sentry-0"), "config", "app.toml"), "utf8");
-    expect(app).toContain('minimum-gas-prices = "25000uspark.sparkdreamtest"');
+    expect(app).toContain('minimum-gas-prices = "0.025uspark.sparkdreamtest"');
     expect(app).toContain("snapshot-interval = 1000");
 
     // SDLs: image, placeholders, tunnels, persistent storage, pricing denom

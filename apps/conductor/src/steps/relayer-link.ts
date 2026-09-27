@@ -9,6 +9,8 @@ import {
   ensureRelayerMnemonic,
   fleetPeer,
   relayerAddress,
+  relayerCap,
+  suggestedTopUp,
   relayPlan,
   RELAYER_DIR,
   renderHermesConfig,
@@ -20,15 +22,33 @@ import { readSecretFile } from "../secrets.js";
 import { patchSentryAppToml, sentryServe } from "../sentry-serve.js";
 import type { SshTarget } from "../services.js";
 import { sshTarget, type SshEndpoints } from "./phase-bcd.js";
+import {
+  chainIdentity,
+  ensurePeerActive,
+  fleetActor,
+  sparkDreamPeerPolicy,
+  type ChainActor,
+  type PeerStatus,
+} from "../peering.js";
 
 /** What linking produced: the relayer's address on each chain and the
  *  channels it opened. Also saved to <launch>/relayer/state.json for the
  *  fleet panel, since the step that last linked may be a launch step or any
  *  op's. */
 export interface RelayerLinkOutput {
-  chains: Array<{ chainId: string; address: string; launchId?: string }>;
+  chains: Array<{
+    chainId: string;
+    address: string;
+    launchId?: string;
+    /** Gas balance at the last link, and the cap it should stay under. */
+    balance?: string;
+    denom?: string;
+    cap?: string;
+  }>;
   channels: RelayChannel[];
   linkedAt: string;
+  /** Federation peers' status on each chain, once link-peers has run. */
+  peers?: PeerStatus[];
 }
 
 /** Bringup opens clients, connections and channels one handshake at a time,
@@ -125,16 +145,41 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     account: boolean | null;
     ready: boolean;
   }>;
+  // the key lives on the relayer's provider: ask for gas money only, and
+  // say so when a balance has grown past the cap
+  for (const c of chains) {
+    const planned = plan.chains.find((p) => p.chainId === c.chainId)!;
+    const s = status.find((x) => x.chain === c.chainId);
+    const cap = relayerCap(spec, planned);
+    Object.assign(c, {
+      ...(s ? { balance: s.balance, denom: s.denom || planned.gasDenom } : {}),
+      ...(cap !== undefined ? { cap: cap.toString() } : {}),
+    });
+    if (s && cap !== undefined && BigInt(s.balance || "0") > cap) {
+      ctx.log(
+        `relayer: WARNING ${c.chainId} key ${c.address} holds ${s.balance} ${planned.gasDenom}, above its cap of ${cap}: ` +
+          "the key sits on the relayer's provider; move the excess out",
+      );
+    }
+  }
   const unready = status.filter((s) => !s.ready);
   if (unready.length > 0) {
-    const denomOf = (id: string) => plan.chains.find((c) => c.chainId === id)?.gasDenom ?? "its gas denom";
     throw new AwaitUser(
       stepName,
-      "fund the relayer so it can pay gas, then resume: " +
+      "fund the relayer so it can pay gas, then resume. Its key sits on the relayer's provider (Hermes cannot " +
+        "sign through a session key), so send gas money only and top up later rather than pre-fund: " +
         unready
           .map((s) => {
+            const planned = plan.chains.find((c) => c.chainId === s.chain);
             const address = s.address || chains.find((c) => c.chainId === s.chain)?.address;
-            return `${s.chain}: send ${denomOf(s.chain)} to ${address}` + (s.account === false ? " (account not found yet)" : "");
+            const denom = planned?.gasDenom ?? "its gas denom";
+            const cap = planned ? relayerCap(spec, planned) : undefined;
+            const amount = planned ? `about ${suggestedTopUp(planned, cap)} ` : "";
+            return (
+              `${s.chain}: send ${amount}${denom} to ${address}` +
+              (cap !== undefined ? ` (cap ${cap})` : "") +
+              (s.account === false ? " (account not found yet)" : "")
+            );
           })
           .join("; "),
     );
@@ -154,11 +199,90 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
   }
 
   const out: RelayerLinkOutput = { chains, channels, linkedAt: new Date().toISOString() };
+  const previous = fs.existsSync(relayerStatePath(ctx.workRoot, ctx.launchId))
+    ? (JSON.parse(fs.readFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), "utf8")) as RelayerLinkOutput)
+    : undefined;
+  if (previous?.peers) out.peers = previous.peers;
   fs.writeFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), JSON.stringify(out, null, 2));
   for (const ch of channels) {
     ctx.log(`relayer: ${ch.id} open — ${ch.a.chain}/${ch.a.channel} <-> ${ch.b.chain}/${ch.b.channel} (${ch.port})`);
   }
   return out;
+}
+
+/**
+ * Bring every federation path's peers to ACTIVE on both chains (§5
+ * peer-link): the relayer's channel carries nothing until each chain has
+ * registered the other, set a policy and activated it. Both ends of a path to
+ * another fleet are handled here, signed with each fleet's launcher-held
+ * founder key. For a chain named by endpoints only this fleet's end is the
+ * launcher's to do; the step then waits until that chain reports its end
+ * ACTIVE, having written the messages its Operations Committee must send.
+ */
+export async function linkFederationPeers(
+  ctx: StepCtx,
+  stepName: string,
+  spec: LaunchSpec,
+): Promise<{ peers: PeerStatus[] }> {
+  const plan = relayPlan(ctx.db, ctx.launchId, spec);
+  const federation = plan.paths.filter((p) => p.kind === "federation");
+  if (federation.length === 0) return { peers: [] };
+  const state = fs.existsSync(relayerStatePath(ctx.workRoot, ctx.launchId))
+    ? (JSON.parse(fs.readFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), "utf8")) as RelayerLinkOutput)
+    : undefined;
+  if (!state) throw new Error("the relayer has not been linked yet: no channels to register peers on");
+
+  const own = await fleetActor(ctx, ctx.launchId, "this fleet");
+  const ownIdentity = await chainIdentity(own.rpc);
+  const peers: PeerStatus[] = [];
+  for (const p of federation) {
+    const ch = state.channels.find((c) => c.id === p.id);
+    if (!ch) throw new Error(`relayer path ${p.id} has no open channel yet`);
+    // the transfer channel to the same chain, if the relayer opened one:
+    // voucher metadata is keyed on it (MsgRegisterPeer ibc_transfer_channel_id)
+    const xfer = state.channels.find((c) => c.port === "transfer" && c.b.chain === p.b);
+    const counterparty = plan.chains.find((c) => c.chainId === p.b)!;
+    const remote: ChainActor = counterparty.launchId
+      ? await fleetActor(ctx, counterparty.launchId, `fleet ${counterparty.launchId}`)
+      : {
+          chainId: counterparty.chainId,
+          rpc: counterparty.rpc,
+          gasDenom: counterparty.gasDenom,
+          gasPrice: counterparty.gasPrice,
+          outDir: path.join(ctx.dirs.root, "peering"),
+          label: "the counterparty chain (not launched here)",
+        };
+    const remoteIdentity = await chainIdentity(remote.rpc);
+    peers.push(
+      await ensurePeerActive(ctx, stepName, own, {
+        id: p.b,
+        type: "PEER_TYPE_SPARK_DREAM",
+        displayName: p.b,
+        ibcChannelId: ch.a.channel,
+        ...(xfer ? { ibcTransferChannelId: xfer.a.channel } : {}),
+        ...(remoteIdentity ? { peerIdentity: remoteIdentity } : {}),
+        policy: sparkDreamPeerPolicy(),
+      }),
+    );
+    peers.push(
+      await ensurePeerActive(ctx, stepName, remote, {
+        id: p.a,
+        type: "PEER_TYPE_SPARK_DREAM",
+        displayName: p.a,
+        ibcChannelId: ch.b.channel,
+        ...(xfer ? { ibcTransferChannelId: xfer.b.channel } : {}),
+        ...(ownIdentity ? { peerIdentity: ownIdentity } : {}),
+        policy: sparkDreamPeerPolicy(),
+      }),
+    );
+  }
+  // the fleet panel shows these beside the channels
+  fs.writeFileSync(
+    relayerStatePath(ctx.workRoot, ctx.launchId),
+    JSON.stringify({ ...state, peers }, null, 2),
+  );
+  for (const peer of peers) ctx.log(`federation: ${peer.chainId} peer ${peer.peerId} ${peer.status}`);
+  return { peers };
 }
 
 /** Launch step: link a relayer the spec enables, after the chain is verified. */
@@ -167,5 +291,14 @@ export const linkRelayerStep: StepDef = {
   async run(ctx) {
     if (!ctx.spec.topology.components.relayer?.enabled) return { skipped: true };
     return linkRelayer(ctx, "link-relayer", ctx.spec);
+  },
+};
+
+/** Launch step: register and activate the federation paths' peers. */
+export const linkPeersStep: StepDef = {
+  name: "link-peers",
+  async run(ctx) {
+    if (!ctx.spec.topology.components.relayer?.enabled) return { skipped: true };
+    return linkFederationPeers(ctx, "link-peers", ctx.spec);
   },
 };

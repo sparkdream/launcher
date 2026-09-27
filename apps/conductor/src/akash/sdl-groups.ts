@@ -50,6 +50,25 @@ export function loadSdl(path: string): Sdl {
 }
 
 export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
+  // manifest + version from the reference implementation (see module doc)
+  const generated = generateManifest(sdl as any);
+  if (!generated.ok) {
+    throw new Error(`SDL rejected by chain-sdk: ${JSON.stringify(generated.value)}`);
+  }
+  const canonical = manifestToSortedJSON(generated.value.groups);
+  const hash = crypto.createHash("sha256").update(canonical).digest();
+  const manifest = JSON.parse(canonical);
+
+  // The provider matches each manifest service to the deployment's group
+  // resource by id, so the ids here must be the manifest's. chain-sdk numbers
+  // a group's services in its own (sorted) order, not the SDL's declaration
+  // order; numbering in declaration order swapped resources between services
+  // once a group held more than one (mastodon: "CPU resources mismatch").
+  const manifestIds = new Map<string, number>();
+  for (const g of manifest as Array<{ name: string; services: Array<{ name: string; resources: { id: number } }> }>) {
+    for (const svc of g.services) manifestIds.set(`${g.name}/${svc.name}`, svc.resources.id);
+  }
+
   const groups: any[] = [];
   let requiredStorageClass: string | undefined;
   let requiresCustomDomain = false;
@@ -100,8 +119,10 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
         requiresCustomDomain = true;
       }
 
+      const id = manifestIds.get(`${placementName}/${serviceName}`);
+      if (id === undefined) throw new Error(`SDL: service ${serviceName} missing from the ${placementName} manifest group`);
       const resource = {
-        id: groupResources.length + 1,
+        id,
         cpu: { units: { val: String(Math.round(Number(compute.cpu.units) * 1000)) } },
         memory: { quantity: { val: sizeToBytes(compute.memory.size) } },
         storage,
@@ -123,17 +144,10 @@ export function sdlArtifacts(sdl: Sdl): SdlArtifacts {
 
     }
 
+    groupResources.sort((a, b) => a.resource.id - b.resource.id);
     groups.push({ name: placementName, requirements: { attributes: [], signed_by: { all_of: [], any_of: [] } }, resources: groupResources });
   }
 
-  // manifest + version from the reference implementation (see module doc)
-  const generated = generateManifest(sdl as any);
-  if (!generated.ok) {
-    throw new Error(`SDL rejected by chain-sdk: ${JSON.stringify(generated.value)}`);
-  }
-  const canonical = manifestToSortedJSON(generated.value.groups);
-  const hash = crypto.createHash("sha256").update(canonical).digest();
-  const manifest = JSON.parse(canonical);
   return {
     groups,
     manifest,

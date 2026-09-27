@@ -13,7 +13,7 @@ import type { LaunchSpec } from "./schema.js";
  * `hub` is deliberately absent: the schema has a toggle for it but nothing
  * deploys it (validate-spec warns that it is ignored).
  */
-export const COMPONENT_KEYS = ["explorer", "frontend", "relayer"] as const;
+export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier"] as const;
 export type ComponentKey = (typeof COMPONENT_KEYS)[number];
 
 export interface ComponentKind {
@@ -73,6 +73,31 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
     needsSentry: true,
     needsLcd: false,
     needsGrpc: true,
+  },
+  mastodon: {
+    key: "mastodon",
+    label: "Mastodon",
+    // talks to the world over its domain; its bridge reaches the chain over
+    // the public api endpoint, like any client
+    mesh: false,
+    // upstream-derived image, no sshd: configured over lease-shell
+    ssh: false,
+    domain: true,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
+  verifier: {
+    key: "verifier",
+    label: "Content verifier",
+    // a client of the target chain's public api and of the Mastodon it
+    // checks, like any outsider: no mesh, no sshd (the sdap image)
+    mesh: false,
+    ssh: false,
+    domain: false,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
   },
 };
 

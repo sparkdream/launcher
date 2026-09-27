@@ -65,10 +65,58 @@ export class AwaitSignature extends Error {
 }
 
 /** Thrown by a step to pause for non-signature user action (DNS, tmkms). */
+/**
+ * A transaction a user's own wallet must sign on a fleet's chain (§5
+ * wallet-signed pauses): the launcher holds no key that may send it, so the
+ * web UI connects the wallet, fills in its address and broadcasts. The step
+ * re-checks the chain when resumed, so nothing is taken on trust.
+ */
+export interface WalletRequest {
+  /** One line on what the signature authorizes, for the pause card. */
+  title: string;
+  chain: {
+    chainId: string;
+    chainName: string;
+    /** CometBFT RPC and LCD the browser reaches (the fleet's public ones). */
+    rpc: string;
+    rest?: string;
+    bech32Prefix: string;
+    denom: string;
+    displayDenom: string;
+    decimals: number;
+    gasPrice: number;
+  };
+  /** Who may sign ("an Operations Committee member", "any funded account"). */
+  signerRole: string;
+  /** The one address that must sign, when it matters who (a member bonding
+   *  or granting from its own account). The messages carry it literally, so
+   *  another account's signature would be rejected by the chain anyway: the
+   *  pause card checks first and asks to switch accounts. */
+  signer?: string;
+  /** Messages as proto-JSON ("@type" + proto field names), for display and
+   *  the CLI route. */
+  msgs: unknown[];
+  /** The same messages as protobuf Anys (base64 value), encoded by the
+   *  chain's own binary so enums, nested messages and every field come out
+   *  exactly as the chain parses them. Every string equal to WALLET_SIGNER
+   *  in a decoded message is the connected wallet's address. */
+  encoded: Array<{ typeUrl: string; value: string }>;
+  /** Gas limit for the tx; the wallet simulates when unset. */
+  gas?: number;
+  /** A fee floor the chain enforces beyond gas (commons proposal_fee). */
+  minFee?: { denom: string; amount: string };
+  /** Equivalent CLI commands, for a key kept outside a browser wallet. */
+  cli?: string;
+}
+
+/** Placeholder for the signing wallet's address in WalletRequest.msgs. */
+export const WALLET_SIGNER = "<signer>";
+
 export class AwaitUser extends Error {
   constructor(
     readonly step: string,
     readonly reason: string,
+    readonly wallet?: WalletRequest,
   ) {
     super(reason);
   }
@@ -217,7 +265,7 @@ export async function runLaunch(
         return { status: "awaiting-signature", failedStep: step.name };
       }
       if (cause instanceof AwaitUser) {
-        db.stepWaiting(launchId, step.name, cause.reason);
+        db.stepWaiting(launchId, step.name, cause.reason, cause.wallet);
         db.setLaunchStatus(launchId, "paused");
         return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
       }

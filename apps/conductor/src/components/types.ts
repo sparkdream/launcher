@@ -20,6 +20,16 @@ export interface RenderInput {
    *  Those fleets are already running, so their addresses are known at render
    *  time; this fleet's own peers stay placeholders until persist-start. */
   peerTailnetIp?: (peer: string) => string | undefined;
+  /** The launch's secrets directory, for a kind whose env carries secrets it
+   *  keeps there (Mastodon's keys, the bridge operator's mnemonic). */
+  secretsDir?: string;
+  /** Another fleet's (or this one's) spec and secrets directory, for a kind
+   *  that acts on a target fleet's chain (the verifier). */
+  resolveFleet?: (
+    launchId: string,
+  ) => { spec: LaunchSpec; secretsDir: string; launchId: string; accounts: Record<string, string> } | undefined;
+  /** This launch's id (what a target defaults to). */
+  launchId?: string;
 }
 
 /** A mesh tunnel: local port → `remote` port on the fleet component `peer`. */
@@ -47,7 +57,7 @@ export interface ComponentDescriptor {
   render(input: RenderInput): Record<string, { service: Record<string, unknown>; resources: SdlResources }>;
   /** Compute resources per service — what the estimator prices. Must agree
    *  with render(). */
-  resources(): SdlResources[];
+  resources(spec: LaunchSpec): SdlResources[];
   /** Services that run the component's own image; an upgrade swaps only these
    *  (a sidecar database keeps its image). */
   imageServices: string[];
@@ -72,6 +82,24 @@ export interface ComponentDescriptor {
    * configures itself from its env.
    */
   configureSteps?(name: (step: string) => string, spec: LaunchSpec): StepDef[];
+  /** Every image the kind deploys, when more than its own (validate-spec
+   *  probes them). Default: the component's image. */
+  images?(spec: LaunchSpec): string[];
+  /** Every public ingress and the URL that proves it serves, when more than
+   *  https://<domain>/ (verify-chain's DNS gate and the health monitor). */
+  ingress?(spec: LaunchSpec): Array<{ domain: string; healthUrl: string }>;
+  /** A health probe run in the container over SSH (kinds without a public
+   *  domain): the command, and what its output means. */
+  probe?: { command: string; verdict(stdout: string): { healthy: boolean; detail: string } };
+  /** Providers this kind must not land on, decided at placement time (the
+   *  verifier avoids whichever provider hosts the Mastodon it checks).
+   *  `assigned` holds this launch's placements made so far. */
+  avoidProviders?(input: {
+    db: import("../db.js").ConductorDb;
+    launchId: string;
+    spec: LaunchSpec;
+    assigned: Record<string, string>;
+  }): string[];
   /** Env derived from domains; a domain retarget sets these (undefined =
    *  remove) alongside rewriting accept lists. */
   retargetEnv?(spec: LaunchSpec): Record<string, string | undefined>;

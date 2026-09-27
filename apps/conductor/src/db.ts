@@ -20,6 +20,8 @@ export interface StepRow {
   finished_at: string | null;
   output_json: string | null;
   error: string | null;
+  /** A waiting step's WalletRequest (engine.ts), when a wallet must sign. */
+  wallet_json: string | null;
 }
 
 const SCHEMA = `
@@ -159,6 +161,9 @@ export class ConductorDb {
     }
     if (!cols("fleet_ops").includes("progress_json")) {
       this.db.exec("ALTER TABLE fleet_ops ADD COLUMN progress_json TEXT");
+    }
+    if (!cols("launch_steps").includes("wallet_json")) {
+      this.db.exec("ALTER TABLE launch_steps ADD COLUMN wallet_json TEXT");
     }
     // one-time: lift any per-launch prefs into the wallet-global list
     this.db.exec(
@@ -360,7 +365,8 @@ export class ConductorDb {
            status = 'running',
            started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
            finished_at = NULL,
-           error = NULL`,
+           error = NULL,
+           wallet_json = NULL`,
       )
       .run(launchId, name);
   }
@@ -393,12 +399,12 @@ export class ConductorDb {
       .run(output === undefined ? null : JSON.stringify(output), launchId, name);
   }
 
-  stepWaiting(launchId: string, name: string, reason: string): void {
+  stepWaiting(launchId: string, name: string, reason: string, wallet?: unknown): void {
     this.db
       .prepare(
-        "UPDATE launch_steps SET status = 'waiting', error = ? WHERE launch_id = ? AND name = ?",
+        "UPDATE launch_steps SET status = 'waiting', error = ?, wallet_json = ? WHERE launch_id = ? AND name = ?",
       )
-      .run(reason, launchId, name);
+      .run(reason, wallet === undefined ? null : JSON.stringify(wallet), launchId, name);
   }
 
   stepFailed(launchId: string, name: string, error: string): void {

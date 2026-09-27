@@ -449,9 +449,17 @@
       "evidence": []
     },
     "federation": {
+      "arbiter_escalation_queue": [],
+      "arbiter_hash_counts": [],
+      "arbiter_resolution_queue": [],
+      "arbiter_submissions": [],
       "bridge_bindings": [],
+      "challenge_window_queue": [],
+      "escalated_challenge_deadline_queue": [],
+      "escalated_challenges": [],
       "federated_content": [],
       "identity_links": [],
+      "next_arbiter_anon_submission_id": "0",
       "next_content_id": "0",
       "next_outbound_attestation_id": "0",
       "operator_reward_day_funding_list": [],
@@ -511,6 +519,7 @@
       "port_id": "federation",
       "reputation_attestations": [],
       "verification_records": [],
+      "verification_window_queue": [],
       "verifier_activities": []
     },
     "forum": {
@@ -1864,7 +1873,10 @@
           "/sparkdream.service.v1.MsgUnbondOperator",
           "/sparkdream.service.v1.MsgTopUpBond",
           "/sparkdream.service.v1.MsgUpdateMetadata",
-          "/sparkdream.service.v1.MsgClaimUnbondedBond"
+          "/sparkdream.service.v1.MsgClaimUnbondedBond",
+          "/sparkdream.federation.v1.MsgSubmitFederatedContent",
+          "/sparkdream.federation.v1.MsgAttestOutbound",
+          "/sparkdream.federation.v1.MsgVerifyContent"
         ],
         "authorized_grant_creators": [
           "sprkdrm1m0a2t448gsfxq5nr6el96jmm6svj43sym0derq"
@@ -1927,7 +1939,10 @@
           "/sparkdream.service.v1.MsgUnbondOperator",
           "/sparkdream.service.v1.MsgTopUpBond",
           "/sparkdream.service.v1.MsgUpdateMetadata",
-          "/sparkdream.service.v1.MsgClaimUnbondedBond"
+          "/sparkdream.service.v1.MsgClaimUnbondedBond",
+          "/sparkdream.federation.v1.MsgSubmitFederatedContent",
+          "/sparkdream.federation.v1.MsgAttestOutbound",
+          "/sparkdream.federation.v1.MsgVerifyContent"
         ],
         "max_endblocker_dispatches_per_pass": 100,
         "max_exec_count": "10000",

@@ -116,6 +116,35 @@ export interface StepView {
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** A waiting step's transaction for the user's own wallet to sign. */
+  wallet?: WalletRequest;
+}
+
+/** A transaction on a fleet's chain the launcher cannot sign itself (it
+ *  holds no key allowed to): the user's wallet signs it in the pause card. */
+export interface WalletRequest {
+  title: string;
+  chain: {
+    chainId: string;
+    chainName: string;
+    rpc: string;
+    rest?: string;
+    bech32Prefix: string;
+    denom: string;
+    displayDenom: string;
+    decimals: number;
+    gasPrice: number;
+  };
+  signerRole: string;
+  /** The one address that must sign, when it matters who. */
+  signer?: string;
+  /** Proto-JSON, for display; "<signer>" stands for the wallet's address. */
+  msgs: Array<Record<string, unknown>>;
+  /** The same messages encoded by the chain binary (base64 Any values). */
+  encoded: Array<{ typeUrl: string; value: string }>;
+  gas?: number;
+  minFee?: { denom: string; amount: string };
+  cli?: string;
 }
 
 export interface LaunchView {
@@ -337,6 +366,8 @@ export interface FleetSummary {
     }>;
     /** Placements the launch itself is holding for a manual bid pick. */
     bidPicks: Array<{ key: string; dseq: string; bids: OfferedBid[] }>;
+    /** The daemons' session keys: what was granted, never the key. */
+    sessions?: SessionView[];
   }>;
   unmanaged: Array<{ dseq: string; state: string }>;
 }
@@ -409,7 +440,9 @@ export type FleetAction =
   | "clear-halt-height"
   /** Wipe a node's chain data and leave it stopped (the empty database a
    *  from-genesis restore replays into). */
-  | "reset-data";
+  | "reset-data"
+  /** Mastodon: move to a deployment of another size, data and all. */
+  | "resize";
 
 export async function postFleetAction(
   launchId: string,
@@ -425,6 +458,7 @@ export async function postFleetAction(
     archiveDir?: string;
     validate?: boolean;
     endHeight?: number;
+    size?: "small" | "standard";
   } = {},
 ): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
@@ -544,7 +578,7 @@ export async function postDomainUpdate(
 /** Add a service component to a running fleet (add-component op). */
 export async function postAddComponent(
   launchId: string,
-  body: { key: string; domain?: string; image?: string; paths?: unknown[] },
+  body: { key: string; domain?: string; image?: string; paths?: unknown[]; settings?: Record<string, unknown> },
 ): Promise<{ status: string; opId: number }> {
   return json(
     await afetch(`/api/fleet/${launchId}/components`, {
@@ -557,7 +591,9 @@ export async function postAddComponent(
 
 /** The relayer's address per chain and the channels its last link opened. */
 export interface RelayerState {
-  chains: Array<{ chainId: string; address: string; launchId?: string }>;
+  /** balance/cap: the key's gas balance at the last link, and the most it
+   *  should hold (the key sits on the relayer's provider). */
+  chains: Array<{ chainId: string; address: string; launchId?: string; balance?: string; denom?: string; cap?: string }>;
   channels: Array<{
     id: string;
     port: string;
@@ -566,10 +602,41 @@ export interface RelayerState {
     b: { chain: string; channel: string };
   }>;
   linkedAt: string;
+  /** Federation peers' status on each chain (x/federation), once linked. */
+  peers?: Array<{ chainId: string; peerId: string; status: string; ibcChannelId?: string }>;
 }
 
 export async function getRelayerState(launchId: string): Promise<RelayerState> {
   return json(await afetch(`/api/fleet/${launchId}/relayer`));
+}
+
+/** A daemon's session grant (§5 session keys). */
+export interface SessionView {
+  role: "verifier" | "bridge" | string;
+  grantee: string;
+  granter: string;
+  chainId: string;
+  dseq: string;
+  createdAt: string;
+  expiresAt: string;
+  renewAt: string;
+  spendLimit: string;
+  maxExecCount: number;
+  pendingRevoke?: string[];
+}
+
+/** Rotate a daemon's session key now (sessions op); every one when no role. */
+export async function postRotateSessions(
+  launchId: string,
+  role?: "verifier" | "bridge",
+): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/sessions/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(role ? { role } : {}),
+    }),
+  );
 }
 
 /** Re-link the relayer (relink op), after a chain reset on either end. */
@@ -593,10 +660,21 @@ export async function postChainReset(
 }
 
 /** Live block height of a node's RPC (for a real-time indicator). */
+/** A chain node's height: its own RPC (`source: "node"`), or, for a
+ *  validator whose provider could not be reached, the chain's latest commit
+ *  read through a sentry, with whether the validator signed it. */
+export interface NodeHeight {
+  height: number;
+  catchingUp: boolean;
+  source?: "node" | "chain";
+  signed?: boolean;
+  providerError?: string;
+}
+
 export async function getComponentHeight(
   launchId: string,
   dseq: string,
-): Promise<{ height: number; catchingUp: boolean }> {
+): Promise<NodeHeight> {
   return json(await afetch(`/api/fleet/${launchId}/${dseq}/height`));
 }
 

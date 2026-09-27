@@ -22,6 +22,16 @@ export function renderComponentSdl(input: RenderComponentSdlInput): void {
   const rendered = descriptor(component.key).render(input);
   const pricing = { denom: PRICING_DENOM[spec.infra.akashNetwork], amount: 1000 };
   const names = Object.keys(rendered);
+  // a provider rejects the manifest otherwise ("zero global services"), and
+  // only after the deployment is on chain and leased: catch it here
+  const global = names.some((n) =>
+    ((rendered[n]!.service as { expose?: Array<{ to?: Array<{ global?: boolean }> }> }).expose ?? []).some((e) =>
+      (e.to ?? []).some((t) => t.global),
+    ),
+  );
+  if (!global) {
+    throw new Error(`${component.key}: no service is exposed globally, and Akash providers refuse such a manifest`);
+  }
   const sdl = {
     version: "2.0",
     services: Object.fromEntries(names.map((n) => [n, rendered[n]!.service])),

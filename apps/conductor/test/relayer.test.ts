@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
-import { testnetSpec, type LaunchSpec, type RelayerPath } from "@sparkdream/launch-spec";
+import { chainId, testnetSpec, validateSpec, type LaunchSpec, type RelayerPath } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
 import { allSteps } from "../src/index.js";
@@ -19,6 +19,7 @@ import {
 } from "../src/relayer.js";
 import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
+import { chainStub, withStub } from "./chain-stub.js";
 
 const tmpDirs: string[] = [];
 function tmp(): string {
@@ -64,6 +65,15 @@ function spec(name: string, headscale: Record<string, unknown>, paths: RelayerPa
 async function launch(db: ConductorDb, work: string, services: ReturnType<typeof fakeServices>, id: string, s: LaunchSpec) {
   db.createLaunch(id, JSON.stringify(s), "akash1owner");
   return runWithSigner(db, id, s, work, allSteps(), services, new FakeSigner());
+}
+
+/** The forwarded RPC the conductor reaches a node through (fake provider). */
+async function nodeRpcUrlFor(services: ReturnType<typeof fakeServices>, row: { host_uri: string; dseq: string }): Promise<string> {
+  const status = (await services.provider.leaseStatus({} as never, row.host_uri, row.dseq, 1, 1)) as any;
+  for (const list of Object.values(status?.forwarded_ports ?? {}) as any[]) {
+    for (const fp of list) if (fp.port === 26657) return `http://${fp.host}:${fp.externalPort}`;
+  }
+  throw new Error("no forwarded RPC");
 }
 
 function explain(db: ConductorDb, id: string): string {
@@ -213,21 +223,63 @@ describe("relayer launch", () => {
     db.close();
   }, 120_000);
 
-  it("pauses with the address to fund when a counterparty key cannot pay gas, then links", async () => {
+  it("pauses with the address and a capped amount to fund when a counterparty key cannot pay gas, then links", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
     services.ssh.unfundedChains.add("osmo-test-5");
-    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    const capped: RelayerPath = { ...osmosis, counterparty: { ...osmosis.counterparty, maxBalance: "2000000" } as any };
+    const s = spec("sparkdream", { domain: "hs.example" }, [capped]);
     const paused = await launch(db, work, services, "fl", s);
     expect(paused.status).toBe("awaiting-user");
-    expect(paused.reason).toMatch(/osmo-test-5: send uosmo to osmo1[0-9a-z]+/);
+    // ~1000 relay txs of gas would be 7500000 uosmo: the cap wins
+    expect(paused.reason).toMatch(/osmo-test-5: send about 2000000 uosmo to osmo1[0-9a-z]+ \(cap 2000000\)/);
+    expect(paused.reason).toMatch(/sits on the relayer's provider/);
     expect(services.ssh.relayOpens).toBe(0);
 
     services.ssh.unfundedChains.clear();
     const done = await runWithSigner(db, "fl", s, work, allSteps(), services, new FakeSigner());
     if (done.status !== "completed") throw new Error(explain(db, "fl"));
     expect(services.ssh.relayOpens).toBe(1);
+    // the fleet panel gets each key's balance against its cap
+    const state = JSON.parse(fs.readFileSync(relayerStatePath(work, "fl"), "utf8")) as RelayerLinkOutput;
+    expect(state.chains[0]).toMatchObject({ balance: "1000000", cap: "100000000" });
+    expect(state.chains[1]).toMatchObject({ chainId: "osmo-test-5", cap: "2000000" });
+    db.close();
+  }, 120_000);
+
+  it("refuses a genesis balance above the relayer's cap, and warns that the key is hot", () => {
+    const over = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    over.topology.components.relayer!.genesisBalance = "500000000";
+    const res = validateSpec(over);
+    expect(res.errors.map((e) => e.path)).toContain("topology.components.relayer.genesisBalance");
+    const ok = validateSpec(spec("sparkdream", { domain: "hs.example" }, [osmosis]));
+    expect(ok.errors).toEqual([]);
+    expect(ok.warnings.find((w) => w.path === "topology.components.relayer")?.message).toMatch(/hot key/);
+  });
+});
+
+describe("relayer day-2", () => {
+  it("reports hermes' own state, and a chain reset queues a relink behind it", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    const result = await launch(db, work, services, "fl", s);
+    if (result.status !== "completed") throw new Error(explain(db, "fl"));
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+
+    const { relayer: descriptor } = await import("../src/components/relayer.js");
+    const probe = descriptor.probe!;
+    expect(probe.verdict("relaying\n")).toEqual({ healthy: true, detail: "hermes relaying" });
+    expect(probe.verdict("unlinked")).toMatchObject({ healthy: true });
+    expect(probe.verdict("down")).toMatchObject({ healthy: false });
+
+    const opId = await fleet.requestChainReset(db.getLaunch("fl")!, JSON.parse(db.getLaunch("fl")!.spec_json));
+    const ops = db.listFleetOps("fl", "active");
+    expect(ops.map((o) => o.kind)).toEqual(["reset-chain", "relink"]);
+    expect(ops[0]!.id).toBe(opId);
     db.close();
   }, 120_000);
 });
@@ -262,7 +314,9 @@ describe("relayer between two fleets", () => {
       { fleet: "fleet-a" },
     ]);
     const ops = [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")];
-    const done = await runWithSigner(db, "fleet-b", specB, work, ops, services, new FakeSigner());
+    // the peer link signs on both chains through the chain CLI: a stub chain
+    const chain = chainStub();
+    const done = await withStub(chain, () => runWithSigner(db, "fleet-b", specB, work, ops, services, new FakeSigner()));
     if (done.status !== "completed") throw new Error(explain(db, "fleet-b"));
     expect(db.listFleetOps("fleet-b").find((o) => o.kind === "add-component")!.status).toBe("done");
 
@@ -286,6 +340,19 @@ describe("relayer between two fleets", () => {
     const relayer = db.listFleetComponents("fleet-b").find((c) => c.key === "relayer")!;
     const config = services.ssh.files.get(`${relayer.ssh_host}:${relayer.ssh_port}|/data/relayer/config.toml`)!;
     expect(config).toContain("['federation', 'channel-0'], ['transfer', 'channel-1']");
+    // federation: each chain registered the other on the relayer's channels,
+    // with the transfer channel for voucher metadata, and activated it
+    const chains = Object.values(chain.state().chains);
+    const peerOn = (id: string) => chains.map((c) => c.peers[id]).find(Boolean);
+    const aOnB = peerOn(chainId(specA))!;
+    const bOnA = peerOn(chainId(specB))!;
+    expect(aOnB).toMatchObject({ status: "PEER_STATUS_ACTIVE", ibc_channel_id: "channel-0", ibc_transfer_channel_id: "channel-1" });
+    expect(bOnA).toMatchObject({ status: "PEER_STATUS_ACTIVE", ibc_channel_id: "channel-0", ibc_transfer_channel_id: "channel-1" });
+    // each side signed with its own fleet's launcher-held founder key
+    expect(new Set(chain.state().log.map((l) => l.from))).toEqual(new Set(["acct-founder"]));
+    expect(new Set(chain.state().log.map((l) => l.node)).size).toBe(2);
+    expect(state.peers?.map((p) => p.status)).toEqual(["PEER_STATUS_ACTIVE", "PEER_STATUS_ACTIVE"]);
+
     // the relayer's account is listed with the fleet's generated accounts
     expect(fleet.accounts(db.getLaunch("fleet-b")!).find((x) => x.name === "relayer")).toMatchObject({
       hasMnemonic: true,
@@ -317,15 +384,24 @@ describe("relayer between two fleets", () => {
     // relink reuses every open channel: nothing reopened, hermes restarted
     const opens = services.ssh.relayOpens;
     fleet.requestRelink(db.getLaunch("fleet-b")!);
-    const relinked = await runWithSigner(
-      db,
-      "fleet-b",
-      specB,
-      work,
-      [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
-      services,
-      new FakeSigner(),
+    // fleet A's sentry moved above, and its RPC with it; the chain did not
+    const aNode = Object.entries(chain.state().chains).find(([, c]) => c.peers[chainId(specB)])![0];
+    const aRpc = await nodeRpcUrlFor(services, sentryA2);
+    chain.edit((st) => (st.aliases = { [aRpc]: aNode }));
+    const txsBefore = chain.state().log.length;
+    const relinked = await withStub(chain, () =>
+      runWithSigner(
+        db,
+        "fleet-b",
+        specB,
+        work,
+        [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
+        services,
+        new FakeSigner(),
+      ),
     );
+    // peers already active: the relink's peer pass sends nothing
+    expect(chain.state().log).toHaveLength(txsBefore);
     expect(relinked.status).toBe("completed");
     expect(services.ssh.relayOpens).toBe(opens);
     expect(

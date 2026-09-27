@@ -1,7 +1,7 @@
 {
   "name": "sparkdream-launcher",
   "private": true,
-  "version": "1.0.10",
+  "version": "1.0.11",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
@@ -17,7 +17,7 @@
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "dev": "pnpm --parallel -r dev",
-    "start": "pnpm -r build && node apps/conductor/dist/main.js",
+    "start": "pnpm -r build && DATA_DIR=${DATA_DIR:-apps/conductor/data} node apps/conductor/dist/main.js",
     "sync-vendor": "bash scripts/sync-vendor.sh",
     "seed-chain-assets": "pnpm --filter @sparkdream/conductor exec tsx src/chain-assets/seed.ts",
     "sync-releases": "pnpm --filter @sparkdream/conductor exec tsx src/chain-assets/sync-releases.ts"

@@ -1,7 +1,7 @@
 import { z, ZodError } from "zod";
 import { fromBase64, fromBech32 } from "@cosmjs/encoding";
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
-import { chainId, deriveDreamDenom } from "./derive.js";
+import { chainId, deriveDreamDenom, mastodonStreamingDomain } from "./derive.js";
 import { COMPONENT_KEYS, COMPONENT_KINDS, componentDomain } from "./components.js";
 import { profiles } from "./profiles.js";
 import { VENDORED_CHAIN_VERSION } from "./vendor-info.js";
@@ -663,12 +663,91 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         }
       }
     });
-    if (mainnet) {
-      warn(
-        "topology.components.relayer",
-        "the relayer's key is a hot key held by the launcher and the relayer container — fund it with gas money only",
+    if (BigInt(relayer.genesisBalance) > BigInt(relayer.maxBalance)) {
+      err(
+        "topology.components.relayer.genesisBalance",
+        `${relayer.genesisBalance} is above the relayer's maxBalance (${relayer.maxBalance}): ` +
+          "the key lives on the relayer's provider, so fund it with gas money only",
       );
     }
+    warn(
+      "topology.components.relayer",
+      "the relayer's key is a hot key: it sits on the relayer's provider (Hermes cannot sign through a " +
+        "session key), so anything it holds on any chain is at that provider's mercy. Fund each chain " +
+        "with gas money only, and top up rather than pre-fund",
+    );
+  }
+
+  // Mastodon: the owner account is the only way in, and the bridge talks to
+  // the chain through the public api domain
+  const masto = comps.mastodon;
+  if (masto?.enabled) {
+    if (!masto.owner) {
+      err("topology.components.mastodon.owner", "an owner (username + email) is required: it is the instance's only way in");
+    }
+    if (!spec.images.mastodonStreaming) {
+      err("images.mastodonStreaming", "image is required when mastodon is enabled");
+    }
+    if (!masto.smtp) {
+      warn(
+        "topology.components.mastodon.smtp",
+        "no SMTP relay: confirmation emails are never sent, so people who sign up cannot confirm their address",
+      );
+    } else if (!/@/.test(masto.smtp.fromAddress)) {
+      err("topology.components.mastodon.smtp.fromAddress", "must contain an email address");
+    }
+    if (masto.bridge?.enabled) {
+      if (!pub?.api) {
+        err(
+          "topology.publicEndpoints.api",
+          "the mastodon bridge broadcasts through the chain's public api domain — set publicEndpoints.api",
+        );
+      }
+      if (!spec.images.sdap) err("images.sdap", "image is required when the mastodon bridge is enabled");
+      warn(
+        "topology.components.mastodon.bridge",
+        "anchored posts stay unverified until an independent verifier (sdapverify, on another host and " +
+          "account with a federation-verifier bond) runs against this chain",
+      );
+    }
+  }
+
+  // Verifier: checks here are the ones this spec can answer; a fleet target
+  // is resolved, and its account checked, by the conductor
+  const verifier = comps.verifier;
+  if (verifier?.enabled) {
+    if (Boolean(verifier.account) === Boolean(verifier.wallet)) {
+      err(
+        "topology.components.verifier",
+        "set exactly one of verifier.account (a launcher-generated member) or verifier.wallet (a member address whose key stays in your wallet)",
+      );
+    }
+    if (!verifier.target && verifier.wallet && !verifier.wallet.startsWith(`${spec.network.bech32Prefix}1`)) {
+      err("topology.components.verifier.wallet", `"${verifier.wallet}" is not a ${spec.network.bech32Prefix} address`);
+    }
+    if (!verifier.target) {
+      const acct = spec.accounts.initial.find((a) => a.name === verifier.account);
+      const trust = acct && typeof acct.member === "object" ? acct.member.trustLevel : undefined;
+      if (!verifier.account) {
+        // a wallet member's standing is checked on chain, when it bonds
+      } else if (!acct?.generate) {
+        err("topology.components.verifier.account", `"${verifier.account}" must be a generated account in accounts.initial (the launcher signs as it)`);
+      } else if (!trust || !["established", "trusted", "core"].includes(trust)) {
+        err("topology.components.verifier.account", `"${verifier.account}" must be a member with trustLevel established or above`);
+      }
+      if (!pub?.api) err("topology.publicEndpoints.api", "the verifier reads and broadcasts through the public api domain");
+      if (!verifier.peers?.length && !comps.mastodon?.enabled) {
+        err("topology.components.verifier.peers", "name the ActivityPub peers to verify (there is no Mastodon here to default to)");
+      }
+    }
+    warn(
+      "topology.components.verifier",
+      verifier.wallet
+        ? "the verifier runs on its own deployment and provider as your member account, but you also run the " +
+            "bridge: host independence only. A verifier run by another member is the independent one"
+        : "the verifier runs on its own deployment and provider, but the same wallet and launcher hold its key and " +
+            "the bridge's: host independence only. A verifier run by another member is the independent one",
+    );
   }
 
   if ((pub?.api || pub?.rpc) && S === 0) {
@@ -701,6 +780,7 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       comps[key]?.enabled ? componentDomain(spec, key) : undefined,
     ]),
     ["topology.components.hub.domain", comps.hub.enabled ? comps.hub.domain : undefined],
+    ["topology.components.mastodon.streamingDomain", mastodonStreamingDomain(spec)],
     ["topology.publicEndpoints.api", pub?.api],
     ["topology.publicEndpoints.rpc", pub?.rpc],
     ["topology.headscale.domain", spec.topology.headscale.domain],

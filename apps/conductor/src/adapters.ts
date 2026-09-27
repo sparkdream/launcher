@@ -327,8 +327,9 @@ export class DirectProviderGateway implements ProviderGateway {
     oseq: number,
     service: string,
     cmd: string[],
+    opts?: { timeoutMs?: number },
   ) {
-    return new ProviderClient(creds).shellExec(hostUri, dseq, gseq, oseq, service, cmd);
+    return new ProviderClient(creds).shellExec(hostUri, dseq, gseq, oseq, service, cmd, opts);
   }
 
   leaseLogs(

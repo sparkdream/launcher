@@ -1,3 +1,4 @@
+import { descriptorFor } from "../components/index.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -677,10 +678,14 @@ export const collectBidsStep: StepDef = {
         // console-air-style: gather a fuller bid set before the policy engine picks
         settleRounds: 2,
       });
+      // a kind that must keep off a host placed earlier in this batch (the
+      // verifier off the Mastodon it checks)
+      const assigned = Object.fromEntries(Object.entries(perNode).map(([k, a]) => [k, a.provider]));
+      const kindAvoid = descriptorFor(key)?.avoidProviders?.({ db: ctx.db, launchId: ctx.launchId, spec: ctx.spec, assigned }) ?? [];
       let decision = selectProvider(bids.filter((b) => b.bid.state === "open"), {
         policy,
         chosenProviders: stateless.has(key) ? new Set<string>() : chosen,
-        avoidProviders,
+        avoidProviders: kindAvoid.length ? new Set([...avoidProviders, ...kindAvoid]) : avoidProviders,
         excludeMatchers: exclusionEntries(ctx.spec, key),
         log: ctx.log,
         requiredStorageClass: entry.requiredStorageClass,

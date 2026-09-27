@@ -905,9 +905,29 @@ chain given by its endpoints.
   Endpoint counterparties are dialed directly, so their gRPC must be public.
 - **Keys and gas.** One mnemonic (`relayer` in `mnemonics.json`) gives an
   address on every chain, each with its own prefix and HD path. The own-chain
-  address is funded in genesis (`genesisBalance`). Any other chain's key is
-  funded by the operator: the link step pauses (AwaitUser) and names each
-  unfunded chain's address and gas denom, then resumes.
+  address is funded in genesis (`genesisBalance`, 25 SPARK by default). Any
+  other chain's key is funded by the operator: the link step pauses
+  (AwaitUser) and names each unfunded chain's address and gas denom, then
+  resumes.
+- **Funds at risk, and the cap.** Hermes signs with a raw key and cannot use
+  an x/session key, so the relayer's key is on its provider and whatever it
+  holds on any chain is at that provider's mercy. The launcher keeps it to gas
+  money:
+  - `relayer.maxBalance` (100 SPARK by default) caps every Spark Dream chain;
+    an endpoint counterparty sets its own `maxBalance`.
+  - validate-spec refuses a `genesisBalance` above the cap and always warns
+    that the key is hot.
+  - The funding pause asks for about 1000 relay transactions of gas (300k
+    gas each at the chain's gas price), never more than the cap.
+  - Each link records every key's balance against its cap in `state.json`,
+    and logs a warning for a balance above it. The fleet panel's "channels"
+    view flags it as OVER CAP.
+  - Between sister Spark Dream chains the chain refunds relay fees (chain
+    repo `app/relayrefund`, from the release after v1.0.43). A successful,
+    non-redundant relay on an ACTIVE federation peer's federation or transfer
+    channel gets its fee back, so the key's balance there works as a float
+    and stays level. External chains and standalone client refreshes still
+    cost gas, so the cap matters most for those.
 - **Link** (launch step `link-relayer`, the relayer's `configureSteps` after
   every placement, and op `relink`). The steps:
   1. Open the counterparty sentries' gRPC.
@@ -928,11 +948,272 @@ chain given by its endpoints.
   mesh-client pass also re-aims every other fleet's relayer that tunnels to it:
   env rewrite, update tx and manifest push, as for this fleet's own mesh
   components.
-- **Not done here: federation governance.** A federation channel carries
-  nothing until both chains register each other as peers (with
-  `ibc_transfer_channel_id` naming the transfer channel for voucher metadata)
-  and activate them by Operations Committee vote. That is a separate
-  peer-link step.
+- **Health.** The relayer has no domain, so the monitor probes the container
+  over SSH (descriptor `probe`): hermes running, not linked yet, or linked
+  with hermes down. A chain reset queues a `relink` op behind itself, since
+  it wipes every IBC object and re-keys the relayer's genesis account.
+
+### Federation peers (step `link-peers`)
+
+A federation channel carries nothing until each chain has registered the
+other as a peer, set a policy, and activated it. `link-peers` runs after
+`link-relayer` (in the launch, after every relayer placement, and in
+`relink`) and brings each federation path's peer to ACTIVE on both ends with
+`ensurePeerActive` (`apps/conductor/src/peering.ts`):
+
+1. `MsgRegisterPeer`: `ibc_channel_id` is that chain's end of the federation
+   channel, `ibc_transfer_channel_id` its end of a transfer path to the same
+   chain (voucher metadata is keyed on it), and `peer_identity` is the other
+   chain's `x/identity` record.
+2. `MsgUpdatePeerPolicy`, only when no policy was ever set, because it is
+   stored whole and a rewrite would clobber an operator's edits.
+   `deploy/relayer/setup_peers.sh`'s content types, 100/epoch, and
+   reputation on.
+3. `MsgResumePeer` needs the Commons Operations Committee *policy*: a
+   proposal (fee from `commons.params.proposal_fee`), the founder's yes vote
+   (early acceptance on a one-founder committee), and execution retried until
+   `min_execution_period` has passed. The proposal id is pinned to a file, so
+   a pause resumes the same proposal.
+
+Every stage is skipped when the chain already shows it done, so re-runs cost
+a few queries. A SUSPENDED peer is never resumed, since suspension is a
+deliberate committee act. A peer bound to another channel is logged and left
+alone, because rebinding is remove + re-register.
+
+**Who signs.** The launcher signs with a chain's founder key when it
+generated it (`accounts.initial` with `generate` and `council.founder`),
+through `sparkdreamd tx sign`/`broadcast` from that launch's master keyring.
+That covers the other fleet on a fleet-to-fleet path too. With no such key
+(an external founder, or a counterparty chain given by endpoints), the step
+pauses and writes the exact messages for that chain's committee to
+`<launch>/peering/`, then continues once the chain reports them done.
+
+### Mastodon (component `mastodon`)
+
+One deployment, so everything shares a provider and reaches each other by
+service name:
+
+- **`mastodon`:** web and sidekiq in one container, because an Akash
+  persistent volume belongs to one service and both write media.
+- **`streaming`:** the upstream streaming image, on its own ingress,
+  `streaming.<domain>` by default.
+- **`db` (postgres) and `redis`:** exposed only to the two Mastodon services.
+
+The domain is permanent, since ActivityPub ids embed it, so it is not
+retargetable.
+
+- **Image.** The chain repo's `Dockerfile-mastodon` is upstream v4.7.2 plus:
+  - `mastodon-run`, which takes over the root-owned media volume, waits for
+    postgres and redis, runs `rails db:prepare` (so an upgrade migrates
+    itself), then supervises puma and sidekiq as uid 991;
+  - an initializer that turns on `assume_ssl` under `SPARKDREAM_ASSUME_SSL`.
+    TLS ends at Cloudflare or the ingress, which forwards plain HTTP with
+    `X-Forwarded-Proto: http`, so stock `force_ssl` would redirect forever;
+  - `mastodon-bootstrap`, idempotent setup driven over lease-shell (the image
+    runs no sshd).
+
+  `test/federation/mastodon/image_smoke_test.sh` checks all of this behind
+  an http-only proxy.
+- **Secrets.** `SECRET_KEY_BASE`, OTP, VAPID (P-256, urlsafe base64),
+  Active Record encryption keys and the postgres password are generated in
+  the conductor into `secrets/mastodon.json` and rendered into the SDL env.
+  They are never regenerated: losing them locks every account out.
+- **Configure** (`configure-mastodon`, launch step or `configureSteps`):
+  1. Create the Owner (the launcher bypasses Mastodon's email MX check for
+     its own accounts only).
+  2. Keep the generated password, shown once in the accounts panel as
+     `mastodon-owner`.
+  3. Set the registrations mode.
+
+  Health checks and DNS gates cover both ingresses (descriptor `ingress`).
+
+**Size.** `mastodon.size` picks the resources: `small`, the default, is
+about 2.1 CPU, 3.6 GB RAM and a 10 GiB media volume, with one puma worker
+(`WEB_CONCURRENCY=1`, `MAX_THREADS=5`, `MALLOC_ARENA_MAX=2`) so web and sidekiq
+fit in 2 GiB. `standard` is about 4.25 CPU, 8.3 GB and 20 GiB of media. Akash
+cannot change a lease's resources, so moving between sizes means closing the
+component and adding it back: a fresh instance whose database starts empty.
+
+**Mail.** Without `mastodon.smtp` mail is written to disk and never sent, so
+people who sign up cannot confirm their address (validate-spec warns). With it,
+Mastodon sends through the relay: `server`, `port`, `login`, `fromAddress`,
+`security` (`starttls` on 587, `tls` on 465, or `none`) and `authMethod`. The
+password is accepted with the spec when the component is added or the launch
+is created, then moved into `secrets/mastodon.json` (`smtpPassword`) before
+the spec is stored, since specs are exported and shared.
+
+**Bridge** (`mastodon.bridge.enabled`, needs `publicEndpoints.api`).
+`sdapbridge` rides along as a `bridge` service that idles on
+`MASTODON_TOKEN=pending`. `link-bridge` then:
+
+1. Registers and activates the instance as a `PEER_TYPE_ACTIVITYPUB` peer
+   whose id is the domain, inbound `blog_post`/`blog_reply` only. That goes
+   through the same `ensurePeerActive`. The policy carries the spec's
+   `bridge.authors` (author curation: `allow`, default `["*"]`, and an
+   optional x/collect `collectionId`, both of which the chain requires an
+   author to pass). When the spec sets `bridge.authors`, those two fields are
+   `syncPolicy` fields: when the stored policy differs, the step rewrites
+   them and carries the rest of the policy over as the committee left it.
+   When it does not, a new peer starts at `["*"]` and the fields belong to
+   the community from then on (the frontend's peer policy form); the
+   launcher never rewrites them.
+2. Issues the `@bridge` account's token (`read write:follows`: the daemon
+   follows the admitted authors so their posts reach it).
+3. Has the `bridge-operator` key (master keyring, mnemonic in
+   `mnemonics.json`, genesis-funded on a new launch) bond
+   `service-type federation-bridge-activitypub` `min_bond_amount` via
+   `MsgRegisterBridge`. An unfunded operator pauses with its address.
+4. Delivers the token with one deployment update, after which the service
+   `exec`s the real daemon.
+5. Grants the daemon its session key (below). The operator's own key never
+   reaches the provider; the SDL carries only its address.
+
+Anchored posts still need a verifier (`sdapverify`, on another host and
+account): the `verifier` component below, or one run elsewhere.
+
+**Resize** (fleet row "resize…", op `mastodon-resize`). Akash fixes a
+deployment's resources (MsgUpdateDeployment changes only the manifest
+hash, and a provider refuses a manifest whose resources differ from the
+lease), so a new size is a new deployment, and its volumes start empty.
+The op carries the data across:
+
+1. `backup`: over lease-shell from the running deployment, `pg_dump -Fc`
+   of the database and a tar of `public/system` without the remote-media
+   cache, each streamed as base64. Kept encrypted with the secrets
+   (`secrets/backups/mastodon-<dseq>/`): the dump holds every account's
+   ActivityPub key and password hash. More than 256 MiB pauses: pushing
+   it back in chunks would take hours.
+2. `render`: the SDL at the new size.
+3. The relaunch steps (close, deploy, lease, manifest), preferring the
+   current provider rather than avoiding it, since staying keeps the
+   domains' DNS target. Moving pauses at the domain gate naming both
+   domains.
+4. `restore`, before anything configures the instance (which would
+   otherwise create a second owner and a new bridge token): lease-shell
+   has no usable stdin, so the dump goes up as base64 chunks appended
+   through the command (halved on a request-line refusal) and is checked
+   by digest; it restores into a scratch database, which replaces the
+   empty one in two back-to-back statements; the media is unpacked; then
+   Mastodon restarts, and `rails db:prepare` migrates the restored schema.
+   The spec records the new size here.
+5. Mastodon's configure steps, as after any placement.
+
+The instance is down from the close to the restart, and posts made
+between the backup and the close are not carried. Redis and the bridge's
+state file start over; both are caches. A plain relaunch of Mastodon
+warns that it leaves the data behind and points at resize.
+
+### Content verifier (component `verifier`)
+
+`sdapverify` (the `sdap` image) watches a chain through its public api. It
+re-fetches every post a bridge anchors there, and confirms or disputes the
+hash. A verifier's worth is independence from the bridge, so:
+
+- **Own deployment, other host.** It is its own deployment. Its
+  `avoidProviders` hook keeps it off whichever provider hosts the target's
+  Mastodon. At launch, placements are made in component order, so the
+  Mastodon's provider is known by then; at relaunch or add it comes from the
+  target's fleet row.
+- **Own identity.** It acts as a member (ESTABLISHED or above) of the
+  target chain, never the bridge operator, which the chain enforces with
+  `ErrSelfVerification`. Exactly one of:
+  - `verifier.account`: a launcher-generated member. The launcher bonds and
+    grants with its key, unattended.
+  - `verifier.wallet`: the address of a member whose key stays in the
+    user's wallet, for a chain whose members the launcher did not create
+    (a devnet whose ESTABLISHED members are its founders). The bond and
+    every session grant pause for that member's signature; the
+    `WalletRequest` names the member as `signer`, and the pause card
+    refuses to sign from another account. Before asking, the bond step
+    reads the member (`query rep get-member`) and explains a trust level
+    below ESTABLISHED or too little unlocked DREAM instead of asking for a
+    signature the chain would refuse.
+
+  Either way the daemon signs through a session key (below), and render
+  gets only the member's address. No key material goes in the spec or the
+  SDL.
+- **Target.** The target is this fleet, or another fleet of the same wallet
+  on this launcher (`verifier.target.fleet`). It is resolved to a launch id,
+  and its account checked, at launch creation and at add-component. Peers
+  default to the target's Mastodon domain.
+- **Bond.** `configure-verifier` (launch step, or `configureSteps` after a
+  placement) bonds `federation-verifier` with `MsgBondRole`, signed by that
+  member, topping up to `verifier.bond` (500 DREAM by default). A DREAM
+  shortfall pauses with the amount.
+
+The same wallet and launcher still hold both the bridge's and the verifier's
+keys, so this is host independence, not operator independence. validate-spec
+says so. A verifier run by another member remains the independent check.
+
+### Session keys for the daemons (`sessions.ts`, op `sessions`)
+
+`sdapverify` and `sdapbridge` run unattended on providers the user does not
+control. Their accounts' own keys stay in the launcher: the verifier's member
+key holds a DREAM bond and the bridge operator's key holds the service bond.
+Each daemon instead signs with an x/session SESSION_KEY grant from its
+account. The daemon wraps every message in `MsgExecSession`, and the account
+pays its fees from the grant's budget (chain repo `internal/sdaptx`, env
+`SDA_SESSION_KEY_FILE` + `SDA_GRANTER`).
+
+- **Scope.** Each grant allows one message: `MsgVerifyContent` for the
+  verifier, `MsgSubmitFederatedContent` for the bridge. It has a fee budget
+  (`session.spendLimit`, 25 SPARK by default) and the chain's exec cap. A
+  leaked key can send that one message until the budget, the cap or the
+  expiry runs out, or until the grant is revoked.
+- **Lifetime.** `session.days` defaults to 90 (30 on mainnet) and is capped by
+  the chain's `session.max_expiration`. New launches write that ceiling into
+  genesis (`chainParams.session.maxExpirationDays`, same defaults; the code
+  default is 7 days). On a chain with a shorter ceiling the grant is shorter
+  and simply renews more often.
+- **Grant** (`ensureSession`). A fresh 24-word key, then one tx signed
+  locally by the account: a 1-unit `MsgSend` creates the grantee's auth
+  account (`MsgCreateSession` does not, and a missing account cannot sign),
+  plus `MsgCreateSession`. The record goes in `secrets/sessions.json`
+  (encrypted like the other secrets) before delivery, so a failure retries
+  with the same key.
+- **Delivery.** Over lease-shell into `/data/session-key` on the daemon's
+  persistent volume, written atomically and handed to the image's `sdap`
+  user. The daemon re-reads the file before every tx, so rotation needs no
+  restart. Until a key is there, or while the chain rejects the grant as
+  missing, expired or spent, the daemon keeps polling and holds its work.
+- **Rotation.** A new key replaces the old one, and the old grant is revoked
+  only after the new key is in place. This happens when:
+  - there is no session yet;
+  - the chain lost the grant (a chain reset, an outside revoke);
+  - the daemon moved to another deployment (relaunch, re-add), since the old
+    provider keeps a copy of the old key;
+  - a third of the lifetime is left;
+  - two thirds of the budget or exec cap is used;
+  - the user asks (fleet panel "session key" button,
+    `POST /api/fleet/:id/sessions/rotate`).
+
+  A revoke that fails is kept in `pendingRevoke` and retried at the next
+  renewal.
+- **Unattended renewal.** Every monitor pass checks the local records
+  (`sessionsDue`); once an hour it also queries each grant on chain. When
+  something is due and no other op is running, the monitor queues a
+  `sessions` op and drives it. Only local signing is involved, so no wallet is
+  needed. A chain reset queues one behind itself. A daemon whose component
+  closed or was disabled has its grant revoked and its record dropped. The
+  launcher has to run at least once in every two-thirds of a lifetime (60 days
+  by default); a verifier or bridge left longer idles when its key expires,
+  and picks up again on the next renewal.
+- **A wallet member's grant** (`verifier.wallet`, `walletGrant`). The
+  launcher holds no key for the granter, so a grant or renewal pauses the
+  op for the member's signature. The new key is minted and recorded with
+  `pending: true` before the pause, and a resume that finds the grant on
+  chain delivers that key (an unsigned resume asks again for the same key,
+  until two thirds of its asked lifetime has passed). The revoke of the key
+  it replaces rides in the same transaction, so the daemon waits only
+  between the signature and the delivery. Renewal still starts on its own,
+  but it waits on the wallet: a pause every 60 days by default. When such a
+  daemon is retired, its grant cannot be revoked unattended; the record is
+  dropped with a log line naming the grant, which lapses at its expiry
+  unless revoked from the wallet.
+- **Image.** The sdap image starts as root only to hand `/data` to `sdap`
+  (a fresh Akash volume is root-owned), then drops privileges with
+  `su-exec`. That is why the SDLs pass the daemon as `args`, not `command`:
+  a `command` would replace the entrypoint.
 
 ### Node upgrades (day-2)
 
@@ -1024,6 +1305,20 @@ and tmkms keys its state per chain-id (the flow pauses before the resume
 until the user updates `chain_id` in tmkms.toml and the privval probe
 passes). Node keys, consensus keys, tailnet IPs, and SSH endpoints all
 survive.
+
+Components that set things up on the chain stay where they are, but what
+they set up does not survive: Mastodon's ActivityPub peer, its bridge
+operator's bond and this fleet's verifier's bond. The reset queues a
+`reconfigure` op behind itself that runs those kinds' `configureSteps` on
+the existing deployments (peer registration and activation, bridge bond,
+verifier bond, session keys; wallet pauses where the launcher holds no
+key), ahead of the `sessions` op. A relaunch would do the same but move
+the component, and Mastodon's database with it. The bridge operator's key
+is the one generated account kept across the rebuilt keyring: the running
+bridge's env names it as its granter, so `createNamedAccounts` keeps its
+mnemonic and `ensureBridgeOperatorKey` imports it back (`keys add
+--recover`, the mnemonic on stdin), and the new genesis funds the same
+address.
 
 ### Repair (day-2)
 

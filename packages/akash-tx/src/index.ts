@@ -199,3 +199,4 @@ export function mintActMsg(owner: string, coinsToBurn: { denom: string; amount: 
 export function launcherRegistry(): Registry {
   return new Registry([...defaultRegistryTypes, ...(akashProtoRegistry as any)]);
 }
+export * from "./sparkdream.js";

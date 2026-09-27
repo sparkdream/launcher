@@ -22,7 +22,7 @@
     "@fastify/websocket": "^11.2.0",
     "@sparkdream/akash-tx": "workspace:*",
     "@sparkdream/launch-spec": "workspace:*",
-    "@sparkdreamnft/sparkdreamjs": "^0.0.31",
+    "@sparkdreamnft/sparkdreamjs": "^0.0.43",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0",
     "js-yaml": "^4.1.0",

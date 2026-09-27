@@ -1,6 +1,6 @@
 import { sha256 } from "@cosmjs/crypto";
 import { toBech32 } from "@cosmjs/encoding";
-import { deriveDreamDenom, type LaunchSpec } from "@sparkdream/launch-spec";
+import { deriveDreamDenom, sessionMaxDays, type LaunchSpec } from "@sparkdream/launch-spec";
 
 /**
  * Cosmos SDK decimal string: 18 fractional digits. Pads the number's exact
@@ -484,6 +484,11 @@ export function applyChainParams(genesis: Json, spec: LaunchSpec): Json {
     if (s.slashFractionDoubleSign !== undefined)
       slashing.slash_fraction_double_sign = dec(s.slashFractionDoubleSign);
   }
+
+  // The daemons' session keys are renewed within this ceiling; the code
+  // default (7 days) would mean a re-grant every few days.
+  const session = app.session?.params as Json | undefined;
+  if (session) session.max_expiration = `${sessionMaxDays(spec) * 86_400}s`;
 
   // Legacy module some chains still carry; keep its denom consistent if present.
   const crisis = app.crisis as Json | undefined;

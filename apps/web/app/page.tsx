@@ -129,8 +129,13 @@ topology:
     # moves tokens (ICS-20); kind federation carries x/federation content to
     # a sister Spark Dream chain. A counterparty is another fleet on this
     # launcher (sharing this fleet's mesh) or any chain by its endpoints.
+    # The relayer's key sits on its provider (Hermes cannot use a session
+    # key): fund it with gas money only. maxBalance caps what the launcher
+    # asks for on Spark Dream chains; set one per endpoint chain too.
     # relayer:
     #   enabled: true
+    #   genesisBalance: "25000000"     # this chain, at genesis
+    #   maxBalance: "100000000"
     #   paths:
     #     - { id: sister, kind: federation, counterparty: { fleet: <launch id or network name> } }
     #     - id: osmosis
@@ -142,6 +147,46 @@ topology:
     #         bech32Prefix: osmo
     #         gasDenom: uosmo
     #         gasPrice: 0.025
+    #         maxBalance: "5000000"
+    # Mastodon instance (web + sidekiq, streaming, postgres, redis in one
+    # deployment). Its domain is permanent (ActivityPub ids embed it); DNS
+    # needs the domain and streaming.<domain>. The owner's password shows up
+    # in the fleet's accounts panel. bridge: anchor opted-in authors' posts on
+    # this chain (needs publicEndpoints.api; registers the instance as an
+    # ActivityPub peer and bonds a bridge operator, 1000 SPARK). The bridge
+    # signs through a session key; the operator's key stays here.
+    # mastodon:
+    #   enabled: true
+    #   domain: social.example.com
+    #   owner: { username: admin, email: you@example.com }
+    #   registrations: approved        # open | approved | none
+    #   size: small                    # small (~2 CPU, 3.6 GB) | standard (~4 CPU, 8 GB); fixed per deployment
+    #   # outgoing mail, so sign-ups can confirm their address; the password
+    #   # moves to the launcher's secret store when the component is added
+    #   smtp:
+    #     server: smtp.example.com
+    #     port: 587                    # security: starttls (587) | tls (465) | none
+    #     login: apikey
+    #     password: <relay password or API key>
+    #     fromAddress: "Mastodon <notifications@example.com>"
+    #   bridge: { enabled: true }
+    # Content verifier (sdapverify) for the bridge's anchored posts, on its
+    # own deployment and never on the Mastodon's provider. Acts as a member
+    # (ESTABLISHED+) of the target chain and bonds 500 DREAM as
+    # federation-verifier: account names a generated member (the launcher
+    # signs as it), or wallet gives a member address whose key stays in your
+    # wallet (the launcher pauses for your signature to bond and to grant or
+    # renew the session key). target: another fleet's chain (omit: this one);
+    # peers default to the target's Mastodon domain. It signs through a
+    # session key, renewed with a third of its lifetime left: session.days
+    # defaults to 90 (30 on mainnet), within the chain's
+    # chainParams.session.maxExpirationDays.
+    # verifier:
+    #   enabled: true
+    #   account: vera                  # or: wallet: <your member address>
+    #   # session: { days: 90, spendLimit: "25000000" }
+    #   # target: { fleet: <launch id or network name> }
+    #   # alarmWebhook: https://hooks.example.com/sdapverify
   # required when frontend is enabled — sentry-0 serves these domains:
   # publicEndpoints:
   #   api: api.example.com
@@ -1177,9 +1222,7 @@ export default function Page() {
     {},
   );
   // live sentry block heights, keyed by dseq, polled every 3s
-  const [liveHeights, setLiveHeights] = useState<
-    Record<string, { height: number; catchingUp: boolean }>
-  >({});
+  const [liveHeights, setLiveHeights] = useState<Record<string, import("../lib/api").NodeHeight>>({});
   // per-launch provider avoid/prefer lists, keyed by launchId
   const [providerPrefs, setProviderPrefs] = useState<
     Record<string, { avoid: string[]; prefer: string[]; names: Record<string, string> }>
@@ -1229,13 +1272,15 @@ export default function Page() {
       | "repair"
       | "force-redeploy"
       | "clear-halt-height"
-      | "reset-data",
+      | "reset-data"
+      | "resize",
     extra: {
       image?: string;
       components?: string[];
       amount?: string;
       haltHeight?: number;
       manualBid?: boolean;
+      size?: "small" | "standard";
     } = {},
   ) => {
     setError(null);
@@ -2218,6 +2263,61 @@ export default function Page() {
             :
           </span>
           <pre>{waitingStep.error}</pre>
+          {waitingStep.wallet && (
+            // a transaction the launcher holds no key for: the user's wallet signs it here
+            <div style={{ display: "grid", gap: 8 }}>
+              <div>
+                <b>{waitingStep.wallet.title}</b>
+                <div className="dim-note">
+                  Sign as {waitingStep.wallet.signerRole}
+                  {waitingStep.wallet.signer && (
+                    <>
+                      {" "}(<span className="mono">{waitingStep.wallet.signer}</span>)
+                    </>
+                  )}{" "}
+                  on {waitingStep.wallet.chain.chainName} (
+                  {waitingStep.wallet.chain.chainId}). Your wallet shows the transaction before
+                  anything is sent.
+                </div>
+                <ul style={{ margin: "4px 0 0 18px" }}>
+                  {waitingStep.wallet.msgs.map((m, i) => (
+                    <li key={i} className="mono">
+                      {String(m["@type"]).split(".").pop()}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <button
+                className="btn primary"
+                style={{ justifySelf: "start" }}
+                disabled={busy !== null}
+                onClick={async () => {
+                  const w = waitingStep.wallet;
+                  if (!launchId || !w) return;
+                  setBusy(`signing in your wallet: ${w.title}…`);
+                  setError(null);
+                  try {
+                    const { signWalletRequest } = await import("../lib/fleet-wallet");
+                    const { address, txHash } = await signWalletRequest(w);
+                    showToast(`signed by ${address.slice(0, 14)}…, tx ${txHash.slice(0, 10)}…; resuming`);
+                    await resumeLaunch(launchId);
+                  } catch (e) {
+                    setError(String(e));
+                  } finally {
+                    setBusy(null);
+                  }
+                }}
+              >
+                Sign with Keplr
+              </button>
+              {waitingStep.wallet.cli && (
+                <details>
+                  <summary className="dim-note">Key not in a browser wallet? Show the CLI commands</summary>
+                  <pre style={{ whiteSpace: "pre-wrap" }}>{waitingStep.wallet.cli}</pre>
+                </details>
+              )}
+            </div>
+          )}
           {awaitingSigner(waitingStep.name) && (
             <button className="btn" onClick={() => launchId && showTmkms(launchId)}>
               Show tmkms signer setup
@@ -2227,7 +2327,7 @@ export default function Page() {
             className="btn"
             onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
           >
-            I did it, resume
+            {waitingStep.wallet ? "Signed another way, resume" : "I did it, resume"}
           </button>
         </div>
       )}
@@ -3370,30 +3470,44 @@ export default function Page() {
                                   setError(`"${key}" is not one of: ${addable.join(", ")}`);
                                   return;
                                 }
-                                let domain: string | undefined;
-                                if (COMPONENT_KINDS[key].domain) {
-                                  domain = window.prompt(`Public domain for the ${COMPONENT_KINDS[key].label}:`)?.trim();
-                                  if (!domain) return;
-                                }
-                                // the relayer's paths are structured: take them from
-                                // the spec editor, as the domains button takes domains
-                                let paths: unknown[] | undefined;
-                                if (key === "relayer") {
+                                // kinds with structured settings (the relayer's paths,
+                                // mastodon's owner and bridge) take them from the spec
+                                // editor, as the domains button takes domains
+                                const structured = key === "relayer" || key === "mastodon" || key === "verifier";
+                                let settings: Record<string, unknown> | undefined;
+                                if (structured) {
                                   const edited = yaml.load(specText) as any;
-                                  paths = edited?.topology?.components?.relayer?.paths;
-                                  if (!Array.isArray(paths) || paths.length === 0) {
+                                  settings = edited?.topology?.components?.[key];
+                                  if ((!settings || typeof settings !== "object") && key === "verifier") {
+                                    // the common case needs one value: the member it acts as,
+                                    // whose wallet signs the bond and the session grant
+                                    const wallet = window
+                                      .prompt(
+                                        "Verifier member address (ESTABLISHED or above on this chain, not the bridge operator). " +
+                                          "Your wallet signs its 500 DREAM bond and the daemon's session key; its key never leaves the wallet:",
+                                      )
+                                      ?.trim();
+                                    if (!wallet) return;
+                                    settings = { enabled: true, wallet };
+                                  }
+                                  if (!settings || typeof settings !== "object") {
                                     setError(
-                                      "add topology.components.relayer.paths in the spec editor first (see the example spec), then add the relayer",
+                                      `add topology.components.${key} in the spec editor first (see the example spec), then add the ${COMPONENT_KINDS[key].label}`,
                                     );
                                     return;
                                   }
+                                }
+                                let domain = typeof settings?.domain === "string" ? (settings.domain as string) : undefined;
+                                if (COMPONENT_KINDS[key].domain && !domain) {
+                                  domain = window.prompt(`Public domain for the ${COMPONENT_KINDS[key].label}:`)?.trim();
+                                  if (!domain) return;
                                 }
                                 try {
                                   const { postAddComponent } = await import("../lib/api");
                                   await postAddComponent(f.launchId, {
                                     key,
                                     ...(domain ? { domain } : {}),
-                                    ...(paths ? { paths } : {}),
+                                    ...(settings ? { settings } : {}),
                                   });
                                   openLaunch(f.launchId); // surfaces the signing banner
                                 } catch (e) {
@@ -3864,6 +3978,29 @@ export default function Page() {
                                     {height.height.toLocaleString()}
                                     {height.catchingUp ? " (syncing)" : ""}
                                   </span>
+                                  {height.source === "chain" && (
+                                    // the provider could not reach into the node:
+                                    // this is the chain's latest commit, via a sentry
+                                    <span className="dim-note">
+                                      {" "}
+                                      (chain, via sentry
+                                      {height.signed === true
+                                        ? ": signed the latest block"
+                                        : height.signed === false
+                                          ? ": NOT in the latest commit"
+                                          : ""}
+                                      )
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                              {height?.source === "chain" && (
+                                <span title={height.providerError}>
+                                  provider API{" "}
+                                  <span className="v" style={{ color: "var(--amber-text)" }}>
+                                    unreachable
+                                  </span>
+                                  <span className="dim-note"> (logs, shell, restart and upload wait on the provider)</span>
                                 </span>
                               )}
                               {c.health && (
@@ -4043,6 +4180,51 @@ export default function Page() {
                                       upgrade…
                                     </button>
                                   )}
+                                  {(() => {
+                                    // the daemon in this component signs through a session key
+                                    const role = c.key === "verifier" ? "verifier" : c.key === "mastodon" ? "bridge" : undefined;
+                                    const session = role ? f.sessions?.find((x) => x.role === role) : undefined;
+                                    if (!role || !session) return null;
+                                    const days = Math.max(0, Math.floor((Date.parse(session.expiresAt) - Date.now()) / 86_400_000));
+                                    return (
+                                      <button
+                                        className={days <= 7 ? "btn amber" : "btn"}
+                                        title={
+                                          `The ${role} signs through a session key granted by ${session.granter}: scoped to its one message, ` +
+                                          `a fee budget of ${session.spendLimit}, expiring ${session.expiresAt}. The account's own key never ` +
+                                          `leaves this launcher. Renewed automatically from ${session.renewAt} while the launcher runs. ` +
+                                          "Click to see it, or to rotate it now (e.g. after a provider incident)."
+                                        }
+                                        onClick={async () => {
+                                          const ok = window.confirm(
+                                            [
+                                              `${role} session key`,
+                                              `  key (grantee):  ${session.grantee}`,
+                                              `  granted by:     ${session.granter} on ${session.chainId}`,
+                                              `  fee budget:     ${session.spendLimit}`,
+                                              `  expires:        ${session.expiresAt} (${days} days)`,
+                                              `  auto-renews:    ${session.renewAt} (the launcher must be running then)`,
+                                              ...(session.pendingRevoke?.length
+                                                ? [`  revoke pending: ${session.pendingRevoke.join(", ")}`]
+                                                : []),
+                                              "",
+                                              "Rotate it now? A new key is granted and delivered, then the old one is revoked. No wallet signature.",
+                                            ].join("\n"),
+                                          );
+                                          if (!ok) return;
+                                          try {
+                                            const { postRotateSessions } = await import("../lib/api");
+                                            await postRotateSessions(f.launchId, role);
+                                            openLaunch(f.launchId);
+                                          } catch (e) {
+                                            setError(String(e));
+                                          }
+                                        }}
+                                      >
+                                        session key ({days}d)
+                                      </button>
+                                    );
+                                  })()}
                                   {c.key === "relayer" && (
                                     <>
                                       <button
@@ -4054,14 +4236,30 @@ export default function Page() {
                                             const st = await getRelayerState(f.launchId);
                                             window.alert(
                                               [
-                                                "Relayer addresses (each pays gas on its chain):",
-                                                ...st.chains.map((ch) => `  ${ch.chainId}: ${ch.address}`),
+                                                "Relayer addresses (each pays gas on its chain). The key sits on the",
+                                                "relayer's provider: keep each balance to gas money, under its cap.",
+                                                ...st.chains.map((ch) => {
+                                                  const over = ch.balance && ch.cap && BigInt(ch.balance) > BigInt(ch.cap);
+                                                  const money = ch.balance
+                                                    ? ` holds ${ch.balance} ${ch.denom ?? ""}${ch.cap ? ` (cap ${ch.cap})` : ""}${over ? "  OVER CAP: move the excess out" : ""}`
+                                                    : "";
+                                                  return `  ${ch.chainId}: ${ch.address}${money}`;
+                                                }),
                                                 "",
                                                 "Channels:",
                                                 ...st.channels.map(
                                                   (ch) =>
                                                     `  ${ch.id} (${ch.port}): ${ch.a.chain}/${ch.a.channel} <-> ${ch.b.chain}/${ch.b.channel}`,
                                                 ),
+                                                ...(st.peers?.length
+                                                  ? [
+                                                      "",
+                                                      "Federation peers (content moves only when both ends are ACTIVE):",
+                                                      ...st.peers.map(
+                                                        (p) => `  on ${p.chainId}: ${p.peerId} ${p.status.replace("PEER_STATUS_", "")}`,
+                                                      ),
+                                                    ]
+                                                  : []),
                                                 "",
                                                 `Linked ${st.linkedAt}`,
                                               ].join("\n"),
@@ -4089,6 +4287,37 @@ export default function Page() {
                                         relink
                                       </button>
                                     </>
+                                  )}
+                                  {c.key === "mastodon" && (
+                                    <button
+                                      className="btn amber"
+                                      title="Move the instance to a deployment of another size, with its database and uploaded media. Akash cannot resize a running deployment, so this backs the data up, closes the old deployment, deploys the new size (preferring the same provider, so DNS stays put), restores, and restarts. The instance is down for several minutes."
+                                      onClick={() => {
+                                        const size = window.prompt(
+                                          "Resize Mastodon to which size?\n" +
+                                            "  small    ~2 CPU, ~3.6 GB RAM, 10 GiB media (a new community)\n" +
+                                            "  standard ~4 CPU, ~8 GB RAM, 20 GiB media",
+                                          "small",
+                                        )?.trim();
+                                        if (!size) return;
+                                        if (size !== "small" && size !== "standard") {
+                                          setError('size must be "small" or "standard"');
+                                          return;
+                                        }
+                                        const ok = window.confirm(
+                                          `Resize Mastodon to "${size}"?\n\n` +
+                                            "1. Its database and uploaded media are backed up to the launcher (encrypted).\n" +
+                                            "2. The current deployment is closed (one signature): the instance goes down.\n" +
+                                            "3. A new deployment at the new size is created and leased (signatures), on the same provider if it bids.\n" +
+                                            "4. The data is restored and Mastodon restarts; the bridge is re-linked.\n\n" +
+                                            "Posts made during the few minutes between the backup and the close are not carried over. " +
+                                            "If the new deployment lands on another provider, you will be asked to update the DNS records.",
+                                        );
+                                        if (ok) fleetAction(f.launchId, c.dseq, "resize", { size });
+                                      }}
+                                    >
+                                      resize…
+                                    </button>
                                   )}
                                   <button
                                     className="btn"

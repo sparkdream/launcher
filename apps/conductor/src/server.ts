@@ -59,11 +59,14 @@ import type {
   SshEndpoints,
 } from "./steps/phase-bcd.js";
 import type { SshTarget } from "./services.js";
+import { sessionRoles } from "./sessions.js";
+import { stashSmtpPassword } from "./components/mastodon-secrets.js";
 import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
 import { resolveRelayFleet } from "./relayer.js";
+import { resolveVerifierTarget } from "./verifier.js";
 import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
 import { prefillSpecFromGenesis } from "./genesis-prefill.js";
 import { joinSpecFromBundle } from "./join-prefill.js";
@@ -215,6 +218,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         deps.db.listCompletedLaunches().map(async (launch) => {
           await fleet.tick(launch.id).catch(() => {});
           await fleet.settleFleetTxs(launch.id).catch(() => {});
+          // daemon session keys renew unattended: local signing, no wallet
+          if (await fleet.sessionsDue(launch.id).catch(() => false)) {
+            if (fleet.requestSessions(launch) !== undefined) drive(launch.id, JSON.parse(launch.spec_json));
+          }
           broadcast({ type: "health", launchId: launch.id, health: deps.db.listComponentHealth(launch.id) });
         }),
       );
@@ -433,6 +440,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         });
       }
     }
+    // a verifier of another fleet's chain: resolve the reference to its
+    // launch id and check the account it will sign as
+    const verifier = spec.topology.components.verifier;
+    if (verifier?.enabled && verifier.target) {
+      try {
+        verifier.target.fleet = resolveVerifierTarget(
+          deps.db,
+          spec,
+          requestOwner(req, body.owner) ?? "",
+          verifier.target.fleet,
+        );
+      } catch (e) {
+        return reply.status(400).send({
+          error: "validation",
+          issues: [{ path: "topology.components.verifier.target.fleet", message: String(e instanceof Error ? e.message : e) }],
+        });
+      }
+    }
     if (deps.onAkash && spec.network.type === "mainnet") {
       // §2 security model: mainnet secrets do not belong on provider disk
       warnings.push({
@@ -442,6 +467,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
     }
     const id = randomUUID();
+    // secrets never live in the stored spec
+    stashSmtpPassword(launchDirs(deps.workRoot, id).secrets, spec);
     deps.db.createLaunch(id, JSON.stringify(spec), requestOwner(req, body.owner) ?? "");
     return reply.status(201).send({ id, warnings });
   });
@@ -461,6 +488,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         error: s.error,
         started_at: s.started_at,
         finished_at: s.finished_at,
+        // what a wallet must sign to get a waiting step going again
+        ...(s.status === "waiting" && s.wallet_json ? { wallet: JSON.parse(s.wallet_json) } : {}),
       })),
     };
   });
@@ -599,8 +628,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "repair"
         | "force-redeploy"
         | "clear-halt-height"
-        | "reset-data";
+        | "reset-data"
+        | "resize";
       confirm?: boolean;
+      /** resize (Mastodon): the size to move the instance to. */
+      size?: "small" | "standard";
       image?: string;
       components?: string[];
       amount?: string;
@@ -698,6 +730,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         const opId = await fleet.requestRelaunch(launch, component, { manualBid: picksBids });
         drive(launchId, spec);
         return { status: "relaunch-started", opId, manualBid: picksBids };
+      }
+      case "resize": {
+        if (body.size !== "small" && body.size !== "standard") {
+          return reply.status(400).send({ error: 'size must be "small" or "standard"' });
+        }
+        try {
+          const opId = await fleet.requestMastodonResize(launch, component, body.size);
+          drive(launchId, spec);
+          return { status: "resize-started", opId, size: body.size };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
       }
       case "upgrade": {
         if (!body.image) return reply.status(400).send({ error: "image required" });
@@ -1090,13 +1134,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const launch = deps.db.getLaunch(launchId);
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
-    const body = (req.body ?? {}) as { key?: string; domain?: string; image?: string; paths?: RelayerPath[] };
+    const body = (req.body ?? {}) as {
+      key?: string;
+      domain?: string;
+      image?: string;
+      paths?: RelayerPath[];
+      settings?: Record<string, unknown>;
+    };
     if (!body.key) return reply.status(400).send({ error: "key is required" });
     try {
       const opId = fleet.requestAddComponent(launch, body.key, {
         ...(body.domain ? { domain: body.domain } : {}),
         ...(body.image ? { image: body.image } : {}),
         ...(body.paths ? { paths: body.paths } : {}),
+        ...(body.settings ? { settings: body.settings } : {}),
       });
       // drive with the UPDATED spec — requestAddComponent just rewrote it
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
@@ -1129,6 +1180,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       const opId = fleet.requestRelink(launch);
       drive(launchId, JSON.parse(launch.spec_json));
       return { status: "relink-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // rotate the daemons' session keys now (sessions op): the fleet panel's
+  // "rotate" button, e.g. after a provider incident. Renewal is otherwise
+  // automatic (the monitor's sessionsDue).
+  app.post("/api/fleet/:launchId/sessions/rotate", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { role?: unknown };
+    if (body.role !== undefined && body.role !== "verifier" && body.role !== "bridge") {
+      return reply.status(400).send({ error: "role must be verifier or bridge" });
+    }
+    try {
+      const roles = body.role
+        ? [body.role as "verifier" | "bridge"]
+        : sessionRoles(withDefaults(JSON.parse(launch.spec_json)));
+      if (roles.length === 0) throw new Error("this fleet runs no daemon with a session key");
+      const opId = fleet.requestSessions(launch, roles);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "rotation-started", opId };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

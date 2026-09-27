@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -17,7 +18,21 @@ import {
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
 import { RELAYER_ACCOUNT, resolveRelayFleet } from "./relayer.js";
+import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
+import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
+
+/** The accounts-panel entry for the Mastodon instance's Owner. */
+const MASTODON_OWNER = "mastodon-owner";
 import { relayerStatePath, type RelayerLinkOutput } from "./steps/relayer-link.js";
+import {
+  grantHolds,
+  readSessions,
+  sessionChainLaunch,
+  sessionRoles,
+  sessionsDue,
+  sessionSummary,
+  type SessionRole,
+} from "./sessions.js";
 import type { ConductorDb, FleetComponentRow, FleetOpProgress, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
@@ -36,7 +51,7 @@ import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type Head
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import type { AddComponentParams, RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
+import type { AddComponentParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -148,6 +163,8 @@ export interface FleetView {
   /** Placements the launch itself is holding for a manual bid pick (§6.6).
    *  Op-made placements carry theirs on the op's params instead. */
   bidPicks: Array<{ key: string; dseq: string; bids: OfferedBid[] }>;
+  /** The daemons' session keys (§5 session keys): grants, never the keys. */
+  sessions: ReturnType<typeof sessionSummary>;
 }
 
 export interface FleetSummary {
@@ -215,7 +232,27 @@ export function describePendingTx(
   return { kind: "launch-step", origin: `the launch's ${step} step` };
 }
 
+/** A chain node's height, as the fleet panel shows it. `source: "node"` is
+ *  the node's own RPC; `"chain"` is the chain's view through a sentry, for a
+ *  validator whose provider could not be reached (`providerError`), with
+ *  `signed` telling whether it signed the latest commit. */
+export interface NodeHeight {
+  height: number;
+  catchingUp: boolean;
+  source: "node" | "chain";
+  signed?: boolean;
+  providerError?: string;
+}
+
+/** CometBFT consensus address (uppercase hex) of a base64 ed25519 pubkey. */
+export function consensusAddress(pubkeyBase64: string): string {
+  return createHash("sha256").update(Buffer.from(pubkeyBase64, "base64")).digest("hex").slice(0, 40).toUpperCase();
+}
+
 export class FleetService {
+  /** Last hourly on-chain look at each fleet's session grants. */
+  private readonly sessionChecks = new Map<string, number>();
+
   constructor(
     private readonly db: ConductorDb,
     private readonly services: Services,
@@ -354,6 +391,13 @@ export class FleetService {
    */
   private rpcUrlCache = new Map<string, { url: string | null; at: number }>();
 
+  /** dseq → the provider's last refusal of a validator's in-container probe,
+   *  so the UI's frequent polls go straight to the chain's view for a while
+   *  instead of each waiting out the provider's timeout. */
+  private providerDown = new Map<string, { error: string; at: number }>();
+  /** dseq → the height probe in flight: concurrent polls share it. */
+  private heightInflight = new Map<string, Promise<NodeHeight | null>>();
+
   /**
    * Current block height of a node's CometBFT RPC — a lightweight probe the
    * UI polls a few times a second for a live-updating indicator, separate
@@ -364,12 +408,19 @@ export class FleetService {
    * inside the container. The resolution is cached so we don't hit the
    * provider on every call.
    */
-  async componentHeight(
-    launch: LaunchRow,
-    component: FleetComponentRow,
-  ): Promise<{ height: number; catchingUp: boolean } | null> {
+  async componentHeight(launch: LaunchRow, component: FleetComponentRow): Promise<NodeHeight | null> {
     // only chain nodes have an RPC; headscale/explorer/frontend do not
     if (!/^(val|sentry)-/.test(component.key)) return null;
+    const inflight = this.heightInflight.get(component.dseq);
+    if (inflight) return inflight;
+    const probe = this.probeHeight(launch, component).finally(() => this.heightInflight.delete(component.dseq));
+    this.heightInflight.set(component.dseq, probe);
+    return probe;
+  }
+
+  private async probeHeight(launch: LaunchRow, component: FleetComponentRow): Promise<NodeHeight | null> {
+    const down = this.providerDown.get(component.dseq);
+    if (down && Date.now() - down.at < 60_000) return this.chainView(launch, component, down.error);
     let cached = this.rpcUrlCache.get(component.dseq);
     if (!cached || Date.now() - cached.at > 120_000) {
       let url: string | null = null;
@@ -392,7 +443,7 @@ export class FleetService {
     try {
       if (cached.url) {
         const s = await this.services.rpc.status(cached.url);
-        return { height: s.latestBlockHeight, catchingUp: s.catchingUp };
+        return { height: s.latestBlockHeight, catchingUp: s.catchingUp, source: "node" };
       }
       // No forwarded RPC (validators): read localhost RPC in-container via
       // the provider lease-shell DIRECTLY (~1s). NOT the SSH runner — its
@@ -409,9 +460,44 @@ export class FleetService {
       );
       const height = Number(/latest_block_height."?:?"?(\d+)/.exec(r.stdout)?.[1]);
       const catchingUp = /catching_up"?:?"?(\w+)/.exec(r.stdout)?.[1] === "true";
-      return Number.isFinite(height) ? { height, catchingUp } : null;
-    } catch {
+      this.providerDown.delete(component.dseq);
+      return Number.isFinite(height) ? { height, catchingUp, source: "node" } : null;
+    } catch (e) {
       this.rpcUrlCache.delete(component.dseq); // forwarded port / endpoint moved
+      // a validator the provider cannot reach into (its API down, the pod
+      // restarting) is not necessarily a validator that stopped: say what
+      // the chain shows of it instead of showing nothing
+      if (!component.key.startsWith("val-")) return null;
+      const error = String((e as Error)?.message ?? e).slice(0, 200);
+      this.providerDown.set(component.dseq, { error, at: Date.now() });
+      return this.chainView(launch, component, error);
+    }
+  }
+
+  /**
+   * A validator as the chain sees it, read through the fleet's sentry: the
+   * latest committed height, and whether this validator's signature is in
+   * that commit (its consensus address from generate-keys). For when its
+   * provider cannot run the in-container probe.
+   */
+  private async chainView(launch: LaunchRow, component: FleetComponentRow, providerError: string): Promise<NodeHeight | null> {
+    const url = await this.sentryRpcUrl(launch).catch(() => null);
+    if (!url) return null;
+    try {
+      const commit = JSON.parse(await this.services.rpc.getText(`${url}/commit`)) as any;
+      const header = commit.result?.signed_header ?? commit.signed_header;
+      const height = Number(header?.header?.height);
+      if (!Number.isFinite(height)) return null;
+      const pubkey = this.db.stepOutput<{ consensusPubkeys?: Record<string, string> }>(launch.id, "generate-keys")
+        ?.consensusPubkeys?.[component.key];
+      const address = pubkey ? consensusAddress(pubkey) : undefined;
+      const signatures: Array<{ validator_address?: string; block_id_flag?: number | string }> = header?.commit?.signatures ?? [];
+      // block_id_flag 2 = BLOCK_ID_FLAG_COMMIT: it signed this block
+      const signed = address
+        ? signatures.some((sig) => sig.validator_address === address && Number(sig.block_id_flag) === 2)
+        : undefined;
+      return { height, catchingUp: false, source: "chain", ...(signed === undefined ? {} : { signed }), providerError };
+    } catch {
       return null;
     }
   }
@@ -558,6 +644,7 @@ export class FleetService {
             dseq: p.dseq!,
             bids: JSON.parse(p.offers_json!) as OfferedBid[],
           })),
+        sessions: sessionSummary(launchDirs(this.workRoot, launch.id).secrets),
       });
     }
 
@@ -600,8 +687,13 @@ export class FleetService {
     const owner = launch.owner;
     const spec = this.spec(launch);
     const perDay = blocksPerDay(spec);
-    const componentDomains = new Map<string, string>(
-      serviceComponents(spec).flatMap((c) => (c.domain ? [[c.key, c.domain] as const] : [])),
+    // each public ingress a component serves, and the URL proving it does
+    const componentHealthUrls = new Map<string, string[]>(
+      serviceComponents(spec).flatMap((c) => {
+        const ingress = descriptorFor(c.key)?.ingress?.(spec);
+        if (ingress) return [[c.key, ingress.map((i) => i.healthUrl)] as const];
+        return c.domain ? [[c.key, [`https://${c.domain}/`]] as const] : [];
+      }),
     );
 
     // Every chain node's height, probed once up front, because no node's
@@ -702,13 +794,24 @@ export class FleetService {
                 return;
               }
             }
-          } else if (componentDomains.has(c.key)) {
-            // stateless components: HTTP 200 on the public domain (§5 step 21)
-            const url = `https://${componentDomains.get(c.key)}/`;
-            if (!(await this.services.rpc.httpOk(url))) {
-              this.db.setComponentHealth(
-                launchId, c.key, "unreachable", `${url} not answering`,
-              );
+          } else if (componentHealthUrls.has(c.key)) {
+            // service components: HTTP 200 on every public ingress (§5 step 21)
+            for (const url of componentHealthUrls.get(c.key)!) {
+              if (!(await this.services.rpc.httpOk(url))) {
+                this.db.setComponentHealth(
+                  launchId, c.key, "unreachable", `${url} not answering`,
+                );
+                return;
+              }
+            }
+          } else if (descriptorFor(c.key)?.probe && c.ssh_host) {
+            // domainless components: ask the container itself
+            const probe = descriptorFor(c.key)!.probe!;
+            const { stdout } = await this.services.ssh.exec(this.sshTargetFor(launch, c), probe.command, { quick: true });
+            const verdict = probe.verdict(stdout);
+            details.push(verdict.detail);
+            if (!verdict.healthy) {
+              this.db.setComponentHealth(launchId, c.key, "unreachable", details.join("; "));
               return;
             }
           }
@@ -795,6 +898,13 @@ export class FleetService {
               "component re-registers with a fresh preauth key, tailnet IPs can change, and a " +
               "tmkms signer must re-join with the new key the op shows at the end. The chain " +
               "signs nothing between the DNS flip and the signer repoint.",
+      );
+    } else if (component.key === "mastodon") {
+      warnings.push(
+        "relaunching Mastodon starts it on EMPTY volumes on another provider: its accounts, posts " +
+          "and uploaded media stay behind with the closed deployment, and the launcher creates a new " +
+          "owner account. To move the instance with its data (to change its size, or to leave a " +
+          "provider), use resize instead.",
       );
     } else if (component.key.startsWith("val-")) {
       warnings.push(
@@ -922,14 +1032,27 @@ export class FleetService {
     if (!(RELAYER_ACCOUNT in accounts) && RELAYER_ACCOUNT in mnemonics && relayer) {
       accounts[RELAYER_ACCOUNT] = relayer.address;
     }
-    return Object.entries(accounts).map(([name, address]) => ({
+    const out = Object.entries(accounts).map(([name, address]) => ({
       name,
       address,
       hasMnemonic: name in mnemonics,
     }));
+    // the Mastodon owner: its "address" is the handle, its secret the
+    // password the instance generated (captured once, at creation)
+    const masto = this.spec(launch).topology.components.mastodon;
+    const password = readMastodonSecrets(launchDirs(this.workRoot, launch.id).secrets)?.ownerPassword;
+    if (masto?.enabled && masto.owner && password) {
+      out.push({ name: MASTODON_OWNER, address: `@${masto.owner.username}@${masto.domain}`, hasMnemonic: true });
+    }
+    return out;
   }
 
   mnemonic(launch: LaunchRow, name: string): string {
+    if (name === MASTODON_OWNER) {
+      const password = readMastodonSecrets(launchDirs(this.workRoot, launch.id).secrets)?.ownerPassword;
+      if (!password) throw new Error("no Mastodon owner password recorded");
+      return password;
+    }
     const m = this.mnemonics(launch)[name];
     // external operators (§3) are addresses only — their keys never exist here
     if (!m) throw new Error(`no mnemonic stored for ${name}`);
@@ -1304,6 +1427,34 @@ export class FleetService {
     });
   }
 
+  /**
+   * Move the Mastodon instance to a deployment of another size, data and all
+   * (mastodonResizeSteps). The current provider is preferred rather than
+   * avoided, since staying keeps the domains' DNS target; the spec records
+   * the size only once the new deployment holds the restored data.
+   */
+  async requestMastodonResize(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    size: "small" | "standard",
+  ): Promise<number> {
+    if (component.key !== "mastodon") throw new Error("only the Mastodon component can be resized");
+    if (component.state !== "active") throw new Error(`mastodon is ${component.state}, not active`);
+    if (launch.status !== "completed") throw new Error("the launch has not finished");
+    const busy = this.db
+      .listFleetOps(launch.id, "active")
+      .some((o) => o.kind === "mastodon-resize" || (o.kind === "relaunch" && JSON.parse(o.params_json).key === "mastodon"));
+    if (busy) throw new Error("Mastodon is already being moved: finish or abort that op first");
+    const prefs = this.db.providerPrefs(launch.owner);
+    return this.db.createFleetOp(launch.id, "mastodon-resize", {
+      key: "mastodon",
+      generation: component.generation + 1,
+      avoidProviders: prefs.avoid.filter((p) => p !== component.provider),
+      preferProviders: [...new Set([component.provider, ...prefs.prefer])],
+      size,
+    } satisfies MastodonResizeParams);
+  }
+
   /** Joining the mesh mints a preauth key via headscale — impossible once the
    *  mesh is gone. A shared mesh (reuseFleet) has no headscale row here;
    *  check the owning fleet's. */
@@ -1329,6 +1480,50 @@ export class FleetService {
     return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as RelayerLinkOutput) : undefined;
   }
 
+  /**
+   * Whether the daemons' session keys need a "sessions" op (§5 session keys):
+   * a running daemon with no key, a moved one, a due renewal or a retired
+   * daemon's grant (local records, every pass), or a grant the chain no
+   * longer honours, spent or revoked or reset away (checked hourly).
+   */
+  async sessionsDue(launchId: string): Promise<boolean> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return false;
+    const spec = this.spec(launch);
+    const secrets = launchDirs(this.workRoot, launchId).secrets;
+    if (sessionsDue(this.db, launchId, secrets, spec)) return true;
+    const last = this.sessionChecks.get(launchId) ?? 0;
+    if (Date.now() - last < 3_600_000) return false;
+    this.sessionChecks.set(launchId, Date.now());
+    for (const [role, record] of Object.entries(readSessions(secrets))) {
+      const chainLaunch = this.db.getLaunch(sessionChainLaunch(spec, launchId, role as SessionRole));
+      const rpc = chainLaunch ? await this.sentryRpcUrl(chainLaunch) : null;
+      if (!rpc) continue;
+      const holds = await runWithAssets(resolveChainAssets(this.spec(chainLaunch!), this.workRoot), () =>
+        grantHolds(rpc, record),
+      ).catch(() => true); // an unanswered query is no reason to rotate
+      if (!holds) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Queue a "sessions" op: renew what is due, or rotate `force`'s roles now
+   * (the fleet panel's rotate button). The monitor's own requests step aside
+   * while any other op runs; a user's request says why it cannot start.
+   */
+  requestSessions(launch: LaunchRow, force: SessionRole[] = []): number | undefined {
+    const spec = this.spec(launch);
+    for (const role of force) {
+      if (!sessionRoles(spec).includes(role)) throw new Error(`this fleet runs no ${role} daemon`);
+    }
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      if (force.length > 0) throw new Error("another operation is in progress: rotate once it is done");
+      return undefined;
+    }
+    return this.db.createFleetOp(launch.id, "sessions", { force });
+  }
+
   /** Re-link an active relayer: reopen whatever a chain reset closed and
    *  restart Hermes on the current channels. */
   requestRelink(launch: LaunchRow): number {
@@ -1350,7 +1545,14 @@ export class FleetService {
   requestAddComponent(
     launch: LaunchRow,
     key: string,
-    opts: { domain?: string; image?: string; paths?: RelayerPath[] } = {},
+    opts: {
+      domain?: string;
+      image?: string;
+      paths?: RelayerPath[];
+      /** The kind's own settings (its spec toggle's fields: mastodon's owner
+       *  and bridge, ...), merged over what the stored spec has. */
+      settings?: Record<string, unknown>;
+    } = {},
   ): number {
     if (!isComponentKey(key)) throw new Error(`${key} is not a component kind this launcher can add`);
     // the launch's own steps must be through: a paused fleet op also takes the
@@ -1369,6 +1571,7 @@ export class FleetService {
     const comps = spec.topology.components as Record<string, Record<string, unknown> | undefined>;
     comps[key] = {
       ...comps[key],
+      ...(opts.settings ?? {}),
       enabled: true,
       ...(opts.domain ? { domain: opts.domain } : {}),
       ...(opts.paths ? { paths: opts.paths } : {}),
@@ -1378,6 +1581,15 @@ export class FleetService {
     // rejects a malformed path before anything is stored
     const parsed = withDefaults(spec as unknown as LaunchSpecInput);
     Object.assign(spec, parsed);
+    // a verifier: its target resolved and its account checked
+    const verifier = spec.topology.components.verifier;
+    if (key === "verifier" && verifier?.enabled) {
+      if (verifier.target) {
+        verifier.target.fleet = resolveVerifierTarget(this.db, spec, launch.owner, verifier.target.fleet, launch.id);
+      } else {
+        checkVerifierAccount(spec, spec);
+      }
+    }
     // fleet counterparties become launch ids, checked for reachability
     for (const p of spec.topology.components.relayer?.enabled ? spec.topology.components.relayer.paths : []) {
       if ("fleet" in p.counterparty) {
@@ -1388,6 +1600,8 @@ export class FleetService {
     if (errors.length > 0) {
       throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
     }
+    // secrets never live in the stored spec
+    stashSmtpPassword(launchDirs(this.workRoot, launch.id).secrets, spec);
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
     return this.db.createFleetOp(launch.id, "add-component", {
       key,
@@ -1922,9 +2136,35 @@ export class FleetService {
         ? proposed.images.sparkdreamd
         : undefined;
     this.db.setLaunchSpec(launch.id, JSON.stringify(proposed));
-    return this.db.createFleetOp(launch.id, "reset-chain", {
+    const opId = this.db.createFleetOp(launch.id, "reset-chain", {
       ...(image ? { image } : {}),
     } satisfies ResetChainParams);
+    // a reset wipes every IBC client, connection and channel (and re-keys
+    // the relayer's genesis account): relink once the chain is back. Ops run
+    // in creation order, so this one starts when the reset is done.
+    const relayer = this.db.listFleetComponents(launch.id).find((c) => c.key === "relayer");
+    if (relayer?.state === "active" && proposed.topology.components.relayer?.enabled) {
+      this.db.createFleetOp(launch.id, "relink", {});
+    }
+    // the reset wipes what components set up on the chain (Mastodon's peer
+    // and its bridge's bond, this fleet's verifier's bond): redo it on the
+    // deployments as they are, before the session grants below
+    const staying = new Set(
+      this.db.listFleetComponents(launch.id).filter((c) => c.state === "active").map((c) => c.key),
+    );
+    const comps = proposed.topology.components;
+    const reconfigure = [
+      ...(staying.has("mastodon") && comps.mastodon?.enabled && comps.mastodon.bridge?.enabled ? ["mastodon"] : []),
+      ...(staying.has("verifier") && comps.verifier?.enabled && !comps.verifier.target ? ["verifier"] : []),
+    ];
+    if (reconfigure.length > 0) {
+      this.db.createFleetOp(launch.id, "reconfigure", { keys: reconfigure } satisfies ReconfigureParams);
+    }
+    // the reset takes the daemons' session grants with it: grant new ones
+    // (a verifier watching this chain from another fleet finds out at the
+    // monitor's hourly grant check)
+    if (sessionRoles(proposed).length > 0) this.db.createFleetOp(launch.id, "sessions", { force: [] });
+    return opId;
   }
 
   /** Recent provider logs for a component (M5 logs viewer, REST poll). */

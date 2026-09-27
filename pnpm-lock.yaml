@@ -44,8 +44,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/launch-spec
       '@sparkdreamnft/sparkdreamjs':
-        specifier: ^0.0.31
-        version: 0.0.31(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
+        specifier: ^0.0.43
+        version: 0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
       better-sqlite3:
         specifier: ^11.7.0
         version: 11.10.0
@@ -141,6 +141,9 @@ importers:
 
   packages/akash-tx:
     dependencies:
+      '@cosmjs/encoding':
+        specifier: ^0.39.0
+        version: 0.39.0
       '@cosmjs/proto-signing':
         specifier: ^0.39.0
         version: 0.39.0
@@ -148,8 +151,8 @@ importers:
         specifier: ^0.39.0
         version: 0.39.0
       '@sparkdreamnft/sparkdreamjs':
-        specifier: ^0.0.31
-        version: 0.0.31(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
+        specifier: ^0.0.43
+        version: 0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
     devDependencies:
       typescript:
         specifier: ^5.6.0
@@ -1746,8 +1749,8 @@ packages:
   '@sinclair/typebox@0.24.51':
     resolution: {integrity: sha512-1P1OROm/rdubP5aFDSZQILU0vrLCJ4fvHt6EoqHEM+2D/G5MK3bIaymUKLit8Js9gbns5UyJnkP/TZROLw4tUA==}
 
-  '@sparkdreamnft/sparkdreamjs@0.0.31':
-    resolution: {integrity: sha512-TMMT/XqyqFuxckUZPIa/Q4Hpn59SDS52iscxYkLynAA7BwRAaxHBt0Yv4Xi2AfOw0WO2RQvmmXk1A/frlffkHg==}
+  '@sparkdreamnft/sparkdreamjs@0.0.43':
+    resolution: {integrity: sha512-QN6KfNLPUZU41Dk5t7NoE9GGuENFmG5SxrIr2Ffyc6dgFgnJlycX0mCHTKyUmRnxdkcq3UwR2aFF21MloFkayQ==}
 
   '@swc/helpers@0.5.15':
     resolution: {integrity: sha512-JQ5TuMi45Owi4/BIMAJBoSQoOJu12oOk/gADqlcUL9JEdHB8vyjUSsxqeNXnmXHjYKMi2WcYtezGEEhqUI/E2g==}
@@ -5530,7 +5533,7 @@ snapshots:
 
   '@sinclair/typebox@0.24.51': {}
 
-  '@sparkdreamnft/sparkdreamjs@0.0.31(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)':
+  '@sparkdreamnft/sparkdreamjs@0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)':
     dependencies:
       '@cosmjs/proto-signing': 0.39.0
       '@cosmjs/stargate': 0.39.0

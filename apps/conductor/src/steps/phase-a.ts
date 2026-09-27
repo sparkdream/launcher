@@ -12,7 +12,7 @@ import {
   type NodeRef,
 } from "@sparkdream/launch-spec";
 import type { StepCtx, StepDef } from "../engine.js";
-import { writeSecretFile } from "../secrets.js";
+import { readSecretFile, writeSecretFile } from "../secrets.js";
 import { sparkdreamd, run } from "../exec.js";
 import { generateAgeKeypair, generateSshKeypair } from "../keys.js";
 import {
@@ -39,6 +39,10 @@ import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
 import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress } from "../relayer.js";
+import { descriptor } from "../components/index.js";
+import { BRIDGE_OPERATOR } from "../components/mastodon-secrets.js";
+import { ensureBridgeOperatorKey } from "./mastodon.js";
+import { fleetResolver } from "../verifier.js";
 import {
   bakedModeError,
   chainAssetMode,
@@ -103,7 +107,7 @@ export const validateSpecStep: StepDef = {
     const images = [
       ctx.spec.images.sparkdreamd,
       ...(ctx.spec.topology.headscale.reuseFleet ? [] : [ctx.spec.images.headscale]),
-      ...serviceComponents(ctx.spec).map((c) => c.image),
+      ...serviceComponents(ctx.spec).flatMap((c) => descriptor(c.key).images?.(ctx.spec) ?? [c.image]),
     ];
     const missing = (
       await Promise.all(
@@ -280,10 +284,19 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
       mnemonics[`acct-${acct.name}`] = parsed.mnemonic;
     }
   }
+  // a chain reset rebuilds every account but the bridge operator's: the
+  // running bridge carries its address (SDA_GRANTER), so it keeps its key
+  const mnemonicsFile = path.join(dirs.secrets, "mnemonics.json");
+  const previous: Record<string, string> = fs.existsSync(mnemonicsFile) ? JSON.parse(readSecretFile(mnemonicsFile)) : {};
+  if (previous[BRIDGE_OPERATOR]) mnemonics[BRIDGE_OPERATOR] = previous[BRIDGE_OPERATOR];
   // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
-  writeSecretFile(path.join(dirs.secrets, "mnemonics.json"), JSON.stringify(mnemonics, null, 2));
+  writeSecretFile(mnemonicsFile, JSON.stringify(mnemonics, null, 2));
   // the relayer's key (cosmjs-derived: other chains need other prefixes, so
   // the keyring's single prefix cannot make it); funded in genesis
+  // the mastodon bridge's operator bonds with its own key; funded in genesis
+  if (spec.topology.components.mastodon?.enabled && spec.topology.components.mastodon.bridge?.enabled) {
+    accounts[BRIDGE_OPERATOR] = await ensureBridgeOperatorKey(dirs.secrets, masterHome(ctx));
+  }
   if (spec.topology.components.relayer?.enabled) {
     const mnemonic = await ensureRelayerMnemonic(dirs.secrets);
     accounts[RELAYER_ACCOUNT] = await relayerAddress(mnemonic, {
@@ -373,6 +386,11 @@ export async function buildGenesisFiles(
     );
   }
   // the relayer pays gas for every packet this chain's side submits
+  const bridgeOperator = keys.accounts[BRIDGE_OPERATOR];
+  const bridge = spec.topology.components.mastodon?.bridge;
+  if (bridgeOperator && spec.topology.components.mastodon?.enabled && bridge?.enabled) {
+    await addGenesisAccount(bridgeOperator, bridge.genesisBalance);
+  }
   const relayerAccount = keys.accounts[RELAYER_ACCOUNT];
   if (relayerAccount && spec.topology.components.relayer?.enabled) {
     await addGenesisAccount(relayerAccount, spec.topology.components.relayer.genesisBalance);
@@ -594,6 +612,9 @@ export const renderSdlsStep: StepDef = {
         outPath,
         placeholder,
         peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+        secretsDir: ctx.dirs.secrets,
+        resolveFleet: fleetResolver(ctx),
+        launchId: ctx.launchId,
       });
       written.push(outPath);
     }

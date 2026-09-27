@@ -152,6 +152,34 @@ export interface RelayChain {
   launchId?: string;
 }
 
+/** Relay transactions a suggested top-up covers: weeks of light traffic. */
+const TOPUP_TXS = 1_000;
+/** Gas of a typical relay tx (client update + one packet). */
+const RELAY_TX_GAS = 300_000;
+
+/**
+ * The most the relayer key should hold on `chain`, in its gas denom, if the
+ * spec bounds it: relayer.maxBalance for a Spark Dream fleet, the path's own
+ * maxBalance for a chain named by endpoints. The key sits on the relayer's
+ * provider, so this is what a compromised provider can take.
+ */
+export function relayerCap(spec: LaunchSpec, chain: Pick<RelayChain, "chainId" | "launchId">): bigint | undefined {
+  const relayer = spec.topology.components.relayer;
+  if (!relayer) return undefined;
+  if (chain.launchId) return BigInt(relayer.maxBalance);
+  for (const p of relayer.paths) {
+    const cp = p.counterparty;
+    if (!("fleet" in cp) && cp.chainId === chain.chainId && cp.maxBalance) return BigInt(cp.maxBalance);
+  }
+  return undefined;
+}
+
+/** A top-up worth asking for: ~1000 relay txs of gas, never above the cap. */
+export function suggestedTopUp(chain: Pick<RelayChain, "gasPrice">, cap: bigint | undefined): bigint {
+  const gas = BigInt(Math.ceil(chain.gasPrice * RELAY_TX_GAS * TOPUP_TXS));
+  return cap !== undefined && cap < gas ? cap : gas;
+}
+
 export interface RelayPlanPath {
   id: string;
   kind: RelayerPath["kind"];

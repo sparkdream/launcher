@@ -1,6 +1,6 @@
 import { headscaleDomain } from "@sparkdream/launch-spec";
 import { relayerTunnels } from "../relayer.js";
-import { linkRelayer } from "../steps/relayer-link.js";
+import { linkFederationPeers, linkRelayer } from "../steps/relayer-link.js";
 import type { ComponentDescriptor, RenderInput, SdlResources } from "./types.js";
 
 const resources: SdlResources = {
@@ -54,9 +54,22 @@ export const relayer: ComponentDescriptor = {
   tunnels: relayerTunnels,
   // its chain identities live in the Hermes config the link step uploads
   envRefresh: "none",
+  // hermes is PID-supervised by relayer-run only once linked: before that the
+  // container idles on purpose, after it a missing hermes is a real fault
+  probe: {
+    command: "pgrep -x hermes >/dev/null && echo relaying || (test -f /data/relayer/ready && echo down || echo unlinked)",
+    verdict(stdout) {
+      const state = stdout.trim().split("\n").pop() ?? "";
+      if (state === "relaying") return { healthy: true, detail: "hermes relaying" };
+      if (state === "unlinked") return { healthy: true, detail: "not linked yet (relink)" };
+      return { healthy: false, detail: "linked but hermes is not running" };
+    },
+  },
   // a fresh volume has no config, keys or ready marker: link it again
   // (bringup reuses the channels already open, so this is cheap)
   configureSteps: (name, spec) => [
     { name: name("link-relayer"), run: (ctx) => linkRelayer(ctx, name("link-relayer"), spec) },
+    // federation paths only: already-active peers are a few queries
+    { name: name("link-peers"), run: (ctx) => linkFederationPeers(ctx, name("link-peers"), spec) },
   ],
 };

@@ -350,3 +350,31 @@ describe("bid polling", () => {
     expect(bids.length).toBeGreaterThanOrEqual(2);
   });
 });
+
+describe("multi-service SDL group ids", () => {
+  // The provider pairs each manifest service with the deployment resource of
+  // the same id. chain-sdk numbers a group's services in sorted order, so the
+  // deployment must too: numbering in declaration order put the mastodon
+  // bridge's 0.25 CPU under the web service's id (422 "CPU resources mismatch").
+  it("gives every service the same resource id in the deployment and the manifest", () => {
+    const profile = (cpu: number, mem: string) => ({ resources: { cpu: { units: cpu }, memory: { size: mem }, storage: [{ size: "1Gi" }] } });
+    const sdl = {
+      version: "2.0",
+      services: {
+        web: { image: "example/web:1", expose: [{ port: 3000, as: 80, to: [{ global: true }] }] },
+        sidecar: { image: "example/sidecar:1" },
+      },
+      profiles: {
+        compute: { web: profile(2, "4Gi"), sidecar: profile(0.25, "256Mi") },
+        placement: { dcloud: { pricing: { web: { denom: "uakt", amount: 1000 }, sidecar: { denom: "uakt", amount: 100 } } } },
+      },
+      deployment: { web: { dcloud: { profile: "web", count: 1 } }, sidecar: { dcloud: { profile: "sidecar", count: 1 } } },
+    };
+    const a = sdlArtifacts(sdl as any);
+    const onChain = new Map(a.groups[0].resources.map((r: any) => [r.resource.id, r.resource.cpu.units.val]));
+    for (const svc of a.manifest[0].services) {
+      expect(onChain.get(svc.resources.id)).toBe(svc.resources.cpu.units.val);
+    }
+    expect(a.groups[0].resources.map((r: any) => r.resource.id)).toEqual([1, 2]);
+  });
+});

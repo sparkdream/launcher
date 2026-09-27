@@ -27,7 +27,7 @@ describe("withDefaults", () => {
     expect(spec.security.keyMode).toBe("softsign");
     expect(spec.images.sparkdreamd).toContain("-testnet-ssh:");
     expect(spec.infra.resources.validator.storage.persistent).toBe(true);
-    expect(spec.token.minGasPrice).toBe("25000");
+    expect(spec.token.minGasPrice).toBe("0.025");
     expect(spec.infra.sentrySettings.stateSync).toBe(false);
   });
 
@@ -1097,5 +1097,40 @@ describe("topology connectivity", () => {
       topology: { validators: { count: 2 }, sentries: { count: 1, mapping: [[0, 1]] } },
     });
     expect(topoErrors(covered)).toEqual([]);
+  });
+});
+
+describe("verifier member", () => {
+  // a verifier on this fleet: public api to read through, peers to check
+  const withVerifier = (verifier: Record<string, unknown>) =>
+    testnetSpec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+          verifier: { enabled: true, peers: ["mastodon.phoenix.example"], ...verifier },
+        },
+        publicEndpoints: { api: "api.phoenix.example", rpc: "rpc.phoenix.example" },
+        headscale: { domain: "hs.example" },
+      },
+    } as any);
+  const errorsAt = (spec: LaunchSpec, p: string) => validateSpec(spec).errors.filter((e) => e.path.startsWith(p));
+
+  it("accepts a wallet member: its standing is checked on chain when it bonds", () => {
+    expect(errorsAt(withVerifier({ wallet: SPARK_A }), "topology.components.verifier")).toEqual([]);
+  });
+
+  it("wants exactly one of account and wallet", () => {
+    expect(errorsAt(withVerifier({}), "topology.components.verifier").map((e) => e.message).join()).toMatch(/exactly one/);
+    expect(errorsAt(withVerifier({ wallet: SPARK_A, account: "vera" }), "topology.components.verifier").map((e) => e.message).join()).toMatch(
+      /exactly one/,
+    );
+  });
+
+  it("refuses a wallet address from another chain", () => {
+    expect(errorsAt(withVerifier({ wallet: COSMOS_A }), "topology.components.verifier.wallet")).toHaveLength(1);
   });
 });
