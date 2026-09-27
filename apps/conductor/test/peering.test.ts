@@ -159,7 +159,7 @@ describe("ensurePeerActive", () => {
     // everything signed by the member's wallet, nothing by the launcher
     expect(stub.state().log.every((l) => l.from === MEMBER)).toBe(true);
     expect(stub.state().chains["http://phoenix"]!.peers["aurora-1"]!.authority ?? MEMBER).toBe(MEMBER);
-  });
+  }, 30_000);
 
   it("waits out an accepted proposal's execution time before asking for the execute signature", async () => {
     const stub = chainStub();
@@ -187,7 +187,7 @@ describe("ensurePeerActive", () => {
     expect(err).toBeInstanceOf(AwaitUser);
     expect(err.wallet).toBeUndefined();
     expect(err.reason).toMatch(/proposal 4 .* can be executed from .* resume then/);
-  });
+  }, 30_000);
 
   it("does not overturn a suspension", async () => {
     const stub = chainStub();

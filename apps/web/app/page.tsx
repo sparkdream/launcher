@@ -1273,7 +1273,8 @@ export default function Page() {
       | "force-redeploy"
       | "clear-halt-height"
       | "reset-data"
-      | "resize",
+      | "resize"
+      | "bridge-peers",
     extra: {
       image?: string;
       components?: string[];
@@ -1281,6 +1282,7 @@ export default function Page() {
       haltHeight?: number;
       manualBid?: boolean;
       size?: "small" | "standard";
+      peers?: string[];
     } = {},
   ) => {
     setError(null);
@@ -4166,8 +4168,14 @@ export default function Page() {
                                           fee && fee.upgradeFlat > 0
                                             ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
                                             : "";
+                                        // Mastodon's deployment runs more than its web image: an
+                                        // image of another repository swaps the service running it
+                                        const sideNote =
+                                          c.key === "mastodon"
+                                            ? " The web image upgrades web + sidekiq; an sparkdreamnft/sdap image upgrades the bridge, and a mastodon-streaming image the streaming service, each on its own."
+                                            : "";
                                         const image = window.prompt(
-                                          `Upgrade ${c.key}:${feeNote}`,
+                                          `Upgrade ${c.key}:${sideNote}${feeNote}`,
                                           c.image ?? undefined,
                                         );
                                         if (image && image !== c.image)
@@ -4287,6 +4295,32 @@ export default function Page() {
                                         relink
                                       </button>
                                     </>
+                                  )}
+                                  {c.key === "mastodon" && (
+                                    <button
+                                      className="btn"
+                                      title="Other Mastodon servers whose authors the bridge anchors, each as a federation peer of its own. Each new one is registered and activated (a signature from a council or committee member), closed to every author until you curate it on the frontend, and bound to the bridge operator on its existing bond. For many servers under this instance's one peer instead, list them in the peer policy's content hosts on the frontend."
+                                      onClick={async () => {
+                                        try {
+                                          const current: string[] =
+                                            ((await getLaunch(f.launchId)).spec as any)?.topology?.components?.mastodon?.bridge?.peers?.map(
+                                              (p: { id: string }) => p.id,
+                                            ) ?? [];
+                                          const input = window.prompt(
+                                            "Other Mastodon servers to bridge as peers of their own (comma separated; empty for none).\n" +
+                                              "New servers start closed: open or curate their authors on the frontend's federation page.",
+                                            current.join(", "),
+                                          );
+                                          if (input === null) return;
+                                          const peers = input.split(/[,\s]+/).map((p) => p.trim()).filter(Boolean);
+                                          fleetAction(f.launchId, c.dseq, "bridge-peers", { peers });
+                                        } catch (e) {
+                                          setError(String(e));
+                                        }
+                                      }}
+                                    >
+                                      bridge peers…
+                                    </button>
                                   )}
                                   {c.key === "mastodon" && (
                                     <button

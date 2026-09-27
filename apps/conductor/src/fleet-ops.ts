@@ -2360,7 +2360,11 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         // (descriptor.envRefresh): patched in place so persist-start's
         // resolved tunnel targets survive, or re-rendered wholesale.
         refreshComponentEnv(ctx, spec, key, sdlPath);
-        setComponentImage(sdlPath, key, params.image);
+        const swapped = setComponentImage(sdlPath, key, params.image);
+        // the row shows the component's main image: a side service's
+        // upgrade (Mastodon's bridge) leaves it as it is
+        const mainSwapped =
+          swapped.includes("*") || (descriptorFor(key)?.imageServices ?? []).some((s) => swapped.includes(s));
         const artifacts = sdlArtifacts(loadSdl(sdlPath));
         fs.writeFileSync(
           path.join(ctx.dirs.sdl, `${key}.manifest.json`),
@@ -2412,8 +2416,8 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
           row.dseq,
           fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
         );
-        ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
-        return { image: params.image, txSkipped: onChain?.hash === wantHash };
+        if (mainSwapped) ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
+        return { image: params.image, services: swapped, txSkipped: onChain?.hash === wantHash };
       },
     });
 
@@ -2847,25 +2851,40 @@ function rerenderComponentSdl(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPa
   });
 }
 
+/** An image reference without its tag or digest: "repo/name". */
+export function imageRepo(image: string): string {
+  const noDigest = image.split("@")[0]!;
+  const slash = noDigest.lastIndexOf("/");
+  const colon = noDigest.lastIndexOf(":");
+  return colon > slash ? noDigest.slice(0, colon) : noDigest;
+}
+
 /**
- * Point a deployed SDL at a new image. Node SDLs run one service, so every
- * image line is it; a service component swaps only its image services, so a
- * sidecar (a database, say) keeps its own image.
+ * Point a deployed SDL at a new image; returns the services it swapped.
+ * Node SDLs run one service, so every image line is it. A service component
+ * swaps the services already running that image's repository (Mastodon's
+ * bridge for an sdap image, its streaming for the upstream streaming image),
+ * else its image services; a sidecar that runs something else (a database)
+ * keeps its own image either way.
  */
-function setComponentImage(sdlPath: string, key: string, image: string): void {
+function setComponentImage(sdlPath: string, key: string, image: string): string[] {
   const d = descriptorFor(key);
   if (!d) {
     const sdl = fs.readFileSync(sdlPath, "utf8");
     fs.writeFileSync(sdlPath, sdl.replace(/image: .*/g, `image: ${image}`));
-    return;
+    return ["*"];
   }
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  for (const name of d.imageServices) {
+  const running = Object.entries(doc.services ?? {}) as Array<[string, { image?: string }]>;
+  const same = running.filter(([, svc]) => svc.image && imageRepo(svc.image) === imageRepo(image)).map(([name]) => name);
+  const targets = same.length > 0 ? same : d.imageServices;
+  for (const name of targets) {
     const svc = doc.services?.[name];
     if (!svc) throw new Error(`${key}.yaml has no services.${name}`);
     svc.image = image;
   }
   fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
+  return targets;
 }
 
 /**

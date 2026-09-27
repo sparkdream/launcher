@@ -1134,3 +1134,37 @@ describe("verifier member", () => {
     expect(errorsAt(withVerifier({ wallet: COSMOS_A }), "topology.components.verifier.wallet")).toHaveLength(1);
   });
 });
+
+describe("mastodon bridge peers", () => {
+  const withBridge = (peers: unknown) =>
+    testnetSpec({
+      topology: {
+        validators: { count: 1 },
+        sentries: { count: 1 },
+        components: {
+          explorer: { enabled: false },
+          frontend: { enabled: false },
+          hub: { enabled: false },
+          mastodon: {
+            enabled: true,
+            domain: "social.phoenix.example",
+            owner: { username: "admin", email: "admin@phoenix.example" },
+            bridge: { enabled: true, peers },
+          },
+        },
+        publicEndpoints: { api: "api.phoenix.example", rpc: "rpc.phoenix.example" },
+        headscale: { domain: "hs.example" },
+      },
+    } as any);
+  const at = (spec: LaunchSpec) =>
+    validateSpec(spec).errors.filter((e) => e.path === "topology.components.mastodon.bridge.peers").map((e) => e.message);
+
+  it("takes other servers as their own peers", () => {
+    expect(at(withBridge([{ id: "aurora.example" }, { id: "zenith.example", authors: { allow: ["@phoenix@zenith.example"] } }]))).toEqual([]);
+  });
+  it("refuses the instance's own domain and duplicates", () => {
+    expect(at(withBridge([{ id: "social.phoenix.example" }])).join()).toMatch(/own peer/);
+    expect(at(withBridge([{ id: "aurora.example" }, { id: "aurora.example" }])).join()).toMatch(/once/);
+  });
+});
+

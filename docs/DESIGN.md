@@ -1068,8 +1068,37 @@ the spec is stored, since specs are exported and shared.
 5. Grants the daemon its session key (below). The operator's own key never
    reaches the provider; the SDL carries only its address.
 
+**Other Mastodon servers.** The bridge can anchor authors from servers
+other than its own instance (they follow @bridge from wherever they are,
+and @bridge follows curated authors on any server, resolving unknown ones
+through Mastodon's search). Two ways, combinable:
+
+- **Under this instance's one peer**: list the servers in the peer
+  policy's `content_hosts` on the frontend. No launcher setting; the bridge
+  and the verifier read `content_hosts` from the chain.
+- **As peers of their own** (`mastodon.bridge.peers`, fleet row "bridge
+  peers…" on a running fleet): `link-bridge` registers and activates each
+  server as an ActivityPub peer (closed: `allowed_identities` empty, unless
+  the entry names `authors`, which then owns those fields as above), binds
+  the same operator to it with no new stake (it shares the existing bond),
+  and delivers `SDA_PEER_IDS` (this domain first, then the servers) with
+  the token in one deployment update. The "bridge peers…" action stores the
+  list and queues a `reconfigure` op for Mastodon and for every verifier
+  that watches this chain (its `verifier-env` step updates `SDA_PEER_IDS`,
+  since `verifier.peers` defaults to the bridge's list). A server dropped
+  from the list is no longer watched; its peer and binding stay on chain for
+  the committee to suspend or remove.
+
 Anchored posts still need a verifier (`sdapverify`, on another host and
 account): the `verifier` component below, or one run elsewhere.
+
+**Upgrades.** The deployment runs three images: the derived web image
+(web + sidekiq), upstream streaming and the bridge's sdap. The row's
+"upgrade…" swaps the services already running the new image's repository
+(descriptor `sideImages` names their spec keys), so an sdap image upgrades
+the bridge in place, a streaming image the streaming service, and the web
+image web + sidekiq; the stored spec records each under its own key, and the
+row keeps showing the web image.
 
 **Resize** (fleet row "resize…", op `mastodon-resize`). Akash fixes a
 deployment's resources (MsgUpdateDeployment changes only the manifest

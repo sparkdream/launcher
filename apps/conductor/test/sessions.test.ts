@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import yaml from "js-yaml";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -402,6 +403,89 @@ describe("a chain reset with a bridge and a verifier", () => {
     expect(grants(chain).map((g) => g.grantee).sort()).toEqual([sessions.bridge!.grantee, sessions.verifier!.grantee].sort());
     expect(services.provider.sessionKeys.get(`${before.verifier}/verifier`)).toBe(sessions.verifier!.mnemonic);
     expect(s.topology.components.mastodon!.bridge!.enabled).toBe(true);
+    db.close();
+  }, 300_000);
+});
+
+describe("a bridge anchoring for other servers as peers of their own", () => {
+  it("registers and binds each server, closed by default, and keeps the bridge's and verifier's peer lists in step", async () => {
+    const chain = chainStub();
+    const withPeers = { ...mastodon, bridge: { enabled: true, peers: [{ id: "aurora.example" }] } };
+    const { db, work, secrets, fleet, runOps } = await launched({ mastodon: withPeers, verifier }, chain);
+    const operator = fs.readFileSync(path.join(secrets, "bridge-operator.address"), "utf8").trim();
+    const node = () => Object.values(chain.state().chains).find((c) => c.peers?.[DOMAIN])!;
+    const env = (file: string, service: string) =>
+      (yaml.load(fs.readFileSync(path.join(work, "launches", "fl", "sdl", file), "utf8")) as any).services[service].env as string[];
+
+    // the other server: an ACTIVE ActivityPub peer that admits nobody yet,
+    // bound to the same operator on its existing bond
+    expect(node().peers["aurora.example"]).toMatchObject({ type: "PEER_TYPE_ACTIVITYPUB", status: "PEER_STATUS_ACTIVE" });
+    expect(node().policies["aurora.example"]).toMatchObject({ allowed_identities: [] });
+    expect(node().policies[DOMAIN]).toMatchObject({ allowed_identities: ["*"] });
+    expect(node().bindings![`${operator}/aurora.example`]).toMatchObject({ stake: "0", signer: "bridge-operator" });
+    expect(env("mastodon.yaml", "bridge")).toContain(`SDA_PEER_IDS=${DOMAIN},aurora.example`);
+    expect(env("verifier.yaml", "verifier")).toContain(`SDA_PEER_IDS=${DOMAIN},aurora.example`);
+
+    // a server added on the running fleet: registered, bound, and both
+    // daemons told, in place
+    const before = db.listFleetComponents("fl").map((c) => c.dseq).sort();
+    const ops = fleet.requestBridgePeers(db.getLaunch("fl")!, ["aurora.example", "zenith.example"]);
+    expect(ops).toHaveLength(1);
+    expect(JSON.parse(db.listFleetOps("fl").find((o) => o.id === ops[0]!.opId)!.params_json)).toEqual({ keys: ["mastodon", "verifier"] });
+    const done = await runOps();
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+    expect(db.listFleetComponents("fl").map((c) => c.dseq).sort()).toEqual(before);
+    expect(node().peers["zenith.example"]).toMatchObject({ status: "PEER_STATUS_ACTIVE" });
+    expect(Object.keys(node().bindings!).filter((k) => k.startsWith(operator)).sort()).toEqual(
+      [`${operator}/${DOMAIN}`, `${operator}/aurora.example`, `${operator}/zenith.example`].sort(),
+    );
+    expect(env("mastodon.yaml", "bridge")).toContain(`SDA_PEER_IDS=${DOMAIN},aurora.example,zenith.example`);
+    expect(env("verifier.yaml", "verifier")).toContain(`SDA_PEER_IDS=${DOMAIN},aurora.example,zenith.example`);
+    expect(JSON.parse(db.getLaunch("fl")!.spec_json).topology.components.mastodon.bridge.peers).toEqual([
+      { id: "aurora.example" },
+      { id: "zenith.example" },
+    ]);
+
+    // this instance itself is not an "other" server
+    expect(() => fleet.requestBridgePeers(db.getLaunch("fl")!, [DOMAIN])).toThrow(/own peer/);
+    db.close();
+  }, 300_000);
+});
+
+describe("upgrading a Mastodon deployment's side images", () => {
+  it("swaps only the bridge for an sdap image, and records it as the spec's sdap image", async () => {
+    const chain = chainStub();
+    const { db, work, fleet, runOps } = await launched({ mastodon, verifier }, chain);
+    const sdl = (file: string) => yaml.load(fs.readFileSync(path.join(work, "launches", "fl", "sdl", file), "utf8")) as any;
+    const before = sdl("mastodon.yaml").services;
+    const row = () => db.listFleetComponents("fl").find((c) => c.key === "mastodon")!;
+    const rowImage = row().image;
+    const verifierImage = sdl("verifier.yaml").services.verifier.image;
+
+    fleet.requestUpgrade(db.getLaunch("fl")!, ["mastodon"], "sparkdreamnft/sdap:v9.9.9");
+    const done = await runOps();
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+
+    const after = sdl("mastodon.yaml").services;
+    expect(after.bridge.image).toBe("sparkdreamnft/sdap:v9.9.9");
+    expect(after.mastodon.image).toBe(before.mastodon.image);
+    expect(after.streaming.image).toBe(before.streaming.image);
+    expect(after.db.image).toBe(before.db.image);
+    // the row still shows the web image; the verifier is its own deployment
+    expect(row().image).toBe(rowImage);
+    expect(sdl("verifier.yaml").services.verifier.image).toBe(verifierImage);
+    const images = JSON.parse(db.getLaunch("fl")!.spec_json).images;
+    expect(images.sdap).toBe("sparkdreamnft/sdap:v9.9.9");
+    expect(images.mastodon).toBe(before.mastodon.image);
+
+    // the web image itself still upgrades the main service
+    fleet.requestUpgrade(db.getLaunch("fl")!, ["mastodon"], "sparkdreamnft/mastodon:v9.9.9");
+    expect((await runOps()).status).toBe("completed");
+    expect(sdl("mastodon.yaml").services.mastodon.image).toBe("sparkdreamnft/mastodon:v9.9.9");
+    expect(sdl("mastodon.yaml").services.bridge.image).toBe("sparkdreamnft/sdap:v9.9.9");
+    expect(row().image).toBe("sparkdreamnft/mastodon:v9.9.9");
     db.close();
   }, 300_000);
 });

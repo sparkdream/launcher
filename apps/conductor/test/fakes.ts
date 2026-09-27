@@ -210,6 +210,7 @@ export class FakeProviderGateway {
         );
       }
     }
+    if (manifestJson) this.lastManifest.set(dseq, manifestJson);
     const gated = manifestJson?.includes("WAIT_FOR_CONFIG=")
       ? manifestJson.includes("WAIT_FOR_CONFIG=true")
       : undefined;
@@ -324,6 +325,26 @@ export class FakeProviderGateway {
    *  fail) while the workload keeps running. */
   apiDownDseqs = new Set<string>();
 
+  /** The last manifest each deployment received: what its containers run. */
+  lastManifest = new Map<string, string>();
+
+  /** A service's env as its deployment's last manifest set it. */
+  private runningEnv(dseq: string, service: string): Record<string, string> {
+    const raw = this.lastManifest.get(dseq);
+    if (!raw) return {};
+    const out: Record<string, string> = {};
+    for (const group of JSON.parse(raw) as Array<{ services?: Array<{ name: string; env?: string[] | null }> }>) {
+      for (const svc of group.services ?? []) {
+        if (svc.name !== service) continue;
+        for (const e of svc.env ?? []) {
+          const i = e.indexOf("=");
+          out[e.slice(0, i)] = e.slice(i + 1);
+        }
+      }
+    }
+    return out;
+  }
+
   /** Uploaded media under public/system, by dseq (a resize carries it). */
   mastodonMedia = new Map<string, Buffer>();
   /** Files written through lease-shell, "<dseq>:<path>" -> contents. */
@@ -402,6 +423,13 @@ export class FakeProviderGateway {
     if (cmd[0] === "mastodon-bootstrap") return this.mastodonBootstrap(dseq, cmd.slice(1));
     const data = this.mastodonData(dseq, script);
     if (data) return data;
+    // printing env vars (the bridge's delivered-env check): what the
+    // deployment's last manifest gave the service
+    if (/^(printf '%s\\n' "\$\w+"(; )?)+$/.test(script)) {
+      const env = this.runningEnv(dseq, _service);
+      const vars = [...script.matchAll(/"\$(\w+)"/g)].map((m) => env[m[1]!] ?? "");
+      return { stdout: vars.map((v) => `${v}\n`).join(""), stderr: "" };
+    }
     if (script.includes("/data/session-key")) {
       // a daemon's session key, delivered (sessions.ts)
       const mnemonic = /printf '%s\\n' '([a-z ]+)'/.exec(script)?.[1];

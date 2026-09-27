@@ -51,6 +51,7 @@ import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type Head
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
+import { imageRepo } from "./fleet-ops.js";
 import type { AddComponentParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
 
 /**
@@ -1455,6 +1456,49 @@ export class FleetService {
     } satisfies MastodonResizeParams);
   }
 
+  /**
+   * Set the other Mastodon servers the bridge anchors for as peers of their
+   * own (mastodon.bridge.peers), on a running fleet: the spec takes the list
+   * (entries already there keep their authors setting), and a "reconfigure"
+   * op registers and binds the new ones and updates the bridge's peer list
+   * in place, as does one for every verifier watching this chain. A server
+   * dropped from the list stops being watched; its peer and binding stay on
+   * chain, for the committee to suspend or remove.
+   */
+  requestBridgePeers(launch: LaunchRow, ids: string[]): Array<{ launchId: string; opId: number }> {
+    const spec = this.spec(launch);
+    const m = spec.topology.components.mastodon;
+    if (!m?.enabled || !m.bridge?.enabled) throw new Error("this fleet runs no Mastodon bridge");
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "mastodon");
+    if (row?.state !== "active") throw new Error("Mastodon is not running");
+    const wanted = [...new Set(ids.map((id) => id.trim().toLowerCase()).filter(Boolean))];
+    const kept = new Map((m.bridge.peers ?? []).map((p) => [p.id.toLowerCase(), p]));
+    const stored = JSON.parse(launch.spec_json);
+    stored.topology.components.mastodon.bridge.peers = wanted.map((id) => kept.get(id) ?? { id });
+    const { errors } = validateSpec(withDefaults(stored));
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+
+    const ops: Array<{ launchId: string; opId: number }> = [];
+    const ownVerifier = this.db.listFleetComponents(launch.id).some((c) => c.key === "verifier" && c.state === "active") &&
+      !spec.topology.components.verifier?.target;
+    ops.push({
+      launchId: launch.id,
+      opId: this.db.createFleetOp(launch.id, "reconfigure", {
+        keys: ["mastodon", ...(ownVerifier ? ["verifier"] : [])],
+      } satisfies ReconfigureParams),
+    });
+    // a verifier on another fleet of this launcher that checks this chain
+    for (const other of this.db.listLaunches()) {
+      if (other.id === launch.id || other.status !== "completed") continue;
+      const v = this.spec(other).topology.components.verifier;
+      if (!v?.enabled || v.target?.fleet !== launch.id || v.peers?.length) continue;
+      if (!this.db.listFleetComponents(other.id).some((c) => c.key === "verifier" && c.state === "active")) continue;
+      ops.push({ launchId: other.id, opId: this.db.createFleetOp(other.id, "reconfigure", { keys: ["verifier"] } satisfies ReconfigureParams) });
+    }
+    return ops;
+  }
+
   /** Joining the mesh mints a preauth key via headscale — impossible once the
    *  mesh is gone. A shared mesh (reuseFleet) has no headscale row here;
    *  check the owning fleet's. */
@@ -1978,9 +2022,17 @@ export class FleetService {
    */
   private recordSpecImage(launch: LaunchRow, components: string[], image: string): void {
     const spec = this.spec(launch);
+    const images = spec.images as Record<string, string | undefined>;
     for (const key of components) {
       if (/^(val|sentry)-/.test(key)) spec.images.sparkdreamd = image;
-      else if (isComponentKey(key)) spec.images[key] = image;
+      else if (isComponentKey(key)) {
+        // an image one of the deployment's side services runs (Mastodon's
+        // bridge: sdap) is recorded under that service's key, not the main
+        const side = Object.values(descriptorFor(key)?.sideImages ?? {}).find(
+          (k) => images[k] && imageRepo(images[k]!) === imageRepo(image),
+        );
+        images[side ?? key] = image;
+      }
     }
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
   }

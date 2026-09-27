@@ -279,6 +279,38 @@ const mastodonComponent = z.object({
         })
         .strict()
         .optional(),
+      /**
+       * Other Mastodon servers bridged as peers of their own, beside this
+       * instance: authors there are followed by @bridge like local ones, and
+       * their posts are anchored under the server's own peer id. Each is
+       * registered and activated as an ActivityPub peer and bound to the same
+       * operator (sharing its bond), and added to the bridge's and the
+       * verifier's peer lists.
+       *
+       * The alternative is one peer for many servers: list them in this
+       * instance's peer policy content_hosts (the frontend's policy form),
+       * with no launcher setting at all.
+       *
+       * A server's peer starts closed (allowed_identities empty) unless
+       * `authors` is given, which then owns those fields as it does above.
+       */
+      peers: z
+        .array(
+          z
+            .object({
+              id: domain,
+              authors: z
+                .object({
+                  allow: z.array(z.string().min(1)).max(256).default(["*"]),
+                  collectionId: z.number().int().min(0).optional(),
+                })
+                .strict()
+                .optional(),
+            })
+            .strict(),
+        )
+        .max(16)
+        .optional(),
     })
     .optional(),
 });

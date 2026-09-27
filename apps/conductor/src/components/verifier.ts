@@ -2,7 +2,7 @@ import { chainId } from "@sparkdream/launch-spec";
 import type { FleetComponentRow } from "../db.js";
 import type { StepCtx } from "../engine.js";
 import { SESSION_KEY_FILE, ensureSession } from "../sessions.js";
-import { bondVerifier, refreshVerifierGranter } from "../steps/verifier.js";
+import { bondVerifier, refreshVerifierEnv } from "../steps/verifier.js";
 import { verifierPeers, verifierTargetId } from "../verifier.js";
 import type { ComponentDescriptor, RenderInput, SdlResources } from "./types.js";
 
@@ -89,7 +89,7 @@ export const verifier: ComponentDescriptor = {
     return row ? [row.provider] : [];
   },
   configureSteps: (name, spec) => [
-    { name: name("verifier-granter"), run: (ctx: StepCtx) => refreshVerifierGranter(ctx, name("verifier-granter"), spec) },
+    { name: name("verifier-env"), run: (ctx: StepCtx) => refreshVerifierEnv(ctx, name("verifier-env"), spec) },
     { name: name("bond-verifier"), run: (ctx: StepCtx) => bondVerifier(ctx, name("bond-verifier"), spec) },
     { name: name("session-verifier"), run: (ctx: StepCtx) => ensureSession(ctx, spec, "verifier") },
   ],

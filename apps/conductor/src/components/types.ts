@@ -58,9 +58,17 @@ export interface ComponentDescriptor {
   /** Compute resources per service — what the estimator prices. Must agree
    *  with render(). */
   resources(spec: LaunchSpec): SdlResources[];
-  /** Services that run the component's own image; an upgrade swaps only these
-   *  (a sidecar database keeps its image). */
+  /** Services that run the component's own image. An upgrade swaps the
+   *  services already running the new image's repository, else these (a
+   *  sidecar database keeps its image either way). */
   imageServices: string[];
+  /**
+   * The spec image (spec.images key) each other service of the deployment
+   * runs, for a deployment that carries more than its main image (Mastodon:
+   * upstream streaming, the bridge's sdap). An upgrade to one of those
+   * images swaps that service and records it under its own key.
+   */
+  sideImages?: Record<string, string>;
   /** Service that lease-shell restarts and execs target. */
   shellService: string;
   /** Mesh tunnels its env bakes, re-aimed when a peer's tailnet IP moves. */

@@ -5,6 +5,7 @@ import type { LaunchSpec } from "@sparkdream/launch-spec";
 import { TypeUrl } from "../akash/messages.js";
 import { loadSdl, sdlArtifacts } from "../akash/sdl-groups.js";
 import { setServiceEnv } from "../components/index.js";
+import { bridgePeerIds } from "../components/mastodon.js";
 import {
   BRIDGE_OPERATOR,
   readMastodonSecrets,
@@ -159,26 +160,28 @@ async function bridgeBound(chain: ChainActor, operator: string, peerId: string):
   }
 }
 
-/** Put the issued token into the bridge service's env: one deployment
- *  update, after which the bridge leaves its idle loop for sdapbridge. */
-async function deliverToken(ctx: StepCtx, stepName: string, token: string): Promise<boolean> {
+/** Put the issued token and the peer list into the bridge service's env:
+ *  one deployment update, after which the bridge leaves its idle loop for
+ *  sdapbridge (or restarts with the peers it now watches). */
+async function deliverBridgeEnv(ctx: StepCtx, stepName: string, want: Record<string, string>): Promise<boolean> {
   const lease = mastodonLease(ctx);
   // Delivered means the running bridge has it, not that the SDL file does: a
   // pause for the update signature between writing the SDL and pushing the
-  // manifest left the file with the token and the container without it.
+  // manifest left the file with the new env and the container without it.
+  const keys = Object.keys(want);
   const running = await ctx.services.provider
     .shellExec(loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, "bridge", [
-      "sh", "-c", 'printf %s "$MASTODON_TOKEN"',
+      "sh", "-c", keys.map((k) => `printf '%s\\n' "$${k}"`).join("; "),
     ])
-    .then((r) => r.stdout.trim())
-    .catch(() => "");
-  if (running === token) return false;
+    .then((r) => r.stdout.split("\n"))
+    .catch(() => [] as string[]);
+  if (keys.every((k, i) => running[i] === want[k])) return false;
 
   const sdlPath = path.join(ctx.dirs.sdl, "mastodon.yaml");
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  const current = (doc.services?.bridge?.env as string[] | undefined)?.find((e) => e.startsWith("MASTODON_TOKEN="));
-  if (current !== `MASTODON_TOKEN=${token}`) {
-    setServiceEnv(doc, ["bridge"], { MASTODON_TOKEN: token });
+  const env = (doc.services?.bridge?.env as string[] | undefined) ?? [];
+  if (keys.some((k) => !env.includes(`${k}=${want[k]}`))) {
+    setServiceEnv(doc, ["bridge"], want);
     fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
   }
   const artifacts = sdlArtifacts(loadSdl(sdlPath));
@@ -199,7 +202,7 @@ export async function linkMastodonBridge(
   ctx: StepCtx,
   stepName: string,
   spec: LaunchSpec,
-): Promise<{ peer: PeerStatus; operator: string; bonded: string; tokenDelivered: boolean }> {
+): Promise<{ peer: PeerStatus; peers: PeerStatus[]; operator: string; bonded: string; tokenDelivered: boolean }> {
   const m = spec.topology.components.mastodon!;
   const domain = m.domain!;
   const chain = await fleetActor(ctx, ctx.launchId, "this fleet");
@@ -216,6 +219,21 @@ export async function linkMastodonBridge(
     ...(m.bridge?.authors ? { syncPolicy: BRIDGE_AUTHOR_FIELDS } : {}),
   });
 
+  // 1b. other servers bridged as peers of their own (bridge.peers): closed
+  //     until the community opens them, unless the spec names their authors
+  const peers: PeerStatus[] = [];
+  for (const other of m.bridge?.peers ?? []) {
+    peers.push(
+      await ensurePeerActive(ctx, stepName, chain, {
+        id: other.id,
+        type: "PEER_TYPE_ACTIVITYPUB",
+        displayName: other.id,
+        policy: activityPubPeerPolicy(other.authors ?? { allow: [] }),
+        ...(other.authors ? { syncPolicy: BRIDGE_AUTHOR_FIELDS } : {}),
+      }),
+    );
+  }
+
   // 2. the bridge account and its read-only token, asked of the running
   //    instance every time: the same token while its database lives, a new
   //    one after the instance started over (a close and re-add, a resize)
@@ -230,6 +248,10 @@ export async function linkMastodonBridge(
   const operator = await ensureBridgeOperatorKey(ctx.dirs.secrets, ctx.dirs.node("val-0"));
   const serviceType = await queryJson(["query", "service", "service-type", "federation-bridge-activitypub"], chain.rpc);
   const bond = String(serviceType.config?.min_bond_amount ?? "0");
+  const operatorSigner: ChainActor = {
+    ...chain,
+    signer: { home: ctx.dirs.node("val-0"), key: BRIDGE_OPERATOR, address: operator },
+  };
   if (!(await bridgeBound(chain, operator, domain))) {
     const balances = await queryJson(["query", "bank", "balances", operator], chain.rpc);
     const have = BigInt(
@@ -263,11 +285,7 @@ export async function linkMastodonBridge(
         { signerRole: `an account holding ${chain.gasDenom}` },
       );
     }
-    const signer: ChainActor = {
-      ...chain,
-      signer: { home: ctx.dirs.node("val-0"), key: BRIDGE_OPERATOR, address: operator },
-    };
-    await sendAsOperator(ctx, signer, [
+    await sendAsOperator(ctx, operatorSigner, [
       {
         "@type": "/sparkdream.federation.v1.MsgRegisterBridge",
         operator,
@@ -280,10 +298,30 @@ export async function linkMastodonBridge(
     ctx.log(`mastodon: bridge operator ${operator} bonded ${bond} for peer ${domain}`);
   }
 
-  // 4. the bridge service gets its token and starts anchoring
-  const tokenDelivered = await deliverToken(ctx, stepName, token);
-  if (tokenDelivered) ctx.log("mastodon: bridge token delivered; sdapbridge starting");
-  return { peer, operator, bonded: bond, tokenDelivered };
+  // 3b. the same operator for every other server: one binding each, on the
+  //     bond it already holds (an existing operator binds with no new stake)
+  for (const other of m.bridge?.peers ?? []) {
+    if (await bridgeBound(chain, operator, other.id)) continue;
+    await sendAsOperator(ctx, operatorSigner, [
+      {
+        "@type": "/sparkdream.federation.v1.MsgRegisterBridge",
+        operator,
+        peer_id: other.id,
+        protocol: "activitypub",
+        endpoint: `https://${domain}`,
+        stake_amount: "0",
+      },
+    ]);
+    ctx.log(`mastodon: bridge operator ${operator} bound to peer ${other.id} on its existing bond`);
+  }
+
+  // 4. the bridge service gets its token and the peers it anchors for
+  const tokenDelivered = await deliverBridgeEnv(ctx, stepName, {
+    MASTODON_TOKEN: token,
+    SDA_PEER_IDS: bridgePeerIds(spec).join(","),
+  });
+  if (tokenDelivered) ctx.log(`mastodon: bridge env delivered (peers ${bridgePeerIds(spec).join(", ")})`);
+  return { peer, peers, operator, bonded: bond, tokenDelivered };
 }
 
 /** Sign and broadcast as the bridge operator (its own key). */

@@ -46,6 +46,14 @@ const MASTODON_TUNING: Record<"small" | "standard", string[]> = {
   standard: [],
 };
 
+/** Every peer the bridge anchors for: this instance's own domain, then the
+ *  other servers bridged as peers of their own (bridge.peers). */
+export function bridgePeerIds(spec: LaunchSpec): string[] {
+  const m = spec.topology.components.mastodon;
+  if (!m?.domain) return [];
+  return [m.domain, ...(m.bridge?.peers ?? []).map((p) => p.id)];
+}
+
 function sizeOf(spec: LaunchSpec): "small" | "standard" {
   return spec.topology.components.mastodon?.size ?? "small";
 }
@@ -195,7 +203,7 @@ function render(input: RenderInput) {
           `MASTODON_TOKEN=${BRIDGE_TOKEN_PENDING}`,
           `SDA_SESSION_KEY_FILE=${SESSION_KEY_FILE}`,
           `SDA_GRANTER=${bridgeOperator(input)}`,
-          `SDA_PEER_IDS=${component.domain}`,
+          `SDA_PEER_IDS=${bridgePeerIds(spec).join(",")}`,
           `SDA_LCD=https://${api}`,
           `SDA_CHAIN_ID=${chainId(spec)}`,
           `SDA_PREFIX=${spec.network.bech32Prefix}`,
@@ -220,6 +228,7 @@ export const mastodon: ComponentDescriptor = {
   // web+sidekiq only: streaming follows its own upstream image, and postgres
   // / redis / the bridge keep theirs
   imageServices: ["mastodon"],
+  sideImages: { streaming: "mastodonStreaming", bridge: "sdap" },
   shellService: "mastodon",
   tunnels: () => [],
   envRefresh: "none",

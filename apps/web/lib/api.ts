@@ -442,7 +442,9 @@ export type FleetAction =
    *  from-genesis restore replays into). */
   | "reset-data"
   /** Mastodon: move to a deployment of another size, data and all. */
-  | "resize";
+  | "resize"
+  /** Mastodon: the other servers its bridge anchors for as their own peers. */
+  | "bridge-peers";
 
 export async function postFleetAction(
   launchId: string,
@@ -459,6 +461,7 @@ export async function postFleetAction(
     validate?: boolean;
     endHeight?: number;
     size?: "small" | "standard";
+    peers?: string[];
   } = {},
 ): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {

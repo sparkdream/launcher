@@ -8,7 +8,7 @@ import { setServiceEnv } from "../components/index.js";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { fleetActor, sendTx, walletPause, type ChainActor } from "../peering.js";
 import { componentLease, ensureSession } from "../sessions.js";
-import { verifierMember, verifierTargetId } from "../verifier.js";
+import { verifierMember, verifierPeers, verifierTargetId } from "../verifier.js";
 import { loadCert } from "./phase-bcd.js";
 import { pushManifest } from "./phase-ef.js";
 import { queryJson } from "./phase-g.js";
@@ -97,20 +97,31 @@ export async function bondVerifier(
 }
 
 /**
- * Point the running verifier at its member's current address. The member
- * is fixed for a wallet member, but a launcher-generated one (verifier.
- * account) gets a fresh key when a chain reset rebuilds the keyring, and the
- * deployment's SDA_GRANTER still names the old address: one deployment
- * update puts the new one in. A no-op whenever the env already matches.
+ * Point the running verifier at its member's current address and the peers
+ * it should check. The member is fixed for a wallet member, but a
+ * launcher-generated one (verifier.account) gets a fresh key when a chain
+ * reset rebuilds the keyring, and the target's bridge may have gained or
+ * dropped servers (bridge.peers): one deployment update puts the current
+ * values in. A no-op whenever the env already matches.
  */
-export async function refreshVerifierGranter(ctx: StepCtx, stepName: string, spec: LaunchSpec): Promise<{ granter: string; updated: boolean }> {
+export async function refreshVerifierEnv(
+  ctx: StepCtx,
+  stepName: string,
+  spec: LaunchSpec,
+): Promise<{ granter: string; peers: string[]; updated: boolean }> {
   const { address } = verifierMember(spec, ctx.launchId, ctx.db, ctx.workRoot);
+  const targetId = verifierTargetId(spec, ctx.launchId);
+  const target = targetId === ctx.launchId ? spec : withDefaults(JSON.parse(ctx.db.getLaunch(targetId)!.spec_json));
+  const peers = verifierPeers(spec, target);
+  const want = { SDA_GRANTER: address, SDA_PEER_IDS: peers.join(",") };
   const sdlPath = path.join(ctx.dirs.sdl, "verifier.yaml");
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  const current = (doc.services?.verifier?.env as string[] | undefined)?.find((e) => e.startsWith("SDA_GRANTER="));
-  if (current === `SDA_GRANTER=${address}`) return { granter: address, updated: false };
+  const env = (doc.services?.verifier?.env as string[] | undefined) ?? [];
+  if (Object.entries(want).every(([k, v]) => env.includes(`${k}=${v}`))) {
+    return { granter: address, peers, updated: false };
+  }
 
-  setServiceEnv(doc, ["verifier"], { SDA_GRANTER: address });
+  setServiceEnv(doc, ["verifier"], want);
   fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
   const artifacts = sdlArtifacts(loadSdl(sdlPath));
   fs.writeFileSync(path.join(ctx.dirs.sdl, "verifier.manifest.json"), artifacts.manifestJson);
@@ -124,8 +135,8 @@ export async function refreshVerifierGranter(ctx: StepCtx, stepName: string, spe
     ]);
   }
   await pushManifest(ctx, loadCert(ctx), "verifier", lease.hostUri, lease.dseq, artifacts.manifestJson);
-  ctx.log(`verifier: granter is now ${address} (the member's key changed)`);
-  return { granter: address, updated: true };
+  ctx.log(`verifier: env updated (granter ${address}, peers ${peers.join(", ")})`);
+  return { granter: address, peers, updated: true };
 }
 
 /** Launch step: bond an enabled verifier once its chain is up. */

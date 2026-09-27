@@ -704,6 +704,13 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         );
       }
       if (!spec.images.sdap) err("images.sdap", "image is required when the mastodon bridge is enabled");
+      const extra = (masto.bridge.peers ?? []).map((p) => p.id.toLowerCase());
+      if (masto.domain && extra.includes(masto.domain.toLowerCase())) {
+        err("topology.components.mastodon.bridge.peers", `${masto.domain} is this instance's own peer: list only other servers`);
+      }
+      if (new Set(extra).size !== extra.length) {
+        err("topology.components.mastodon.bridge.peers", "each server may be listed once");
+      }
       warn(
         "topology.components.mastodon.bridge",
         "anchored posts stay unverified until an independent verifier (sdapverify, on another host and " +

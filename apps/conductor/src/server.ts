@@ -629,8 +629,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "force-redeploy"
         | "clear-halt-height"
         | "reset-data"
-        | "resize";
+        | "resize"
+        | "bridge-peers";
       confirm?: boolean;
+      /** bridge-peers (Mastodon): the other servers bridged as their own peers. */
+      peers?: string[];
       /** resize (Mastodon): the size to move the instance to. */
       size?: "small" | "standard";
       image?: string;
@@ -730,6 +733,21 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         const opId = await fleet.requestRelaunch(launch, component, { manualBid: picksBids });
         drive(launchId, spec);
         return { status: "relaunch-started", opId, manualBid: picksBids };
+      }
+      case "bridge-peers": {
+        if (!Array.isArray(body.peers) || body.peers.some((p) => typeof p !== "string")) {
+          return reply.status(400).send({ error: "peers must be a list of server domains" });
+        }
+        try {
+          const ops = fleet.requestBridgePeers(launch, body.peers);
+          for (const o of ops) {
+            const l = deps.db.getLaunch(o.launchId);
+            if (l) drive(o.launchId, JSON.parse(l.spec_json));
+          }
+          return { status: "bridge-peers-started", ops };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
       }
       case "resize": {
         if (body.size !== "small" && body.size !== "standard") {
