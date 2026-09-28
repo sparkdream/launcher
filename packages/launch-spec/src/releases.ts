@@ -20,6 +20,40 @@ export interface ChainRelease {
 
 export const CHAIN_RELEASES: ChainRelease[] = [
   {
+    "version": "v1.0.47",
+    "commit": "2fe1ec1e15fb9e1abd78ac4d596c38db94bc9a23",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.47",
+        "digest": "sha256:1048def3fac555e2e861912d7c3fc9844ae85d1be1d312fbc1bcc46e797d101e"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.47"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.47",
+        "digest": "sha256:4067f814dce03c7562c1d9ca59587fc300be206547b1d2c9b4d6cd2e6e7e537e"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.46",
+    "commit": "f96dcbfc234f02cb956ac2cd41b857338640437d",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.46",
+        "digest": "sha256:cb03e5fd8d5b1ac281edaac885d45048c61ba36bff3f824f3a09b3b5a977aa8a"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.46"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.46",
+        "digest": "sha256:c497111a6aa021de9097390a6911f695807a23a6fdc7c5ef4ef849c277516549"
+      }
+    ]
+  },
+  {
     "version": "v1.0.45",
     "commit": "99784aabe7e521326aa8161131bc43e70ebb0c3c",
     "images": [

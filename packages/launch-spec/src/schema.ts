@@ -191,6 +191,69 @@ const sessionKey = z
   .strict();
 
 /**
+ * Which authors a bridged peer admits (the peer policy's author curation;
+ * both gates must pass, and authors still opt in by following the bridge
+ * account). `allow` lists admitted authors ("@user@<domain>") or ["*"] for
+ * any; `collectionId` names an x/collect collection whose link items must
+ * also list the author, typically owned by the Operations Committee with
+ * members as editors so they curate without a proposal per author.
+ *
+ * Set, the spec owns these two policy fields: they are rewritten on the
+ * chain whenever the bridge step runs and the stored policy differs. Unset,
+ * the fields are the community's (the frontend's peer policy form), never
+ * touched again by the launcher.
+ */
+const bridgeAuthors = z
+  .object({
+    allow: z.array(z.string().min(1)).max(256).default(["*"]),
+    collectionId: z.number().int().min(0).optional(),
+  })
+  .strict();
+
+/** A Mastodon account name (the bridge's own account on the instance). */
+const mastodonUsername = z.string().regex(/^[a-z0-9_]{1,30}$/i);
+
+/**
+ * What a bridge (the Mastodon component's sidecar, or a standalone `bridge`
+ * component) links: its operator, session key, account and peers.
+ */
+const bridgeLink = z.object({
+  enabled: z.boolean(),
+  /** Genesis balance for the bridge operator, in the base denom: the
+   *  operator bond (x/service min_bond, 1000 SPARK by default) plus gas. */
+  genesisBalance: z.string().regex(/^[0-9]+$/).default("1100000000"),
+  /** sdapbridge signs through this session key; the operator's own key
+   *  (it controls the bond) stays with the launcher. */
+  session: sessionKey.default({}),
+  /** The bridge's account on the Mastodon instance: authors follow it to
+   *  opt in. Defaults by the network it anchors to: "bridge" on mainnet,
+   *  "bridgetest" on a testnet, "bridgedev" on a devnet, so one instance
+   *  can carry a bridge per network. */
+  account: mastodonUsername.optional(),
+  /** Authors of the instance's own peer; unset, a new peer starts at ["*"]. */
+  authors: bridgeAuthors.optional(),
+  /**
+   * Other Mastodon servers bridged as peers of their own, beside the
+   * instance: authors there are followed by the bridge account like local
+   * ones, and their posts are anchored under the server's own peer id. Each
+   * is registered and activated as an ActivityPub peer and bound to the same
+   * operator (sharing its bond), and added to the bridge's and the
+   * verifier's peer lists.
+   *
+   * The alternative is one peer for many servers: list them in the
+   * instance's peer policy content_hosts (the frontend's policy form), with
+   * no launcher setting at all.
+   *
+   * A server's peer starts closed (allowed_identities empty) unless its
+   * `authors` is given, which then owns those fields as above.
+   */
+  peers: z
+    .array(z.object({ id: domain, authors: bridgeAuthors.optional() }).strict())
+    .max(16)
+    .optional(),
+});
+
+/**
  * A Mastodon instance (the chain repo's Dockerfile-mastodon: web + sidekiq,
  * upstream streaming, postgres, redis in one deployment). Its domain is the
  * instance's identity for good -- ActivityPub ids embed it -- so it cannot be
@@ -210,8 +273,13 @@ const mastodonComponent = z.object({
       email: z.string().email(),
     })
     .optional(),
-  /** Who may sign up: anyone, anyone with the owner's approval, or nobody. */
-  registrations: z.enum(["open", "approved", "none"]).default("approved"),
+  /**
+   * Who may sign up: anyone, anyone with the owner's approval, or nobody.
+   * Defaults to nobody: the instance exists to host the bridge account, and
+   * authors reach it by following that account from their own servers, so
+   * nothing needs local sign-ups (or the mail they depend on).
+   */
+  registrations: z.enum(["open", "approved", "none"]).default("none"),
   /**
    * Resources: "small" (~2 CPU, ~3.6 GB RAM, 10 GiB media; a new community)
    * or "standard" (~4 CPU, ~8 GB, 20 GiB media). A deployment's resources
@@ -222,7 +290,8 @@ const mastodonComponent = z.object({
   /**
    * Outgoing mail (sign-up confirmations, password resets, notifications),
    * through any SMTP relay. Without it mail is written to disk and never
-   * sent, so new users cannot confirm their address. The password is kept
+   * sent, so people who sign up cannot confirm their address; only needed
+   * when registrations is not "none". The password is kept
    * in the launcher's secret store, never in the spec.
    */
   smtp: z
@@ -232,6 +301,10 @@ const mastodonComponent = z.object({
       login: z.string().min(1).optional(),
       /** Accepted when adding the component; moved to the secret store. */
       password: z.string().min(1).optional(),
+      /** Instead of a password: the launch id of another fleet of this
+       *  wallet whose stored SMTP password to copy (the services spec
+       *  builder writes it, so the secret never passes through the editor). */
+      passwordFromFleet: z.string().min(1).optional(),
       /** The sender, e.g. "Mastodon <notifications@example.com>". */
       fromAddress: z.string().min(3),
       /** starttls (587), tls (implicit, 465) or none. */
@@ -241,78 +314,52 @@ const mastodonComponent = z.object({
     .strict()
     .optional(),
   /**
+   * Wallet sign-in: members of the chains linked to this instance sign in
+   * with Keplr through the sdaplogin sidecar (sdap image), an OpenID Connect
+   * provider at `domain` (default: the instance's domain with its first label
+   * suffixed, mstdn.example.io → mstdn-login.example.io, so it sits at the
+   * same depth and a proxy's edge certificate covers both). A chain is linked when the
+   * instance runs in its fleet, or when its fleet's standalone bridge
+   * targets the instance. A member's handle is their primary x/name; there
+   * is no email to confirm and no password, and the instance's hourly sweep
+   * disables the login of anyone who is no longer an active member. The
+   * provider creates accounts even with registrations "none", so sign-ups
+   * can stay closed.
+   */
+  walletLogin: z
+    .object({
+      enabled: z.boolean().default(false),
+      domain: domain.optional(),
+      /** The lowest x/rep trust level that may sign in. */
+      minTrustLevel: z.enum(["new", "provisional", "established", "trusted", "core"]).default("new"),
+    })
+    .strict()
+    .optional(),
+  /**
    * The ActivityPub live link (sdapbridge beside the instance): registers the
    * instance as an x/federation ActivityPub peer, bonds a bridge operator for
-   * it, and anchors posts of authors who opt in by following @bridge. Needs
-   * topology.publicEndpoints.api (the bridge broadcasts through the LCD).
-   * Anchored posts only verify once an independent verifier (sdapverify, on
-   * another host and account) runs against the chain.
+   * it, and anchors posts of authors who opt in by following the bridge
+   * account. Needs topology.publicEndpoints.api (the bridge broadcasts
+   * through the LCD). Anchored posts only verify once an independent
+   * verifier (sdapverify, on another host and account) runs against the
+   * chain. Another fleet's chain can bridge the same instance with a
+   * standalone `bridge` component of its own.
    */
-  bridge: z
-    .object({
-      enabled: z.boolean(),
-      /** Genesis balance for the bridge operator, in the base denom: the
-       *  operator bond (x/service min_bond, 1000 SPARK by default) plus gas. */
-      genesisBalance: z.string().regex(/^[0-9]+$/).default("1100000000"),
-      /** sdapbridge signs through this session key; the operator's own key
-       *  (it controls the bond) stays with the launcher. */
-      session: sessionKey.default({}),
-      /**
-       * Which of the instance's authors the chain anchors (the peer policy's
-       * author curation; both gates must pass, and authors still opt in by
-       * following @bridge). `allow` lists admitted authors ("@user@<domain>")
-       * or ["*"] for any; `collectionId` names an x/collect collection whose
-       * link items must also list the author, typically owned by the
-       * Operations Committee with members as editors so they curate without
-       * a proposal per author.
-       *
-       * Set, the spec owns these two policy fields: they are rewritten on the
-       * chain whenever the bridge step runs and the stored policy differs.
-       * Unset, a new peer starts at ["*"] and the fields are the
-       * community's from then on (the frontend's peer policy form), never
-       * touched again by the launcher.
-       */
-      authors: z
-        .object({
-          allow: z.array(z.string().min(1)).max(256).default(["*"]),
-          collectionId: z.number().int().min(0).optional(),
-        })
-        .strict()
-        .optional(),
-      /**
-       * Other Mastodon servers bridged as peers of their own, beside this
-       * instance: authors there are followed by @bridge like local ones, and
-       * their posts are anchored under the server's own peer id. Each is
-       * registered and activated as an ActivityPub peer and bound to the same
-       * operator (sharing its bond), and added to the bridge's and the
-       * verifier's peer lists.
-       *
-       * The alternative is one peer for many servers: list them in this
-       * instance's peer policy content_hosts (the frontend's policy form),
-       * with no launcher setting at all.
-       *
-       * A server's peer starts closed (allowed_identities empty) unless
-       * `authors` is given, which then owns those fields as it does above.
-       */
-      peers: z
-        .array(
-          z
-            .object({
-              id: domain,
-              authors: z
-                .object({
-                  allow: z.array(z.string().min(1)).max(256).default(["*"]),
-                  collectionId: z.number().int().min(0).optional(),
-                })
-                .strict()
-                .optional(),
-            })
-            .strict(),
-        )
-        .max(16)
-        .optional(),
-    })
-    .optional(),
+  bridge: bridgeLink.optional(),
+});
+
+/**
+ * A standalone ActivityPub bridge (sdapbridge on its own deployment): links
+ * a Mastodon instance another fleet on this launcher runs to THIS fleet's
+ * chain, for when one instance serves several networks. Its account and
+ * token are made on that instance through the other fleet's deployment; its
+ * peer, operator bond and session key are this chain's. A fleet runs either
+ * this or its own Mastodon's bridge sidecar, not both.
+ */
+const bridgeComponent = bridgeLink.extend({
+  /** The fleet running the Mastodon instance (launch id or network name,
+   *  same wallet). `domain` is filled in when the reference is resolved. */
+  target: z.object({ fleet: z.string().min(1), domain: domain.optional() }).strict(),
 });
 
 /**
@@ -420,6 +467,31 @@ const joinBlock = z.object({
 export const launchSpecSchema = z.object({
   version: z.literal(1),
 
+  /**
+   * What the fleet is. "chain" (the default): a Spark Dream network, its
+   * nodes, mesh and the components around it. "services": no chain at all,
+   * only long-lived components several chains share (a Mastodon instance
+   * that each chain's standalone bridge links to), so their life is not tied
+   * to any one network's resets and shutdown. A services fleet deploys no
+   * nodes and no headscale; network.name names the fleet, and the chain
+   * fields keep their defaults unused.
+   */
+  kind: z.enum(["chain", "services"]).default("chain"),
+
+  /**
+   * Other wallets on this launcher allowed to use this services fleet: their
+   * chain fleets may link a standalone bridge to its Mastodon (and copy its
+   * stored SMTP password into a fleet of their own). The fleet's own wallet
+   * always may. For one person's several wallets (a devnet one and a
+   * testnet one sharing one instance); the list is the owner's explicit
+   * opt-in, since a linking fleet's bridge setup reaches into this fleet's
+   * deployment with this fleet's certificate.
+   */
+  sharing: z
+    .object({ wallets: z.array(z.string().regex(/^akash1[02-9ac-hj-np-z]{38,58}$/, "an akash1... address")).max(32) })
+    .strict()
+    .optional(),
+
   network: z.object({
     /** Lowercase alphanumeric with inner hyphens ("sparkdream-test" →
      *  chain id "sparkdream-test-1"). */
@@ -523,6 +595,7 @@ export const launchSpecSchema = z.object({
       relayer: relayerComponent.optional(),
       mastodon: mastodonComponent.optional(),
       verifier: verifierComponent.optional(),
+      bridge: bridgeComponent.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress
@@ -586,6 +659,7 @@ export const launchSpecSchema = z.object({
         relayer: componentProviderRules.optional(),
         mastodon: componentProviderRules.optional(),
         verifier: componentProviderRules.optional(),
+        bridge: componentProviderRules.optional(),
       })
       .strict()
       .default({}),
@@ -660,6 +734,8 @@ export const launchSpecSchema = z.object({
     sdap: z.string().optional(),
     /** sdapverify (the verifier component): the same sdap image by default. */
     verifier: z.string().optional(),
+    /** sdapbridge (the standalone bridge component): the sdap image by default. */
+    bridge: z.string().optional(),
   }),
 
   security: z.object({

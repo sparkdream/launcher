@@ -168,6 +168,30 @@ export interface RunResult {
  * Execute steps in order with checkpointing (§5): done steps skip, failures
  * pause, AwaitSignature/AwaitUser park the step as 'waiting'. Re-run resumes.
  */
+/**
+ * Drop failed step rows that are no longer in the plan. Such a step never
+ * runs again (a finished op rebuilt without it), so its error would stay on
+ * the panel, and count as an unfinished step, for good. `steps` must be the
+ * whole plan, as every drive passes. Returns how many were dropped.
+ */
+export function dropStaleFailures(
+  db: ConductorDb,
+  launchId: string,
+  steps: StepDef[],
+  log: (message: string) => void = () => {},
+): number {
+  const planned = new Set(steps.map((s) => s.name));
+  let dropped = 0;
+  for (const row of db.listSteps(launchId)) {
+    if (row.status === "error" && !planned.has(row.name)) {
+      db.resetStep(launchId, row.name);
+      log(`dropped ${row.name}: it failed, and is no longer part of the plan`);
+      dropped++;
+    }
+  }
+  return dropped;
+}
+
 export async function runLaunch(
   db: ConductorDb,
   launchId: string,
@@ -184,6 +208,7 @@ export async function runLaunch(
   // hides the earlier step actually holding the launch up
   const orphaned = db.clearOrphanedRunningSteps(launchId);
   if (orphaned > 0) log(`cleared ${orphaned} orphaned running step(s) from a previous driver`);
+  dropStaleFailures(db, launchId, steps, log);
   db.setLaunchStatus(launchId, "running");
 
   const ctx: StepCtx = {

@@ -1,6 +1,5 @@
-import { withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { bridgePeerIds, fleetBridge, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, LaunchRow } from "./db.js";
-import { bridgePeerIds } from "./components/mastodon.js";
 import { launchDirs } from "./engine.js";
 
 /**
@@ -26,10 +25,11 @@ export function verifierTargetId(spec: LaunchSpec, selfId: string): string {
 export function verifierPeers(spec: LaunchSpec, target: LaunchSpec): string[] {
   const v = spec.topology.components.verifier!;
   if (v.peers?.length) return v.peers;
+  // the target chain's bridge (a sidecar or a standalone one) anchors for
+  // its instance and any other servers it bridges as peers
+  if (fleetBridge(target)) return bridgePeerIds(target);
   const m = target.topology.components.mastodon;
-  if (!m?.enabled || !m.domain) return [];
-  // the target's bridge may anchor for other servers too (bridge.peers)
-  return m.bridge?.enabled ? bridgePeerIds(target) : [m.domain];
+  return m?.enabled && m.domain ? [m.domain] : [];
 }
 
 /**

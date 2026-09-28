@@ -2,7 +2,7 @@ import { descriptorFor } from "../components/index.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { headscaleDomain, nodes, serviceComponents } from "@sparkdream/launch-spec";
+import { headscaleDomain, isServicesFleet, nodes, serviceComponents } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import {
@@ -53,7 +53,17 @@ function certPaths(ctx: StepCtx) {
 }
 
 export function loadCert(ctx: StepCtx): Certificate {
-  const p = certPaths(ctx);
+  return loadCertAt(ctx.dirs.secrets);
+}
+
+/** The Akash client certificate kept in a launch's secrets directory (a
+ *  standalone bridge reaches another fleet's Mastodon with that fleet's). */
+export function loadCertAt(secretsDir: string): Certificate {
+  const p = {
+    cert: path.join(secretsDir, "akash-cert.pem"),
+    key: path.join(secretsDir, "akash-cert-key.pem"),
+    pub: path.join(secretsDir, "akash-cert-pub.pem"),
+  };
   return {
     certPem: fs.readFileSync(p.cert, "utf8"),
     keyPem: readSecretFile(p.key),
@@ -549,7 +559,10 @@ export const createDeploymentsStep: StepDef = {
   name: "create-deployments",
   async run(ctx): Promise<DeploymentPlan> {
     const addr = owner(ctx);
-    const preauth = ctx.output<PreauthKeys>("configure-headscale");
+    // a services fleet runs no mesh: nothing to inject
+    const preauth = isServicesFleet(ctx.spec)
+      ? ({ perNode: {} } as unknown as PreauthKeys)
+      : ctx.output<PreauthKeys>("configure-headscale");
     if (!preauth) throw new Error("configure-headscale output missing");
 
     // a fleet shutdown may have closed headscale while this launch sat in
@@ -649,10 +662,11 @@ export const collectBidsStep: StepDef = {
   async run(ctx): Promise<Assignments> {
     const addr = owner(ctx);
     const plan = ctx.output<DeploymentPlan>("create-deployments")!;
-    const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
+    // a services fleet deploys no headscale
+    const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
     const providers = await ctx.services.api.listProviders();
 
-    const chosen = new Set<string>([hs.provider]);
+    const chosen = new Set<string>(hs ? [hs.provider] : []);
     // anti-affinity covers headscale/validators/sentries (§6); the stateless
     // components can share providers freely — requiring N more distinct
     // providers for them would only shrink the viable bid set
@@ -809,9 +823,9 @@ export const createLeasesStep: StepDef = {
     const fee = feeConfig();
     let feePaid: { address: string; amount: string; denom: string } | undefined;
     if (fee.launchBps > 0) {
-      const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
+      const hs = ctx.output<HeadscaleOutput>("deploy-headscale");
       const amount = launchFeeAmount(
-        [hs.price, ...Object.values(assignments.perNode).map((a) => a.price)],
+        [...(hs ? [hs.price] : []), ...Object.values(assignments.perNode).map((a) => a.price)],
         fee.launchBps,
       );
       const coin = await feeCoin(
@@ -1036,11 +1050,34 @@ async function rebidComponent(
     }),
   ]);
 
+  const leaseStep = `send-manifests:release:${key}:${dseq}`;
+  const leaseRow = ctx.db.getPendingTx(ctx.launchId, leaseStep);
+
+  // 3b. a deployment whose bids all closed unleased (a manual pick made after
+  //     the providers' bid timeout) never draws new ones: providers bid once
+  //     per order. Close it and start over on a fresh dseq, or every resume
+  //     would poll the dead order and park on an empty bid list.
+  if (!(leaseRow && (leaseRow.status === "signed" || leaseRow.status === "confirmed"))) {
+    const staleClose = `send-manifests:close-stale:${key}:${dseq}`;
+    const drawn = await ctx.services.api.listBids(addr, dseq).catch(() => [] as Bid[]);
+    const expired = drawn.length > 0 && !drawn.some((b) => b.bid.state === "open");
+    if (expired || ctx.db.getPendingTx(ctx.launchId, staleClose)) {
+      ctx.log(`${key}: every bid on deployment ${dseq} expired unleased — closing it to draw a fresh set`);
+      const live = await ctx.services.api.deploymentInfo(addr, dseq).catch(() => undefined);
+      if (live?.state === "active") await ctx.requireTx(staleClose, [closeDeploymentMsg(addr, dseq)]);
+      ctx.db.deletePendingTx(ctx.launchId, staleClose);
+      ctx.db.deletePendingTx(ctx.launchId, redeployStep);
+      clearPin(ctx, `rebid-${key}-dseq`);
+      // keep the pick row open (a manual placement stays manual) but drop
+      // the choice and offers that named the dead deployment
+      if (ctx.db.getBidPick(ctx.launchId, key)) ctx.db.requestBidPick(ctx.launchId, key);
+      return rebidComponent(ctx, key, plan, assignments, { ...opts, blameProvider: false });
+    }
+  }
+
   // 4. pick a replacement, honoring anti-affinity against the components that
   //    are staying put
   const providers = await ctx.services.api.listProviders();
-  const leaseStep = `send-manifests:release:${key}:${dseq}`;
-  const leaseRow = ctx.db.getPendingTx(ctx.launchId, leaseStep);
   let decision: PolicyDecision;
   /** provider/gseq/oseq of the placement we end up with, plus its price. */
   let placement: { provider: string; gseq: number; oseq: number; price: string };

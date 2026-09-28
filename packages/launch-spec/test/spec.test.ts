@@ -1168,3 +1168,25 @@ describe("mastodon bridge peers", () => {
   });
 });
 
+describe("services fleet sharing", () => {
+  const services = (sharing?: unknown) =>
+    checkSpec({
+      version: 1,
+      kind: "services",
+      network: { name: "zenith-services" },
+      ...(sharing ? { sharing } : {}),
+      topology: { components: { mastodon: { enabled: true, domain: "mstdn.zenith.example", owner: { username: "admin", email: "a@zenith.example" } } } },
+    });
+  it("takes a list of akash wallets, and a minimal services spec needs nothing chain-shaped", () => {
+    expect(services().errors).toEqual([]);
+    // no network type: the audited-provider profile a shared service wants
+    expect(services().spec!.network.type).toBe("testnet");
+    expect(services().spec!.providers.policy.auditedOnly).toBe(true);
+    expect(services({ wallets: [AKASH_A] }).errors).toEqual([]);
+  });
+  it("refuses other addresses and duplicates", () => {
+    expect(services({ wallets: [SPARK_A] }).errors.length).toBeGreaterThan(0);
+    expect(services({ wallets: [AKASH_A, AKASH_A] }).errors.map((e) => e.path)).toContain("sharing.wallets");
+  });
+});
+

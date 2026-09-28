@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import {
   chainId,
   checkSpec,
+  isServicesFleet,
   findChainRelease,
   knownChainVersions,
   nodes,
@@ -31,7 +32,7 @@ import {
 } from "./chain-assets/index.js";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
 import { manualBidRequired } from "./akash/policy.js";
-import { launchDirs, runLaunch, type StepDef } from "./engine.js";
+import { dropStaleFailures, launchDirs, runLaunch, type StepDef } from "./engine.js";
 import { AuthService } from "./auth.js";
 import {
   buildTmkmsSetup,
@@ -60,13 +61,16 @@ import type {
 } from "./steps/phase-bcd.js";
 import type { SshTarget } from "./services.js";
 import { sessionRoles } from "./sessions.js";
-import { stashSmtpPassword } from "./components/mastodon-secrets.js";
+import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
+import { resolveSmtpPasswordSource, servicesSpecDraft, servicesSpecFrom, type ServicesDraft } from "./services-spec.js";
 import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
 import { resolveRelayFleet } from "./relayer.js";
 import { resolveVerifierTarget } from "./verifier.js";
+import { resolveBridgeTarget } from "./bridge-target.js";
+import { servicesSteps } from "./services-steps.js";
 import { gentxResponseFromSignedTx, unsignedTxJsonFromSignDoc } from "./gentx.js";
 import { prefillSpecFromGenesis } from "./genesis-prefill.js";
 import { joinSpecFromBundle } from "./join-prefill.js";
@@ -217,7 +221,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       await Promise.all(
         deps.db.listCompletedLaunches().map(async (launch) => {
           await fleet.tick(launch.id).catch(() => {});
-          await fleet.settleFleetTxs(launch.id).catch(() => {});
+          const queued = await fleet.settleFleetTxs(launch.id).catch((): string[] => []);
+          for (const other of queued) {
+            const l = deps.db.getLaunch(other);
+            if (l) drive(other, JSON.parse(l.spec_json));
+          }
           // daemon session keys renew unattended: local signing, no wallet
           if (await fleet.sessionsDue(launch.id).catch(() => false)) {
             if (fleet.requestSessions(launch) !== undefined) drive(launch.id, JSON.parse(launch.spec_json));
@@ -235,21 +243,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // A drive requested while one is active re-runs when it finishes, so a
   // tx-result landing mid-run is never stranded.
   const rerun = new Set<string>();
+  // fleet ops (relaunch/upgrade) compose onto the launch's step list —
+  // completed launch steps checkpoint-skip, then op steps run. Restore runs
+  // ahead of them all: the launch step it would otherwise queue behind is
+  // usually the one failing for want of the block history it restores.
+  const planFor = (id: string, spec: LaunchSpec) => [
+    ...buildPreLaunchOpSteps(deps.db, id),
+    // a services fleet has no chain: its own, shorter pipeline
+    ...(isServicesFleet(spec) ? servicesSteps() : deps.steps),
+    ...buildOpSteps(deps.db, id),
+  ];
+
   const drive = (id: string, spec: LaunchSpec): "started" | "already-running" => {
     if (running.has(id)) {
       rerun.add(id);
       return "already-running";
     }
     running.add(id);
-    // fleet ops (relaunch/upgrade) compose onto the launch's step list —
-    // completed launch steps checkpoint-skip, then op steps run. Restore runs
-    // ahead of them all: the launch step it would otherwise queue behind is
-    // usually the one failing for want of the block history it restores.
-    const steps = [
-      ...buildPreLaunchOpSteps(deps.db, id),
-      ...deps.steps,
-      ...buildOpSteps(deps.db, id),
-    ];
+    const steps = planFor(id, spec);
     void runLaunch(deps.db, id, spec, deps.workRoot, steps, deps.services, (m) =>
       app.log.info(`launch ${id}: ${m}`),
     )
@@ -458,6 +469,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         });
       }
     }
+    // a standalone bridge: resolve its Mastodon fleet to a launch id and the
+    // instance's domain, which its SDL and peer are named after
+    const bridge = spec.topology.components.bridge;
+    if (bridge?.enabled) {
+      try {
+        bridge.target = resolveBridgeTarget(deps.db, requestOwner(req, body.owner) ?? "", bridge.target.fleet);
+      } catch (e) {
+        return reply.status(400).send({
+          error: "validation",
+          issues: [{ path: "topology.components.bridge.target.fleet", message: String(e instanceof Error ? e.message : e) }],
+        });
+      }
+    }
     if (deps.onAkash && spec.network.type === "mainnet") {
       // §2 security model: mainnet secrets do not belong on provider disk
       warnings.push({
@@ -467,6 +491,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
     }
     const id = randomUUID();
+    // a password named by source fleet (the services spec builder's) is read
+    // from that fleet's secret store, then stashed like a typed one
+    try {
+      resolveSmtpPasswordSource(deps.db, deps.workRoot, requestOwner(req, body.owner) ?? "", spec);
+    } catch (e) {
+      return reply.status(400).send({
+        error: "validation",
+        issues: [{ path: "topology.components.mastodon.smtp.passwordFromFleet", message: String(e instanceof Error ? e.message : e) }],
+      });
+    }
     // secrets never live in the stored spec
     stashSmtpPassword(launchDirs(deps.workRoot, id).secrets, spec);
     deps.db.createLaunch(id, JSON.stringify(spec), requestOwner(req, body.owner) ?? "");
@@ -502,7 +536,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const launch = deps.db.getLaunch(id);
     if (!launch) return reply.status(404).send({ error: "not found" });
     if (denyForeign(req, reply, launch)) return;
-    if (launch.status === "completed") return { status: "completed" };
+    if (launch.status === "completed") {
+      // nothing to drive; a failure left by a step no longer in the plan
+      // is cleared, or the panel's Retry would show it forever
+      if (!running.has(id)) dropStaleFailures(deps.db, id, planFor(id, JSON.parse(launch.spec_json)));
+      return { status: "completed" };
+    }
     if (launch.status === "aborted") {
       return reply
         .status(409)
@@ -597,7 +636,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     deps.db.setPendingTxSigned(id, pending.step, txHash);
     if (pending.step.startsWith("fleet:")) {
       // fleet actions settle outside the launch step engine
-      await fleet.settleFleetTxs(id);
+      const queued = await fleet.settleFleetTxs(id);
+      // a closed bridge re-syncs its Mastodon's wallet sign-in chains
+      for (const other of queued) {
+        const l = deps.db.getLaunch(other);
+        if (l) drive(other, JSON.parse(l.spec_json));
+      }
+      // ...except the close of a mid-launch re-place: the launch then has to
+      // run again to deploy the replacement (requestReplace reset its
+      // manifests step), and nothing else would start it
+      const settled = deps.db.getLaunch(id);
+      if (
+        pending.step.startsWith("fleet:close:") &&
+        settled &&
+        settled.status !== "completed" &&
+        settled.status !== "aborted" &&
+        deps.db.getStep(id, "create-leases")?.status === "done" &&
+        deps.db.getStep(id, "send-manifests")?.status !== "done"
+      ) {
+        return { status: "settled", resumed: drive(id, JSON.parse(settled.spec_json)) };
+      }
       return { status: "settled" };
     }
     // resume in the background: requireTx verifies inclusion on-chain
@@ -630,8 +688,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "clear-halt-height"
         | "reset-data"
         | "resize"
-        | "bridge-peers";
+        | "mastodon-settings"
+        | "bridge-peers"
+        | "remove";
       confirm?: boolean;
+      /** mastodon-settings: who may sign up, and wallet sign-in (merged into
+       *  the current settings). */
+      registrations?: "open" | "approved" | "none";
+      walletLogin?: Record<string, unknown>;
       /** bridge-peers (Mastodon): the other servers bridged as their own peers. */
       peers?: string[];
       /** resize (Mastodon): the size to move the instance to. */
@@ -734,6 +798,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         drive(launchId, spec);
         return { status: "relaunch-started", opId, manualBid: picksBids };
       }
+      case "remove": {
+        try {
+          fleet.removeComponent(launch, component.key);
+          return { status: "removed", key: component.key };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
       case "bridge-peers": {
         if (!Array.isArray(body.peers) || body.peers.some((p) => typeof p !== "string")) {
           return reply.status(400).send({ error: "peers must be a list of server domains" });
@@ -757,6 +829,35 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           const opId = await fleet.requestMastodonResize(launch, component, body.size);
           drive(launchId, spec);
           return { status: "resize-started", opId, size: body.size };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "mastodon-settings": {
+        if (body.registrations === undefined && body.walletLogin === undefined) {
+          return reply.status(400).send({ error: "nothing to change: give registrations and/or walletLogin" });
+        }
+        const settings = {
+          ...(body.registrations !== undefined ? { registrations: body.registrations } : {}),
+          ...(body.walletLogin !== undefined ? { walletLogin: body.walletLogin } : {}),
+        };
+        try {
+          // turning sign-in on or off moves the instance: say so first
+          if (!body.confirm && fleet.mastodonSettingsMove(launch, settings)) {
+            return reply.status(409).send({
+              warnings: [
+                "Turning wallet sign-in on or off adds or removes a service, which Akash cannot do to a running " +
+                  "deployment. Mastodon moves to a new deployment at its current size, data and all, as a resize does: " +
+                  "backup, close (the instance goes down), deploy and lease (signatures), restore, restart. " +
+                  "Posts made between the backup and the close are not carried over.",
+              ],
+              confirmPrompt: "Move Mastodon to a new deployment?",
+            });
+          }
+          const { opId, move } = fleet.requestMastodonSettings(launch, component, settings);
+          // the op's steps are built from the spec just written
+          drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+          return { status: move ? "mastodon-move-started" : "mastodon-settings-started", opId, move };
         } catch (e) {
           return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
         }
@@ -1005,6 +1106,72 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // spec, stripped of everything that belongs to the chain or is already
   // spoken for by the running fleet, with the live join block filled in.
   // A draft for the editor, not a launchable file: what it drops, it says.
+  // the wallets a services fleet is shared with (its card's "share…")
+  app.post("/api/fleet/:launchId/sharing", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const body = (req.body ?? {}) as { wallets?: unknown };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (!Array.isArray(body.wallets) || body.wallets.some((w) => typeof w !== "string")) {
+      return reply.status(400).send({ error: "wallets must be a list of akash1... addresses" });
+    }
+    try {
+      return { wallets: fleet.setSharing(launch, body.wallets as string[]) };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // a services fleet spec (kind: services) from scratch: the launch card's
+  // "New services fleet…" action
+  app.post("/api/services-spec", async (req, reply) => {
+    const body = (req.body ?? {}) as Partial<ServicesDraft>;
+    if (!body.name || !body.domain || !body.owner?.username || !body.owner?.email) {
+      return reply.status(400).send({ error: "name, domain and owner (username, email) are required" });
+    }
+    const result = servicesSpecDraft({
+      name: body.name,
+      ...(body.type ? { type: body.type } : {}),
+      domain: body.domain,
+      ...(body.streamingDomain ? { streamingDomain: body.streamingDomain } : {}),
+      owner: body.owner,
+      ...(body.size ? { size: body.size } : {}),
+      ...(body.registrations ? { registrations: body.registrations } : {}),
+      ...(body.smtp ? { smtp: body.smtp } : {}),
+      ...(Array.isArray(body.sharing) ? { sharing: body.sharing } : {}),
+    });
+    nameFleetUniquely(deps.db, result.spec as unknown as LaunchSpecInput);
+    const check = checkSpec(result.spec);
+    return { ...result, issues: [...check.errors, ...check.warnings.map((w) => ({ ...w, warning: true }))] };
+  });
+
+  // a services fleet spec (kind: services) drafted from this fleet's
+  // Mastodon settings: the launcher's "services spec" action
+  app.get("/api/fleet/:launchId/services-spec", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const q = req.query as { name?: string; domain?: string; streamingDomain?: string; sharing?: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (!q.name || !q.domain) return reply.status(400).send({ error: "name and domain are required" });
+    const base = withDefaults(JSON.parse(launch.spec_json) as LaunchSpecInput);
+    const stored = readMastodonSecrets(launchDirs(deps.workRoot, launchId).secrets)?.smtpPassword;
+    const result = servicesSpecFrom(base, {
+      name: q.name,
+      domain: q.domain,
+      ...(q.streamingDomain ? { streamingDomain: q.streamingDomain } : {}),
+      ...(stored && base.topology.components.mastodon?.smtp ? { smtpPasswordFrom: launchId } : {}),
+      ...(q.sharing ? { sharing: q.sharing.split(",").map((w) => w.trim()).filter(Boolean) } : {}),
+    });
+    nameFleetUniquely(deps.db, result.spec as unknown as LaunchSpecInput);
+    const check = checkSpec(result.spec);
+    return {
+      ...result,
+      issues: [...check.errors, ...check.warnings.map((w) => ({ ...w, warning: true }))],
+    };
+  });
+
   app.get("/api/fleet/:launchId/join-spec", async (req, reply) => {
     const { launchId } = req.params as { launchId: string };
     const launch = deps.db.getLaunch(launchId);
@@ -1044,6 +1211,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (denyForeign(req, reply, launch)) return;
     try {
       const result = await fleet.requestAbortOp(launch, Number(opId));
+      // the op's steps are gone, so nothing is left to pause on — but the
+      // launch stays "paused" (the UI's launching view, with no failed step
+      // to Retry) until a driver walks the remaining steps to "completed"
+      drive(launchId, JSON.parse(launch.spec_json) as LaunchSpec);
       return { status: "aborted", ...result };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });

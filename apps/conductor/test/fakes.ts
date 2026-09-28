@@ -283,6 +283,9 @@ export class FakeProviderGateway {
   shellLog: Array<{ dseq: string; script: string }> = [];
   /** Session keys delivered to daemons, keyed "<dseq>/<service>". */
   sessionKeys = new Map<string, string>();
+  /** Session-key deliveries that fail before one succeeds (the container
+   *  restarting after a deployment update). */
+  sessionKeyNotReady = 0;
   /** headscale users created via lease-shell ("sparkdream" pre-seeded for
    *  tests that mint keys without running configure-headscale first). */
   private hsUsers: string[] = ["sparkdream"];
@@ -290,8 +293,12 @@ export class FakeProviderGateway {
    *  tmkms host, operator laptops. Tests set this to simulate a mesh join. */
   externalMeshNodes: { name: string; ipAddresses: string[]; online: boolean }[] = [];
   /** Mastodon instances by dseq: accounts created, registrations mode,
-   *  bridge token (the image's mastodon-bootstrap, answered in memory). */
-  mastodon = new Map<string, { accounts: Set<string>; registrations?: string; token?: string }>();
+   *  bridge token, wallet sign-in chains (the image's mastodon-bootstrap,
+   *  answered in memory). */
+  mastodon = new Map<
+    string,
+    { accounts: Set<string>; registrations?: string; token?: string; loginChains?: Record<string, any> }
+  >();
   /** Bootstrap calls that fail before one succeeds (instance still starting). */
   mastodonNotReady = 0;
 
@@ -312,6 +319,10 @@ export class FakeProviderGateway {
     if (action === "registrations") {
       inst.registrations = name;
       return out({ registrations: name });
+    }
+    if (action === "login-chain" && name === "sync") {
+      inst.loginChains = JSON.parse(args[2]!);
+      return out({ chains: Object.keys(inst.loginChains!).length });
     }
     if (action === "bridge-token") {
       inst.accounts.add(name!);
@@ -431,6 +442,10 @@ export class FakeProviderGateway {
       return { stdout: vars.map((v) => `${v}\n`).join(""), stderr: "" };
     }
     if (script.includes("/data/session-key")) {
+      if (this.sessionKeyNotReady > 0) {
+        this.sessionKeyNotReady--;
+        throw new Error("lease shell: no active replicas for service");
+      }
       // a daemon's session key, delivered (sessions.ts)
       const mnemonic = /printf '%s\\n' '([a-z ]+)'/.exec(script)?.[1];
       if (!mnemonic) throw new Error(`unexpected session-key script: ${script}`);

@@ -47,6 +47,10 @@ export interface ProviderInfo {
 export interface Rejection {
   provider: string;
   reason: string;
+  /** The component cannot work on this provider at all (no storage of the
+   *  class it needs, no custom domains), as opposed to a preference the
+   *  operator may knowingly override by picking the bid anyway. */
+  fatal?: boolean;
 }
 
 export interface PolicyDecision {
@@ -89,7 +93,7 @@ export interface ExclusionEntry {
 /**
  * Effective exclusions for a component key: the fleet-wide list plus the
  * key's component group. val-N -> validators, sentry-N -> sentries, every
- * other key (headscale, explorer, frontend, hub) maps to itself.
+ * other key (headscale and the service components) maps to itself.
  * Null-tolerant: resumed launches replay the stored spec JSON without a
  * schema re-parse, so specs written before this feature arrive with
  * providers.exclude / providers.components undefined at runtime.
@@ -177,10 +181,16 @@ export function describeBids(
   providers: Map<string, ProviderInfo>,
   decision: PolicyDecision,
 ): OfferedBid[] {
+  const rank = new Map<string, number>();
   const offers = open.flatMap((b) => {
     const info = providers.get(b.bid.id.provider);
     if (!info) return [];
-    const rejected = decision.rejected.find((r) => r.provider === b.bid.id.provider)?.reason;
+    const rejection = decision.rejected.find((r) => r.provider === b.bid.id.provider);
+    const rejected = rejection?.reason;
+    rank.set(
+      b.bid.id.provider,
+      !rejection ? 0 : rejection.fatal ? 3 : info.isAudited && info.uptime7d >= RELIABLE_UPTIME ? 1 : 2,
+    );
     return [
       {
         provider: b.bid.id.provider,
@@ -194,8 +204,23 @@ export function describeBids(
       },
     ];
   });
-  return offers.sort((a, b) => Number(a.price) - Number(b.price));
+  // Dependable first: a list sorted by price alone puts a wall of cheap,
+  // unaudited, flaky bids on top and buries the audited ones mid-list. Bids
+  // the policy accepts come first, then audited reliable ones it passed over
+  // for a preference (avoid list, price ceiling, anti-affinity), then the
+  // rest, and last the ones the component cannot run on. Within a tier,
+  // reliable uptime before spotty, then cheapest.
+  const reliable = (o: OfferedBid) => (o.uptime7d >= RELIABLE_UPTIME ? 0 : 1);
+  return offers.sort(
+    (a, b) =>
+      rank.get(a.provider)! - rank.get(b.provider)! ||
+      reliable(a) - reliable(b) ||
+      Number(a.price) - Number(b.price),
+  );
 }
+
+/** 7-day uptime a bid needs to rank among the dependable ones in a pick list. */
+const RELIABLE_UPTIME = 0.99;
 
 /**
  * Provider selection (§6): hard filters → preference list → lowest price.
@@ -216,8 +241,8 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
   const survivors = open.filter((b) => {
     const provider = b.bid.id.provider;
     const info = ctx.providers.get(provider);
-    const reject = (reason: string) => {
-      rejected.push({ provider, reason });
+    const reject = (reason: string, fatal = false) => {
+      rejected.push({ provider, reason, ...(fatal ? { fatal } : {}) });
       return false;
     };
 
@@ -249,7 +274,7 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
       !bidOffersStorageClass(b, ctx.requiredStorageClass) &&
       !info.storageClasses.includes(ctx.requiredStorageClass)
     ) {
-      return reject(`no ${ctx.requiredStorageClass} persistent storage`);
+      return reject(`no ${ctx.requiredStorageClass} persistent storage`, true);
     }
     // A provider that does not do custom domains still bids on the order —
     // nothing in the group spec says the service names a host, so the bid
@@ -260,7 +285,7 @@ export function selectProvider(bids: Bid[], ctx: PolicyContext): PolicyDecision 
     // altogether.) So the capability is filtered here, where the SDL is
     // known, rather than left to the order.
     if (ctx.requiresCustomDomain && !info.customDomain) {
-      return reject("does not serve custom domains (featEndpointCustomDomain)");
+      return reject("does not serve custom domains (featEndpointCustomDomain)", true);
     }
     return true;
   });

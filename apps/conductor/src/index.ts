@@ -42,8 +42,14 @@ import { phaseASteps } from "./steps/phase-a.js";
 import { phaseBCDSteps } from "./steps/phase-bcd.js";
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import type { StepDef } from "./engine.js";
+import { isServicesFleet, type LaunchSpec } from "@sparkdream/launch-spec";
+import { servicesSteps } from "./services-steps.js";
+export { servicesSteps };
 
-/** The complete launch pipeline, Phase A through F (§5). */
-export function allSteps(): StepDef[] {
+/** The complete launch pipeline, Phase A through F (§5); a services fleet
+ *  (spec.kind "services") gets its own, shorter one. */
+export function allSteps(spec?: Pick<LaunchSpec, "kind">): StepDef[] {
+  if (spec && isServicesFleet(spec)) return servicesSteps();
   return [...phaseASteps(), ...phaseBCDSteps(), ...phaseEFSteps()];
 }
+

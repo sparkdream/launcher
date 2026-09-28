@@ -353,6 +353,8 @@ export interface FleetSummary {
     launchStatus: string;
     /** The spec's network name (distinguishes fleets sharing a chain id). */
     name: string;
+    /** "services": a fleet of shared components with no chain of its own. */
+    kind?: "chain" | "services";
     chainId: string;
     /** softsign | tmkms — signer-related actions are gated on this. */
     keyMode: string;
@@ -443,8 +445,13 @@ export type FleetAction =
   | "reset-data"
   /** Mastodon: move to a deployment of another size, data and all. */
   | "resize"
+  /** Mastodon: registrations and wallet sign-in (turning sign-in on or off
+   *  moves the instance, as a resize does). */
+  | "mastodon-settings"
   /** Mastodon: the other servers its bridge anchors for as their own peers. */
-  | "bridge-peers";
+  | "bridge-peers"
+  /** A closed service component: drop it from the fleet and the spec. */
+  | "remove";
 
 export async function postFleetAction(
   launchId: string,
@@ -462,6 +469,8 @@ export async function postFleetAction(
     endHeight?: number;
     size?: "small" | "standard";
     peers?: string[];
+    registrations?: "open" | "approved" | "none";
+    walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
   } = {},
 ): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
@@ -858,6 +867,63 @@ export async function postJoinPrefill(bundle: unknown): Promise<SpecPrefill> {
       body: JSON.stringify({ bundle }),
     }),
   );
+}
+
+/** Set the wallets a services fleet is shared with (its card's "share…"). */
+export async function postFleetSharing(launchId: string, wallets: string[]): Promise<{ wallets: string[] }> {
+  const res = await afetch(`/api/fleet/${launchId}/sharing`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ wallets }),
+  });
+  const body = (await res.json().catch(() => null)) as { wallets?: string[]; error?: string } | null;
+  if (!res.ok || !body?.wallets) throw new Error(body?.error ?? `sharing: HTTP ${res.status}`);
+  return { wallets: body.wallets };
+}
+
+/** A services fleet spec draft from scratch (the launch card's action). */
+export async function postServicesSpec(draft: {
+  name: string;
+  domain: string;
+  streamingDomain?: string;
+  owner: { username: string; email: string };
+  size?: "small" | "standard";
+  type?: "devnet" | "testnet" | "mainnet";
+  sharing?: string[];
+}): Promise<SpecPrefill> {
+  const res = await afetch(`/api/services-spec`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(draft),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `services spec: HTTP ${res.status}`);
+  }
+  return res.json() as Promise<SpecPrefill>;
+}
+
+/**
+ * A services fleet spec draft (kind: services) from THIS fleet's Mastodon
+ * settings, under a new fleet name and domain. The SMTP password is named
+ * by source fleet and copied server-side, never sent to the browser.
+ */
+export async function getServicesSpec(
+  launchId: string,
+  opts: { name: string; domain: string; streamingDomain?: string; sharing?: string[] },
+): Promise<SpecPrefill> {
+  const q = new URLSearchParams({
+    name: opts.name,
+    domain: opts.domain,
+    ...(opts.streamingDomain ? { streamingDomain: opts.streamingDomain } : {}),
+    ...(opts.sharing?.length ? { sharing: opts.sharing.join(",") } : {}),
+  });
+  const res = await afetch(`/api/fleet/${launchId}/services-spec?${q}`);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `services spec: HTTP ${res.status}`);
+  }
+  return res.json() as Promise<SpecPrefill>;
 }
 
 /**

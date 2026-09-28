@@ -490,3 +490,34 @@ describe("upgrading a Mastodon deployment's side images", () => {
   }, 300_000);
 });
 
+describe("removing closed components", () => {
+  it("drops the row and disables the component, and a rebuild does not bring it back", async () => {
+    const chain = chainStub();
+    const { db, fleet } = await launched({ mastodon, verifier }, chain);
+    const launch = () => db.getLaunch("fl")!;
+    const keys = () => db.listFleetComponents("fl").map((c) => c.key).sort();
+
+    expect(() => fleet.removeComponent(launch(), "mastodon")).toThrow(/close mastodon first/);
+    expect(() => fleet.removeComponent(launch(), "val-0")).toThrow(/not a service component/);
+    db.setComponentState("fl", "mastodon", "closed");
+    db.setComponentState("fl", "verifier", "closed");
+    // the verifier checks the Mastodon's peer: it has to go first
+    expect(() => fleet.removeComponent(launch(), "mastodon")).toThrow(/would not validate/);
+
+    fleet.removeComponent(launch(), "verifier");
+    fleet.removeComponent(launch(), "mastodon");
+    expect(keys()).not.toContain("mastodon");
+    expect(keys()).not.toContain("verifier");
+    const comps = JSON.parse(launch().spec_json).topology.components;
+    expect(comps.mastodon).toMatchObject({ enabled: false, domain: DOMAIN });
+    expect(comps.verifier).toMatchObject({ enabled: false, account: "vera" });
+
+    // both were deployed at launch: the launch outputs still list them
+    fleet.materialize("fl");
+    expect(keys()).not.toContain("mastodon");
+    expect(keys()).not.toContain("verifier");
+    expect(keys()).toEqual(expect.arrayContaining(["headscale", "sentry-0", "val-0"]));
+    db.close();
+  }, 180_000);
+});
+

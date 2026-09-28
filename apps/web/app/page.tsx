@@ -6,7 +6,9 @@ import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-
 import {
   checkSpec,
   COMPONENT_KEYS,
+  SERVICES_FLEET_COMPONENTS,
   COMPONENT_KINDS,
+  defaultLoginDomain,
   isComponentKey,
   type LaunchSpec,
   type SpecCheck,
@@ -66,6 +68,9 @@ import {
 } from "../lib/lcd";
 
 const EXAMPLE_SPEC = `version: 1
+# kind: services   # a fleet of shared components with no chain (a Mastodon
+#                  # that several chains bridge to): no nodes, no mesh;
+#                  # topology.components may then enable mastodon only
 network:
   name: sparkdreamdev
   type: devnet
@@ -154,22 +159,39 @@ topology:
     # in the fleet's accounts panel. bridge: anchor opted-in authors' posts on
     # this chain (needs publicEndpoints.api; registers the instance as an
     # ActivityPub peer and bonds a bridge operator, 1000 SPARK). The bridge
-    # signs through a session key; the operator's key stays here.
+    # signs through a session key; the operator's key stays here. Its account
+    # on the instance is named after the network (bridgedev, bridgetest,
+    # bridge on mainnet). An instance several chains share belongs in a
+    # services fleet, each chain linking it with a standalone bridge (below).
     # mastodon:
     #   enabled: true
     #   domain: social.example.com
     #   owner: { username: admin, email: you@example.com }
-    #   registrations: approved        # open | approved | none
+    #   registrations: none            # none (default: bridge only) | approved | open
     #   size: small                    # small (~2 CPU, 3.6 GB) | standard (~4 CPU, 8 GB); fixed per deployment
-    #   # outgoing mail, so sign-ups can confirm their address; the password
-    #   # moves to the launcher's secret store when the component is added
+    #   # outgoing mail, so sign-ups can confirm their address (only needed
+    #   # when registrations is not none); the password moves to the
+    #   # launcher's secret store when the component is added
     #   smtp:
     #     server: smtp.example.com
     #     port: 587                    # security: starttls (587) | tls (465) | none
     #     login: apikey
     #     password: <relay password or API key>
     #     fromAddress: "Mastodon <notifications@example.com>"
+    #   # members sign in with Keplr (sdaplogin, sdap image) on their own domain
+    #   # (default: mstdn.example.io -> mstdn-login.example.io, same depth):
+    #   # handle = their x/name, no email or password; chains linked by a
+    #   # standalone bridge are offered too. Needs publicEndpoints api + rpc
+    #   walletLogin: { enabled: true, minTrustLevel: new }   # new | provisional | established | trusted | core
     #   bridge: { enabled: true }
+    # Standalone bridge: links a Mastodon another fleet runs (typically a
+    # services fleet) to THIS chain, with its own account there, its own
+    # peer, operator bond and session key here. Not together with a Mastodon
+    # bridge sidecar in the same fleet.
+    # bridge:
+    #   enabled: true
+    #   target: { fleet: <services fleet's network name or launch id> }
+    #   # account: bridgedev          # default: by this network's type
     # Content verifier (sdapverify) for the bridge's anchored posts, on its
     # own deployment and never on the Mastodon's provider. Acts as a member
     # (ESTABLISHED+) of the target chain and bonds 500 DREAM as
@@ -523,6 +545,86 @@ export default function Page() {
       );
     } catch (e) {
       setError(`join spec: ${String(e instanceof Error ? e.message : e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // The questions every services fleet draft asks: its name and its
+  // Mastodon's domains. undefined when the user cancels.
+  const askServicesBasics = ():
+    | { name: string; domain: string; streamingDomain: string; sharing: string[] }
+    | undefined => {
+    const name = window.prompt("Name of the new services fleet:", "sparkdream-services")?.trim();
+    if (!name) return undefined;
+    const domain = window.prompt("The Mastodon instance's domain (permanent: handles are @user@<domain>):", "mstdn.example.com")?.trim();
+    if (!domain) return undefined;
+    // one label deep by default: a free Cloudflare certificate covers
+    // *.example.com, not streaming.mstdn.example.com
+    const dot = domain.indexOf(".");
+    const suggested = dot > 0 ? `${domain.slice(0, dot)}-streaming${domain.slice(dot)}` : `streaming.${domain}`;
+    const streamingDomain = window.prompt("Its streaming domain:", suggested)?.trim();
+    if (!streamingDomain) return undefined;
+    // one person's other wallets (a devnet one and a testnet one) whose
+    // chain fleets should link bridges to this instance
+    const shareInput = window.prompt(
+      "Other Akash wallets whose chain fleets may link bridges to this instance (comma separated; empty for none):",
+      "",
+    );
+    if (shareInput === null) return undefined;
+    const sharing = shareInput.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean);
+    return { name, domain, streamingDomain, sharing };
+  };
+
+  // "New services fleet…": a services fleet (kind: services) from scratch,
+  // the usual start for a Mastodon several chains share
+  const newServicesFleet = async () => {
+    const basics = askServicesBasics();
+    if (!basics) return;
+    const username = window.prompt("Owner account's username (the instance's admin):", "admin")?.trim();
+    if (!username) return;
+    const email = window.prompt("Owner's email address:")?.trim();
+    if (!email) return;
+    const size = window.prompt("Size: small (~2 CPU, 3.6 GB, a new community) or standard (~4 CPU, 8 GB):", "small")?.trim();
+    if (size !== "small" && size !== "standard") {
+      setError('size must be "small" or "standard"');
+      return;
+    }
+    if (!confirmDraftOverwrite()) return;
+    setBusy("drafting a services fleet spec…");
+    setError(null);
+    try {
+      const { postServicesSpec } = await import("../lib/api");
+      const result = await postServicesSpec({ ...basics, owner: { username, email }, size });
+      closeLaunch();
+      switchMode("yaml"); // the notes are YAML comments; guided mode hides them
+      applyPrefill(result, "a new services fleet");
+      setTimeout(() => launchCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+    } catch (e) {
+      setError(`services spec: ${String(e instanceof Error ? e.message : e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // "services spec…" on a fleet card: the same, drafted from a fleet that ran
+  // Mastodon itself (its owner, SMTP, size, providers carry over)
+  const servicesSpecFromFleet = async (fleet: { launchId: string; name: string }) => {
+    const basics = askServicesBasics();
+    if (!basics) return;
+    const { name, domain, streamingDomain, sharing } = basics;
+    if (!confirmDraftOverwrite()) return;
+    setBusy("drafting a services fleet spec…");
+    setError(null);
+    try {
+      const { getServicesSpec } = await import("../lib/api");
+      const result = await getServicesSpec(fleet.launchId, { name, domain, streamingDomain, sharing });
+      closeLaunch();
+      switchMode("yaml"); // the notes are YAML comments; guided mode hides them
+      applyPrefill(result, `${fleet.name}'s Mastodon settings`);
+      setTimeout(() => launchCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+    } catch (e) {
+      setError(`services spec: ${String(e instanceof Error ? e.message : e)}`);
     } finally {
       setBusy(null);
     }
@@ -1067,6 +1169,10 @@ export default function Page() {
   };
 
   const specName: string = specDoc?.network?.name ?? "";
+  // a services fleet spec has no chain for the guided and form editors to
+  // shape: it is edited as YAML only
+  const servicesDraft = specDoc?.kind === "services";
+  const viewMode: EditMode = servicesDraft ? "yaml" : mode;
   const specType: string = specDoc?.network?.type ?? "devnet";
   const specSym: string = specDoc?.token?.displayDenom ?? "";
   const specDream: string = specDoc?.token?.dreamDisplayDenom ?? "DREAM";
@@ -1274,7 +1380,9 @@ export default function Page() {
       | "clear-halt-height"
       | "reset-data"
       | "resize"
-      | "bridge-peers",
+      | "mastodon-settings"
+      | "bridge-peers"
+      | "remove",
     extra: {
       image?: string;
       components?: string[];
@@ -1283,6 +1391,8 @@ export default function Page() {
       manualBid?: boolean;
       size?: "small" | "standard";
       peers?: string[];
+      registrations?: "open" | "approved" | "none";
+      walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
     } = {},
   ) => {
     setError(null);
@@ -2351,6 +2461,23 @@ export default function Page() {
           </button>
         </div>
       )}
+      {/* paused with nothing failed, waiting or to sign (a re-place whose close
+          was just confirmed, say): nothing else here would move it on */}
+      {!pending &&
+        !pendingGentx &&
+        !waitingStep &&
+        !failedStep &&
+        launch.status === "paused" && (
+          <div className="banner wait">
+            <span>The launch is paused with nothing waiting on you.</span>
+            <button
+              className="btn"
+              onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
+            >
+              Resume
+            </button>
+          </div>
+        )}
     </>
   );
 
@@ -2684,9 +2811,13 @@ export default function Page() {
             {idle && (
               <>
                 <div>
-                  <div className="card-title">Launch your chain</div>
+                  <div className="card-title">
+                    {specDoc?.kind === "services" ? "Launch your services fleet" : "Launch your chain"}
+                  </div>
                   <div className="card-sub">
-                    Guided setup, or switch to the form or raw YAML.
+                    {specDoc?.kind === "services"
+                      ? "Shared components, no chain: edit the YAML, or start another draft from New services fleet…."
+                      : "Guided setup, or switch to the form or raw YAML."}
                     {costRange && ` Est. ${costRange} first month.`}
                   </div>
                 </div>
@@ -2698,8 +2829,10 @@ export default function Page() {
                         ["form", "Form"],
                         ["yaml", "YAML"],
                       ] as const
-                    ).map(([m, label]) => (
-                      <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(m)}>
+                    )
+                      .filter(([m]) => !servicesDraft || m === "yaml")
+                      .map(([m, label]) => (
+                      <button key={m} className={viewMode === m ? "on" : ""} onClick={() => switchMode(m)}>
                         {label}
                       </button>
                     ))}
@@ -2811,7 +2944,7 @@ export default function Page() {
           </div>
 
           {/* guided wizard */}
-          {idle && mode === "guided" && (
+          {idle && viewMode === "guided" && (
             <div className="card-body">
               <div className="wiz-tabs">
                 {["Wallet", "Configure", "Review"].map((label, i) => {
@@ -3010,6 +3143,13 @@ export default function Page() {
                         }}
                       />
                     </label>
+                    <button
+                      className="btn link"
+                      title="A services fleet: no chain, only shared components several chains use (a Mastodon instance each chain links with a standalone bridge). Asks for its name, the instance's domains, owner and size, and writes the spec into the editor."
+                      onClick={() => void newServicesFleet()}
+                    >
+                      New services fleet…
+                    </button>
                   </div>
                   {advOpen && <div style={{ marginTop: 10 }}>{specTextarea(220)}</div>}
                   {specIssueList(!advOpen)}
@@ -3091,11 +3231,11 @@ export default function Page() {
           )}
 
           {/* form / yaml modes */}
-          {idle && mode !== "guided" && (
+          {idle && viewMode !== "guided" && (
             <div className="card-body">
               <div className="editor-grid">
                 <div>
-                  {mode === "form" && (
+                  {viewMode === "form" && (
                     <>
                       <div className="two-col">
                         <div>
@@ -3129,7 +3269,7 @@ export default function Page() {
                       </div>
                     </>
                   )}
-                  {mode === "yaml" && (
+                  {viewMode === "yaml" && (
                     <>
                       {specTextarea(280)}
                       <div className="spec-btns">
@@ -3162,7 +3302,7 @@ export default function Page() {
                     </>
                   )}
                   {assetsBanner()}
-                  {specIssueList(mode !== "yaml")}
+                  {specIssueList(viewMode !== "yaml")}
                 </div>
                 {editorRail}
               </div>
@@ -3211,7 +3351,12 @@ export default function Page() {
           )}
 
           {/* banners follow the card in every state */}
-          {(pending || pendingGentx || waitingStep || failedStep || launch?.status === "aborted") && (
+          {(pending ||
+            pendingGentx ||
+            waitingStep ||
+            failedStep ||
+            launch?.status === "aborted" ||
+            launch?.status === "paused") && (
             <div className="card-body" style={{ paddingTop: launching || launched ? 0 : undefined }}>
               {launchBanners}
             </div>
@@ -3251,8 +3396,9 @@ export default function Page() {
               </>
             ) : (
               <>
-                Your fleet appears here once the chain is live: validator, sentry, headscale,
-                explorer and frontend.
+                {specDoc?.kind === "services"
+                  ? "Your services fleet appears here once its components are live."
+                  : "Your fleet appears here once the chain is live: validator, sentry, headscale, explorer and frontend."}
               </>
             )}
           </div>
@@ -3260,8 +3406,14 @@ export default function Page() {
 
         {/* ---------- fleet + accounts cards, one pair per launch ---------- */}
         {(fleet?.fleets ?? []).map((f) => {
+          // a launch still placing (a re-place closed the old deployment and
+          // the new one is not leased yet) is not shut down: its bid picks
+          // render in this card
           const shutDown =
-            f.components.length > 0 && f.components.every((c) => c.state === "closed");
+            f.components.length > 0 &&
+            f.components.every((c) => c.state === "closed") &&
+            f.bidPicks.length === 0 &&
+            !["running", "paused"].includes(f.launchStatus);
           const collapsed = shutDown && !showClosedFleet[f.launchId];
           // delete is offered on shut-down fleets (collapsed or not) and on
           // stale records that never placed anything (failed/aborted attempts,
@@ -3280,6 +3432,8 @@ export default function Page() {
                 f.launchStatus === "paused" ||
                 f.launchStatus === "created"));
           const active = f.components.filter((c) => c.state === "active");
+          // a services fleet has no chain: only component actions apply
+          const chainFleet = f.kind !== "services";
           const unhealthy = active.filter((c) => healthKind(c) !== "ok");
           const monthly = fleetMonthlyUsd(f.components);
           const prefs = providerPrefs[f.launchId];
@@ -3387,73 +3541,80 @@ export default function Page() {
                   <div className="fleet-acts">
                     {!shutDown && (
                       <>
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            const feeNote =
-                              fee && fee.upgradeFlat > 0
-                                ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
-                                : "";
-                            // node fleet only — prefill with a current node image so
-                            // the expected ns/repo:tag format is obvious
-                            const nodes = f.components.filter(
-                              (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
-                            );
-                            const node = nodes[0];
-                            const image = window.prompt(
-                              `New sparkdreamd image for validators + sentries:${feeNote}`,
-                              node?.image ?? undefined,
-                            );
-                            // skip only when the whole node fleet already runs the
-                            // image — after an aborted mid-upgrade the fleet is mixed
-                            // and re-running with the same tag is the retry path
-                            if (image && node && nodes.some((c) => c.image !== image))
-                              fleetAction(f.launchId, node.dseq, "upgrade", { image });
-                          }}
-                        >
-                          rolling upgrade…
-                        </button>
-                        <button
-                          className="btn"
-                          onClick={async () => {
-                            const feeNote =
-                              fee && fee.upgradeFlat > 0
-                                ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
-                                : "";
-                            // prefill with a current node image, as the rolling
-                            // prompt does: the expected ns/repo:tag shape is
-                            // then obvious, and a tag typed from memory cannot
-                            // quietly disagree with what the fleet runs
-                            const nodes = f.components.filter(
-                              (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
-                            );
-                            const image = window.prompt(
-                              `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
-                              nodes[0]?.image ?? undefined,
-                            );
-                            // an unedited prefill on a fleet already running it
-                            // would halt consensus to install what is installed;
-                            // a mixed fleet is the aborted-upgrade retry path
-                            if (!image || !nodes.some((c) => c.image !== image)) return;
-                            const h = window.prompt("Halt height:");
-                            const first = f.components.find(
-                              (c) => c.state === "active" && c.key !== "headscale",
-                            );
-                            if (h && first) {
-                              const { postFleetAction: post } = await import("../lib/api");
-                              await post(f.launchId, first.dseq, "halt-upgrade", {
-                                image,
-                                haltHeight: Number(h),
-                              }).catch((e) => setError(String(e)));
-                              openLaunch(f.launchId);
-                            }
-                          }}
-                        >
-                          halt-height upgrade…
-                        </button>
+                        {chainFleet && (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              const feeNote =
+                                fee && fee.upgradeFlat > 0
+                                  ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
+                                  : "";
+                              // node fleet only — prefill with a current node image so
+                              // the expected ns/repo:tag format is obvious
+                              const nodes = f.components.filter(
+                                (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                              );
+                              const node = nodes[0];
+                              const image = window.prompt(
+                                `New sparkdreamd image for validators + sentries:${feeNote}`,
+                                node?.image ?? undefined,
+                              );
+                              // skip only when the whole node fleet already runs the
+                              // image — after an aborted mid-upgrade the fleet is mixed
+                              // and re-running with the same tag is the retry path
+                              if (image && node && nodes.some((c) => c.image !== image))
+                                fleetAction(f.launchId, node.dseq, "upgrade", { image });
+                            }}
+                          >
+                            rolling upgrade…
+                          </button>
+                        )}
+                        {chainFleet && (
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              const feeNote =
+                                fee && fee.upgradeFlat > 0
+                                  ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
+                                  : "";
+                              // prefill with a current node image, as the rolling
+                              // prompt does: the expected ns/repo:tag shape is
+                              // then obvious, and a tag typed from memory cannot
+                              // quietly disagree with what the fleet runs
+                              const nodes = f.components.filter(
+                                (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                              );
+                              const image = window.prompt(
+                                `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
+                                nodes[0]?.image ?? undefined,
+                              );
+                              // an unedited prefill on a fleet already running it
+                              // would halt consensus to install what is installed;
+                              // a mixed fleet is the aborted-upgrade retry path
+                              if (!image || !nodes.some((c) => c.image !== image)) return;
+                              const h = window.prompt("Halt height:");
+                              const first = f.components.find(
+                                (c) => c.state === "active" && c.key !== "headscale",
+                              );
+                              if (h && first) {
+                                const { postFleetAction: post } = await import("../lib/api");
+                                await post(f.launchId, first.dseq, "halt-upgrade", {
+                                  image,
+                                  haltHeight: Number(h),
+                                }).catch((e) => setError(String(e)));
+                                openLaunch(f.launchId);
+                              }
+                            }}
+                          >
+                            halt-height upgrade…
+                          </button>
+                        )}
                         {(() => {
                           const addable = COMPONENT_KEYS.filter(
-                            (k) => !f.components.some((c) => c.key === k && c.state !== "closed"),
+                            (k) =>
+                              // a services fleet runs chain-independent kinds only
+                              (chainFleet || SERVICES_FLEET_COMPONENTS.includes(k)) &&
+                              !f.components.some((c) => c.key === k && c.state !== "closed"),
                           );
                           if (addable.length === 0) return null;
                           return (
@@ -3475,11 +3636,23 @@ export default function Page() {
                                 // kinds with structured settings (the relayer's paths,
                                 // mastodon's owner and bridge) take them from the spec
                                 // editor, as the domains button takes domains
-                                const structured = key === "relayer" || key === "mastodon" || key === "verifier";
+                                const structured =
+                                  key === "relayer" || key === "mastodon" || key === "verifier" || key === "bridge";
                                 let settings: Record<string, unknown> | undefined;
                                 if (structured) {
                                   const edited = yaml.load(specText) as any;
                                   settings = edited?.topology?.components?.[key];
+                                  if ((!settings || typeof settings !== "object") && key === "bridge") {
+                                    // the one thing it needs: the fleet whose Mastodon it links
+                                    const target = window
+                                      .prompt(
+                                        "Mastodon fleet to bridge to this chain (its network name or launch id, typically your services fleet). " +
+                                          "The bridge's account there is named after this network (bridgedev, bridgetest, or bridge on mainnet):",
+                                      )
+                                      ?.trim();
+                                    if (!target) return;
+                                    settings = { enabled: true, target: { fleet: target } };
+                                  }
                                   if ((!settings || typeof settings !== "object") && key === "verifier") {
                                     // the common case needs one value: the member it acts as,
                                     // whose wallet signs the bond and the session grant
@@ -3570,37 +3743,78 @@ export default function Page() {
                     >
                       export fleet bundle
                     </button>
-                    <button
-                      className="btn"
-                      onClick={async () => {
-                        const { downloadGenesis } = await import("../lib/api");
-                        await downloadGenesis(f.launchId, f.chainId).catch((e) =>
-                          setError(String(e)),
-                        );
-                      }}
-                    >
-                      download genesis
-                    </button>
-                    <button
-                      className="btn"
-                      title="Public join document for third-party operators (genesis sha256, sentry peer strings, state-sync RPCs); they paste it into their own launcher's spec join block"
-                      onClick={async () => {
-                        const { downloadJoinBundle } = await import("../lib/api");
-                        await downloadJoinBundle(f.launchId, f.chainId).catch((e) =>
-                          setError(String(e)),
-                        );
-                      }}
-                    >
-                      join bundle
-                    </button>
-                    <button
-                      className="btn"
-                      title="Add another sovereign validator/sentry pair to this chain: writes a join spec into the editor, built from this fleet's own spec (its resources, providers and key mode) plus the live join bundle. What it cannot carry over, it says in the notes."
-                      onClick={() => void joinSpecFromFleet(f)}
-                    >
-                      join spec
-                    </button>
-                    {!shutDown && active.length > 0 && (
+                    {chainFleet && (
+                      <button
+                        className="btn"
+                        onClick={async () => {
+                          const { downloadGenesis } = await import("../lib/api");
+                          await downloadGenesis(f.launchId, f.chainId).catch((e) =>
+                            setError(String(e)),
+                          );
+                        }}
+                      >
+                        download genesis
+                      </button>
+                    )}
+                    {chainFleet && (
+                      <button
+                        className="btn"
+                        title="Public join document for third-party operators (genesis sha256, sentry peer strings, state-sync RPCs); they paste it into their own launcher's spec join block"
+                        onClick={async () => {
+                          const { downloadJoinBundle } = await import("../lib/api");
+                          await downloadJoinBundle(f.launchId, f.chainId).catch((e) =>
+                            setError(String(e)),
+                          );
+                        }}
+                      >
+                        join bundle
+                      </button>
+                    )}
+                    {!chainFleet && !shutDown && (
+                      <button
+                        className="btn"
+                        title="Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
+                        onClick={async () => {
+                          try {
+                            const current: string[] = ((await getLaunch(f.launchId)).spec as any)?.sharing?.wallets ?? [];
+                            const input = window.prompt(
+                              "Wallets this services fleet is shared with (comma separated; empty for none):",
+                              current.join(", "),
+                            );
+                            if (input === null) return;
+                            const { postFleetSharing } = await import("../lib/api");
+                            const r = await postFleetSharing(
+                              f.launchId,
+                              input.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean),
+                            );
+                            showToast(r.wallets.length ? `shared with ${r.wallets.length} wallet(s)` : "no longer shared");
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        }}
+                      >
+                        share…
+                      </button>
+                    )}
+                    {chainFleet && (
+                      <button
+                        className="btn"
+                        title="For a Mastodon first set up in this chain fleet: draft a services fleet (no chain: shared components several chains use) in the editor, carrying this fleet's Mastodon settings (owner, SMTP, size, providers) under the domain you choose. The SMTP password is copied from this fleet's secret store when you launch it. Starting fresh? Use New services fleet… on the launch card. Each chain then links the instance with a standalone bridge."
+                        onClick={() => void servicesSpecFromFleet(f)}
+                      >
+                        services spec…
+                      </button>
+                    )}
+                    {chainFleet && (
+                      <button
+                        className="btn"
+                        title="Add another sovereign validator/sentry pair to this chain: writes a join spec into the editor, built from this fleet's own spec (its resources, providers and key mode) plus the live join bundle. What it cannot carry over, it says in the notes."
+                        onClick={() => void joinSpecFromFleet(f)}
+                      >
+                        join spec
+                      </button>
+                    )}
+                    {chainFleet && !shutDown && active.length > 0 && (
                       <button
                         className="btn"
                         title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
@@ -3609,7 +3823,7 @@ export default function Page() {
                         repair fleet
                       </button>
                     )}
-                    {!shutDown && active.length > 0 && (
+                    {chainFleet && !shutDown && active.length > 0 && (
                       <button
                         className="btn"
                         title="Set halt-height back to 0 on every chain node. Recovery for a halt-height upgrade abandoned before it cleared the setting itself: until it is cleared, a node that stopped at the halt height halts again on every restart, and nothing else in the launcher edits it. Nothing is started — restart a halted node to resume on its current image, or run an upgrade to bring it back on a new one."
@@ -3642,40 +3856,42 @@ export default function Page() {
                         >
                           load spec into editor
                         </button>
-                        <button
-                          className="btn amber"
-                          title="Wipe all chain state and restart from a genesis rebuilt from this fleet's own spec: accounts and members are re-seeded (fresh mnemonics!), deployments and the chain-id stay. The op pauses after the wipe for you to clear every signer's watermark before the chain restarts. Prompts for the node image; edit accounts, chainParams or token in the spec editor first to change those too."
-                          onClick={async () => {
-                            try {
-                              // the fleet's own spec is the baseline, so the
-                              // reset never has to be reconciled by hand with
-                              // whatever draft the spec editor happens to hold
-                              const live = (await getLaunch(f.launchId)).spec as LaunchSpec;
-                              const { spec, fromEditor } = resetSource(specText, live);
-                              const image = window.prompt(
-                                "sparkdreamd image for the reset chain (the fleet restarts on it):",
-                                spec.images.sparkdreamd,
-                              );
-                              if (image === null) return;
-                              if (image.trim()) spec.images.sparkdreamd = image.trim();
-                              const ok = window.confirm(
-                                `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis, still as ${f.chainId}, built from ` +
-                                  (fromEditor
-                                    ? "your edited spec in the spec editor"
-                                    : "this fleet's own current spec") +
-                                  `. The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones. The op then waits for you to clear every signer's watermark (tmkms state, and any validator outside this fleet) before the chain restarts at height 1. Node image: ${spec.images.sparkdreamd}.`,
-                              );
-                              if (!ok) return;
-                              const { postChainReset } = await import("../lib/api");
-                              await postChainReset(f.launchId, spec);
-                              openLaunch(f.launchId); // surfaces the signing banner
-                            } catch (e) {
-                              setError(String(e));
-                            }
-                          }}
-                        >
-                          reset chain…
-                        </button>
+                        {chainFleet && (
+                          <button
+                            className="btn amber"
+                            title="Wipe all chain state and restart from a genesis rebuilt from this fleet's own spec: accounts and members are re-seeded (fresh mnemonics!), deployments and the chain-id stay. The op pauses after the wipe for you to clear every signer's watermark before the chain restarts. Prompts for the node image; edit accounts, chainParams or token in the spec editor first to change those too."
+                            onClick={async () => {
+                              try {
+                                // the fleet's own spec is the baseline, so the
+                                // reset never has to be reconciled by hand with
+                                // whatever draft the spec editor happens to hold
+                                const live = (await getLaunch(f.launchId)).spec as LaunchSpec;
+                                const { spec, fromEditor } = resetSource(specText, live);
+                                const image = window.prompt(
+                                  "sparkdreamd image for the reset chain (the fleet restarts on it):",
+                                  spec.images.sparkdreamd,
+                                );
+                                if (image === null) return;
+                                if (image.trim()) spec.images.sparkdreamd = image.trim();
+                                const ok = window.confirm(
+                                  `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis, still as ${f.chainId}, built from ` +
+                                    (fromEditor
+                                      ? "your edited spec in the spec editor"
+                                      : "this fleet's own current spec") +
+                                    `. The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones. The op then waits for you to clear every signer's watermark (tmkms state, and any validator outside this fleet) before the chain restarts at height 1. Node image: ${spec.images.sparkdreamd}.`,
+                                );
+                                if (!ok) return;
+                                const { postChainReset } = await import("../lib/api");
+                                await postChainReset(f.launchId, spec);
+                                openLaunch(f.launchId); // surfaces the signing banner
+                              } catch (e) {
+                                setError(String(e));
+                              }
+                            }}
+                          >
+                            reset chain…
+                          </button>
+                        )}
                         <button
                           className="btn red"
                           onClick={async () => {
@@ -4172,7 +4388,7 @@ export default function Page() {
                                         // image of another repository swaps the service running it
                                         const sideNote =
                                           c.key === "mastodon"
-                                            ? " The web image upgrades web + sidekiq; an sparkdreamnft/sdap image upgrades the bridge, and a mastodon-streaming image the streaming service, each on its own."
+                                            ? " The web image upgrades web + sidekiq; an sparkdreamnft/sdap image upgrades the bridge and sign-in services (with neither running, it is only recorded for the next move, with no signature), and a mastodon-streaming image the streaming service, each on its own."
                                             : "";
                                         const image = window.prompt(
                                           `Upgrade ${c.key}:${sideNote}${feeNote}`,
@@ -4190,7 +4406,8 @@ export default function Page() {
                                   )}
                                   {(() => {
                                     // the daemon in this component signs through a session key
-                                    const role = c.key === "verifier" ? "verifier" : c.key === "mastodon" ? "bridge" : undefined;
+                                    const role =
+                                      c.key === "verifier" ? "verifier" : c.key === "mastodon" || c.key === "bridge" ? "bridge" : undefined;
                                     const session = role ? f.sessions?.find((x) => x.role === role) : undefined;
                                     if (!role || !session) return null;
                                     const days = Math.max(0, Math.floor((Date.parse(session.expiresAt) - Date.now()) / 86_400_000));
@@ -4296,7 +4513,7 @@ export default function Page() {
                                       </button>
                                     </>
                                   )}
-                                  {c.key === "mastodon" && (
+                                  {c.key === "mastodon" && chainFleet && (
                                     <button
                                       className="btn"
                                       title="Other Mastodon servers whose authors the bridge anchors, each as a federation peer of its own. Each new one is registered and activated (a signature from a council or committee member), closed to every author until you curate it on the frontend, and bound to the bridge operator on its existing bond. For many servers under this instance's one peer instead, list them in the peer policy's content hosts on the frontend."
@@ -4353,6 +4570,67 @@ export default function Page() {
                                       resize…
                                     </button>
                                   )}
+                                  {c.key === "mastodon" && (
+                                    <button
+                                      className="btn"
+                                      title="Who may sign up, and wallet sign-in (members of the linked chains sign in with Keplr; their handle is their x/name). Registrations and the sign-in trust level apply in place. Turning wallet sign-in on or off moves the instance to a new deployment at its current size, as a resize does."
+                                      onClick={async () => {
+                                        try {
+                                          const m = ((await getLaunch(f.launchId)).spec as any)?.topology?.components?.mastodon ?? {};
+                                          const registrations = window.prompt(
+                                            "Who may sign up?\n" +
+                                              "  none      nobody (the bridge account, and wallet sign-in if on)\n" +
+                                              "  approved  anyone, once an admin approves them\n" +
+                                              "  open      anyone",
+                                            m.registrations ?? "none",
+                                          )?.trim();
+                                          if (!registrations) return;
+                                          if (!["none", "approved", "open"].includes(registrations)) {
+                                            setError('registrations must be "none", "approved" or "open"');
+                                            return;
+                                          }
+                                          const signIn = window.prompt(
+                                            "Wallet sign-in (on/off): members of this fleet's chain and of every chain whose bridge links " +
+                                              "this instance sign in with Keplr on a domain of its own, which needs a DNS record.",
+                                            m.walletLogin?.enabled ? "on" : "off",
+                                          )?.trim();
+                                          if (!signIn) return;
+                                          if (signIn !== "on" && signIn !== "off") {
+                                            setError('wallet sign-in must be "on" or "off"');
+                                            return;
+                                          }
+                                          let minTrustLevel: string | undefined;
+                                          let domain: string | undefined;
+                                          if (signIn === "on") {
+                                            minTrustLevel = window.prompt(
+                                              "Lowest x/rep trust level that may sign in: new, provisional, established, trusted or core",
+                                              m.walletLogin?.minTrustLevel ?? "new",
+                                            )?.trim();
+                                            if (!minTrustLevel) return;
+                                            domain = window.prompt(
+                                              "Sign-in domain. Keep it at the same depth as the instance's own domain: behind Cloudflare, " +
+                                                "the free certificate covers only one level below the zone (mstdn-login.example.io works, " +
+                                                "login.mstdn.example.io does not). Changing it later updates the deployment in place.",
+                                              m.walletLogin?.domain ?? (m.domain ? defaultLoginDomain(m.domain) : ""),
+                                            )?.trim().toLowerCase();
+                                            if (!domain) return;
+                                          }
+                                          fleetAction(f.launchId, c.dseq, "mastodon-settings", {
+                                            registrations: registrations as "none" | "approved" | "open",
+                                            walletLogin: {
+                                              enabled: signIn === "on",
+                                              ...(minTrustLevel ? { minTrustLevel } : {}),
+                                              ...(domain ? { domain } : {}),
+                                            },
+                                          });
+                                        } catch (e) {
+                                          setError(String(e));
+                                        }
+                                      }}
+                                    >
+                                      settings…
+                                    </button>
+                                  )}
                                   <button
                                     className="btn"
                                     title="Make the provider re-create this container from its current manifest, on the same deployment and provider. For when the deployment already carries the right settings but the running container was never rebuilt from them, so it keeps serving stale env (a tunnel aimed at an address that has since moved). Carries a nonce so the manifest is genuinely new, since a provider refuses an identical one. One signature; the component restarts, nothing else is touched."
@@ -4389,6 +4667,24 @@ export default function Page() {
                                   (redeploy fresh) — the only action that applies */}
                               {c.state !== "active" && !shutDown && (
                                 <>
+                                  {c.state === "closed" && isComponentKey(c.key) && (
+                                    <button
+                                      className="btn red"
+                                      title="Remove this closed component from the fleet: its row goes and the spec stops enabling it (its settings stay for a later add). Nothing is signed: its deployment is already closed."
+                                      onClick={() => {
+                                        if (
+                                          window.confirm(
+                                            `Remove ${c.key} from this fleet? Its row disappears and the spec no longer enables it. ` +
+                                              "Its settings, secrets and anything it set up on chain are kept, so adding it again later starts from them.",
+                                          )
+                                        ) {
+                                          fleetAction(f.launchId, c.dseq, "remove");
+                                        }
+                                      }}
+                                    >
+                                      remove
+                                    </button>
+                                  )}
                                   <button
                                     className="btn amber"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "relaunch")}

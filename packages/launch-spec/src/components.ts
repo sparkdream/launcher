@@ -9,11 +9,8 @@ import type { LaunchSpec } from "./schema.js";
  * in apps/conductor/src/components/) instead of comparing keys, so adding a
  * kind is an entry here plus a descriptor there — not a sweep for
  * `key === "explorer"`.
- *
- * `hub` is deliberately absent: the schema has a toggle for it but nothing
- * deploys it (validate-spec warns that it is ignored).
  */
-export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier"] as const;
+export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub"] as const;
 export type ComponentKey = (typeof COMPONENT_KEYS)[number];
 
 export interface ComponentKind {
@@ -87,6 +84,18 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
     needsLcd: false,
     needsGrpc: false,
   },
+  bridge: {
+    key: "bridge",
+    label: "ActivityPub bridge",
+    // a client of another fleet's Mastodon (its API) and of this chain's
+    // public api, like the verifier: no mesh, no sshd (the sdap image)
+    mesh: false,
+    ssh: false,
+    domain: false,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
   verifier: {
     key: "verifier",
     label: "Content verifier",
@@ -95,6 +104,18 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
     mesh: false,
     ssh: false,
     domain: false,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
+  hub: {
+    key: "hub",
+    label: "Landing page",
+    // a static site (nginx serving the hub's Vite build): reads nothing from
+    // any chain, so it runs the same beside a chain or in a services fleet
+    mesh: false,
+    ssh: false,
+    domain: true,
     needsSentry: false,
     needsLcd: false,
     needsGrpc: false,

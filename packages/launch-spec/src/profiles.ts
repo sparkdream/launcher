@@ -28,6 +28,8 @@ export interface Profile {
     mastodonStreaming: string;
     sdap: string;
     verifier: string;
+    bridge: string;
+    hub: string;
   };
   security: { keyMode: "softsign" | "tmkms" };
   infra: {
@@ -76,6 +78,9 @@ const RELAYER_IMAGE = `sparkdreamnft/hermes:${VENDORED_CHAIN_VERSION}`;
 const MASTODON_IMAGE = `sparkdreamnft/mastodon:${VENDORED_CHAIN_VERSION}`;
 const MASTODON_STREAMING_IMAGE = "ghcr.io/mastodon/mastodon-streaming:v4.7.2";
 const SDAP_IMAGE = `sparkdreamnft/sdap:${VENDORED_CHAIN_VERSION}`;
+// the landing page (the hub repo's Dockerfile: its Vite build behind nginx);
+// versioned on its own, not with the chain
+const HUB_IMAGE = "sparkdreamnft/hub:v1.0.2";
 
 const nodeResources = {
   validator: {
@@ -132,6 +137,8 @@ export const profiles: Record<NetworkType, Profile> = {
       mastodonStreaming: MASTODON_STREAMING_IMAGE,
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
+      bridge: SDAP_IMAGE,
+      hub: HUB_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -173,6 +180,8 @@ export const profiles: Record<NetworkType, Profile> = {
       mastodonStreaming: MASTODON_STREAMING_IMAGE,
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
+      bridge: SDAP_IMAGE,
+      hub: HUB_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -212,6 +221,8 @@ export const profiles: Record<NetworkType, Profile> = {
       mastodonStreaming: MASTODON_STREAMING_IMAGE,
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
+      bridge: SDAP_IMAGE,
+      hub: HUB_IMAGE,
     },
     security: { keyMode: "tmkms" },
     infra: {

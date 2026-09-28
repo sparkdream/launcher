@@ -1,23 +1,32 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import type { LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  bridgeAccount,
+  bridgePeerIds,
+  fleetBridge,
+  isServicesFleet,
+  mastodonLoginDomain,
+  withDefaults,
+  type LaunchSpec,
+} from "@sparkdream/launch-spec";
 import { TypeUrl } from "../akash/messages.js";
 import { loadSdl, sdlArtifacts } from "../akash/sdl-groups.js";
 import { setServiceEnv } from "../components/index.js";
-import { bridgePeerIds } from "../components/mastodon.js";
 import {
   BRIDGE_OPERATOR,
   readMastodonSecrets,
   updateMastodonSecrets,
   writeBridgeOperatorAddress,
 } from "../components/mastodon-secrets.js";
-import { WALLET_SIGNER, type StepCtx, type StepDef } from "../engine.js";
+import type { FleetComponentRow } from "../db.js";
+import { launchDirs, WALLET_SIGNER, type StepCtx, type StepDef } from "../engine.js";
 import { sparkdreamd } from "../exec.js";
-import { ensurePeerActive, walletPause, fleetActor, sendTx, type ChainActor, type PeerStatus } from "../peering.js";
+import { ensurePeerActive, walletPause, fleetActor, sendTx, walletChain, type ChainActor, type PeerStatus } from "../peering.js";
+import { bridgeDependents } from "../bridge-target.js";
 import { readSecretFile, writeSecretFile } from "../secrets.js";
 import { componentLease, ensureSession, sessionReserve, sessionSpendLimit } from "../sessions.js";
-import { loadCert } from "./phase-bcd.js";
+import { loadCert, loadCertAt } from "./phase-bcd.js";
 import { pushManifest } from "./phase-ef.js";
 import { queryJson } from "./phase-g.js";
 
@@ -27,6 +36,9 @@ import { queryJson } from "./phase-g.js";
  *   configure-mastodon  the Owner account (its password kept for the fleet's
  *                       accounts panel: the only time it is ever shown) and
  *                       the registrations mode
+ *                       and, with walletLogin, the chains whose members may
+ *                       sign in (its own, and every chain whose standalone
+ *                       bridge links it)
  *   link-bridge         with the bridge: the instance as an ActivityPub peer
  *                       of this chain (registered, policy, activated), the
  *                       bridge account and its read-only token, the operator
@@ -45,7 +57,17 @@ function mastodonLease(ctx: StepCtx): { hostUri: string; dseq: string; gseq: num
 
 /** Run mastodon-bootstrap in the instance; returns its JSON result line. */
 async function bootstrap(ctx: StepCtx, args: string[]): Promise<Record<string, unknown>> {
-  const lease = mastodonLease(ctx);
+  return bootstrapOn(ctx, mastodonLease(ctx), loadCert(ctx), args);
+}
+
+/** mastodon-bootstrap on a given Mastodon deployment (another fleet's, for
+ *  a standalone bridge), with that deployment's owner certificate. */
+async function bootstrapOn(
+  ctx: StepCtx,
+  lease: { hostUri: string; dseq: string; gseq: number; oseq: number },
+  cert: ReturnType<typeof loadCert>,
+  args: string[],
+): Promise<Record<string, unknown>> {
   let lastError = "";
   // the web container may still be preparing its schema right after a
   // (re)placement: rails runner cannot connect until it is done
@@ -53,7 +75,7 @@ async function bootstrap(ctx: StepCtx, args: string[]): Promise<Record<string, u
     if (attempt > 0) await ctx.services.sleep(15_000);
     try {
       const { stdout } = await ctx.services.provider.shellExec(
-        loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, "mastodon",
+        cert, lease.hostUri, lease.dseq, lease.gseq, lease.oseq, "mastodon",
         ["mastodon-bootstrap", ...args],
       );
       const line = stdout.trim().split("\n").pop() ?? "";
@@ -78,7 +100,66 @@ export async function configureMastodon(
     ctx.log(`mastodon: owner @${owner.username}@${m.domain} created — its password is in the fleet's accounts panel`);
   }
   await bootstrap(ctx, ["registrations", m.registrations]);
-  return { owner: `@${owner.username}@${m.domain}`, created: res.created === true, registrations: m.registrations };
+  const loginChains = mastodonLoginDomain(spec)
+    ? await syncLoginChains(ctx, ctx.launchId, (args) => bootstrap(ctx, args))
+    : undefined;
+  return {
+    owner: `@${owner.username}@${m.domain}`,
+    created: res.created === true,
+    registrations: m.registrations,
+    ...(loginChains !== undefined ? { loginChains } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// wallet sign-in
+
+/** A chain whose members may sign in: what the login page suggests to
+ *  Keplr, the LCD sdaplogin reads membership from, and the trust floor. */
+export type LoginChain = ReturnType<typeof walletChain> & { minTrustLevel: string };
+
+/**
+ * The chains fleet `mastodonFleetId`'s instance offers at wallet sign-in,
+ * keyed by chain fleet id: its own chain (a chain fleet's), and each chain
+ * whose standalone bridge links it. `linking` is a chain being linked right
+ * now, counted before its bridge row settles. A chain without public api
+ * and rpc domains cannot be offered (membership is read through the api,
+ * Keplr needs the rpc). Empty when the instance has sign-in off.
+ */
+export function loginChains(
+  db: StepCtx["db"],
+  mastodonFleetId: string,
+  linking?: { id: string; spec: LaunchSpec },
+): Record<string, LoginChain> {
+  const launch = db.getLaunch(mastodonFleetId);
+  if (!launch) return {};
+  const spec = withDefaults(JSON.parse(launch.spec_json));
+  const login = spec.topology.components.mastodon?.walletLogin;
+  if (!mastodonLoginDomain(spec) || !login) return {};
+  const minTrustLevel = `TRUST_LEVEL_${login.minTrustLevel.toUpperCase()}`;
+  const chains: Record<string, LoginChain> = {};
+  const add = (id: string, s: LaunchSpec) => {
+    const pub = s.topology.publicEndpoints;
+    if (isServicesFleet(s) || !pub?.api || !pub.rpc) return;
+    chains[id] = { ...walletChain(s), minTrustLevel };
+  };
+  add(mastodonFleetId, spec);
+  for (const l of bridgeDependents(db, mastodonFleetId)) add(l.id, withDefaults(JSON.parse(l.spec_json)));
+  if (linking) add(linking.id, linking.spec);
+  return chains;
+}
+
+/** Store the instance's sign-in chains (replacing the previous list). */
+async function syncLoginChains(
+  ctx: StepCtx,
+  mastodonFleetId: string,
+  run: (args: string[]) => Promise<Record<string, unknown>>,
+  linking?: { id: string; spec: LaunchSpec },
+): Promise<number> {
+  const chains = loginChains(ctx.db, mastodonFleetId, linking);
+  await run(["login-chain", "sync", JSON.stringify(chains)]);
+  ctx.log(`mastodon: wallet sign-in offers ${Object.keys(chains).length} chain(s)`);
+  return Object.keys(chains).length;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,8 +244,13 @@ async function bridgeBound(chain: ChainActor, operator: string, peerId: string):
 /** Put the issued token and the peer list into the bridge service's env:
  *  one deployment update, after which the bridge leaves its idle loop for
  *  sdapbridge (or restarts with the peers it now watches). */
-async function deliverBridgeEnv(ctx: StepCtx, stepName: string, want: Record<string, string>): Promise<boolean> {
-  const lease = mastodonLease(ctx);
+async function deliverBridgeEnv(
+  ctx: StepCtx,
+  stepName: string,
+  component: "mastodon" | "bridge",
+  want: Record<string, string>,
+): Promise<boolean> {
+  const lease = componentLease(ctx, component);
   // Delivered means the running bridge has it, not that the SDL file does: a
   // pause for the update signature between writing the SDL and pushing the
   // manifest left the file with the new env and the container without it.
@@ -177,7 +263,7 @@ async function deliverBridgeEnv(ctx: StepCtx, stepName: string, want: Record<str
     .catch(() => [] as string[]);
   if (keys.every((k, i) => running[i] === want[k])) return false;
 
-  const sdlPath = path.join(ctx.dirs.sdl, "mastodon.yaml");
+  const sdlPath = path.join(ctx.dirs.sdl, `${component}.yaml`);
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
   const env = (doc.services?.bridge?.env as string[] | undefined) ?? [];
   if (keys.some((k) => !env.includes(`${k}=${want[k]}`))) {
@@ -185,7 +271,7 @@ async function deliverBridgeEnv(ctx: StepCtx, stepName: string, want: Record<str
     fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
   }
   const artifacts = sdlArtifacts(loadSdl(sdlPath));
-  fs.writeFileSync(path.join(ctx.dirs.sdl, "mastodon.manifest.json"), artifacts.manifestJson);
+  fs.writeFileSync(path.join(ctx.dirs.sdl, `${component}.manifest.json`), artifacts.manifestJson);
   const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
   const wantHash = Buffer.from(artifacts.hash).toString("base64");
   const onChain = await ctx.services.api.deploymentInfo(owner, lease.dseq);
@@ -194,17 +280,25 @@ async function deliverBridgeEnv(ctx: StepCtx, stepName: string, want: Record<str
       { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner, dseq: lease.dseq }, hash: wantHash } },
     ]);
   }
-  await pushManifest(ctx, loadCert(ctx), "mastodon", lease.hostUri, lease.dseq, artifacts.manifestJson);
+  await pushManifest(ctx, loadCert(ctx), component, lease.hostUri, lease.dseq, artifacts.manifestJson);
   return true;
 }
 
-export async function linkMastodonBridge(
+/**
+ * Link the fleet's bridge (its Mastodon's sidecar, or a standalone bridge
+ * component) to this fleet's chain: the instance and any other servers as
+ * ActivityPub peers, the bridge account's token on the instance, the
+ * operator's bond and bindings, and the bridge service's env.
+ */
+export async function linkBridge(
   ctx: StepCtx,
   stepName: string,
   spec: LaunchSpec,
-): Promise<{ peer: PeerStatus; peers: PeerStatus[]; operator: string; bonded: string; tokenDelivered: boolean }> {
-  const m = spec.topology.components.mastodon!;
-  const domain = m.domain!;
+  access: BridgeAccess,
+): Promise<{ peer: PeerStatus; peers: PeerStatus[]; operator: string; account: string; bonded: string; tokenDelivered: boolean }> {
+  const link = fleetBridge(spec)!.link;
+  const domain = access.domain;
+  const account = bridgeAccount(spec);
   const chain = await fleetActor(ctx, ctx.launchId, "this fleet");
 
   // 1. the instance as an ActivityPub peer: its domain is the peer id, so
@@ -213,16 +307,16 @@ export async function linkMastodonBridge(
     id: domain,
     type: "PEER_TYPE_ACTIVITYPUB",
     displayName: domain,
-    policy: activityPubPeerPolicy(m.bridge?.authors),
+    policy: activityPubPeerPolicy(link.authors),
     // only a spec that names its authors keeps them in sync: otherwise the
     // committee's edits in the frontend would be undone on the next run
-    ...(m.bridge?.authors ? { syncPolicy: BRIDGE_AUTHOR_FIELDS } : {}),
+    ...(link.authors ? { syncPolicy: BRIDGE_AUTHOR_FIELDS } : {}),
   });
 
   // 1b. other servers bridged as peers of their own (bridge.peers): closed
   //     until the community opens them, unless the spec names their authors
   const peers: PeerStatus[] = [];
-  for (const other of m.bridge?.peers ?? []) {
+  for (const other of link.peers ?? []) {
     peers.push(
       await ensurePeerActive(ctx, stepName, chain, {
         id: other.id,
@@ -237,7 +331,7 @@ export async function linkMastodonBridge(
   // 2. the bridge account and its read-only token, asked of the running
   //    instance every time: the same token while its database lives, a new
   //    one after the instance started over (a close and re-add, a resize)
-  const res = await bootstrap(ctx, ["bridge-token", "bridge", `bridge@${domain}`]);
+  const res = await access.bootstrap(["bridge-token", account, `${account}@${domain}`]);
   if (typeof res.token !== "string" || !res.token) throw new Error("mastodon-bootstrap issued no bridge token");
   const token = res.token;
   if (readMastodonSecrets(ctx.dirs.secrets)?.bridgeToken !== token) {
@@ -300,7 +394,7 @@ export async function linkMastodonBridge(
 
   // 3b. the same operator for every other server: one binding each, on the
   //     bond it already holds (an existing operator binds with no new stake)
-  for (const other of m.bridge?.peers ?? []) {
+  for (const other of link.peers ?? []) {
     if (await bridgeBound(chain, operator, other.id)) continue;
     await sendAsOperator(ctx, operatorSigner, [
       {
@@ -316,12 +410,56 @@ export async function linkMastodonBridge(
   }
 
   // 4. the bridge service gets its token and the peers it anchors for
-  const tokenDelivered = await deliverBridgeEnv(ctx, stepName, {
+  const tokenDelivered = await deliverBridgeEnv(ctx, stepName, access.component, {
     MASTODON_TOKEN: token,
     SDA_PEER_IDS: bridgePeerIds(spec).join(","),
   });
   if (tokenDelivered) ctx.log(`mastodon: bridge env delivered (peers ${bridgePeerIds(spec).join(", ")})`);
-  return { peer, peers, operator, bonded: bond, tokenDelivered };
+  return { peer, peers, operator, account, bonded: bond, tokenDelivered };
+}
+
+/** Where a bridge reaches its Mastodon instance, and which deployment runs it. */
+export interface BridgeAccess {
+  domain: string;
+  /** mastodon-bootstrap on the instance's deployment. */
+  bootstrap: (args: string[]) => Promise<Record<string, unknown>>;
+  /** The component whose deployment runs the bridge service. */
+  component: "mastodon" | "bridge";
+}
+
+/** The Mastodon component's own bridge (its sidecar). */
+export function linkMastodonBridge(ctx: StepCtx, stepName: string, spec: LaunchSpec) {
+  const domain = spec.topology.components.mastodon!.domain!;
+  return linkBridge(ctx, stepName, spec, { domain, bootstrap: (args) => bootstrap(ctx, args), component: "mastodon" });
+}
+
+/**
+ * A standalone bridge component: its Mastodon runs in another fleet of this
+ * launcher (same wallet), reached through that fleet's deployment and
+ * certificate; everything on chain is this fleet's.
+ */
+export async function linkStandaloneBridge(ctx: StepCtx, stepName: string, spec: LaunchSpec) {
+  const target = spec.topology.components.bridge!.target;
+  const launch = ctx.db.getLaunch(target.fleet);
+  if (!launch) throw new Error(`the bridge's Mastodon fleet ${target.fleet} is not on this launcher`);
+  const targetSpec = withDefaults(JSON.parse(launch.spec_json));
+  const domain = targetSpec.topology.components.mastodon?.domain;
+  if (!targetSpec.topology.components.mastodon?.enabled || !domain) {
+    throw new Error(`fleet ${targetSpec.network.name} runs no Mastodon for the bridge to link`);
+  }
+  const row = (ctx.db.listFleetComponents(target.fleet) as FleetComponentRow[]).find(
+    (c) => c.key === "mastodon" && c.state === "active",
+  );
+  if (!row) throw new Error(`fleet ${targetSpec.network.name}'s Mastodon is not running`);
+  const lease = { hostUri: row.host_uri, dseq: row.dseq, gseq: 1, oseq: 1 };
+  const cert = loadCertAt(launchDirs(ctx.workRoot, target.fleet).secrets);
+  const run = (args: string[]) => bootstrapOn(ctx, lease, cert, args);
+  const linked = await linkBridge(ctx, stepName, spec, { domain, bootstrap: run, component: "bridge" });
+  // the instance's wallet sign-in now offers this chain too
+  if (mastodonLoginDomain(targetSpec)) {
+    await syncLoginChains(ctx, target.fleet, run, { id: ctx.launchId, spec });
+  }
+  return linked;
 }
 
 /** Sign and broadcast as the bridge operator (its own key). */

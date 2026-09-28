@@ -865,6 +865,15 @@ sentries → the relaunch placement steps minus the close (fresh deployment,
 bids, lease, manifest, health gate: 2 signatures). Abandoning it closes its
 row so it can be added again.
 
+The new deployment runs the current release. The images it runs, its own and
+its side services' (`sideImages`, e.g. Mastodon's sdap), are raised to the
+network profile's default when the stored spec names an older tag of the
+same repository. The stored spec otherwise keeps the images the fleet
+launched with: without this, a Mastodon added to a fleet launched before
+wallet sign-in would be refused its images. An image shared with a component
+already running (sdap, which a verifier also runs) is recorded as the new tag
+there too; that deployment picks it up at its next relaunch or upgrade.
+
 Opening the sentries is `applySentryServe` (`apps/conductor/src/sentry-serve.ts`),
 a section-scoped, idempotent app.toml transform. It runs in three places so a
 sentry never serves less than the current spec needs: at render time, over
@@ -1023,7 +1032,11 @@ retargetable.
      its own accounts only).
   2. Keep the generated password, shown once in the accounts panel as
      `mastodon-owner`.
-  3. Set the registrations mode.
+  3. Set the registrations mode. The default is `none`: the instance exists
+     to host the bridge account, and authors follow that account from their
+     own servers, so nothing needs local sign-ups. `approved` and `open`
+     remain for an instance meant as a community home.
+  4. With wallet sign-in, sync the chains whose members may sign in (below).
 
   Health checks and DNS gates cover both ingresses (descriptor `ingress`).
 
@@ -1035,12 +1048,76 @@ cannot change a lease's resources, so moving between sizes means closing the
 component and adding it back: a fresh instance whose database starts empty.
 
 **Mail.** Without `mastodon.smtp` mail is written to disk and never sent, so
-people who sign up cannot confirm their address (validate-spec warns). With it,
+people who sign up cannot confirm their address (validate-spec warns unless
+registrations is `none`, where nobody signs up). There is deliberately no
+self-hosted mail component: an Akash lease sends from a shared provider IP
+with no reverse DNS the tenant controls, often with outbound port 25 blocked,
+so direct delivery would land in spam or bounce depending on the provider.
+With it,
 Mastodon sends through the relay: `server`, `port`, `login`, `fromAddress`,
 `security` (`starttls` on 587, `tls` on 465, or `none`) and `authMethod`. The
 password is accepted with the spec when the component is added or the launch
 is created, then moved into `secrets/mastodon.json` (`smtpPassword`) before
 the spec is stored, since specs are exported and shared.
+
+**Wallet sign-in** (`mastodon.walletLogin`: `enabled`, `domain`, and
+`minTrustLevel` defaulting to `new`). The domain defaults to the instance's
+own at the same depth (`mstdn.example.io` → `mstdn-login.example.io`,
+`defaultLoginDomain`). Cloudflare's free edge certificate covers the zone and
+one level below it, so `login.mstdn.example.io` would get a certificate
+error; validation warns about a sign-in domain deeper than the instance's. Members of a Spark
+Dream chain get an account on the instance by signing in with Keplr. There is
+no email to confirm and no password to reset, so the instance needs neither a
+relay nor sign-ups, and `registrations: none` stays right.
+
+- **Services.** `sdaplogin` (in the sdap image) rides along as a `login`
+  service on its own ingress. It is an OpenID Connect provider for exactly
+  one client, this Mastodon, whose stock OIDC env points at it
+  (`walletLoginEnv`). The client secret and the provider's RSA signing key
+  are generated into `secrets/mastodon.json` (`loginClientSecret`,
+  `loginSigningKey`) the first time an instance renders with sign-in on,
+  existing instances included.
+- **Sign-in.**
+  1. The member picks a chain on the login page and signs a challenge with
+     `signArbitrary` (ADR-036).
+  2. The provider checks the signature, then reads x/rep membership (active,
+     at or above the trust floor) and the member's primary x/name from that
+     chain's public api.
+  3. The account's uid is the address bytes in hex, the same on every chain
+     the key is used on. The handle is the x/name with `-` turned into `_`,
+     set by the image's `zz_sparkdream_wallet_login.rb`.
+  4. With no x/name, no account is created, and the page says to register
+     one. Mastodon approves accounts created through a provider even with
+     registrations closed, so the provider is the only way in.
+- **Chains.** The instance offers its own chain (a chain fleet's) plus every
+  chain whose standalone bridge links it. `configure-mastodon` and a
+  standalone bridge's `link-bridge` write the list into the instance
+  (`mastodon-bootstrap login-chain sync`, stored in Postgres, so backups and
+  migrations keep it). `sdaplogin` reads it back from the instance's
+  `/sparkdream/login-chains.json`. When a standalone bridge closes, or its
+  fleet shuts down, settling that close queues a `reconfigure` of the linked
+  Mastodon, which re-syncs without that chain. A chain can be offered only
+  when it has public `api` and `rpc` domains; each entry is `walletChain(spec)`
+  plus the trust floor.
+- **Losing membership.** An hourly sidekiq job in the instance asks
+  `https://<login domain>/membership/<uid>`. It disables the login of an
+  account whose owner is no longer an active member of any offered chain,
+  which also ends open sessions, and re-enables it once they are again. It
+  never re-enables an account an admin disabled, and it changes nothing when
+  a chain cannot be reached.
+- **Turning it on later.** For a running instance, use the "settings…"
+  action (below). It moves the instance, as a resize does.
+- **Images.** Both halves must be new enough: an sdap image that ships
+  `sdaplogin`, and a Mastodon image with the initializer and the
+  `login-chain` bootstrap action. Older images would deploy and then fail (the
+  login service crash-loops, the chain sync never lands). So validation
+  refuses sign-in when `images.sdap` or `images.mastodon` carries a version
+  tag older than `WALLET_LOGIN_MIN_VERSION` (`v1.0.46`, the first release
+  shipping both), and "settings…" refuses the move with the same message.
+  Tags that are not versions (`dev`, `latest`) cannot be judged and pass.
+  For a running fleet, upgrade both images first, then turn sign-in on.
+- **Tests.** `test/federation/mastodon/wallet_login_e2e.sh` in the chain repo
+  runs the real OIDC round trip between the two images.
 
 **Bridge** (`mastodon.bridge.enabled`, needs `publicEndpoints.api`).
 `sdapbridge` rides along as a `bridge` service that idles on
@@ -1057,7 +1134,7 @@ the spec is stored, since specs are exported and shared.
    When it does not, a new peer starts at `["*"]` and the fields belong to
    the community from then on (the frontend's peer policy form); the
    launcher never rewrites them.
-2. Issues the `@bridge` account's token (`read write:follows`: the daemon
+2. Issues the bridge account's token (`@bridgedev`, `@bridgetest` or `@bridge` by network, see the standalone bridge section) (`read write:follows`: the daemon
    follows the admitted authors so their posts reach it).
 3. Has the `bridge-operator` key (master keyring, mnemonic in
    `mnemonics.json`, genesis-funded on a new launch) bond
@@ -1069,8 +1146,8 @@ the spec is stored, since specs are exported and shared.
    reaches the provider; the SDL carries only its address.
 
 **Other Mastodon servers.** The bridge can anchor authors from servers
-other than its own instance (they follow @bridge from wherever they are,
-and @bridge follows curated authors on any server, resolving unknown ones
+other than its own instance (they follow the bridge account from wherever they are,
+and the bridge account follows curated authors on any server, resolving unknown ones
 through Mastodon's search). Two ways, combinable:
 
 - **Under this instance's one peer**: list the servers in the peer
@@ -1098,7 +1175,11 @@ account): the `verifier` component below, or one run elsewhere.
 (descriptor `sideImages` names their spec keys), so an sdap image upgrades
 the bridge in place, a streaming image the streaming service, and the web
 image web + sidekiq; the stored spec records each under its own key, and the
-row keeps showing the web image.
+row keeps showing the web image. A side image that no running service uses
+(sdap on an instance without bridge or sign-in) changes nothing in the
+deployment and signs nothing: the spec records it for the next render (the
+move that turns sign-in on). Falling back to the image services there would
+put the sdap image in place of Mastodon's web image.
 
 **Resize** (fleet row "resize…", op `mastodon-resize`). Akash fixes a
 deployment's resources (MsgUpdateDeployment changes only the manifest
@@ -1115,8 +1196,11 @@ The op carries the data across:
 2. `render`: the SDL at the new size.
 3. The relaunch steps (close, deploy, lease, manifest), preferring the
    current provider rather than avoiding it, since staying keeps the
-   domains' DNS target. Moving pauses at the domain gate naming both
-   domains.
+   domains' DNS target. The domain gate then probes every domain the
+   instance serves, each on its health path, and pauses naming the ones
+   that do not answer, with the new ingress as their CNAME target: all of
+   them after a provider change, and only the sign-in domain when a move turns
+   sign-in on and stays on the provider.
 4. `restore`, before anything configures the instance (which would
    otherwise create a second owner and a new bridge token): lease-shell
    has no usable stdin, so the dump goes up as base64 chunks appended
@@ -1124,13 +1208,136 @@ The op carries the data across:
    by digest; it restores into a scratch database, which replaces the
    empty one in two back-to-back statements; the media is unpacked; then
    Mastodon restarts, and `rails db:prepare` migrates the restored schema.
-   The spec records the new size here.
+   The spec records the new size here, and the new sign-in settings when
+   the move came from "settings…" (below).
 5. Mastodon's configure steps, as after any placement.
 
 The instance is down from the close to the restart, and posts made
 between the backup and the close are not carried. Redis and the bridge's
 state file start over; both are caches. A plain relaunch of Mastodon
 warns that it leaves the data behind and points at resize.
+
+**Settings** (fleet row "settings…", action `mastodon-settings`:
+`registrations`, and `walletLogin` merged into the current one). The new
+settings are validated as a whole spec first, and nothing is written when
+they fail. The path depends on whether the deployment's services change:
+
+- **In place.** The registrations mode and the sign-in trust floor live in
+  the instance (its database and chain list). The spec takes them, and a
+  `reconfigure` of Mastodon re-runs `configure-mastodon`, which sets
+  registrations and re-syncs the chains. It needs no signature and causes
+  no downtime.
+- **Retarget.** A new sign-in domain, while sign-in stays on, changes only
+  the manifest. A `retarget` (the descriptor's `retargetDoc`) rewrites the
+  login service's accept list and the issuer in both services' env. It then
+  sends one MsgUpdateDeployment and pauses on the new domain with its CNAME
+  target until it answers; the `reconfigure` follows. What is compared is the
+  domain the deployed SDL serves, not the spec's: a deployment rendered under
+  an older default is brought in line on the next "settings…".
+- **Move.** Turning wallet sign-in on or off adds or
+  removes the `login` service, which is a new deployment. The server answers
+  the first call with a warning and waits for a confirmed one. Then:
+  1. The registrations mode is written into the spec at once.
+  2. The resize op runs at the instance's current size, carrying the new
+     `walletLogin` (`MastodonResizeParams.walletLogin`).
+  3. The spec takes `walletLogin` at the restore step, so an abandoned move
+     leaves the spec describing the deployment that still runs.
+  4. The domain gate then covers the new sign-in domain.
+
+### Services fleet (`kind: services`)
+
+A fleet with no chain: no validators, sentries, genesis or mesh, only
+chain-independent components several chains share. Today that is Mastodon
+(`SERVICES_FLEET_COMPONENTS`). It exists because a social server's life is
+not a chain's: a chain fleet is reset, halted for upgrades and eventually
+shut down, while an instance's identity is permanent, and with a bridge per
+network (devnet, testnet, mainnet) no one chain is its natural owner.
+
+- **Spec.** `kind: services` (default `chain`). `nodes()` and
+  `resolveTopology()` return nothing for it; `network.name` names the fleet
+  and the chain fields keep their unused defaults. `validateSpec` runs
+  `validateServicesFleet` only: allowed kinds, at least one component, no
+  `join`, no Mastodon bridge sidecar (there is no chain to anchor to), and
+  headscale or publicEndpoints settings are ignored with a warning.
+- **Pipeline** (`servicesSteps`, chosen by `drive` from the spec):
+  validate-spec, generate-keys (an SSH key and age identity, no node homes,
+  no accounts, no chain binary), render-sdls, ensure-certificate, the
+  shared create-deployments / collect-bids / create-leases /
+  send-manifests (they take a missing headscale as "no mesh"),
+  verify-services (the domain half of verify-chain: `verifyPublicDomains`),
+  configure-mastodon, finalize.
+- **Fleet.** The view carries `kind`; the panel hides chain actions
+  (upgrades, reset, genesis, join bundle and spec, repair, clear halt
+  height) and offers only the allowed kinds to add. `requestChainReset` and
+  `requestHaltUpgrade` refuse it. Shutting it down is refused while a chain
+  fleet's standalone bridge links its Mastodon; closing that Mastodon warns
+  about them.
+- **No mesh.** Mastodon is not a mesh member. A mesh component placed here
+  later would share a chain fleet's headscale through `reuseFleet`.
+- **Sharing with other wallets** (`sharing.wallets`, the card's "share…",
+  `POST /api/fleet/:id/sharing`). A standalone bridge's setup reaches into
+  the services fleet's Mastodon with that fleet's own certificate, so by
+  default only fleets of the same wallet may link one (and copy its stored
+  SMTP password). The owner lists other wallets to let their chain fleets
+  do the same: one person's devnet and testnet wallets sharing one
+  instance. `mayUseFleet` is the one check, used by bridge-target
+  resolution and `resolveSmtpPasswordSource`. Removing a wallet stops new
+  links and re-links; bridges already linked keep running.
+- **Drafting one.** Two actions write a services spec into the editor:
+  - "New services fleet…" on the launch card (`POST /api/services-spec`,
+    `servicesSpecDraft`), from scratch: the fleet name, the instance's
+    domain and streaming domain (one label deep by default, for a free
+    wildcard certificate), owner and size. The draft holds only `kind`,
+    `network.name` and the Mastodon; `withDefaults` fills the chain fields a
+    services fleet ignores (`servicesFill`: an inert token and accounts,
+    one placeholder validator, no sentries or headscale, the chain's own
+    components off, `network.bech32Prefix`), so a hand-written services
+    spec needs no more either. `network.type` only picks placement
+    defaults: unset, the audited-provider profile (a shared, long-lived
+    service); `devnet` for looser, cheaper placement.
+  - "services spec…" on a chain fleet's card (`GET
+    /api/fleet/:id/services-spec`, `servicesSpecFrom`), for a Mastodon first
+    set up in a chain fleet: its owner, registrations, size and SMTP, and
+    the fleet's provider policy, key mode, infra and images, carried over;
+    the bridge sidecar is dropped. The SMTP password is not put in the
+    draft: `smtp.passwordFromFleet` names the source fleet, and creating the
+    launch (or adding the component) reads it from that fleet's secret
+    store (same wallet only, `resolveSmtpPasswordSource`) before stashing
+    it as a typed one, so the secret never reaches the browser or the
+    editor's saved draft.
+- **Drafting one** (fleet card "services spec…", `GET
+  /api/fleet/:id/services-spec`, `servicesSpecFrom`): a services fleet spec
+  in the editor built from that fleet's Mastodon settings (owner,
+  registrations, size, SMTP) under the name, domain and streaming domain
+  asked for, with the fleet's provider policy, key mode, infra and images.
+  The bridge sidecar is dropped. The SMTP password is not copied into the
+  draft: `smtp.passwordFromFleet` names the source fleet, and creating the
+  launch (or adding the component) reads it from that fleet's secret store
+  (same wallet only, `resolveSmtpPasswordSource`) before stashing it as a
+  typed one, so the secret never reaches the browser or the editor's
+  saved draft.
+
+### Standalone bridge (component `bridge`)
+
+`sdapbridge` on its own small deployment in a chain fleet, linking a
+Mastodon another fleet runs (typically a services fleet) to this chain:
+`bridge.target.fleet`, resolved like the verifier's target (same wallet,
+launched, running a Mastodon) and stored with the instance's domain
+(`target.domain`), which its SDL and peer are named after. It renders the
+sidecar's service (`bridgeService`) with a placeholder global expose, and
+its configure steps are the sidecar's, generalized (`linkBridge` with a
+`BridgeAccess`): the account and token are made on the target's instance
+through that fleet's deployment and certificate (`bootstrapOn`,
+`loadCertAt`); the peer, operator key and bond, bindings, session key and
+`SDA_PEER_IDS` are this chain's. A fleet runs either this or a Mastodon
+bridge sidecar (`fleetBridge` answers which), and everything keyed on "the
+fleet's bridge" (sessions' host, genesis funding of the operator, the
+verifier's peers, bridge peers, reset reconfigure, upgrades) follows it.
+
+The bridge's account on the instance is named after the network it anchors
+to (`bridgeAccount`): `bridgedev`, `bridgetest`, `bridge` on mainnet, or
+`account` when set. The sidecar follows the same rule, so one instance
+carries a bridge per network, and authors opt into each by following it.
 
 ### Content verifier (component `verifier`)
 
@@ -1139,10 +1346,12 @@ re-fetches every post a bridge anchors there, and confirms or disputes the
 hash. A verifier's worth is independence from the bridge, so:
 
 - **Own deployment, other host.** It is its own deployment. Its
-  `avoidProviders` hook keeps it off whichever provider hosts the target's
-  Mastodon. At launch, placements are made in component order, so the
-  Mastodon's provider is known by then; at relaunch or add it comes from the
-  target's fleet row.
+  `avoidProviders` hook keeps it off whichever provider hosts the Mastodon
+  the target chain's posts come from: the target fleet's own Mastodon, or,
+  for a chain whose standalone bridge links a services fleet's instance,
+  that one (`linkedMastodonRow`). At launch, placements are made in
+  component order, so a same-fleet Mastodon's provider is known by then;
+  otherwise it comes from that fleet's row.
 - **Own identity.** It acts as a member (ESTABLISHED or above) of the
   target chain, never the bridge operator, which the chain enforces with
   `ErrSelfVerification`. Exactly one of:
@@ -1164,7 +1373,11 @@ hash. A verifier's worth is independence from the bridge, so:
 - **Target.** The target is this fleet, or another fleet of the same wallet
   on this launcher (`verifier.target.fleet`). It is resolved to a launch id,
   and its account checked, at launch creation and at add-component. Peers
-  default to the target's Mastodon domain.
+  default to the peers the target chain's bridge anchors for (sidecar or
+  standalone), else the target's Mastodon domain. A verifier stays in the
+  chain fleet it verifies: its member, bond, session key and daemon are all
+  one chain's, and one verifier already covers every peer that chain's
+  bridge anchors for.
 - **Bond.** `configure-verifier` (launch step, or `configureSteps` after a
   placement) bonds `federation-verifier` with `MsgBondRole`, signed by that
   member, topping up to `verifier.bond` (500 DREAM by default). A DREAM
@@ -1348,6 +1561,21 @@ bridge's env names it as its granter, so `createNamedAccounts` keeps its
 mnemonic and `ensureBridgeOperatorKey` imports it back (`keys add
 --recover`, the mnemonic on stdin), and the new genesis funds the same
 address.
+
+### Removing a component (day-2)
+
+A closed service component keeps its fleet row, and the spec keeps enabling
+it, until it is **removed** (the row's "remove" button, fleet action
+`remove`, `FleetService.removeComponent`). Removal needs the row closed and
+no op running on it. It sets `topology.components.<key>.enabled` to false,
+keeping the other settings for a later add, and deletes the row and its
+health entry. It refuses a removal the spec would not validate without, so
+a verifier that checks a Mastodon's peer is removed before the Mastodon.
+`materialize` skips launch-time outputs of service components the spec no
+longer enables, so a component deployed at launch does not come back.
+Nothing on chain or in the secret store is touched: a peer, a bond, a
+Mastodon's keys and the bridge operator's key all wait for a re-add, and
+the next `sessions` op retires any grant whose daemon is gone.
 
 ### Repair (day-2)
 

@@ -332,6 +332,7 @@ export class ConductorDb {
         "fleet_components",
         "component_health",
         "provider_prefs",
+        "bid_picks",
       ]) {
         this.db.prepare(`DELETE FROM ${table} WHERE launch_id = ?`).run(launchId);
       }
@@ -687,6 +688,12 @@ export class ConductorDb {
     return this.db
       .prepare("SELECT * FROM fleet_components WHERE launch_id = ? AND dseq = ?")
       .get(launchId, dseq) as FleetComponentRow | undefined;
+  }
+
+  /** Forget a component that is gone for good: its row and its health. */
+  deleteFleetComponent(launchId: string, key: string): void {
+    this.db.prepare("DELETE FROM fleet_components WHERE launch_id = ? AND key = ?").run(launchId, key);
+    this.db.prepare("DELETE FROM component_health WHERE launch_id = ? AND component = ?").run(launchId, key);
   }
 
   setComponentState(launchId: string, key: string, state: string): void {

@@ -655,7 +655,7 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
       if (!keys) throw new Error("generate-keys output missing");
       // a bridge added after launch: its operator key has to exist before
       // the SDL that carries its mnemonic can render
-      if (key === "mastodon" && spec.topology.components.mastodon?.bridge?.enabled) {
+      if ((key === "mastodon" && spec.topology.components.mastodon?.bridge?.enabled) || key === "bridge") {
         await ensureBridgeOperatorKey(ctx.dirs.secrets, ctx.dirs.node("val-0"));
       }
       renderComponentSdl({
@@ -740,14 +740,19 @@ export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
   ];
 }
 
-/** Params of a "mastodon-resize" op: the relaunch's, plus the new size. */
+/** Params of a "mastodon-resize" op: the relaunch's, plus the new size and,
+ *  when the move turns wallet sign-in on or off (a service more or less),
+ *  its new settings. */
 export interface MastodonResizeParams extends RelaunchParams {
   size: "small" | "standard";
+  walletLogin?: Record<string, unknown>;
 }
 
 /**
- * Resize the Mastodon instance: Akash fixes a deployment's resources, so a
- * new size is a new deployment, and the data has to move with it. Backup
+ * Move the Mastodon instance to a new deployment: a new size, or wallet
+ * sign-in turned on or off (the login service added or dropped). Akash fixes
+ * a deployment's resources, so either is a new deployment, and the data has
+ * to move with it. Backup
  * (database and uploaded media, over lease-shell, kept encrypted) → render
  * the SDL at the new size → the relaunch (close, deploy, lease, manifest) →
  * restore into the new deployment before anything configures it → the
@@ -759,11 +764,15 @@ export interface MastodonResizeParams extends RelaunchParams {
 export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, spec: LaunchSpec): StepDef[] {
   const key = "mastodon";
   const p = (s: string) => `op${opId}:${s}`;
+  const moved = {
+    size: params.size,
+    ...(params.walletLogin ? { walletLogin: params.walletLogin } : {}),
+  };
   const sized = withDefaults({
     ...spec,
     topology: {
       ...spec.topology,
-      components: { ...spec.topology.components, mastodon: { ...spec.topology.components.mastodon!, size: params.size } },
+      components: { ...spec.topology.components, mastodon: { ...spec.topology.components.mastodon!, ...moved } },
     },
   } as unknown as LaunchSpecInput);
   const relaunch = relaunchSteps(opId, params, sized);
@@ -789,7 +798,7 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
           resolveFleet: fleetResolver({ ...ctx, spec: sized }),
           launchId: ctx.launchId,
         });
-        return { size: params.size };
+        return moved;
       },
     },
     ...relaunch.slice(0, at + 1),
@@ -797,11 +806,12 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
       name: p("restore"),
       async run(ctx) {
         const out = await restoreMastodon(ctx, p("restore"), ctx.output<MastodonBackup>(p("backup"))!);
-        // the new deployment holds the data at the new size: from here on
-        // the spec renders it that way (upgrades, a later relaunch)
+        // the new deployment holds the data at the new size (and sign-in
+        // setting): from here on the spec renders it that way (upgrades, a
+        // later relaunch, the chain sync configure runs next)
         const launch = ctx.db.getLaunch(ctx.launchId)!;
         const stored = JSON.parse(launch.spec_json);
-        stored.topology.components.mastodon.size = params.size;
+        Object.assign(stored.topology.components.mastodon, moved);
         ctx.db.setLaunchSpec(ctx.launchId, JSON.stringify(stored));
         return out;
       },
@@ -1184,28 +1194,38 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           return { healthy: true };
         }
         const url = `https://${domain}/`;
+        // every domain the component serves, each on its health path: a
+        // move can add one (Mastodon's login.<domain> when sign-in is turned
+        // on) that no DNS record points at yet, while the main domain still
+        // answers from the same provider
+        const probes = descriptorFor(key)?.ingress?.(spec) ?? [{ domain, healthUrl: url }];
+        let dark = probes;
         for (let i = 0; i < 36; i++) {
-          if (await ctx.services.rpc.httpOk(url)) {
+          const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.healthUrl)));
+          dark = dark.filter((_, j) => !answers[j]);
+          if (dark.length === 0) {
             ctx.db.setComponentState(ctx.launchId, key, "active");
             if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
             return { healthy: true, url };
           }
           await ctx.services.sleep(5000);
         }
-        // the relaunch moved providers, so the domain's DNS record now
-        // points at the OLD provider's ingress — pause with the new target
+        // a domain that does not answer points at the OLD provider's
+        // ingress (the relaunch moved providers) or at nothing yet (it is
+        // new): pause with the target, the same for every domain
         const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
         const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
-        const ingress = await ingressHost(
-          ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain,
-        );
-        // every domain the component serves moved with it (Mastodon's
-        // streaming host too), all to the same ingress
-        const domains = descriptorFor(key)?.ingress?.(spec).map((i) => i.domain) ?? [domain];
+        // each domain to its own service's ingress hostname
+        const records: string[] = [];
+        for (const d of dark) {
+          const ingress = await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, d.domain);
+          records.push(`${d.domain} → CNAME ${ingress}`);
+        }
         throw new AwaitUser(
           p("verify"),
-          `${key} not answering at ${url} — update the DNS record${domains.length > 1 ? "s" : ""} for ` +
-            `${domains.join(" and ")} → CNAME ${ingress} (the relaunch moved providers), then resume`,
+          `${key} not answering at ${dark.map((d) => d.healthUrl).join(", ")} — create or update the DNS ` +
+            `record${records.length > 1 ? "s" : ""} ${records.join(", ")} ` +
+            "(Cloudflare: proxy on, SSL=Flexible), then resume",
         );
       },
     });
@@ -2360,7 +2380,12 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         // (descriptor.envRefresh): patched in place so persist-start's
         // resolved tunnel targets survive, or re-rendered wholesale.
         refreshComponentEnv(ctx, spec, key, sdlPath);
-        const swapped = setComponentImage(sdlPath, key, params.image);
+        const swapped = setComponentImage(sdlPath, key, params.image, spec);
+        if (swapped.length === 0) {
+          // nothing in the deployment changes: no tx, no manifest
+          ctx.log(`${key}: no running service uses ${params.image} yet — recorded in the spec for the next render`);
+          return { image: params.image, services: swapped, txSkipped: true };
+        }
         // the row shows the component's main image: a side service's
         // upgrade (Mastodon's bridge) leaves it as it is
         const mainSwapped =
@@ -2707,6 +2732,7 @@ export function retargetSdl(sdlPath: string, key: string, spec: LaunchSpec): voi
       for (const e of svc.expose ?? []) if (e.accept) e.accept = [domain];
     }
     if (d.retargetEnv) setServiceEnv(doc, d.imageServices, d.retargetEnv(spec));
+    d.retargetDoc?.(doc, spec);
   } else {
     // sentry-0: LCD accept rides the 1317 expose, RPC accept the 26657 one
     const svc = doc.services?.sparkdreamd;
@@ -2775,6 +2801,13 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
         const pub = spec.topology.publicEndpoints;
         const urls: string[] = [];
         for (const key of params.components) {
+          // every domain the component serves, on its health path (Mastodon:
+          // its login domain too), else its one domain
+          const ingress = descriptorFor(key)?.ingress?.(spec);
+          if (ingress) {
+            urls.push(...ingress.map((i) => i.healthUrl));
+            continue;
+          }
           const domain = serviceComponents(spec).find((c) => c.key === key)?.domain;
           if (domain) urls.push(`https://${domain}/`);
         }
@@ -2792,11 +2825,26 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
           if (!ok) dark.push(url);
         }
         if (dark.length > 0) {
+          // name each service component's ingress, so a domain that is new
+          // (not repointed) has its target spelled out
+          const targets: string[] = [];
+          for (const key of params.components) {
+            const own = serviceComponents(spec).find((c) => c.key === key)?.domain;
+            if (!own) continue;
+            // the domains this component serves, among the dark ones
+            const served = new Set(descriptorFor(key)?.ingress?.(spec).map((i) => i.domain) ?? [own]);
+            const row = componentRow(ctx, key);
+            for (const domain of dark.map((u) => new URL(u).hostname).filter((h) => served.has(h))) {
+              const host = await ingressHost(ctx, row.host_uri, row.dseq, 1, 1, domain).catch(() => undefined);
+              if (host) targets.push(`${domain} → CNAME ${host}`);
+            }
+          }
           throw new AwaitUser(
             p("verify"),
             `not reachable after the domain update: ${dark.join(", ")} — ` +
-              "create or repoint the DNS records (CNAME each domain to its provider ingress host, " +
-              "same target as before for unchanged providers), then resume.",
+              "create or repoint the DNS records (CNAME each domain to its provider ingress host" +
+              (targets.length > 0 ? `: ${targets.join("; ")}` : ", same target as before for unchanged providers") +
+              "; Cloudflare: proxy on, SSL=Flexible), then resume.",
           );
         }
         ctx.db.setFleetOpStatus(opId, "done");
@@ -2863,11 +2911,14 @@ export function imageRepo(image: string): string {
  * Point a deployed SDL at a new image; returns the services it swapped.
  * Node SDLs run one service, so every image line is it. A service component
  * swaps the services already running that image's repository (Mastodon's
- * bridge for an sdap image, its streaming for the upstream streaming image),
- * else its image services; a sidecar that runs something else (a database)
- * keeps its own image either way.
+ * bridge or login for an sdap image, its streaming for the upstream
+ * streaming image), else its image services; a sidecar that runs something
+ * else (a database) keeps its own image either way. A side image no running
+ * service uses (sdap on a Mastodon without bridge or sign-in) swaps nothing:
+ * the spec records it for the next render, and falling back to the image
+ * services would run it in place of Mastodon.
  */
-function setComponentImage(sdlPath: string, key: string, image: string): string[] {
+function setComponentImage(sdlPath: string, key: string, image: string, spec: LaunchSpec): string[] {
   const d = descriptorFor(key);
   if (!d) {
     const sdl = fs.readFileSync(sdlPath, "utf8");
@@ -2877,6 +2928,11 @@ function setComponentImage(sdlPath: string, key: string, image: string): string[
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
   const running = Object.entries(doc.services ?? {}) as Array<[string, { image?: string }]>;
   const same = running.filter(([, svc]) => svc.image && imageRepo(svc.image) === imageRepo(image)).map(([name]) => name);
+  const images = spec.images as Record<string, string | undefined>;
+  const sideOnly =
+    same.length === 0 &&
+    Object.values(d.sideImages ?? {}).some((k) => images[k] && imageRepo(images[k]!) === imageRepo(image));
+  if (sideOnly) return [];
   const targets = same.length > 0 ? same : d.imageServices;
   for (const name of targets) {
     const svc = doc.services?.[name];
@@ -4595,10 +4651,12 @@ function buildSteps(
   const launch = db.getLaunch(launchId);
   if (!launch) return [];
   const spec = withDefaults(JSON.parse(launch.spec_json));
-  const steps: StepDef[] = [];
+  const all: StepDef[] = [];
+  const done = new Set(db.listSteps(launchId).filter((s) => s.status === "done").map((s) => s.name));
   for (const op of db.listFleetOps(launchId) as FleetOpRow[]) {
     if (op.status !== "active" && op.status !== "done") continue;
     if (!wanted(op.kind)) continue;
+    const steps: StepDef[] = [];
     // done ops keep their steps in the list — checkpointed rows skip instantly
     const params = JSON.parse(op.params_json);
     if (op.kind === "relaunch") {
@@ -4622,6 +4680,11 @@ function buildSteps(
     if (op.kind === "restore-archive") steps.push(...restoreArchiveSteps(op.id, params));
     if (op.kind === "repair") steps.push(...repairSteps(op.id, params, spec));
     if (op.kind === "force-redeploy") steps.push(...forceRedeploySteps(op.id, params, spec));
+    // ...but only the steps it ran. Rebuilt from today's spec, a done op can
+    // take another shape (its component since removed from the spec turns a
+    // service relaunch into a node one, 2026-09-28), and a step it never had
+    // would run now, long after the op finished
+    all.push(...(op.status === "done" ? steps.filter((st) => done.has(st.name)) : steps));
   }
-  return steps;
+  return all;
 }

@@ -1,5 +1,5 @@
-import { chainId } from "@sparkdream/launch-spec";
-import type { FleetComponentRow } from "../db.js";
+import { chainId, withDefaults } from "@sparkdream/launch-spec";
+import { linkedMastodonRow } from "../bridge-target.js";
 import type { StepCtx } from "../engine.js";
 import { SESSION_KEY_FILE, ensureSession } from "../sessions.js";
 import { bondVerifier, refreshVerifierEnv } from "../steps/verifier.js";
@@ -83,9 +83,12 @@ export const verifier: ComponentDescriptor = {
   avoidProviders({ db, launchId, spec, assigned }) {
     const targetId = verifierTargetId(spec, launchId);
     if (targetId === launchId && assigned.mastodon) return [assigned.mastodon];
-    const row = (db.listFleetComponents(targetId) as FleetComponentRow[]).find(
-      (c) => c.key === "mastodon" && c.state !== "closed" && c.provider,
-    );
+    // the Mastodon the target chain's bridge links: its own sidecar's, or the
+    // one a standalone bridge reaches in another (services) fleet
+    const targetLaunch = targetId === launchId ? undefined : db.getLaunch(targetId);
+    const target = targetId === launchId ? spec : targetLaunch ? withDefaults(JSON.parse(targetLaunch.spec_json)) : undefined;
+    if (!target) return [];
+    const row = linkedMastodonRow(db, target, targetId);
     return row ? [row.provider] : [];
   },
   configureSteps: (name, spec) => [

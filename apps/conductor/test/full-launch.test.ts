@@ -574,8 +574,11 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
       rejected?: string;
     }>;
     expect(bids.length).toBeGreaterThan(1);
-    expect(bids.map((b) => Number(b.price))).toEqual(
-      [...bids.map((b) => Number(b.price))].sort((a, b) => a - b),
+    // bids the policy accepts lead the list, cheapest first
+    const accepted = bids.filter((b) => !b.rejected);
+    expect(bids.slice(0, accepted.length)).toEqual(accepted);
+    expect(accepted.map((b) => Number(b.price))).toEqual(
+      [...accepted.map((b) => Number(b.price))].sort((a, b) => a - b),
     );
     // the fleet payload carries the offer so the panel can render it
     const view = (await fleet.fleetForOwner("akash1owner")).fleets.find(
@@ -600,6 +603,69 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     expect(plan.perNode["sentry-0"].dseq).not.toBe(deadDseq);
     // the pick applied to that placement only — nothing left to park on
     expect(db.getBidPick("pickbid", "sentry-0")).toBeUndefined();
+    db.close();
+  }, 180_000);
+
+  it("a re-place pick made after its bids expired closes that deployment and draws a fresh set", async () => {
+    // Providers bid once per order and close their bids a few minutes later.
+    // A pick made after that names a bid that is gone; resuming on the same
+    // deployment would poll the dead order forever, so the re-place closes it
+    // and deploys again for new bids.
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const s = spec();
+    db.createLaunch("latepick", JSON.stringify(s), "akash1owner");
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const fleet = new FleetService(db, services, work);
+
+    expect((await runWithSigner(db, "latepick", s, work, allSteps(), services, signer)).status).toBe(
+      "completed",
+    );
+    fleet.materialize("latepick");
+    db.setLaunchStatus("latepick", "paused");
+    const sentry = db.listFleetComponents("latepick").find((c) => c.key === "sentry-0")!;
+    services.provider.leaselessDseqs.add(sentry.dseq);
+    (services.api as any).leaseStates.set(sentry.dseq, "closed");
+    db.requestBidPick("latepick", "sentry-0");
+    await fleet.requestReplace(db.getLaunch("latepick")!, sentry);
+
+    expect((await runWithSigner(db, "latepick", s, work, allSteps(), services, signer)).status).toBe(
+      "awaiting-user",
+    );
+    const first = db.getBidPick("latepick", "sentry-0")!;
+    const late = (JSON.parse(first.offers_json!) as Array<{ provider: string }>)[0]!.provider;
+
+    // the bids time out, then the operator picks
+    (services.api as any).expiredBidDseqs.add(first.dseq!);
+    db.setBidPick("latepick", "sentry-0", late);
+    expect((await runWithSigner(db, "latepick", s, work, allSteps(), services, signer)).status).toBe(
+      "awaiting-user",
+    );
+    const closed = db.getPendingTx("latepick", `send-manifests:close-stale:sentry-0:${first.dseq}`);
+    // the close ran and its row was cleared with the attempt
+    expect(closed).toBeUndefined();
+    const fresh = db.getBidPick("latepick", "sentry-0")!;
+    expect(fresh.dseq).not.toBe(first.dseq);
+    expect(fresh.provider).toBeNull();
+    expect(JSON.parse(fresh.offers_json!).length).toBeGreaterThan(1);
+    expect(
+      signer.signed.some((m: any) =>
+        m.some(
+          (x: any) =>
+            x.typeUrl.endsWith("MsgCloseDeployment") && x.value.id.dseq === first.dseq,
+        ),
+      ),
+    ).toBe(true);
+
+    db.setBidPick("latepick", "sentry-0", late);
+    const done = await runWithSigner(db, "latepick", s, work, allSteps(), services, signer);
+    expect(done.status).toBe("completed");
+    const assignments = db.stepOutput<any>("latepick", "collect-bids")!;
+    expect(assignments.perNode["sentry-0"].provider).toBe(late);
+    expect(db.stepOutput<any>("latepick", "create-deployments")!.perNode["sentry-0"].dseq).toBe(
+      fresh.dseq,
+    );
     db.close();
   }, 180_000);
 

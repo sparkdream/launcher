@@ -262,9 +262,12 @@ describe("relaunch op", () => {
     const offers = JSON.parse(w.db.listFleetOps("fl").find((o) => o.id === opId)!.params_json)
       .offeredBids as { dseq: string; bids: Array<{ provider: string; rejected?: string }> };
     expect(offers.bids.length).toBeGreaterThan(1);
-    // cheapest first, and the reasons the policy passed a bid over travel
-    // to the picker (they are exactly what the operator is overriding)
-    const prices = offers.bids.map((b) => Number((b as { price: string }).price));
+    // accepted bids first, cheapest first, and the reasons the policy passed
+    // a bid over travel to the picker (they are exactly what the operator is
+    // overriding)
+    const accepted = offers.bids.filter((b) => !b.rejected);
+    expect(offers.bids.slice(0, accepted.length)).toEqual(accepted);
+    const prices = accepted.map((b) => Number((b as { price: string }).price));
     expect([...prices].sort((a, b) => a - b)).toEqual(prices);
     // the fellow sentry's provider is rejected by anti-affinity — pick it
     // anyway: a hand-picked bid beats every filter
@@ -577,7 +580,7 @@ describe("add-component op", () => {
     const w = await launched(specWithComponents());
     const launch = w.db.getLaunch("fl")!;
     expect(() => w.fleet.requestAddComponent(launch, "explorer")).toThrow(/already deployed/);
-    expect(() => w.fleet.requestAddComponent(launch, "hub")).toThrow(/not a component kind/);
+    expect(() => w.fleet.requestAddComponent(launch, "gateway")).toThrow(/not a component kind/);
     const bare = await launched(spec1x1());
     // no domain: validation names the field
     expect(() => bare.fleet.requestAddComponent(bare.db.getLaunch("fl")!, "explorer")).toThrow(

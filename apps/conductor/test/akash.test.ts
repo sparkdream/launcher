@@ -1,7 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { testnetSpec } from "@sparkdream/launch-spec";
-import { exclusionEntries, selectProvider, type Bid } from "../src/akash/policy.js";
+import { describeBids, exclusionEntries, selectProvider, type Bid } from "../src/akash/policy.js";
 import { accountDepositMsg, createDeploymentMsg, createLeaseMsg, TypeUrl } from "../src/akash/messages.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "../src/akash/sdl-groups.js";
 import { pollBids } from "../src/akash/client.js";
@@ -229,6 +229,51 @@ describe("policy engine (§6)", () => {
     expect(lines[0]).toContain("provider1");
     expect(lines[0]).toContain("https://provider1.example.com:8443");
     expect(lines[0]).toContain("headscale list");
+  });
+});
+
+describe("describeBids (manual pick list)", () => {
+  it("ranks dependable bids above cheap flaky ones, and unusable ones last", () => {
+    const providers = fakeProviders();
+    const keys = [...providers.keys()];
+    const [accepted, auditedAvoided, cheapFlaky, cheapSteady, noDomains] = keys as [string, string, string, string, string];
+    providers.get(cheapFlaky)!.isAudited = false;
+    providers.get(cheapFlaky)!.uptime7d = 0.4;
+    providers.get(cheapSteady)!.isAudited = false;
+    providers.get(cheapSteady)!.uptime7d = 1;
+    providers.get(auditedAvoided)!.uptime7d = 0.998;
+    const offers = describeBids(
+      [bid(noDomains, "1"), bid(cheapFlaky, "2"), bid(cheapSteady, "3"), bid(auditedAvoided, "4"), bid(accepted, "9")],
+      providers,
+      {
+        chosen: bid(accepted, "9"),
+        rejected: [
+          { provider: noDomains, reason: "does not serve custom domains (featEndpointCustomDomain)", fatal: true },
+          { provider: cheapFlaky, reason: "not audited" },
+          { provider: cheapSteady, reason: "not audited" },
+          { provider: auditedAvoided, reason: "on the avoid list" },
+        ],
+      },
+    );
+    expect(offers.map((o) => o.provider)).toEqual([accepted, auditedAvoided, cheapSteady, cheapFlaky, noDomains]);
+    expect(offers[0]).toMatchObject({ autoPick: true });
+  });
+
+  it("marks storage and custom-domain rejections as fatal, preferences not", () => {
+    const providers = fakeProviders();
+    const [p1, p2] = [...providers.keys()] as [string, string];
+    providers.get(p1)!.isAudited = false;
+    providers.get(p2)!.customDomain = false;
+    const decision = selectProvider([bid(p1, "100"), bid(p2, "100")], {
+      policy: basePolicy,
+      chosenProviders: new Set(),
+      requiresCustomDomain: true,
+      providers,
+    });
+    expect(decision.rejected).toEqual([
+      { provider: p1, reason: "not audited" },
+      { provider: p2, reason: expect.stringContaining("custom domains"), fatal: true },
+    ]);
   });
 });
 

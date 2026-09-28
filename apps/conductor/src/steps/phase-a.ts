@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   chainId,
+  fleetBridge,
   nodes,
   resolveTopology,
   serviceComponents,
@@ -293,8 +294,9 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
   writeSecretFile(mnemonicsFile, JSON.stringify(mnemonics, null, 2));
   // the relayer's key (cosmjs-derived: other chains need other prefixes, so
   // the keyring's single prefix cannot make it); funded in genesis
-  // the mastodon bridge's operator bonds with its own key; funded in genesis
-  if (spec.topology.components.mastodon?.enabled && spec.topology.components.mastodon.bridge?.enabled) {
+  // the fleet's bridge (its Mastodon's sidecar or a standalone one) bonds
+  // with the operator's own key; funded in genesis
+  if (fleetBridge(spec)) {
     accounts[BRIDGE_OPERATOR] = await ensureBridgeOperatorKey(dirs.secrets, masterHome(ctx));
   }
   if (spec.topology.components.relayer?.enabled) {
@@ -387,8 +389,8 @@ export async function buildGenesisFiles(
   }
   // the relayer pays gas for every packet this chain's side submits
   const bridgeOperator = keys.accounts[BRIDGE_OPERATOR];
-  const bridge = spec.topology.components.mastodon?.bridge;
-  if (bridgeOperator && spec.topology.components.mastodon?.enabled && bridge?.enabled) {
+  const bridge = fleetBridge(spec)?.link;
+  if (bridgeOperator && bridge) {
     await addGenesisAccount(bridgeOperator, bridge.genesisBalance);
   }
   const relayerAccount = keys.accounts[RELAYER_ACCOUNT];
@@ -619,6 +621,30 @@ export const renderSdlsStep: StepDef = {
       written.push(outPath);
     }
     return { written };
+  },
+};
+
+/**
+ * A services fleet's keys: no nodes, no accounts, no chain binary. The SSH
+ * key (for a component that runs sshd) and the age identity the rest of the
+ * launcher expects; the output keeps generate-keys' shape so later steps
+ * and the fleet read it the same way.
+ */
+export const generateServicesKeysStep: StepDef = {
+  name: "generate-keys",
+  async run(ctx): Promise<GenerateKeysOutput> {
+    const { spec, dirs } = ctx;
+    fs.mkdirSync(dirs.secrets, { recursive: true, mode: 0o700 });
+    let sshPublicKey = spec.security.sshPublicKey;
+    if (!sshPublicKey) {
+      const pair = generateSshKeypair(`launch-${ctx.launchId}`);
+      writeSecretFile(path.join(dirs.secrets, "ssh_ed25519.pem"), pair.privateKeyPem);
+      fs.writeFileSync(path.join(dirs.secrets, "ssh_ed25519.pub"), pair.publicKeyOpenssh);
+      sshPublicKey = pair.publicKeyOpenssh;
+    }
+    const age = generateAgeKeypair();
+    writeSecretFile(path.join(dirs.secrets, "age.txt"), `# recipient: ${age.recipient}\n${age.identity}\n`);
+    return { nodeIds: {}, accounts: {}, consensusPubkeys: {}, sshPublicKey, ageRecipient: age.recipient };
   },
 };
 

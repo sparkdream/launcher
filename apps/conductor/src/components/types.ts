@@ -111,4 +111,8 @@ export interface ComponentDescriptor {
   /** Env derived from domains; a domain retarget sets these (undefined =
    *  remove) alongside rewriting accept lists. */
   retargetEnv?(spec: LaunchSpec): Record<string, string | undefined>;
+  /** A domain retarget's component-specific part, applied to the deployed
+   *  SDL after the accept lists and retargetEnv: the domains of side
+   *  services (Mastodon's login) and the env that names them. */
+  retargetDoc?(doc: any, spec: LaunchSpec): void;
 }

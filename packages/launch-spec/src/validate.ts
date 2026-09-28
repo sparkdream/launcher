@@ -1,7 +1,15 @@
 import { z, ZodError } from "zod";
 import { fromBase64, fromBech32 } from "@cosmjs/encoding";
 import { launchSpecSchema, type LaunchSpec, type NetworkType } from "./schema.js";
-import { chainId, deriveDreamDenom, mastodonStreamingDomain } from "./derive.js";
+import {
+  chainId,
+  deriveDreamDenom,
+  defaultLoginDomain,
+  isServicesFleet,
+  mastodonLoginDomain,
+  mastodonStreamingDomain,
+  SERVICES_FLEET_COMPONENTS,
+} from "./derive.js";
 import { COMPONENT_KEYS, COMPONENT_KINDS, componentDomain } from "./components.js";
 import { profiles } from "./profiles.js";
 import { VENDORED_CHAIN_VERSION } from "./vendor-info.js";
@@ -29,10 +37,39 @@ export function withDefaults(input: unknown): LaunchSpec {
   if (!isPlainObject(input) || !isPlainObject(input.network)) {
     return launchSpecSchema.parse(input); // let zod produce the error
   }
-  const type = input.network.type as NetworkType;
+  const filled = input.kind === "services" ? servicesFill(input) : input;
+  const type = (filled.network as Record<string, unknown>).type as NetworkType;
   const profile = profiles[type];
-  if (!profile) return launchSpecSchema.parse(input);
-  return launchSpecSchema.parse(merge(profile, input));
+  if (!profile) return launchSpecSchema.parse(filled);
+  return launchSpecSchema.parse(merge(profile, filled));
+}
+
+/**
+ * A services fleet has no chain, but the schema still carries the chain's
+ * token, accounts and node topology: fill what the spec leaves out with
+ * inert values, so a services spec only has to say what it runs.
+ */
+function servicesFill(input: Record<string, unknown>): Record<string, unknown> {
+  const topology = isPlainObject(input.topology) ? input.topology : {};
+  const network = isPlainObject(input.network) ? input.network : {};
+  const components = isPlainObject(topology.components) ? topology.components : {};
+  return {
+    token: { baseDenom: "uspark.services", displayDenom: "SPARK" },
+    accounts: { initial: [], validatorSelfDelegation: "1" },
+    ...input,
+    // network.name names the fleet. The type only picks placement defaults:
+    // a shared, long-lived service gets the audited-provider profile unless
+    // the spec asks for devnet's looser one; the prefix is never used.
+    network: { type: "testnet", bech32Prefix: "sprkdrm", ...network },
+    topology: {
+      validators: { count: 1 },
+      sentries: { count: 0 },
+      headscale: {},
+      ...topology,
+      // the chain's own components stay off unless the spec says otherwise
+      components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false }, ...components },
+    },
+  };
 }
 
 export interface ValidationIssue {
@@ -177,6 +214,17 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   const warnings: ValidationIssue[] = [];
   const err = (path: string, message: string) => errors.push({ path, message });
   const warn = (path: string, message: string) => warnings.push({ path, message });
+
+  // a services fleet: shared components and nothing chain-shaped (its chain
+  // fields keep their defaults and are never used)
+  if (isServicesFleet(spec)) {
+    validateServicesFleet(spec, err, warn);
+    return { ok: errors.length === 0, errors, warnings };
+  }
+
+  if (spec.sharing?.wallets?.length) {
+    warn("sharing", "sharing applies to services fleets: a chain fleet's components are not linked from other wallets");
+  }
 
   const mainnet = spec.network.type === "mainnet";
   const join = spec.join;
@@ -616,9 +664,6 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       );
     }
   }
-  if (comps.hub.enabled) {
-    warn("topology.components.hub", "hub deployment is not implemented yet — toggle is ignored");
-  }
   const pub = spec.topology.publicEndpoints;
   if (comps.frontend.enabled && !(pub?.api && pub?.rpc)) {
     err(
@@ -689,12 +734,22 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       err("images.mastodonStreaming", "image is required when mastodon is enabled");
     }
     if (!masto.smtp) {
-      warn(
-        "topology.components.mastodon.smtp",
-        "no SMTP relay: confirmation emails are never sent, so people who sign up cannot confirm their address",
-      );
+      // with registrations "none" nobody signs up, so there is nothing to confirm
+      if (masto.registrations !== "none") {
+        warn(
+          "topology.components.mastodon.smtp",
+          "no SMTP relay: confirmation emails are never sent, so people who sign up cannot confirm their address",
+        );
+      }
     } else if (!/@/.test(masto.smtp.fromAddress)) {
       err("topology.components.mastodon.smtp.fromAddress", "must contain an email address");
+    }
+    validateWalletLogin(spec, err, warn);
+    if (masto.walletLogin?.enabled && (!pub?.api || !pub?.rpc)) {
+      err(
+        "topology.publicEndpoints",
+        "wallet sign-in reads membership through the chain's public api domain, and Keplr needs its rpc: set publicEndpoints.api and publicEndpoints.rpc",
+      );
     }
     if (masto.bridge?.enabled) {
       if (!pub?.api) {
@@ -717,6 +772,22 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
           "account with a federation-verifier bond) runs against this chain",
       );
     }
+  }
+
+  // Standalone bridge: its Mastodon runs in another fleet (resolved, and
+  // its domain filled in, by the conductor)
+  const standalone = comps.bridge;
+  if (standalone?.enabled) {
+    if (masto?.enabled && masto.bridge?.enabled) {
+      err("topology.components.bridge", "this fleet already bridges its own Mastodon: run the sidecar or a standalone bridge, not both");
+    }
+    if (!pub?.api) err("topology.publicEndpoints.api", "the bridge broadcasts through this chain's public api domain");
+    if (!(spec.images.bridge ?? spec.images.sdap)) err("images.bridge", "image is required when the bridge is enabled");
+    const extra = (standalone.peers ?? []).map((p) => p.id.toLowerCase());
+    if (standalone.target.domain && extra.includes(standalone.target.domain.toLowerCase())) {
+      err("topology.components.bridge.peers", `${standalone.target.domain} is the instance's own peer: list only other servers`);
+    }
+    if (new Set(extra).size !== extra.length) err("topology.components.bridge.peers", "each server may be listed once");
   }
 
   // Verifier: checks here are the ones this spec can answer; a fleet target
@@ -743,7 +814,7 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         err("topology.components.verifier.account", `"${verifier.account}" must be a member with trustLevel established or above`);
       }
       if (!pub?.api) err("topology.publicEndpoints.api", "the verifier reads and broadcasts through the public api domain");
-      if (!verifier.peers?.length && !comps.mastodon?.enabled) {
+      if (!verifier.peers?.length && !comps.mastodon?.enabled && !comps.bridge?.enabled) {
         err("topology.components.verifier.peers", "name the ActivityPub peers to verify (there is no Mastodon here to default to)");
       }
     }
@@ -788,6 +859,7 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     ]),
     ["topology.components.hub.domain", comps.hub.enabled ? comps.hub.domain : undefined],
     ["topology.components.mastodon.streamingDomain", mastodonStreamingDomain(spec)],
+    ["topology.components.mastodon.walletLogin.domain", mastodonLoginDomain(spec)],
     ["topology.publicEndpoints.api", pub?.api],
     ["topology.publicEndpoints.rpc", pub?.rpc],
     ["topology.headscale.domain", spec.topology.headscale.domain],
@@ -925,18 +997,8 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   // join mode is exempt (the live chain's genesis, not the vendored
   // reference, is what matters — run whatever the join bundle names).
   if (!join) {
-    const floor = /^v(\d+)\.(\d+)\.(\d+)$/.exec(VENDORED_CHAIN_VERSION);
-    const m = /^sparkdreamnft\/sparkdreamd-[a-z]+-ssh:v(\d+)\.(\d+)\.(\d+)$/.exec(
-      spec.images.sparkdreamd,
-    );
-    if (floor && m) {
-      const minVersion = [Number(floor[1]), Number(floor[2]), Number(floor[3])];
-      const tag = [Number(m[1]), Number(m[2]), Number(m[3])];
-      const older =
-        tag[0]! !== minVersion[0] ? tag[0]! < minVersion[0]!
-        : tag[1]! !== minVersion[1] ? tag[1]! < minVersion[1]!
-        : tag[2]! < minVersion[2]!;
-      if (older) {
+    if (/^sparkdreamnft\/sparkdreamd-[a-z]+-ssh:/.test(spec.images.sparkdreamd)) {
+      if (imageBefore(spec.images.sparkdreamd, VENDORED_CHAIN_VERSION)) {
         err(
           "images.sparkdreamd",
           `${spec.images.sparkdreamd} predates the vendored reference genesis ` +
@@ -949,3 +1011,120 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
 
   return { errors, warnings, ok: errors.length === 0 };
 }
+
+/** An image's vX.Y.Z tag, when it has one. */
+export function versionTag(image: string): [number, number, number] | undefined {
+  const m = /:v(\d+)\.(\d+)\.(\d+)$/.exec(image);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : undefined;
+}
+
+/** Whether `image` carries a version tag older than `version` (vX.Y.Z).
+ *  Images tagged otherwise (dev, latest, a digest) cannot be told apart:
+ *  false. */
+export function imageBefore(image: string, version: string): boolean {
+  const tag = versionTag(image);
+  const floor = versionTag(`:${version}`);
+  if (!tag || !floor) return false;
+  for (let i = 0; i < 3; i++) if (tag[i] !== floor[i]) return tag[i]! < floor[i]!;
+  return false;
+}
+
+/**
+ * The first chain release whose images carry wallet sign-in: the sdap image
+ * ships sdaplogin, the Mastodon image the zz_sparkdream_wallet_login.rb
+ * initializer and the `login-chain` bootstrap action. Older images deploy
+ * cleanly and then fail (the login service crash-loops, the chain sync never
+ * lands), so this refuses them at validation, before anything is signed.
+ */
+export const WALLET_LOGIN_MIN_VERSION = "v1.0.46";
+
+/**
+ * Mastodon wallet sign-in, in a chain or a services fleet: the sdaplogin
+ * sidecar runs on the sdap image, on an ingress of its own.
+ */
+function validateWalletLogin(
+  spec: LaunchSpec,
+  err: (path: string, message: string) => void,
+  warn: (path: string, message: string) => void,
+): void {
+  const m = spec.topology.components.mastodon;
+  if (!m?.enabled || !m.walletLogin?.enabled) return;
+  if (!spec.images.sdap) err("images.sdap", "image is required for mastodon.walletLogin (sdaplogin ships in it)");
+  for (const key of ["sdap", "mastodon"] as const) {
+    const image = spec.images[key];
+    if (image && imageBefore(image, WALLET_LOGIN_MIN_VERSION)) {
+      err(
+        `images.${key}`,
+        `${image} predates wallet sign-in (${WALLET_LOGIN_MIN_VERSION} or later): upgrade the ${key} image first ` +
+          "(on a running fleet, \"upgrade…\" on the Mastodon row records it even when no service runs it yet)",
+      );
+    }
+  }
+  const login = mastodonLoginDomain(spec);
+  if (login && (login === m.domain || login === mastodonStreamingDomain(spec))) {
+    err("topology.components.mastodon.walletLogin.domain", `"${login}" is already the instance's own domain: sign-in needs one of its own`);
+  }
+  if (login && m.domain && login.split(".").length > m.domain.split(".").length) {
+    warn(
+      "topology.components.mastodon.walletLogin.domain",
+      `"${login}" sits a level deeper than the instance (${m.domain}): behind Cloudflare, whose free edge ` +
+        "certificate covers only one level below the zone, browsers would reject its certificate. " +
+        `A name at the instance's depth, like ${defaultLoginDomain(m.domain)}, avoids that`,
+    );
+  }
+}
+
+/**
+ * A services fleet (spec.kind "services"): only chain-independent
+ * components, at least one, and none of the chain's own machinery.
+ */
+function validateServicesFleet(
+  spec: LaunchSpec,
+  err: (path: string, message: string) => void,
+  warn: (path: string, message: string) => void,
+): void {
+  const comps = spec.topology.components as Record<string, { enabled?: boolean } | undefined>;
+  const enabled = Object.entries(comps).filter(([, c]) => c?.enabled).map(([k]) => k);
+  for (const key of enabled) {
+    if (!(SERVICES_FLEET_COMPONENTS as readonly string[]).includes(key)) {
+      err(
+        `topology.components.${key}`,
+        `a services fleet runs chain-independent components only (${SERVICES_FLEET_COMPONENTS.join(", ")}); ` +
+          `${key} belongs in a chain fleet`,
+      );
+    }
+  }
+  if (enabled.length === 0) warn("topology.components", "a services fleet with no component deploys nothing");
+  const shared = spec.sharing?.wallets ?? [];
+  if (new Set(shared).size !== shared.length) err("sharing.wallets", "each wallet may be listed once");
+  if (spec.join) err("join", "a services fleet runs no chain to join");
+  if (spec.topology.headscale.reuseFleet || spec.topology.headscale.domain) {
+    warn("topology.headscale", "a services fleet runs no mesh: the headscale settings are ignored");
+  }
+  if (spec.topology.publicEndpoints) warn("topology.publicEndpoints", "a services fleet serves no chain endpoints: ignored");
+  const masto = spec.topology.components.mastodon;
+  if (masto?.enabled) {
+    if (masto.bridge?.enabled) {
+      err(
+        "topology.components.mastodon.bridge",
+        "a services fleet has no chain to anchor to: each chain fleet links this instance with a standalone bridge component",
+      );
+    }
+    if (!masto.domain) err("topology.components.mastodon.domain", "the instance's domain is required");
+    if (!masto.owner) err("topology.components.mastodon.owner", "an owner (username + email) is required: it is the instance's only way in");
+    if (!spec.images.mastodon) err("images.mastodon", "image is required when mastodon is enabled");
+    if (!spec.images.mastodonStreaming) err("images.mastodonStreaming", "image is required when mastodon is enabled");
+    validateWalletLogin(spec, err, warn);
+    if (masto.walletLogin?.enabled) {
+      warn(
+        "topology.components.mastodon.walletLogin",
+        "only members of chains whose fleets link this instance with a standalone bridge can sign in: until one does, the sign-in page has no chain to offer",
+      );
+    }
+  }
+  if (spec.topology.components.hub?.enabled) {
+    if (!spec.topology.components.hub.domain) err("topology.components.hub.domain", "domain is required when enabled");
+    if (!spec.images.hub) err("images.hub", "image is required when enabled");
+  }
+}
+

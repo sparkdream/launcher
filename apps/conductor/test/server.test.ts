@@ -97,6 +97,57 @@ describe("API server (§8)", () => {
     db.close();
   }, 120_000);
 
+  it("launches a services fleet (no chain) through the same routes and signing loop", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const app = buildServer({ db, workRoot: work, steps: allSteps(), services: fakeServices() });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/launches",
+      payload: {
+        owner: "akash1owner",
+        spec: testnetSpecInput({
+          kind: "services",
+          network: { name: "zenith-commons", type: "testnet", bech32Prefix: "sprkdrm" },
+          topology: {
+            validators: { count: 1 },
+            sentries: { count: 1 },
+            components: {
+              explorer: { enabled: false },
+              frontend: { enabled: false },
+              hub: { enabled: false },
+              mastodon: { enabled: true, domain: "social.zenith.example", owner: { username: "admin", email: "admin@zenith.example" } },
+            },
+            headscale: {},
+          },
+        } as any),
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const { id } = created.json() as { id: string };
+    expect(((await app.inject({ method: "POST", url: `/api/launches/${id}/start` })).json() as any).status).toBe("started");
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    let status = "";
+    let signatures = 0;
+    for (let i = 0; i < 2000 && status !== "completed"; i++) {
+      status = ((await app.inject({ method: "GET", url: `/api/launches/${id}` })).json() as any).status;
+      const pending = await app.inject({ method: "GET", url: `/api/launches/${id}/pending-tx` });
+      if (pending.statusCode === 200) {
+        signatures++;
+        await app.inject({ method: "POST", url: `/api/launches/${id}/tx-result`, payload: { txHash: `${signatures}`.repeat(64).slice(0, 64) } });
+      }
+      await sleep(20);
+    }
+    expect(status).toBe("completed");
+    const steps = ((await app.inject({ method: "GET", url: `/api/launches/${id}` })).json() as any).steps.map((s: any) => s.name);
+    expect(steps).toEqual(expect.arrayContaining(["create-deployments", "create-leases", "verify-services", "configure-mastodon"]));
+    expect(steps).not.toContain("build-genesis");
+    expect(steps).not.toContain("deploy-headscale");
+    // one Mastodon deployment: certificate, deployment, lease
+    expect(signatures).toBeLessThanOrEqual(3);
+    db.close();
+  }, 120_000);
+
   it("add-component route: 404 unknown launch, 400 without a key, 409 with the fleet's reason", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));

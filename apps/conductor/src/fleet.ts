@@ -8,6 +8,13 @@ import {
   COMPONENT_KINDS,
   frozenResetViolations,
   isComponentKey,
+  isServicesFleet,
+  fleetBridge,
+  imageBefore,
+  mastodonLoginDomain,
+  mastodonStreamingDomain,
+  profiles,
+  versionTag,
   resolveTopology,
   serviceComponents,
   validateSpec,
@@ -19,6 +26,9 @@ import {
 import { descriptorFor } from "./components/index.js";
 import { RELAYER_ACCOUNT, resolveRelayFleet } from "./relayer.js";
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
+import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
+import { resolveSmtpPasswordSource } from "./services-spec.js";
+import { servicesSteps } from "./services-steps.js";
 import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
 
 /** The accounts-panel entry for the Mastodon instance's Owner. */
@@ -149,6 +159,9 @@ export interface FleetView {
   /** The spec's network name — distinguishes fleets that share a chain id
    *  (e.g. an origin fleet and a joiner on the same chain). */
   name: string;
+  /** "chain", or "services" for a fleet of shared components with no chain
+   *  (the UI hides chain actions on it). */
+  kind: "chain" | "services";
   chainId: string;
   /** softsign | tmkms — the UI gates signer-related actions on this. */
   keyMode: string;
@@ -250,6 +263,12 @@ export function consensusAddress(pubkeyBase64: string): string {
   return createHash("sha256").update(Buffer.from(pubkeyBase64, "base64")).digest("hex").slice(0, 40).toUpperCase();
 }
 
+/** The Mastodon settings a running instance can change (settings action). */
+export interface MastodonSettings {
+  registrations?: "open" | "approved" | "none";
+  walletLogin?: Record<string, unknown>;
+}
+
 export class FleetService {
   /** Last hourly on-chain look at each fleet's session grants. */
   private readonly sessionChecks = new Map<string, number>();
@@ -324,6 +343,10 @@ export class FleetService {
       for (const [key, entry] of Object.entries(plan.perNode)) {
         const a = assignments.perNode[key];
         if (!a) continue;
+        // a service component deployed at launch and removed since
+        // (removeComponent): the spec no longer enables it, so its launch
+        // outputs must not bring the row back
+        if (spec && !/^(val|sentry)-/.test(key) && !componentImages.has(key)) continue;
         // stale-bid recovery and the mid-launch re-place both redeploy inside
         // the launch: the step outputs then carry a NEW dseq while the row
         // holds the closed old placement (upsert is DO NOTHING). Adopt the
@@ -622,6 +645,7 @@ export class FleetService {
         launchId: launch.id,
         launchStatus: launch.status,
         name: spec.network.name,
+        kind: spec.kind ?? "chain",
         // join-aware: a joined fleet runs the LIVE chain, not name-suffix
         chainId: chainId(spec),
         keyMode: spec.security.keyMode,
@@ -868,6 +892,16 @@ export class FleetService {
         );
       }
     }
+    if (component.key === "mastodon") {
+      const bridged = this.bridgeDependents(launch.id);
+      if (bridged.length > 0) {
+        warnings.push(
+          `fleet(s) ${bridged.map((d) => this.spec(d).network.name).join(", ")} bridge this instance to their ` +
+            "chains: their bridges stop anchoring while it is closed, and a new instance starts with an empty " +
+            "database (their bridge accounts are re-made when they are reconfigured)",
+        );
+      }
+    }
     if (component.key.startsWith("val-")) {
       warnings.push(
         `closing ${component.key} deletes its node data, and the chain keeps expecting its ` +
@@ -921,7 +955,54 @@ export class FleetService {
   }
 
   /** Fleets riding this launch's mesh — refuse to sever them (§ shared mesh). */
+  /**
+   * A Mastodon's domains must not be another fleet's on this launcher: the
+   * ingress health check would pass against the other instance (its DNS
+   * answers), and the new one would bridge as that instance's peer. Linking
+   * a chain to an existing instance is the standalone bridge's job.
+   */
+  private assertMastodonDomainFree(launch: LaunchRow, spec: LaunchSpec): void {
+    const domainsOf = (s: LaunchSpec) => {
+      const m = s.topology.components.mastodon;
+      if (!m?.enabled || !m.domain) return [];
+      return [m.domain, mastodonStreamingDomain(s), mastodonLoginDomain(s)].filter((d): d is string => Boolean(d));
+    };
+    const mine = new Set(domainsOf(spec));
+    for (const other of this.db.listLaunches()) {
+      if (other.id === launch.id || other.status === "aborted") continue;
+      let theirs: string[];
+      try {
+        theirs = domainsOf(this.spec(other));
+      } catch {
+        continue;
+      }
+      const clash = theirs.find((d) => mine.has(d));
+      if (clash) {
+        const name = this.spec(other).network.name;
+        throw new Error(
+          mayUseFleet(other, launch.owner)
+            ? `${clash} is already served by fleet "${name}"'s Mastodon. ` +
+                `To link this chain to that instance, add a bridge component targeting "${name}" instead`
+            : `${clash} is already served by another wallet's Mastodon on this launcher: choose a domain of this instance's own`,
+        );
+      }
+    }
+  }
+
+  /** Chain fleets whose standalone bridge links this fleet's Mastodon. */
+  private bridgeDependents(launchId: string): LaunchRow[] {
+    return bridgeDependents(this.db, launchId);
+  }
+
   private assertNoDependentFleets(launch: LaunchRow, closing: string): void {
+    const bridged = this.bridgeDependents(launch.id);
+    if (closing.startsWith("shutting") && bridged.length > 0) {
+      throw new Error(
+        `${closing} would take down the Mastodon that fleet(s) ` +
+          bridged.map((d) => `"${this.spec(d).network.name}" (${d.id})`).join(", ") +
+          " bridge to their chains: close their bridge components first",
+      );
+    }
     const dependents = dependentFleets(this.db, launch.id);
     if (dependents.length > 0) {
       throw new Error(
@@ -1086,8 +1167,10 @@ export class FleetService {
   /**
    * Confirm signed fleet txs (the launch step engine only drives launch
    * steps, so fleet txs are settled here — called on tx-result and ticks).
+   * Returns the other fleets it queued an op on, for the caller to drive.
    */
-  async settleFleetTxs(launchId: string): Promise<void> {
+  async settleFleetTxs(launchId: string): Promise<string[]> {
+    const queued: string[] = [];
     for (const row of this.db.listSignedFleetTxs(launchId)) {
       const status = await this.services.api.txStatus(row.tx_hash!);
       if (status === "pending") continue;
@@ -1100,11 +1183,14 @@ export class FleetService {
       if (action === "close" && dseq) {
         const component = this.db.getFleetComponentByDseq(launchId, dseq);
         if (component) this.db.setComponentState(launchId, component.key, "closed");
+        if (component?.key === "bridge") queued.push(...this.queueLoginResync(launchId));
       }
       if (action === "shutdown") {
+        const bridged = this.db.listFleetComponents(launchId).some((c) => c.key === "bridge" && c.state !== "closed");
         for (const c of this.db.listFleetComponents(launchId)) {
           if (c.state !== "closed") this.db.setComponentState(launchId, c.key, "closed");
         }
+        if (bridged) queued.push(...this.queueLoginResync(launchId));
         // shutting down an in-flight launch ends it — otherwise it lingers
         // "paused" on whatever step it died at, error banner and all
         const launch = this.db.getLaunch(launchId);
@@ -1113,6 +1199,24 @@ export class FleetService {
         }
       }
     }
+    return queued;
+  }
+
+  /**
+   * This chain fleet's standalone bridge just closed: the Mastodon it linked
+   * stops offering the chain at wallet sign-in. A "reconfigure" of that
+   * Mastodon re-syncs its chain list, which no longer counts this fleet (its
+   * bridge row is closed). Returns the fleet to drive, if any.
+   */
+  private queueLoginResync(launchId: string): string[] {
+    const launch = this.db.getLaunch(launchId);
+    const b = launch ? this.spec(launch).topology.components.bridge : undefined;
+    if (!b?.enabled) return [];
+    const target = this.db.getLaunch(b.target.fleet);
+    if (!target || target.status !== "completed" || !mastodonLoginDomain(this.spec(target))) return [];
+    if (!this.db.listFleetComponents(target.id).some((c) => c.key === "mastodon" && c.state === "active")) return [];
+    this.db.createFleetOp(target.id, "reconfigure", { keys: ["mastodon"] } satisfies ReconfigureParams);
+    return [target.id];
   }
 
   /** Restart the component (no signature — §2 scoping rule). Nodes restart
@@ -1381,8 +1485,13 @@ export class FleetService {
     // at it (wire-tunnels, patch-validator-peers), and, on a tmkms fleet, no
     // pause to repoint the signer at its new address (await-signer) — the
     // node boots, times out fetching its pubkey, and crash-loops.
-    const from = phaseEFSteps().map((s) => s.name);
-    for (const name of ["send-manifests", "upload-node-data", ...from]) {
+    // a services fleet has its own, shorter pipeline: everything after the
+    // manifests (its domain check and the components' configuration)
+    const services = servicesSteps().map((s) => s.name);
+    const from = isServicesFleet(this.spec(launch))
+      ? services.slice(services.indexOf("send-manifests") + 1)
+      : ["upload-node-data", ...phaseEFSteps().map((s) => s.name)];
+    for (const name of ["send-manifests", ...from]) {
       this.db.resetStep(launch.id, name);
     }
     return { ...(step ? { step } : {}), closing: info?.state === "active" };
@@ -1439,21 +1548,110 @@ export class FleetService {
     component: FleetComponentRow,
     size: "small" | "standard",
   ): Promise<number> {
-    if (component.key !== "mastodon") throw new Error("only the Mastodon component can be resized");
+    this.assertMastodonIdle(launch, component, "resized");
+    return this.queueMastodonMove(launch, component, { size });
+  }
+
+  private assertMastodonIdle(launch: LaunchRow, component: FleetComponentRow, verb: string): void {
+    if (component.key !== "mastodon") throw new Error(`only the Mastodon component can be ${verb}`);
     if (component.state !== "active") throw new Error(`mastodon is ${component.state}, not active`);
     if (launch.status !== "completed") throw new Error("the launch has not finished");
     const busy = this.db
       .listFleetOps(launch.id, "active")
       .some((o) => o.kind === "mastodon-resize" || (o.kind === "relaunch" && JSON.parse(o.params_json).key === "mastodon"));
     if (busy) throw new Error("Mastodon is already being moved: finish or abort that op first");
+  }
+
+  private queueMastodonMove(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    move: Pick<MastodonResizeParams, "size" | "walletLogin">,
+  ): number {
     const prefs = this.db.providerPrefs(launch.owner);
     return this.db.createFleetOp(launch.id, "mastodon-resize", {
       key: "mastodon",
       generation: component.generation + 1,
       avoidProviders: prefs.avoid.filter((p) => p !== component.provider),
       preferProviders: [...new Set([component.provider, ...prefs.prefer])],
-      size,
+      ...move,
     } satisfies MastodonResizeParams);
+  }
+
+  /** Whether applying `settings` moves the instance to a new deployment
+   *  (throws when they do not validate); nothing is changed. */
+  mastodonSettingsMove(launch: LaunchRow, settings: MastodonSettings): boolean {
+    return this.planMastodonSettings(launch, settings).move;
+  }
+
+  /**
+   * The login domain the running deployment serves, read from its SDL (the
+   * spec's default may have moved on since it was rendered), or undefined
+   * when it runs no login service.
+   */
+  private deployedLoginDomain(launch: LaunchRow): string | undefined {
+    const file = path.join(launchDirs(this.workRoot, launch.id).sdl, "mastodon.yaml");
+    if (!fs.existsSync(file)) return mastodonLoginDomain(this.spec(launch));
+    const doc = yaml.load(fs.readFileSync(file, "utf8")) as any;
+    const login = doc?.services?.login;
+    if (!login) return undefined;
+    return (login.expose ?? []).flatMap((e: { accept?: string[] }) => e.accept ?? [])[0];
+  }
+
+  private planMastodonSettings(launch: LaunchRow, settings: MastodonSettings) {
+    const current = this.spec(launch);
+    const stored = JSON.parse(launch.spec_json);
+    const m = stored.topology.components.mastodon;
+    if (!m?.enabled) throw new Error("this fleet runs no Mastodon");
+    if (settings.registrations) m.registrations = settings.registrations;
+    const walletLogin = settings.walletLogin ? { ...(m.walletLogin ?? {}), ...settings.walletLogin } : m.walletLogin;
+    const next = withDefaults({
+      ...stored,
+      topology: { ...stored.topology, components: { ...stored.topology.components, mastodon: { ...m, walletLogin } } },
+    });
+    const { errors } = validateSpec(next);
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    const deployed = this.deployedLoginDomain(launch);
+    const wanted = mastodonLoginDomain(next);
+    // a login service added or dropped is a new deployment; a login domain
+    // that moves while sign-in stays on is a manifest change, done in place
+    const move = (deployed === undefined) !== (wanted === undefined);
+    const retarget = !move && wanted !== undefined && deployed !== wanted;
+    return { current, stored, m, walletLogin, move, retarget };
+  }
+
+  /**
+   * Change a running Mastodon's settings: who may sign up, and wallet
+   * sign-in. What only the instance itself holds (the registrations mode,
+   * the sign-in trust floor, which live in its database and the chain list)
+   * is applied in place by a "reconfigure", with no signature. A new login
+   * domain is a manifest change: a "retarget" updates the deployment in
+   * place (one signature) and gates on the new domain. Turning wallet
+   * sign-in on or off changes the deployment's services, which Akash
+   * cannot do to a running deployment: that is the
+   * resize's move at the current size, data and all, and the spec takes the
+   * sign-in settings only once the new deployment holds the data.
+   */
+  requestMastodonSettings(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    settings: MastodonSettings,
+  ): { opId: number; move: boolean } {
+    this.assertMastodonIdle(launch, component, "reconfigured");
+    const { current, stored, m, walletLogin, move, retarget } = this.planMastodonSettings(launch, settings);
+    if (move) {
+      // registrations apply now (the move's configure sets them); sign-in
+      // lands in the spec with the new deployment
+      this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+      const size = current.topology.components.mastodon!.size ?? "small";
+      return { opId: this.queueMastodonMove(launch, component, { size, walletLogin }), move };
+    }
+    if (walletLogin) m.walletLogin = walletLogin;
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    // the login domain first (one deployment update, then its DNS gate),
+    // then configure re-applies registrations and re-syncs the chains
+    if (retarget) this.db.createFleetOp(launch.id, "retarget", { components: ["mastodon"] } satisfies RetargetParams);
+    const opId = this.db.createFleetOp(launch.id, "reconfigure", { keys: ["mastodon"] } satisfies ReconfigureParams);
+    return { opId, move };
   }
 
   /**
@@ -1467,14 +1665,17 @@ export class FleetService {
    */
   requestBridgePeers(launch: LaunchRow, ids: string[]): Array<{ launchId: string; opId: number }> {
     const spec = this.spec(launch);
-    const m = spec.topology.components.mastodon;
-    if (!m?.enabled || !m.bridge?.enabled) throw new Error("this fleet runs no Mastodon bridge");
-    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "mastodon");
-    if (row?.state !== "active") throw new Error("Mastodon is not running");
+    // the fleet's bridge: its Mastodon's sidecar, or a standalone component
+    const fb = fleetBridge(spec);
+    if (!fb) throw new Error("this fleet runs no bridge");
+    const host = fb.kind === "sidecar" ? "mastodon" : "bridge";
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === host);
+    if (row?.state !== "active") throw new Error(`the ${host === "bridge" ? "bridge" : "Mastodon"} is not running`);
     const wanted = [...new Set(ids.map((id) => id.trim().toLowerCase()).filter(Boolean))];
-    const kept = new Map((m.bridge.peers ?? []).map((p) => [p.id.toLowerCase(), p]));
+    const kept = new Map((fb.link.peers ?? []).map((p) => [p.id.toLowerCase(), p]));
     const stored = JSON.parse(launch.spec_json);
-    stored.topology.components.mastodon.bridge.peers = wanted.map((id) => kept.get(id) ?? { id });
+    const storedLink = fb.kind === "sidecar" ? stored.topology.components.mastodon.bridge : stored.topology.components.bridge;
+    storedLink.peers = wanted.map((id) => kept.get(id) ?? { id });
     const { errors } = validateSpec(withDefaults(stored));
     if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
     this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
@@ -1485,7 +1686,7 @@ export class FleetService {
     ops.push({
       launchId: launch.id,
       opId: this.db.createFleetOp(launch.id, "reconfigure", {
-        keys: ["mastodon", ...(ownVerifier ? ["verifier"] : [])],
+        keys: [host, ...(ownVerifier ? ["verifier"] : [])],
       } satisfies ReconfigureParams),
     });
     // a verifier on another fleet of this launcher that checks this chain
@@ -1497,6 +1698,58 @@ export class FleetService {
       ops.push({ launchId: other.id, opId: this.db.createFleetOp(other.id, "reconfigure", { keys: ["verifier"] } satisfies ReconfigureParams) });
     }
     return ops;
+  }
+
+  /**
+   * Take a closed service component out of the fleet: the spec stops
+   * enabling it (its settings stay, so adding it back later starts from
+   * them) and its row and health go. What it set up elsewhere stays where it
+   * is: its peer and bond on chain, its secrets here (a Mastodon's keys, the
+   * bridge operator's key), for a re-add to pick up. A daemon's session
+   * grant is retired by the next "sessions" op, which finds no component
+   * running it.
+   */
+  removeComponent(launch: LaunchRow, key: string): void {
+    if (!isComponentKey(key)) throw new Error(`${key} is not a service component; nodes and the mesh are not removed this way`);
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+    if (!row) throw new Error(`${key} is not in this fleet`);
+    if (row.state !== "closed") throw new Error(`close ${key} first: only a closed component can be removed`);
+    const busy = this.db.listFleetOps(launch.id, "active").some((o) => {
+      try {
+        const p = JSON.parse(o.params_json);
+        return p.key === key || (Array.isArray(p.keys) && p.keys.includes(key)) || (Array.isArray(p.components) && p.components.includes(key));
+      } catch {
+        return false;
+      }
+    });
+    if (busy) throw new Error(`an op on ${key} is still running: finish or abort it first`);
+    const stored = JSON.parse(launch.spec_json);
+    const comp = stored.topology?.components?.[key];
+    if (comp) comp.enabled = false;
+    const { errors } = validateSpec(withDefaults(stored));
+    if (errors.length > 0) {
+      throw new Error(`without ${key} the spec would not validate: ${errors.map((e) => `${e.path}: ${e.message}`).join("; ")}`);
+    }
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    this.db.deleteFleetComponent(launch.id, key);
+  }
+
+  /**
+   * Set the wallets a services fleet is shared with (sharing.wallets): their
+   * chain fleets may link bridges to its Mastodon. Owner only (the route
+   * checks); a chain fleet has nothing to share this way. Removing a wallet
+   * does not undo bridges already linked; it stops new links and re-links.
+   */
+  setSharing(launch: LaunchRow, wallets: string[]): string[] {
+    if (!isServicesFleet(this.spec(launch))) throw new Error("only a services fleet is shared with other wallets");
+    const list = [...new Set(wallets.map((w) => w.trim()).filter(Boolean))].filter((w) => w !== launch.owner);
+    const stored = JSON.parse(launch.spec_json);
+    if (list.length > 0) stored.sharing = { wallets: list };
+    else delete stored.sharing;
+    const { errors } = validateSpec(withDefaults(stored));
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    return list;
   }
 
   /** Joining the mesh mints a preauth key via headscale — impossible once the
@@ -1620,6 +1873,19 @@ export class FleetService {
       ...(opts.domain ? { domain: opts.domain } : {}),
       ...(opts.paths ? { paths: opts.paths } : {}),
     };
+    // a component deployed now runs the current release, not the one the
+    // fleet launched with: an image it runs (its own, and its side services'
+    // such as Mastodon's sdap) that is an older tag of the profile default's
+    // repository moves up to the default
+    const images = spec.images as Record<string, string | undefined>;
+    const defaults = profiles[spec.network.type]?.images as Record<string, string | undefined> | undefined;
+    for (const k of [key, ...Object.values(descriptorFor(key)?.sideImages ?? {})]) {
+      const current = images[k];
+      const latest = defaults?.[k];
+      const tag = latest ? versionTag(latest) : undefined;
+      if (!current || !latest || !tag || imageRepo(current) !== imageRepo(latest)) continue;
+      if (imageBefore(current, `v${tag.join(".")}`)) images[k] = latest;
+    }
     if (opts.image) spec.images[key] = opts.image;
     // parse through the schema again: fills the relayer's defaults and
     // rejects a malformed path before anything is stored
@@ -1634,6 +1900,11 @@ export class FleetService {
         checkVerifierAccount(spec, spec);
       }
     }
+    // a standalone bridge: its Mastodon fleet resolved, and the domain taken
+    const bridge = spec.topology.components.bridge;
+    if (key === "bridge" && bridge?.enabled) {
+      bridge.target = resolveBridgeTarget(this.db, launch.owner, bridge.target.fleet, launch.id);
+    }
     // fleet counterparties become launch ids, checked for reachability
     for (const p of spec.topology.components.relayer?.enabled ? spec.topology.components.relayer.paths : []) {
       if ("fleet" in p.counterparty) {
@@ -1644,7 +1915,10 @@ export class FleetService {
     if (errors.length > 0) {
       throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
     }
-    // secrets never live in the stored spec
+    if (key === "mastodon") this.assertMastodonDomainFree(launch, spec);
+    // secrets never live in the stored spec; one named by source fleet is
+    // read from that fleet's store first
+    resolveSmtpPasswordSource(this.db, this.workRoot, launch.owner, spec);
     stashSmtpPassword(launchDirs(this.workRoot, launch.id).secrets, spec);
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
     return this.db.createFleetOp(launch.id, "add-component", {
@@ -2120,6 +2394,7 @@ export class FleetService {
 
   /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */
   requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number): number {
+    if (isServicesFleet(this.spec(launch))) throw new Error("a services fleet runs no chain to upgrade");
     this.recordSpecImage(launch, ["val-0"], image); // halt-upgrade swaps every node
     return this.db.createFleetOp(launch.id, "halt-upgrade", { image, haltHeight });
   }
@@ -2136,6 +2411,7 @@ export class FleetService {
    * operator to clear it before any node comes back up.
    */
   requestChainReset(launch: LaunchRow, proposedInput: unknown): number {
+    if (isServicesFleet(this.spec(launch))) throw new Error("a services fleet runs no chain to reset");
     const current = this.spec(launch);
     const proposed = withDefaults(proposedInput);
     if (current.join || proposed.join) {
@@ -2152,7 +2428,7 @@ export class FleetService {
     const rawImages =
       ((proposedInput ?? {}) as { images?: Record<string, string | undefined> }).images ?? {};
     const images = proposed.images as Record<string, string | undefined>;
-    for (const key of ["sparkdreamd", "headscale", ...COMPONENT_KEYS, "hub"]) {
+    for (const key of ["sparkdreamd", "headscale", ...COMPONENT_KEYS]) {
       if (rawImages[key] === undefined) {
         const cur = (current.images as Record<string, string | undefined>)[key];
         if (cur === undefined) delete images[key];
@@ -2207,6 +2483,7 @@ export class FleetService {
     const comps = proposed.topology.components;
     const reconfigure = [
       ...(staying.has("mastodon") && comps.mastodon?.enabled && comps.mastodon.bridge?.enabled ? ["mastodon"] : []),
+      ...(staying.has("bridge") && comps.bridge?.enabled ? ["bridge"] : []),
       ...(staying.has("verifier") && comps.verifier?.enabled && !comps.verifier.target ? ["verifier"] : []),
     ];
     if (reconfigure.length > 0) {

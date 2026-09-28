@@ -1,5 +1,5 @@
 import path from "node:path";
-import { serviceComponents, type LaunchSpec } from "@sparkdream/launch-spec";
+import { isServicesFleet, serviceComponents, type LaunchSpec } from "@sparkdream/launch-spec";
 import { loadSdl } from "./akash/sdl-groups.js";
 import { feeConfig } from "./fee.js";
 import { descriptor } from "./components/index.js";
@@ -108,7 +108,15 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
     sdlResourcesToWorkload(p.resources),
   );
 
-  const roles: Array<{ role: string; count: number; workloads: Workload[] }> = [
+  // a services fleet deploys its components and nothing else
+  const services = isServicesFleet(spec);
+  const roles: Array<{ role: string; count: number; workloads: Workload[] }> = services
+    ? serviceComponents(spec).map((c) => ({
+        role: c.key,
+        count: 1,
+        workloads: descriptor(c.key).resources(spec).map(sdlResourcesToWorkload),
+      }))
+    : [
     {
       role: "validators",
       count: spec.topology.validators.count,

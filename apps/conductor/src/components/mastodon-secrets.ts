@@ -28,6 +28,11 @@ export interface MastodonSecrets {
   bridgeToken?: string;
   /** mastodon.smtp's password, kept out of the spec. */
   smtpPassword?: string;
+  /** Wallet sign-in: the OIDC client secret Mastodon and sdaplogin share. */
+  loginClientSecret?: string;
+  /** Wallet sign-in: sdaplogin's id-token signing key (RSA, PKCS#8 DER,
+   *  base64). Replacing it only fails sign-ins already in flight. */
+  loginSigningKey?: string;
 }
 
 const FILE = "mastodon.json";
@@ -70,6 +75,23 @@ export function ensureMastodonSecrets(secretsDir: string): MastodonSecrets {
   fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
   writeSecretFile(path.join(secretsDir, FILE), JSON.stringify(fresh, null, 2));
   return fresh;
+}
+
+/**
+ * The wallet sign-in's secrets, made the first time the instance renders
+ * with walletLogin on (existing launches included: ensureMastodonSecrets
+ * returns a file written before these fields existed unchanged).
+ */
+export function ensureLoginSecrets(secretsDir: string): { clientSecret: string; signingKey: string } {
+  let s = ensureMastodonSecrets(secretsDir);
+  if (!s.loginClientSecret || !s.loginSigningKey) {
+    const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    s = updateMastodonSecrets(secretsDir, {
+      loginClientSecret: s.loginClientSecret ?? crypto.randomBytes(32).toString("hex"),
+      loginSigningKey: s.loginSigningKey ?? privateKey.export({ type: "pkcs8", format: "der" }).toString("base64"),
+    });
+  }
+  return { clientSecret: s.loginClientSecret!, signingKey: s.loginSigningKey! };
 }
 
 /** Record something the running instance produced (owner password, token). */

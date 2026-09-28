@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
-import { sessionDays, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { fleetBridge, sessionDays, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { BRIDGE_OPERATOR } from "./components/mastodon-secrets.js";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
 import { AwaitUser, WALLET_SIGNER, type StepCtx } from "./engine.js";
@@ -58,10 +58,13 @@ const MSG_TYPES: Record<SessionRole, string[]> = {
 };
 
 /** The component a role's daemon runs in, and the SDL service inside it. */
-const HOST: Record<SessionRole, { component: string; service: string }> = {
-  verifier: { component: "verifier", service: "verifier" },
-  bridge: { component: "mastodon", service: "bridge" },
-};
+function HOST_OF(spec: LaunchSpec, role: SessionRole): { component: string; service: string } {
+  if (role === "verifier") return { component: "verifier", service: "verifier" };
+  // a fleet's bridge is its Mastodon's sidecar, or a standalone component
+  return fleetBridge(spec)?.kind === "standalone"
+    ? { component: "bridge", service: "bridge" }
+    : { component: "mastodon", service: "bridge" };
+}
 
 /** One daemon's session, as last granted (secrets/sessions.json). */
 export interface SessionRecord {
@@ -107,7 +110,7 @@ export function sessionRoles(spec: LaunchSpec): SessionRole[] {
   const c = spec.topology.components;
   return [
     ...(c.verifier?.enabled ? (["verifier"] as const) : []),
-    ...(c.mastodon?.enabled && c.mastodon.bridge?.enabled ? (["bridge"] as const) : []),
+    ...(fleetBridge(spec) ? (["bridge"] as const) : []),
   ];
 }
 
@@ -116,7 +119,7 @@ function settings(spec: LaunchSpec, role: SessionRole): { days: number; spendLim
   const s =
     role === "verifier"
       ? spec.topology.components.verifier?.session
-      : spec.topology.components.mastodon?.bridge?.session;
+      : fleetBridge(spec)?.link.session;
   return { days: sessionDays(spec, s), spendLimit: s?.spendLimit ?? "25000000" };
 }
 
@@ -242,21 +245,35 @@ async function rotationReason(
 
 /** Write the key into the daemon's container, atomically. */
 async function deliverKey(ctx: StepCtx, role: SessionRole, mnemonic: string): Promise<void> {
-  const host = HOST[role];
+  const host = HOST_OF(ctx.spec, role);
   const lease = componentLease(ctx, host.component);
   // BIP39 words are lowercase ASCII: safe inside single quotes
   if (!/^[a-z ]+$/.test(mnemonic)) throw new Error("session mnemonic has unexpected characters");
   const tmp = `${SESSION_KEY_FILE}.new`;
-  await ctx.services.provider.shellExec(
-    loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, host.service,
-    // lease-shell runs as the image's user (root, for the sdap image, whose
-    // entrypoint drops the daemon to "sdap"): hand the file to the daemon
-    [
-      "sh", "-c",
-      `umask 077 && printf '%s\\n' '${mnemonic}' > ${tmp} && ` +
-        `(chown sdap ${tmp} 2>/dev/null || true) && mv ${tmp} ${SESSION_KEY_FILE}`,
-    ],
-  );
+  let lastError = "";
+  // the container is often restarting right now: the bridge's token lands
+  // through a deployment update just before this, and lease-shell answers
+  // "no active replicas" until the new one is up
+  for (let attempt = 0; attempt < 12; attempt++) {
+    if (attempt > 0) await ctx.services.sleep(10_000);
+    try {
+      await ctx.services.provider.shellExec(
+        loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, host.service,
+        // lease-shell runs as the image's user (root, for the sdap image, whose
+        // entrypoint drops the daemon to "sdap"): hand the file to the daemon
+        [
+          "sh", "-c",
+          `umask 077 && printf '%s\\n' '${mnemonic}' > ${tmp} && ` +
+            `(chown sdap ${tmp} 2>/dev/null || true) && mv ${tmp} ${SESSION_KEY_FILE}`,
+        ],
+      );
+      return;
+    } catch (e) {
+      lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
+      ctx.log(`${host.component}: session key delivery attempt ${attempt + 1} failed: ${lastError}`);
+    }
+  }
+  throw new Error(`could not deliver the session key to ${host.component}: ${lastError}`);
 }
 
 /** Revoke grants that were replaced; ones already gone count as done.
@@ -432,7 +449,7 @@ export async function ensureSession(
   opts: { force?: boolean } = {},
 ): Promise<SessionOutcome> {
   const { chain, granter } = await granterActor(ctx, spec, role);
-  const dseq = componentLease(ctx, HOST[role].component).dseq;
+  const dseq = componentLease(ctx, HOST_OF(spec, role).component).dseq;
   const record = readSessions(ctx.dirs.secrets)[role];
   // a wallet grant signed since the pause: rotationReason sees it hold
   const forced = opts.force && !record?.pending;
@@ -537,14 +554,14 @@ export function sessionsDue(db: ConductorDb, launchId: string, secretsDir: strin
   const rows = db.listFleetComponents(launchId) as FleetComponentRow[];
   const roles = sessionRoles(spec);
   for (const role of roles) {
-    const row = rows.find((c) => c.key === HOST[role].component && c.state === "active");
+    const row = rows.find((c) => c.key === HOST_OF(spec, role).component && c.state === "active");
     if (!row) continue;
     const record = records[role];
     // a revoke that failed is retried by the next renewal, not by its own op
     if (!record || record.dseq !== row.dseq || Date.now() >= renewAt(record)) return true;
   }
   for (const role of Object.keys(records) as SessionRole[]) {
-    const running = rows.some((c) => c.key === HOST[role]?.component && c.state !== "closed");
+    const running = rows.some((c) => c.key === HOST_OF(spec, role).component && c.state !== "closed");
     if (!roles.includes(role) || !running) return true;
   }
   return false;
@@ -559,11 +576,11 @@ export async function reconcileSessions(ctx: StepCtx, spec: LaunchSpec, force: S
   const roles = sessionRoles(spec);
   const out: SessionOutcome[] = [];
   for (const role of roles) {
-    if (!rows.some((c) => c.key === HOST[role].component && c.state === "active")) continue;
+    if (!rows.some((c) => c.key === HOST_OF(spec, role).component && c.state === "active")) continue;
     out.push(await ensureSession(ctx, spec, role, { force: force.includes(role) }));
   }
   for (const role of Object.keys(readSessions(ctx.dirs.secrets)) as SessionRole[]) {
-    const running = rows.some((c) => c.key === HOST[role]?.component && c.state !== "closed");
+    const running = rows.some((c) => c.key === HOST_OF(spec, role).component && c.state !== "closed");
     if (!roles.includes(role) || !running) await retireSession(ctx, spec, role);
   }
   return out;

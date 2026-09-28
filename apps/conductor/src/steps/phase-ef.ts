@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { chainId, headscaleDomain, nodes, resolveTopology, serviceComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
+import { chainId, headscaleDomain, isServicesFleet, nodes, resolveTopology, serviceComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
+import { ensureSession } from "../sessions.js";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { linkPeersStep, linkRelayerStep } from "./relayer-link.js";
-import { configureMastodonStep } from "./mastodon.js";
+import { configureMastodonStep, linkStandaloneBridge } from "./mastodon.js";
 import { configureVerifierStep } from "./verifier.js";
 import { descriptorFor } from "../components/index.js";
 import { isManifestVersionRejected } from "../akash/client.js";
@@ -755,10 +756,21 @@ export const verifyChainStep: StepDef = {
       ctx.log(`${key}: verified at height ${checks[key]!.height}`);
     }
 
-    // §5 step 21 continued: explorer/frontend HTTP 200 on their domains,
-    // public api/rpc serving chain data. The domains are user-created DNS
-    // records pointing at provider ingress hosts, so an unreachable one
-    // pauses with the exact record needed (headscale DNS-gate pattern).
+    const http = await verifyPublicDomains(ctx, "verify-chain");
+    return { sentries: checks, http };
+  },
+};
+
+/**
+ * §5 step 21 continued: the components' domains answering (explorer,
+ * frontend, Mastodon's web and streaming), and the public api/rpc serving
+ * chain data. The domains are user-created DNS records pointing at provider
+ * ingress hosts, so an unreachable one pauses with the exact record needed
+ * (headscale DNS-gate pattern). A services fleet runs only this half.
+ */
+export async function verifyPublicDomains(ctx: StepCtx, stepName: string): Promise<Record<string, string>> {
+    const assignments = ctx.output<Assignments>("collect-bids")!;
+    const plan = ctx.output<DeploymentPlan>("create-deployments")!;
     const http: Record<string, string> = {};
     const targets: Array<{ name: string; domain: string; url: string; behind: string }> = [];
     for (const c of serviceComponents(ctx.spec)) {
@@ -773,7 +785,7 @@ export const verifyChainStep: StepDef = {
       if (!c.domain) continue;
       targets.push({ name: c.key, domain: c.domain, url: `https://${c.domain}/`, behind: c.key });
     }
-    const pub = ctx.spec.topology.publicEndpoints;
+    const pub = isServicesFleet(ctx.spec) ? undefined : ctx.spec.topology.publicEndpoints;
     if (pub?.api) {
       targets.push({
         name: "public-api",
@@ -814,9 +826,16 @@ export const verifyChainStep: StepDef = {
       );
     }
     if (failures.length > 0) {
-      throw new AwaitUser("verify-chain", `${failures.join("\n")}\nThen resume.`);
+      throw new AwaitUser(stepName, `${failures.join("\n")}\nThen resume.`);
     }
-    return { sentries: checks, http };
+    return http;
+}
+
+/** A services fleet's verify: its components' domains, nothing chain. */
+export const verifyServicesStep: StepDef = {
+  name: "verify-services",
+  async run(ctx) {
+    return { http: await verifyPublicDomains(ctx, "verify-services") };
   },
 };
 
@@ -832,10 +851,25 @@ export async function ingressHost(
   const status: any = await ctx.services.provider.leaseStatus(
     loadCert(ctx), hostUri, dseq, gseq, oseq,
   );
-  const uris: string[] = Object.values(status?.services ?? {}).flatMap(
-    (s: any) => s?.uris ?? [],
-  );
-  return uris.find((u) => u !== domain) ?? new URL(hostUri).hostname;
+  return serviceIngressHost(status, domain) ?? new URL(hostUri).hostname;
+}
+
+/**
+ * The provider-generated hostname of the service that serves `domain`, from
+ * a lease status. Akash gives every exposed service a hostname of its own
+ * (Mastodon's web, streaming and login each have one), listed beside the
+ * custom domains it accepts: the CNAME target is the one next to `domain`,
+ * not the first in the deployment. With no service listing `domain`, the
+ * first generated hostname found (a one-service deployment's).
+ */
+export function serviceIngressHost(status: any, domain: string): string | undefined {
+  const services: any[] = Object.values(status?.services ?? {});
+  const generated = (s: any): string | undefined => {
+    const uris: string[] = (s?.uris ?? []).filter((u: string) => u !== domain);
+    return uris.find((u) => /\.ingress\./.test(u)) ?? uris[0];
+  };
+  const own = services.find((s) => (s?.uris ?? []).includes(domain));
+  return (own ? generated(own) : undefined) ?? services.map(generated).find(Boolean);
 }
 
 export const finalizeStep: StepDef = {
@@ -863,6 +897,17 @@ export const finalizeStep: StepDef = {
   },
 };
 
+/** The standalone bridge's link at launch (a component added later runs the
+ *  same steps from its descriptor). */
+export const configureBridgeStep: StepDef = {
+  name: "configure-bridge",
+  async run(ctx) {
+    if (!ctx.spec.topology.components.bridge?.enabled) return { skipped: true };
+    const linked = await linkStandaloneBridge(ctx, "configure-bridge", ctx.spec);
+    return { ...linked, session: await ensureSession(ctx, ctx.spec, "bridge") };
+  },
+};
+
 export function phaseEFSteps(): StepDef[] {
   return [
     uploadNodeDataStep,
@@ -887,6 +932,9 @@ export function phaseEFSteps(): StepDef[] {
     linkPeersStep,
     // mastodon (no-op without one): owner, registrations, and its bridge
     configureMastodonStep,
+    // a standalone bridge (no-op without one): its account on the other
+    // fleet's Mastodon, its peer and bond here
+    configureBridgeStep,
     // verifier (no-op without one): its federation-verifier bond
     configureVerifierStep,
     finalizeStep,

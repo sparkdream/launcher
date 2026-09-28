@@ -61,6 +61,8 @@ export interface Topology {
 
 /** Expand round-robin or explicit mapping into both directions. */
 export function resolveTopology(spec: LaunchSpec): Topology {
+  // a services fleet runs no nodes
+  if (isServicesFleet(spec)) return { sentryValidators: [], validatorSentries: [] };
   const V = spec.topology.validators.count;
   const S = spec.topology.sentries.count;
   const mapping = spec.topology.sentries.mapping;
@@ -92,7 +94,16 @@ export interface NodeRef {
   moniker: string;
 }
 
+/** A fleet of shared components with no chain of its own (spec.kind). */
+export function isServicesFleet(spec: Pick<LaunchSpec, "kind"> | { kind?: string }): boolean {
+  return spec.kind === "services";
+}
+
+/** The kinds a services fleet may run: chain-independent ones. */
+export const SERVICES_FLEET_COMPONENTS: readonly ComponentKey[] = ["mastodon", "hub"];
+
 export function nodes(spec: LaunchSpec): NodeRef[] {
+  if (isServicesFleet(spec)) return [];
   const out: NodeRef[] = [];
   for (let v = 0; v < spec.topology.validators.count; v++) {
     out.push({ role: "validator", index: v, key: `val-${v}`, moniker: validatorMoniker(spec, v) });
@@ -159,6 +170,27 @@ export function mastodonStreamingDomain(spec: LaunchSpec): string | undefined {
   return m.streamingDomain ?? `streaming.${m.domain}`;
 }
 
+/**
+ * The default wallet sign-in domain for an instance at `domain`, at the same
+ * depth: mstdn.example.io → mstdn-login.example.io. A proxy's free edge
+ * certificate (Cloudflare's covers the zone and one level below it) then
+ * covers it whenever it covers the instance, which login.mstdn.example.io
+ * would not. A two-label domain, most likely the zone itself, gets
+ * login.<domain>, one level below.
+ */
+export function defaultLoginDomain(domain: string): string {
+  const labels = domain.split(".");
+  if (labels.length <= 2) return `login.${domain}`;
+  return [`${labels[0]}-login`, ...labels.slice(1)].join(".");
+}
+
+/** The Mastodon wallet sign-in's own ingress, when it is on. */
+export function mastodonLoginDomain(spec: LaunchSpec): string | undefined {
+  const m = spec.topology.components.mastodon;
+  if (!m?.enabled || !m.domain || !m.walletLogin?.enabled) return undefined;
+  return m.walletLogin.domain ?? defaultLoginDomain(m.domain);
+}
+
 /** True when some enabled workload consumes sentry-0's gRPC (9090). */
 export function grpcRequired(spec: LaunchSpec): boolean {
   return serviceComponents(spec).some((c) => COMPONENT_KINDS[c.key].needsGrpc);
@@ -181,3 +213,37 @@ export function sessionMaxDays(spec: LaunchSpec): number {
 export function sessionDays(spec: LaunchSpec, session: { days?: number | undefined } | undefined): number {
   return session?.days ?? (spec.network.type === "mainnet" ? 30 : 90);
 }
+
+/**
+ * The bridge's account name on its Mastodon instance: the spec's, else by
+ * the network the bridge anchors to, so one instance can carry a bridge per
+ * network ("bridge" for mainnet, "bridgetest", "bridgedev").
+ */
+export function bridgeAccount(spec: LaunchSpec): string {
+  const own = spec.topology.components.mastodon?.bridge?.enabled
+    ? spec.topology.components.mastodon.bridge.account
+    : spec.topology.components.bridge?.account;
+  if (own) return own;
+  return spec.network.type === "mainnet" ? "bridge" : spec.network.type === "testnet" ? "bridgetest" : "bridgedev";
+}
+
+/** The fleet's bridge, whichever form it takes: the Mastodon component's
+ *  sidecar or a standalone bridge component. Undefined when it runs none. */
+export function fleetBridge(spec: LaunchSpec):
+  | { kind: "sidecar" | "standalone"; domain: string | undefined; link: NonNullable<LaunchSpec["topology"]["components"]["bridge"]> | NonNullable<NonNullable<LaunchSpec["topology"]["components"]["mastodon"]>["bridge"]> }
+  | undefined {
+  const m = spec.topology.components.mastodon;
+  if (m?.enabled && m.bridge?.enabled) return { kind: "sidecar", domain: m.domain, link: m.bridge };
+  const b = spec.topology.components.bridge;
+  if (b?.enabled) return { kind: "standalone", domain: b.target.domain, link: b };
+  return undefined;
+}
+
+/** Every peer the fleet's bridge anchors for: its instance's domain, then
+ *  the other servers bridged as peers of their own (bridge peers). */
+export function bridgePeerIds(spec: LaunchSpec): string[] {
+  const b = fleetBridge(spec);
+  if (!b?.domain) return [];
+  return [b.domain, ...(b.link.peers ?? []).map((p) => p.id)];
+}
+

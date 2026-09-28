@@ -158,7 +158,7 @@ function stripOrigin(base: LaunchSpec, notes: string[], colocated: string[]): Js
         "Give the new sentry its own api/rpc names to serve them, or leave it off the public web",
     );
   }
-  const toggles = [...COMPONENT_KEYS, "hub"];
+  const toggles = [...COMPONENT_KEYS];
   const enabled = toggles.filter((c) => (spec.topology.components as Json)[c]?.enabled);
   for (const c of toggles) {
     const comp = (spec.topology.components as Json)[c];
