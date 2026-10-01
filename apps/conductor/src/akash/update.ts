@@ -42,12 +42,16 @@ export interface PersistUpdate {
  */
 export function updateDeploymentMsgs(input: UpdateInput): PersistUpdate[] {
   const updates: PersistUpdate[] = [];
+  // A component enabled after the launch (an add-component op: the relayer,
+  // say) is in the spec but not in the launch's plan. Its op placed and
+  // persisted it, so a re-run of the launch's persist-start has nothing to
+  // do for it (and used to crash reading its missing plan entry).
   const keys = [
     ...nodes(input.spec).map((n) => n.key),
     ...serviceComponents(input.spec)
       .filter((c) => c.mesh)
       .map((c) => c.key),
-  ];
+  ].filter((key) => input.plan.perNode[key]);
   for (const key of keys) {
     const sdlPath = path.join(input.sdlDir, `${key}.yaml`);
     let text = fs.readFileSync(sdlPath, "utf8");

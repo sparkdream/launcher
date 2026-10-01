@@ -118,6 +118,37 @@ export interface StepView {
   finished_at: string | null;
   /** A waiting step's transaction for the user's own wallet to sign. */
   wallet?: WalletRequest;
+  /** Accounts to send money to before the step can go on (relayer keys). */
+  funding?: FundingRequest[];
+}
+
+/** How the launcher's Keplr can send to a relayer key: a launcher fleet's
+ *  chain (suggested from its public endpoints) or a chain Keplr knows by id. */
+export type KeplrRoute =
+  | { kind: "fleet"; chain: WalletRequest["chain"] }
+  | { kind: "native"; chainId: string; rpc: string; gasPrice: number };
+
+/** One relayer key to fund (amounts in base units of `denom`). */
+export interface FundingRequest {
+  chainId: string;
+  address: string;
+  denom: string;
+  displayDenom: string;
+  decimals: number;
+  /** Suggested top-up. */
+  amount: string;
+  cap?: string;
+  balance?: string;
+  keplr?: KeplrRoute;
+}
+
+/** A relayer key with its live balance and what it needs. */
+export interface RelayerFunds extends FundingRequest {
+  status: "ok" | "low" | "empty" | "over-cap" | "unknown";
+  error?: string;
+  /** Its paths are configured but unopened (openWhenFunded). */
+  waiting: boolean;
+  launchId?: string;
 }
 
 /** A transaction on a fleet's chain the launcher cannot sign itself (it
@@ -614,6 +645,9 @@ export interface RelayerState {
     b: { chain: string; channel: string };
   }>;
   linkedAt: string;
+  /** openWhenFunded paths left unopened because the relayer's key on their
+   *  chain held nothing at the last link: fund it, then relink. */
+  waiting?: Array<{ chainId: string; paths: string[]; address: string; denom: string; amount: string; cap?: string }>;
   /** Federation peers' status on each chain (x/federation), once linked. */
   peers?: Array<{ chainId: string; peerId: string; status: string; ibcChannelId?: string }>;
 }
@@ -647,6 +681,27 @@ export async function postRotateSessions(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(role ? { role } : {}),
+    }),
+  );
+}
+
+/** Every relayer key with its live balance (funds panel). */
+export async function getRelayerFunds(launchId: string): Promise<RelayerFunds[]> {
+  return (await json<{ funds: RelayerFunds[] }>(await afetch(`/api/fleet/${launchId}/relayer/funds`))).funds;
+}
+
+/** Send a relayer key's balance on one chain, less the fee, to `to` (the
+ *  owner's own address there when omitted). */
+export async function postRelayerWithdraw(
+  launchId: string,
+  chainId: string,
+  to?: string,
+): Promise<{ txHash: string; amount: string; denom: string; to: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/relayer/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chainId, ...(to ? { to } : {}) }),
     }),
   );
 }

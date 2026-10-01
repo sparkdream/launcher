@@ -552,6 +552,10 @@ export class FakeSsh {
   unfundedChains = new Set<string>();
   /** Relayer: containers holding the ready marker (hermes running). */
   relayerReady = new Set<string>();
+  /** Relayer: container restarts so far, per target (PID 1's start time). */
+  relayerBoots = new Map<string, number>();
+  /** Relayer targets on the old image, whose PID 1 (hermes) ignores `kill 1`. */
+  relayerIgnoresTerm = new Set<string>();
   /** Relayer: channel ids per path id per container — stable across
    *  re-runs, since bringup reuses what is open. */
   private relayChannels = new Map<string, unknown>();
@@ -671,6 +675,16 @@ export class FakeSsh {
     }
     if (command === "test -f /data/relayer/ready && echo running || true") {
       return ok(this.relayerReady.has(id) ? "running" : "");
+    }
+    if (command.startsWith("pgrep -x hermes")) {
+      return ok(this.relayerReady.has(id) ? "relaying" : "unlinked");
+    }
+    if (command === "awk '{print $22}' /proc/1/stat") {
+      return ok(String(1000 + (this.relayerBoots.get(id) ?? 0)));
+    }
+    if (command.startsWith("setsid sh -c 'sleep 1; kill 1'")) {
+      if (!this.relayerIgnoresTerm.has(id)) this.relayerBoots.set(id, (this.relayerBoots.get(id) ?? 0) + 1);
+      return ok();
     }
     if (command === "touch /data/relayer/ready") {
       this.relayerReady.add(id);
@@ -805,6 +819,13 @@ export class FakeSsh {
         this.noteHalt();
       }
       return ok();
+    }
+    // a chain query run on the node against its own RPC: answered by the
+    // same stub binary the tests point the launcher's local CLI at
+    if (/^sparkdreamd '?query'? /.test(command)) {
+      const bin = process.env.SPARKDREAMD_BIN;
+      if (!bin) throw new Error(`no SPARKDREAMD_BIN stub for: ${command}`);
+      return ok(execFileSync("sh", ["-c", `${bin} ${command.slice("sparkdreamd ".length)}`], { encoding: "utf8" }));
     }
     if (command.includes("sparkdreamd version")) {
       const v = this.nodeVersions.get(id);

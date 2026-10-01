@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { LaunchSpec } from "@sparkdream/launch-spec";
+import { relayerPaths, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { FleetComponentRow } from "../db.js";
 import { AwaitUser, launchDirs, type StepCtx, type StepDef } from "../engine.js";
 import { toSsh2CompatiblePrivateKey } from "../keys.js";
@@ -26,10 +26,12 @@ import {
   chainIdentity,
   ensurePeerActive,
   fleetActor,
+  sendTx,
   sparkDreamPeerPolicy,
   type ChainActor,
   type PeerStatus,
 } from "../peering.js";
+import { fundAmount, relayerFunds, SEND_GAS, type FundingRequest } from "../relayer-funds.js";
 
 /** What linking produced: the relayer's address on each chain and the
  *  channels it opened. Also saved to <launch>/relayer/state.json for the
@@ -47,9 +49,16 @@ export interface RelayerLinkOutput {
   }>;
   channels: RelayChannel[];
   linkedAt: string;
+  /** openWhenFunded paths left unopened at the last link because the
+   *  relayer's key on their chain held nothing: fund it, then relink. */
+  waiting?: Array<{ chainId: string; paths: string[]; address: string; denom: string; amount: string; cap?: string }>;
   /** Federation peers' status on each chain, once link-peers has run. */
   peers?: PeerStatus[];
 }
+
+/** PID 1's start time (clock ticks since boot): changes when the container
+ *  restarts. */
+export const PID1_STARTED = "awk '{print $22}' /proc/1/stat";
 
 /** Bringup opens clients, connections and channels one handshake at a time,
  *  each waiting on blocks from both chains. */
@@ -143,8 +152,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
   await ctx.services.ssh.exec(target, "relayer-bringup --keys-only");
 
   // every key must be able to pay gas before a handshake can start
-  const check = await ctx.services.ssh.exec(target, "relayer-fundcheck || true");
-  const status = JSON.parse(check.stdout) as Array<{
+  type FundCheck = Array<{
     chain: string;
     address: string;
     balance: string;
@@ -152,6 +160,28 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     account: boolean | null;
     ready: boolean;
   }>;
+  const fundcheck = async () =>
+    JSON.parse((await ctx.services.ssh.exec(target, "relayer-fundcheck || true")).stdout) as FundCheck;
+  let status = await fundcheck();
+
+  // a chain reached only by unopened openWhenFunded paths waits for its
+  // funds outside this link instead of pausing it; an opened path, or one
+  // without the flag, still needs a key that can pay
+  const previous = fs.existsSync(relayerStatePath(ctx.workRoot, ctx.launchId))
+    ? (JSON.parse(fs.readFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), "utf8")) as RelayerLinkOutput)
+    : undefined;
+  const pathsTo = (chain: string) =>
+    relayerPaths(spec).filter((p) => !("fleet" in p.counterparty) && p.counterparty.chainId === chain);
+  const canWait = (chain: string) => {
+    const ps = pathsTo(chain);
+    return ps.length > 0 && ps.every((p) => p.openWhenFunded && !previous?.channels.some((c) => c.id === p.id));
+  };
+  const unreadyOf = (st: FundCheck) => st.filter((s) => !s.ready && !canWait(s.chain));
+
+  // a launcher fleet's chain whose founder key the launcher holds is funded
+  // from it, capped like any top-up; only what is left asks the user
+  if (await fundFromFounders(ctx, spec, plan, chains, unreadyOf(status))) status = await fundcheck();
+
   // the key lives on the relayer's provider: ask for gas money only, and
   // say so when a balance has grown past the cap
   for (const c of chains) {
@@ -169,8 +199,18 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
       );
     }
   }
-  const unready = status.filter((s) => !s.ready);
+  const waitingChains = new Set(status.filter((s) => !s.ready && canWait(s.chain)).map((s) => s.chain));
+  const unready = unreadyOf(status);
   if (unready.length > 0) {
+    // one row per key for the pause card (address to copy, amount, a Keplr
+    // send where the browser can reach the chain); the text says the same
+    const funds = await relayerFunds(ctx.db, ctx.services.rpc, ctx.launchId, spec, ctx.dirs.secrets);
+    const rows: FundingRequest[] = unready.flatMap((s) => {
+      const f = funds.find((x) => x.chainId === s.chain);
+      if (!f) return [];
+      const { status: _status, error: _error, waiting: _waiting, launchId: _launchId, ...row } = f;
+      return [{ ...row, balance: s.balance || row.balance || "0" }];
+    });
     throw new AwaitUser(
       stepName,
       "fund the relayer so it can pay gas, then resume. Its key sits on the relayer's provider (Hermes cannot " +
@@ -194,7 +234,41 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
             );
           })
           .join("; "),
+      undefined,
+      rows,
     );
+  }
+
+  const active: RelayPlan =
+    waitingChains.size === 0
+      ? plan
+      : {
+          chains: plan.chains.filter((c) => !waitingChains.has(c.chainId)),
+          paths: plan.paths.filter((p) => !waitingChains.has(p.b)),
+        };
+  const waiting = [...waitingChains].map((chain) => {
+    const planned = plan.chains.find((c) => c.chainId === chain)!;
+    const cap = relayerCap(spec, planned);
+    return {
+      chainId: chain,
+      paths: pathsTo(chain).map((p) => p.id),
+      address: chains.find((c) => c.chainId === chain)!.address,
+      denom: planned.gasDenom,
+      amount: suggestedTopUp(planned, cap).toString(),
+      ...(cap !== undefined ? { cap: cap.toString() } : {}),
+    };
+  });
+  if (waiting.length > 0) {
+    // bringup opens what relayer.json lists, and health-checks every chain in
+    // config.toml: both name only what can pay
+    await put("relayer.json", renderRelayManifest(active));
+    await put("config.toml", renderHermesConfig(active));
+    for (const w of waiting) {
+      ctx.log(
+        `relayer: ${w.paths.join(", ")} waiting for funds: send about ${w.amount} ${w.denom} to ${w.address} ` +
+          `on ${w.chainId}, then relink`,
+      );
+    }
   }
 
   const opened = await ctx.services.ssh.exec(target, "relayer-bringup", { timeoutMs: BRINGUP_TIMEOUT_MS });
@@ -203,17 +277,41 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
   // pin the filter to the channels just opened, then (re)start hermes: a
   // first link only needs the ready marker; a relink restarts the container,
   // whose relayer-run re-execs hermes on the new config
-  await put("config.toml", renderHermesConfig(plan, channels));
+  await put("config.toml", renderHermesConfig(active, channels));
   const running = (await ctx.services.ssh.exec(target, `test -f ${RELAYER_DIR}/ready && echo running || true`)).stdout;
   await ctx.services.ssh.exec(target, `touch ${RELAYER_DIR}/ready`);
   if (running.includes("running")) {
-    await ctx.services.ssh.exec(target, "(sleep 1; kill 1) >/dev/null 2>&1 &").catch(() => undefined);
+    // the restart is checked, not assumed: an image whose PID 1 is hermes
+    // itself ignores the signal (see relayer-run), and hermes then keeps
+    // relaying on the previous config while this step reads as done
+    const started = async () =>
+      (await ctx.services.ssh.exec(target, PID1_STARTED, { quick: true }).catch(() => ({ stdout: "" }))).stdout.trim();
+    const before = await started();
+    // detached, so it outlives the session (a lease-shell exec ends its
+    // children when it returns)
+    await ctx.services.ssh
+      .exec(target, "setsid sh -c 'sleep 1; kill 1' >/dev/null 2>&1 < /dev/null &")
+      .catch(() => undefined);
+    let after = before;
+    for (let i = 0; i < 12 && before && (!after || after === before); i++) {
+      await ctx.services.sleep(5000);
+      after = await started();
+    }
+    if (before && after === before) {
+      ctx.log(
+        "relayer: WARNING hermes did not restart, so it is still relaying on its previous config and " +
+          "will not pick up this link's channels until its container restarts. The relayer image predates " +
+          "the relayer-run fix: upgrade it, or force-redeploy the relayer",
+      );
+    }
   }
 
-  const out: RelayerLinkOutput = { chains, channels, linkedAt: new Date().toISOString() };
-  const previous = fs.existsSync(relayerStatePath(ctx.workRoot, ctx.launchId))
-    ? (JSON.parse(fs.readFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), "utf8")) as RelayerLinkOutput)
-    : undefined;
+  const out: RelayerLinkOutput = {
+    chains,
+    channels,
+    linkedAt: new Date().toISOString(),
+    ...(waiting.length > 0 ? { waiting } : {}),
+  };
   if (previous?.peers) out.peers = previous.peers;
   fs.writeFileSync(relayerStatePath(ctx.workRoot, ctx.launchId), JSON.stringify(out, null, 2));
   for (const ch of channels) {
@@ -314,3 +412,58 @@ export const linkPeersStep: StepDef = {
     return linkFederationPeers(ctx, "link-peers", ctx.spec);
   },
 };
+
+/**
+ * Top up unfunded relayer keys on launcher fleets' chains from each fleet's
+ * founder account, when the launcher holds that key: the same account that
+ * signs the federation peer setup. Never above the relayer's cap; a failure
+ * (founder short of funds, chain unreachable) leaves the key for the user to
+ * fund. Returns whether anything was sent.
+ */
+async function fundFromFounders(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  plan: RelayPlan,
+  chains: Array<{ chainId: string; address: string }>,
+  unready: Array<{ chain: string }>,
+): Promise<boolean> {
+  let sent = false;
+  for (const u of unready) {
+    const planned = plan.chains.find((c) => c.chainId === u.chain);
+    if (!planned?.launchId) continue;
+    const label = planned.launchId === ctx.launchId ? "this fleet's chain" : `fleet ${planned.chainId}`;
+    let actor: ChainActor;
+    try {
+      actor = await fleetActor(ctx, planned.launchId, label);
+    } catch {
+      continue;
+    }
+    if (!actor.signer) continue;
+    const amount = fundAmount(planned, relayerCap(spec, planned)).toString();
+    const to = chains.find((c) => c.chainId === u.chain)!.address;
+    try {
+      await sendTx(
+        ctx,
+        actor,
+        `relayer-fund-${planned.chainId}`,
+        [
+          {
+            "@type": "/cosmos.bank.v1beta1.MsgSend",
+            from_address: actor.signer.address,
+            to_address: to,
+            amount: [{ denom: planned.gasDenom, amount }],
+          },
+        ],
+        { gas: SEND_GAS },
+      );
+      ctx.log(`relayer: funded its ${planned.chainId} key ${to} with ${amount} ${planned.gasDenom} from the founder account`);
+      sent = true;
+    } catch (e) {
+      ctx.log(
+        `relayer: could not fund its ${planned.chainId} key from the founder account ` +
+          `(${String(e instanceof Error ? e.message : e).slice(0, 200)}); asking instead`,
+      );
+    }
+  }
+  return sent;
+}

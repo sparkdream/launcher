@@ -172,6 +172,12 @@ const relayerPath = z.object({
    */
   kind: z.enum(["transfer", "federation"]),
   counterparty: z.union([relayerFleetCounterparty, relayerEndpointCounterparty]),
+  /** Endpoint counterparties only: keep the path configured but unopened
+   *  while the relayer's key on that chain holds nothing. Linking skips it
+   *  (and says so) instead of pausing for funds; a relink after funding opens
+   *  its channel. For a chain whose gas costs real money, so the path can
+   *  stand ready without anyone paying for it yet. */
+  openWhenFunded: z.boolean().optional(),
 });
 
 /**

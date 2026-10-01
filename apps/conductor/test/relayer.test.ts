@@ -19,6 +19,7 @@ import {
   type RelayChannel,
 } from "../src/relayer.js";
 import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
+import { fundAmount, fundStatus, lowWater, ownerAddressOn } from "../src/relayer-funds.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 import { chainStub, withStub } from "./chain-stub.js";
 
@@ -339,6 +340,248 @@ describe("relayer day-2", () => {
     expect(ops[0]!.id).toBe(opId);
     db.close();
   }, 120_000);
+});
+
+describe("relayer funds", () => {
+  it("sizes top-ups and low water by gas price, and finds the owner's address on another chain", () => {
+    const priced = { gasPrice: 0.025 };
+    // ~1000 relays of 300k gas, under no cap / under a cap
+    expect(fundAmount(priced, undefined)).toBe(7_500_000n);
+    expect(fundAmount(priced, 2_000_000n)).toBe(2_000_000n);
+    // a fee market asks for what its ceiling would cost
+    expect(fundAmount({ gasPrice: 0.025, dynamicGasPrice: { multiplier: 1.1, max: 0.1 } }, undefined)).toBe(30_000_000n);
+    // free gas: one token, so the key has an account and a balance
+    expect(fundAmount({ gasPrice: 0 }, undefined)).toBe(1_000_000n);
+    expect(lowWater(priced)).toBe(375_000n);
+    expect(lowWater({ gasPrice: 0 })).toBe(1n);
+    expect(fundStatus(0n, priced)).toBe("empty");
+    expect(fundStatus(100_000n, priced)).toBe("low");
+    expect(fundStatus(5_000_000n, priced, 2_000_000n)).toBe("over-cap");
+    expect(fundStatus(1_000_000n, priced, 2_000_000n)).toBe("ok");
+    // the same key Keplr shows on each chain
+    expect(ownerAddressOn("akash1kss2m5m0tlqasu22zlntjvvpgahgkmvs7dq95l", "osmo")).toBe(
+      "osmo1kss2m5m0tlqasu22zlntjvvpgahgkmvsmd7jmh",
+    );
+    expect(ownerAddressOn("not-an-address", "osmo")).toBeUndefined();
+  });
+
+  /** Launch a fleet whose relayer relays to Osmosis testnet, with public
+   *  endpoints so its own key's balance can be read too. */
+  async function fundedFleet() {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const osmoLcd: RelayerPath = {
+      ...osmosis,
+      counterparty: { ...osmosis.counterparty, lcd: "https://lcd.osmotest5.example", maxBalance: "2000000" } as RelayerPath["counterparty"],
+    };
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmoLcd]);
+    s.topology.publicEndpoints = { api: "api.sparkdream.example", rpc: "rpc.sparkdream.example" };
+    const result = await launch(db, work, services, "fl", s);
+    if (result.status !== "completed") throw new Error(explain(db, "fl"));
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    const balance = (lcd: string, address: string, amount: string) =>
+      services.rpc.texts.set(`${lcd}/cosmos/bank/v1beta1/balances/${address}/by_denom`, JSON.stringify({ balance: { amount } }));
+    return { work, db, services, fleet, s, balance };
+  }
+
+  it("lists each key's live balance, and the monitor flags an opened path's empty key", async () => {
+    const { db, services, fleet, balance } = await fundedFleet();
+    const state = fleet.relayerState(db.getLaunch("fl")!)!;
+    const own = state.chains[0]!.address;
+    const osmo = state.chains[1]!.address;
+    balance("https://api.sparkdream.example", own, "25000000");
+    balance("https://lcd.osmotest5.example", osmo, "0");
+
+    const funds = await fleet.relayerFunds(db.getLaunch("fl")!);
+    expect(funds.map((f) => [f.chainId, f.status, f.balance])).toEqual([
+      [funds[0]!.chainId, "ok", "25000000"],
+      ["osmo-test-5", "empty", "0"],
+    ]);
+    const osmoRow = funds[1]!;
+    expect(osmoRow).toMatchObject({ address: osmo, denom: "uosmo", displayDenom: "OSMO", amount: "2000000", cap: "2000000" });
+    // Osmosis is a chain Keplr knows by id; this fleet's chain is suggested from its endpoints
+    expect(osmoRow.keplr).toEqual({ kind: "native", chainId: "osmo-test-5", rpc: "https://rpc.osmotest5.example", gasPrice: 0.025 });
+    expect(funds[0]!.keplr).toMatchObject({ kind: "fleet", chain: { rpc: "https://rpc.sparkdream.example" } });
+
+    // a long escrow runway, so the balance check is what speaks
+    const row = db.listFleetComponents("fl").find((c) => c.key === "relayer")!;
+    services.api.escrowBalances.set(row.dseq, { denom: "uact", amount: "100000000000" });
+    await fleet.tick("fl");
+    const health = db.listComponentHealth("fl").find((h) => h.component === "relayer")!;
+    expect(health.status).toBe("low-gas");
+    expect(health.detail).toContain(`osmo-test-5 key is empty`);
+    expect(health.detail).toContain(osmo);
+    db.close();
+  }, 120_000);
+
+  it("withdraws a key's balance less the fee, only to an address on that chain", async () => {
+    const { db, fleet, balance } = await fundedFleet();
+    const osmo = fleet.relayerState(db.getLaunch("fl")!)!.chains[1]!.address;
+    balance("https://lcd.osmotest5.example", osmo, "1500000");
+    const sent: Array<{ rpc: string; to: string; amount: unknown; fee: unknown }> = [];
+    fleet.withdrawDeps = {
+      async connect(rpc) {
+        return {
+          address: osmo,
+          async send(to, amount, fee) {
+            sent.push({ rpc, to, amount, fee });
+            return "WITHDRAWTX";
+          },
+          disconnect() {},
+        };
+      },
+    };
+    const dest = "osmo1kss2m5m0tlqasu22zlntjvvpgahgkmvsmd7jmh";
+    await expect(fleet.withdrawRelayerFunds(db.getLaunch("fl")!, "osmo-test-5", "sprkdrm1kss2m5m0tlqasu22zlntjvvpgahgkmvsww28rc")).rejects.toThrow(
+      /start with osmo1/,
+    );
+    const out = await fleet.withdrawRelayerFunds(db.getLaunch("fl")!, "osmo-test-5", dest);
+    // fee: 120k gas at 0.025 = 3000 uosmo
+    expect(out).toEqual({ txHash: "WITHDRAWTX", amount: "1497000", denom: "uosmo", to: dest });
+    expect(sent).toEqual([
+      {
+        rpc: "https://rpc.osmotest5.example",
+        to: dest,
+        amount: { denom: "uosmo", amount: "1497000" },
+        fee: { amount: [{ denom: "uosmo", amount: "3000" }], gas: "120000" },
+      },
+    ]);
+    // a test fleet's owner ("akash1owner") is no real address: there is no default destination
+    await expect(fleet.withdrawRelayerFunds(db.getLaunch("fl")!, "osmo-test-5")).rejects.toThrow(/name an address/);
+    db.close();
+  }, 120_000);
+
+  it("puts one row per key to fund on the pause, with how Keplr can send it", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    services.ssh.unfundedChains.add("osmo-test-5");
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    const paused = await launch(db, work, services, "fl", s);
+    expect(paused.status).toBe("awaiting-user");
+    const step = db.listSteps("fl").find((x) => x.status === "waiting")!;
+    const stored = JSON.parse(step.wallet_json!) as { funding: Array<Record<string, unknown>>; wallet?: unknown };
+    expect(stored.wallet).toBeUndefined();
+    expect(stored.funding).toEqual([
+      expect.objectContaining({
+        chainId: "osmo-test-5",
+        address: expect.stringMatching(/^osmo1/),
+        denom: "uosmo",
+        amount: "7500000",
+        balance: expect.any(String),
+        keplr: { kind: "native", chainId: "osmo-test-5", rpc: "https://rpc.osmotest5.example", gasPrice: 0.025 },
+      }),
+    ]);
+    db.close();
+  }, 120_000);
+
+  it("funds its own-chain key from the launcher-held founder account instead of asking", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    // the own-chain key starts empty, as when the relayer is added after launch
+    services.ssh.unfundedChains.add(chainId(s));
+    const chain = chainStub();
+    // fundcheck sees what the founder's send put on chain
+    const exec = services.ssh.exec.bind(services.ssh);
+    services.ssh.exec = async (target, command, opts) => {
+      if (command === "relayer-fundcheck || true") {
+        const funded = Object.values(chain.state().balances ?? {}).some((b) => b[s.token.baseDenom]);
+        if (funded) services.ssh.unfundedChains.delete(chainId(s));
+      }
+      return exec(target, command, opts);
+    };
+    const logs: string[] = [];
+    db.createLaunch("fl", JSON.stringify(s), "akash1owner");
+    const result = await withStub(chain, () =>
+      runWithSigner(db, "fl", s, work, allSteps(), services, new FakeSigner(), (m) => logs.push(m)),
+    );
+    if (result.status !== "completed") throw new Error(explain(db, "fl"));
+    const sends = chain.state().log.filter((l) => l.types.includes("/cosmos.bank.v1beta1.MsgSend"));
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.from).toBe("acct-founder");
+    expect(logs.some((m) => /funded its .* key .* from the founder account/.test(m))).toBe(true);
+    db.close();
+  }, 120_000);
+});
+
+describe("relayer path waiting for funds", () => {
+  it("leaves an unfunded openWhenFunded path unopened without pausing, then opens it on a relink once funded", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    const result = await launch(db, work, services, "fl", s);
+    if (result.status !== "completed") throw new Error(explain(db, "fl"));
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    const logs: string[] = [];
+    const run = async () => {
+      const res = await runWithSigner(
+        db,
+        "fl",
+        s,
+        work,
+        [...buildPreLaunchOpSteps(db, "fl"), ...allSteps(), ...buildOpSteps(db, "fl")],
+        services,
+        new FakeSigner(),
+        (m) => logs.push(m),
+      );
+      if (res.status !== "completed") throw new Error(explain(db, "fl"));
+    };
+    const relayer = db.listFleetComponents("fl").find((c) => c.key === "relayer")!;
+    const relayerId = `${relayer.ssh_host}:${relayer.ssh_port}`;
+    const config = () => services.ssh.files.get(`${relayer.ssh_host}:${relayer.ssh_port}|/data/relayer/config.toml`)!;
+
+    const mainnet: RelayerPath = {
+      id: "osmo-main",
+      kind: "transfer",
+      counterparty: { ...osmosis.counterparty, chainId: "osmosis-1", maxBalance: "5000000" } as RelayerPath["counterparty"],
+      openWhenFunded: true,
+    };
+    services.ssh.unfundedChains.add("osmosis-1");
+    fleet.requestRelayerPaths(db.getLaunch("fl")!, [osmosis, mainnet]);
+    await run();
+    // the op finished: the testnet channel kept, the mainnet path waiting
+    const state = fleet.relayerState(db.getLaunch("fl")!)!;
+    expect(state.channels.map((c) => c.id)).toEqual(["osmo"]);
+    expect(state.waiting).toEqual([
+      expect.objectContaining({ chainId: "osmosis-1", paths: ["osmo-main"], denom: "uosmo", cap: "5000000" }),
+    ]);
+    expect(state.waiting![0]!.address).toMatch(/^osmo1/);
+    expect(config()).not.toContain("osmosis-1");
+    expect(db.listFleetOps("fl").find((o) => o.kind === "relayer-paths")!.status).toBe("done");
+
+    // funded: a relink opens it and restarts Hermes onto both
+    services.ssh.unfundedChains.clear();
+    const boots = services.ssh.relayerBoots.get(relayerId) ?? 0;
+    fleet.requestRelink(db.getLaunch("fl")!);
+    await run();
+    const after = fleet.relayerState(db.getLaunch("fl")!)!;
+    expect(after.channels.map((c) => c.id)).toEqual(["osmo", "osmo-main"]);
+    expect(after.waiting).toBeUndefined();
+    expect(config()).toContain("osmosis-1");
+    expect(services.ssh.relayerBoots.get(relayerId)).toBe(boots + 1);
+    expect(logs.some((m) => /hermes did not restart/.test(m))).toBe(false);
+
+    // an old image whose PID 1 ignores the signal: the relink says so
+    services.ssh.relayerIgnoresTerm.add(relayerId);
+    fleet.requestRelink(db.getLaunch("fl")!);
+    await run();
+    expect(logs.some((m) => /WARNING hermes did not restart/.test(m))).toBe(true);
+    db.close();
+  }, 180_000);
+
+  it("refuses openWhenFunded on a fleet counterparty", () => {
+    const s = spec("sparkdream", { domain: "hs.example" }, [
+      osmosis,
+      { id: "fed", kind: "federation", counterparty: { fleet: "fleet-b" }, openWhenFunded: true },
+    ]);
+    expect(validateSpec(s).errors.map((e) => e.path)).toContain("topology.components.relayer.paths.1.openWhenFunded");
+  });
 });
 
 describe("relayer between two fleets", () => {

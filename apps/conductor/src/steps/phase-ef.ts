@@ -249,46 +249,89 @@ export const wireTunnelsStep: StepDef = {
   },
 };
 
+/**
+ * Write a validator's whole `persistent_peers` line: one entry per sentry it
+ * peers through. A sentry whose public p2p endpoint answers from the
+ * validator is peered over that one direct TCP hop (§5 public-first: the
+ * mesh path rides a DERP relay whose silent stalls drop votes in bursts).
+ * Otherwise the FIRST sentry is dialed through the local proxy on
+ * VAL_PEER_TUNNEL_PORT (userspace tailscale cannot dial a tailnet IP from a
+ * normal socket), so the validator re-establishes that link itself the
+ * moment it is back, instead of waiting out the sentry's exponential redial
+ * backoff, which grows to hours. Any further mesh-only sentry is left at its
+ * tailnet IP and still reaches the validator through its own dial-in tunnel.
+ *
+ * The line is replaced, not patched with seds: a sed only fixes the address
+ * it expects to find, and a validator home whose line names something else
+ * entirely (seen live: the validator itself, written by collect-gentxs on a
+ * reset) went on booting with no route to its sentry at all.
+ */
+export async function wireValidatorPeers(
+  ctx: StepCtx,
+  key: string,
+  target: SshTarget,
+  sentryIp: (s: number) => string | null | undefined,
+  publicEndpoint: (s: number) => Promise<{ host: string; port: number } | undefined>,
+): Promise<{ peers: string; publicPeers: string[] }> {
+  const v = Number(key.split("-")[1]);
+  const sentries = resolveTopology(ctx.spec).validatorSentries[v] ?? [];
+  const nodeIds = ctx.output<GenerateKeysOutput>("generate-keys")?.nodeIds ?? {};
+  const entries: string[] = [];
+  const publicPeers: string[] = [];
+  // any remaining placeholder references (tmkms addr blocks) get the IP
+  const seds: string[] = [];
+  for (const [i, s] of sentries.entries()) {
+    const sentryKey = `sentry-${s}`;
+    const id = nodeIds[sentryKey];
+    if (!id) throw new Error(`no node id recorded for ${sentryKey}`);
+    const ip = sentryIp(s);
+    if (!ip) throw new Error(`${sentryKey} has no recorded tailnet IP`);
+    seds.push(`s|${placeholder.tailnetIp(sentryKey)}|${ip}|g`);
+    const pub = await publicEndpoint(s).catch(() => undefined);
+    if (pub) {
+      const probe = await ctx.services.ssh.exec(
+        target,
+        `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
+        { quick: true },
+      );
+      if (probe.stdout.includes("open")) {
+        ctx.log(`${key}: peering with ${sentryKey} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
+        entries.push(`${id}@${pub.host}:${pub.port}`);
+        publicPeers.push(sentryKey);
+        continue;
+      }
+    }
+    if (i === 0) {
+      await ctx.services.ssh.exec(target, socatTunnelCmd(VAL_PEER_TUNNEL_PORT, ip, 26656));
+      entries.push(`${id}@127.0.0.1:${VAL_PEER_TUNNEL_PORT}`);
+      continue;
+    }
+    entries.push(`${id}@${ip}:26656`);
+  }
+  const peers = entries.join(",");
+  // anchored on the assignment: `^persistent_peers` alone also matches
+  // persistent_peers_max_dial_period (see repair's peers pass)
+  seds.unshift(`s|^persistent_peers[[:space:]]*=.*|persistent_peers = "${peers}"|`);
+  await ctx.services.ssh.exec(target, `sed -i '${seds.join("; ")}' ${NODE_HOME}/config/config.toml`);
+  return { peers, publicPeers };
+}
+
 export const patchValidatorPeersStep: StepDef = {
   name: "patch-validator-peers",
   async run(ctx) {
     const mesh = ctx.output<MeshTable>("await-mesh")!;
-    const topo = resolveTopology(ctx.spec);
     const p2p = ctx.output<SshEndpoints>("send-manifests")?.p2p;
     const publicPeers: Record<string, string[]> = {};
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
-      const target = nodeTarget(ctx, `val-${v}`);
-      for (const s of topo.validatorSentries[v] ?? []) {
-        const token = placeholder.tailnetIp(`sentry-${s}`);
-        const ip = mesh.ips[`sentry-${s}`];
-        if (!ip) throw new Error(`no tailnet IP for sentry-${s}`);
-        // public-first (§5): the mesh path rides a DERP relay whose silent
-        // stalls drop votes in bursts — a validator that can reach its
-        // sentry's public p2p endpoint peers over one direct TCP hop
-        // instead. The tailnet form stays as the fallback (the sentry's
-        // dial-in tunnel still covers those providers).
-        const pub = p2p?.[`sentry-${s}`];
-        if (pub) {
-          const probe = await ctx.services.ssh.exec(
-            target,
-            `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
-            { quick: true },
-          );
-          if (probe.stdout.includes("open")) {
-            await ctx.services.ssh.exec(
-              target,
-              `sed -i 's|${token}:26656|${pub.host}:${pub.port}|g' ${NODE_HOME}/config/config.toml`,
-            );
-            ctx.log(`val-${v}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
-            (publicPeers[`val-${v}`] ??= []).push(`sentry-${s}`);
-          }
-        }
-        // any remaining references (tmkms addr blocks, non-peered fallback)
-        await ctx.services.ssh.exec(
-          target,
-          `sed -i 's|${token}|${ip}|g' ${NODE_HOME}/config/config.toml`,
-        );
-      }
+      const key = `val-${v}`;
+      const wired = await wireValidatorPeers(
+        ctx,
+        key,
+        nodeTarget(ctx, key),
+        (s) => mesh.ips[`sentry-${s}`],
+        async (s) => p2p?.[`sentry-${s}`],
+      );
+      if (wired.publicPeers.length > 0) publicPeers[key] = wired.publicPeers;
     }
     return { patched: true, publicPeers };
   },
@@ -433,38 +476,8 @@ async function startJoinChain(ctx: StepCtx, start: (key: string) => Promise<void
           socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657),
         );
         servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
-        // p2p: prefer the own sentry's PUBLIC endpoint over the mesh — the
-        // DERP-relayed path stalls silently and drops votes in bursts
-        // (see the relaunch configure step); mesh proxy stays the fallback
-        const pub = s !== undefined
-          ? ctx.output<SshEndpoints>("send-manifests")?.p2p?.[`sentry-${s}`]
-          : undefined;
-        let peered = false;
-        if (pub) {
-          const probe = await ctx.services.ssh.exec(
-            nodeTarget(ctx, key),
-            `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
-            { quick: true },
-          );
-          if (probe.stdout.includes("open")) {
-            await ctx.services.ssh.exec(
-              nodeTarget(ctx, key),
-              `sed -i 's|@${sentryIp}:26656|@${pub.host}:${pub.port}|' ${NODE_HOME}/config/config.toml`,
-            );
-            ctx.log(`${key}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
-            peered = true;
-          }
-        }
-        if (!peered) {
-          await ctx.services.ssh.exec(
-            nodeTarget(ctx, key),
-            socatTunnelCmd(VAL_PEER_TUNNEL_PORT, sentryIp, 26656),
-          );
-          await ctx.services.ssh.exec(
-            nodeTarget(ctx, key),
-            `sed -i 's|@${sentryIp}:26656|@127.0.0.1:${VAL_PEER_TUNNEL_PORT}|' ${NODE_HOME}/config/config.toml`,
-          );
-        }
+        // p2p: patch-validator-peers already wired this validator to its
+        // sentry (public endpoint first, else the dial-out tunnel)
       }
     }
     await ctx.services.ssh.exec(

@@ -237,6 +237,9 @@ export async function connectFleetChain(chain: {
     currencies: [currency],
     feeCurrencies: [{ ...currency, gasPriceStep: { low: chain.gasPrice, average: chain.gasPrice, high: chain.gasPrice } }],
     stakeCurrency: currency,
+    // as the chain's own frontend declares them: a re-suggest from here must
+    // not take away Keplr's IBC transfer action for the chain
+    features: ["ibc-transfer", "ibc-go"],
   });
   await k.enable(chain.chainId);
   const key = await k.getKey(chain.chainId);

@@ -1040,9 +1040,9 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
         }
       }
     };
-    const drive = async () => {
+    const drive = async (launchSpec: LaunchSpec = s) => {
       for (;;) {
-        const result = await runLaunch(db, "repersist", s, work, allSteps(), services);
+        const result = await runLaunch(db, "repersist", launchSpec, work, allSteps(), services);
         if (result.status !== "awaiting-signature") return result;
         const pending = db.nextPendingTx("repersist")!;
         const msgs = JSON.parse(pending.msgs_json);
@@ -1074,6 +1074,16 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     expect(updates).toHaveLength(1);
     expect(String((updates[0]!.value as any).id.dseq)).toBe(val0);
     expect((updates[0]!.value as any).hash).toBe(persistedHash);
+
+    // a mesh component the spec enables but the launch's plan never placed
+    // (added later by an add-component op, which persisted it itself) is
+    // skipped, not read off a missing plan entry. Seen live: re-placing a
+    // component on a fleet that had since gained a relayer failed with
+    // "Cannot read properties of undefined (reading 'dseq')".
+    const added = structuredClone(s);
+    added.topology.components.explorer = { enabled: true, domain: "explorer.sparkdream.io" };
+    db.resetStep("repersist", "persist-start");
+    expect((await drive(added)).status).toBe("completed");
 
     // a deployment that is gone (closed under the launch) is named, not
     // signed into a tx the chain would reject

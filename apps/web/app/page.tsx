@@ -44,8 +44,10 @@ import {
   type OpProgress,
   type PendingGentx,
   type PendingTx,
+  type RelayerFunds,
   type SpecPrefill,
 } from "../lib/api";
+import { FundingRows } from "./relayer-funds";
 import {
   connectKeplr,
   DEFAULT_CHAIN,
@@ -158,6 +160,9 @@ topology:
     #         # dynamicGasPrice: { multiplier: 1.1, max: 0.1 }
     #         # eventSource: pull
     #         # gasMultiplier: 1.5
+    #       # optional: keep the path ready but unopened until the relayer's key on
+    #       # this chain is funded (linking skips it instead of pausing; relink after)
+    #       # openWhenFunded: true
     # Mastodon instance (web + sidekiq, streaming, postgres, redis in one
     # deployment). Its domain is permanent (ActivityPub ids embed it); DNS
     # needs the domain and streaming.<domain>. The owner's password shows up
@@ -340,6 +345,7 @@ const healthKind = (c: ComponentView): "ok" | "warn" | "err" | "off" => {
     case "healthy":
       return "ok";
     case "low-escrow":
+    case "low-gas":
     case "catching-up":
       return "warn";
     case undefined:
@@ -390,6 +396,19 @@ export default function Page() {
   const [fleetAccounts, setFleetAccounts] = useState<Record<string, AccountView[]>>({});
   const [revealedMnemonics, setRevealedMnemonics] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  // the relayer funds panel: which fleet, and its keys once read
+  const [relayerFundsView, setRelayerFundsView] = useState<{ launchId: string; rows: RelayerFunds[] | null } | null>(null);
+  const openRelayerFunds = useCallback(async (launchId: string) => {
+    setRelayerFundsView((v) => ({ launchId, rows: v?.launchId === launchId ? v.rows : null }));
+    try {
+      const { getRelayerFunds } = await import("../lib/api");
+      const rows = await getRelayerFunds(launchId);
+      setRelayerFundsView((v) => (v?.launchId === launchId ? { launchId, rows } : v));
+    } catch (e) {
+      setError(String(e));
+      setRelayerFundsView(null);
+    }
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [balances, setBalances] = useState<Coin[] | null>(null);
   const [bme, setBme] = useState<BmeInfo | null>(null);
@@ -2380,6 +2399,10 @@ export default function Page() {
             :
           </span>
           <pre>{waitingStep.error}</pre>
+          {waitingStep.funding && waitingStep.funding.length > 0 && (
+            // relayer keys to fund: copy each address, or send from Keplr here
+            <FundingRows rows={waitingStep.funding} toast={showToast} onError={(m) => setError(m)} />
+          )}
           {waitingStep.wallet && (
             // a transaction the launcher holds no key for: the user's wallet signs it here
             <div style={{ display: "grid", gap: 8 }}>
@@ -2444,7 +2467,11 @@ export default function Page() {
             className="btn"
             onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
           >
-            {waitingStep.wallet ? "Signed another way, resume" : "I did it, resume"}
+            {waitingStep.wallet
+              ? "Signed another way, resume"
+              : waitingStep.funding?.length
+                ? "Funded, resume"
+                : "I did it, resume"}
           </button>
         </div>
       )}
@@ -2649,6 +2676,43 @@ export default function Page() {
           </div>
           {wallet && bme && <div className="net-mint">{mintBlock(true)}</div>}
         </section>
+      )}
+
+      {relayerFundsView && (
+        <div className="modal-scrim" onClick={() => setRelayerFundsView(null)}>
+          <div className="modal" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
+            <div className="k">Relayer funds</div>
+            <p className="note">
+              One key per chain the relayer signs on. Each sits on the relayer&apos;s provider, so keep it to
+              gas money, under its cap. Withdrawing empties a key and stops relaying on that chain until it is
+              funded again.
+            </p>
+            {relayerFundsView.rows === null ? (
+              <p className="note">Reading balances…</p>
+            ) : relayerFundsView.rows.length === 0 ? (
+              <p className="note">This fleet has no relayer key yet.</p>
+            ) : (
+              <FundingRows
+                rows={relayerFundsView.rows}
+                toast={showToast}
+                onError={(m) => setError(m)}
+                onChanged={() => openRelayerFunds(relayerFundsView.launchId)}
+                withdraw={async (chainId, to) => {
+                  const { postRelayerWithdraw } = await import("../lib/api");
+                  return postRelayerWithdraw(relayerFundsView.launchId, chainId, to);
+                }}
+              />
+            )}
+            <div className="actions" style={{ marginTop: 12 }}>
+              <button className="btn" onClick={() => openRelayerFunds(relayerFundsView.launchId)}>
+                Refresh
+              </button>
+              <button className="btn" onClick={() => setRelayerFundsView(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {backupPrompt && (
@@ -4481,6 +4545,17 @@ export default function Page() {
                                                   (ch) =>
                                                     `  ${ch.id} (${ch.port}): ${ch.a.chain}/${ch.a.channel} <-> ${ch.b.chain}/${ch.b.channel}`,
                                                 ),
+                                                ...(st.waiting?.length
+                                                  ? [
+                                                      "",
+                                                      "Waiting for funds (configured, not opened; fund the key, then relink):",
+                                                      ...st.waiting.map(
+                                                        (w) =>
+                                                          `  ${w.paths.join(", ")} on ${w.chainId}: send about ${w.amount} ${w.denom} to ${w.address}` +
+                                                          (w.cap ? ` (cap ${w.cap})` : ""),
+                                                      ),
+                                                    ]
+                                                  : []),
                                                 ...(st.peers?.length
                                                   ? [
                                                       "",
@@ -4515,6 +4590,13 @@ export default function Page() {
                                         }}
                                       >
                                         relink
+                                      </button>
+                                      <button
+                                        className="btn"
+                                        title="Each relayer key's live balance against its cap: top one up from Keplr, or withdraw what it holds"
+                                        onClick={() => openRelayerFunds(f.launchId)}
+                                      >
+                                        funds…
                                       </button>
                                       <button
                                         className="btn"

@@ -137,6 +137,15 @@ function nameFleetUniquely(db: ConductorDb, spec: LaunchSpecInput): void {
   }
 }
 
+/** A waiting step's stored extras: a bare WalletRequest, or the funding
+ *  rows (relayer keys to send to) with an optional request beside them. */
+function waitingExtras(stored: any): { wallet?: unknown; funding?: unknown[] } {
+  if (stored && Array.isArray(stored.funding)) {
+    return { funding: stored.funding, ...(stored.wallet ? { wallet: stored.wallet } : {}) };
+  }
+  return { wallet: stored };
+}
+
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify();
   app.addContentTypeParser(
@@ -253,6 +262,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     ...(isServicesFleet(spec) ? servicesSteps() : deps.steps),
     ...buildOpSteps(deps.db, id),
   ];
+
+  /** Every step of the launch pipeline itself (ops aside) has finished. */
+  const launchStepsDone = (id: string, spec: LaunchSpec): boolean => {
+    const done = new Set(
+      deps.db.listSteps(id).filter((s) => s.status === "done").map((s) => s.name),
+    );
+    return (isServicesFleet(spec) ? servicesSteps() : deps.steps).every((s) => done.has(s.name));
+  };
 
   const drive = (id: string, spec: LaunchSpec): "started" | "already-running" => {
     if (running.has(id)) {
@@ -523,7 +540,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         started_at: s.started_at,
         finished_at: s.finished_at,
         // what a wallet must sign to get a waiting step going again
-        ...(s.status === "waiting" && s.wallet_json ? { wallet: JSON.parse(s.wallet_json) } : {}),
+        ...(s.status === "waiting" && s.wallet_json ? waitingExtras(JSON.parse(s.wallet_json)) : {}),
       })),
     };
   });
@@ -746,11 +763,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         // AFTER the launch steps, so a paused launch never reaches them), so
         // the same intent is served by re-placing the component through the
         // launch itself. The caller does not need to know the difference.
-        if (launch.status !== "completed") {
+        // "Finished" means the launch's own steps are all done, not that its
+        // status reads completed: a relaunch or upgrade op that fails or waits
+        // on a signature leaves a finished chain "paused" too. Re-placing
+        // through the launch there resets send-manifests and every bootstrap
+        // step after it across the whole fleet, and closes the op's fresh
+        // deployment (seen live: re-clicking relaunch on an explorer whose
+        // relaunch op was in verify).
+        if (launch.status !== "completed" && !launchStepsDone(launchId, spec)) {
           // mid-launch the move runs through the launch's own re-place step,
           // which has no op row — the pick is requested on the launch instead
           // (§6.6), and the step parks with the bid list when it gets there
-          if (picksBids) deps.db.requestBidPick(launchId, component.key);
           // The usual relaunch warnings (double-sign window, sentry
           // isolation) are about a live chain — before start-chain nothing
           // is signing or serving, so they would only be noise.
@@ -765,6 +788,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           }
           try {
             const { step, closing } = await fleet.requestReplace(launch, component);
+            // asked only once the re-place is accepted, so a refused one leaves
+            // no stray pick request behind
+            if (picksBids) deps.db.requestBidPick(launchId, component.key);
             if (closing) return { status: "awaiting-signature", step };
             // a driver already mid-step cannot start this now; it re-drives
             // when the current step finishes, so say so rather than looking
@@ -1356,6 +1382,32 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const state = fleet.relayerState(launch);
     if (!state) return reply.status(404).send({ error: "no relayer linked in this fleet" });
     return state;
+  });
+
+  // every relayer key with its live balance, its cap, what a top-up should
+  // be, and how the browser's Keplr can send it (the funds panel)
+  app.get("/api/fleet/:launchId/relayer/funds", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    return { funds: await fleet.relayerFunds(launch) };
+  });
+
+  // send a relayer key's balance on one chain (less the fee) back out: to
+  // `to`, or the owner's own address on that chain
+  app.post("/api/fleet/:launchId/relayer/withdraw", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { chainId?: string; to?: string };
+    if (!body.chainId) return reply.status(400).send({ error: "chainId is required" });
+    try {
+      return await fleet.withdrawRelayerFunds(launch, body.chainId, body.to);
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
   });
 
   // replace a running relayer's paths (relayer-paths op): add or drop a

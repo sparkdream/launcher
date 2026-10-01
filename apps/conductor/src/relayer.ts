@@ -162,7 +162,7 @@ export interface RelayChain {
 /** Relay transactions a suggested top-up covers: weeks of light traffic. */
 const TOPUP_TXS = 1_000;
 /** Gas of a typical relay tx (client update + one packet). */
-const RELAY_TX_GAS = 300_000;
+export const RELAY_TX_GAS = 300_000;
 
 /**
  * The most the relayer key should hold on `chain`, in its gas denom, if the

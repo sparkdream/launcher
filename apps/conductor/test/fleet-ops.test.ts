@@ -15,6 +15,7 @@ import {
   pollSsh,
   retagImage,
   rewriteTailnetIps,
+  validatorPeersProblem,
   withRedeployNonce,
 } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
@@ -1316,6 +1317,28 @@ describe("chain reset op", () => {
     ).toContain("WAIT_FOR_CONFIG=false");
   }, 120_000);
 
+  it("keeps the master validator's peers through the genesis rebuild", async () => {
+    // collect-gentxs rewrites its home's persistent_peers from the gentx
+    // memos, which name the validator itself at 127.0.0.1:26656. The reset
+    // rebuilds genesis in the master validator's already-rendered home and
+    // re-packs it into the bundle a relaunch boots from — seen live: a reset
+    // testnet validator came back peering only with itself
+    const w = await launched(tmkms1x1());
+    const launch = w.db.getLaunch("fl")!;
+    const cfg = path.join(w.work, "launches/fl/nodes/val-0/config/config.toml");
+    const peersLine = () => /^persistent_peers = .*$/m.exec(fs.readFileSync(cfg, "utf8"))?.[0];
+    const before = peersLine();
+    const nodeIds = w.db.stepOutput<{ nodeIds: Record<string, string> }>("fl", "generate-keys")!
+      .nodeIds;
+    expect(before).toContain(nodeIds["sentry-0"]);
+
+    w.fleet.requestChainReset(launch, JSON.parse(launch.spec_json));
+    w.spec = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    await driveOps(w); // parks at the signer gate, after rebuild-genesis
+    expect(peersLine()).toBe(before);
+    expect(peersLine()).not.toContain(`${nodeIds["val-0"]}@`);
+  }, 120_000);
+
   it("gates a softsign fleet too, for validators it does not own", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
@@ -1900,14 +1923,56 @@ describe("repair op", () => {
     // one batched update tx for the deployments that changed, no redeploy
     expect(w.signer.signed.length).toBe(sigsBefore + 1);
 
-    // peers: the validator's stale entry is repaired in place...
-    expect(w.services.ssh.configPeers.get(valId)).toBe(
-      `${nodeIds["sentry-0"]}@${after["sentry-0"]}:26656`,
-    );
+    // peers: the validator's stale tailnet entry (which userspace tailscale
+    // could never dial anyway) is rebuilt as the dial-out tunnel, and the
+    // validator's env gains that tunnel at the sentry's live address...
+    expect(w.services.ssh.configPeers.get(valId)).toBe(`${nodeIds["sentry-0"]}@127.0.0.1:16657`);
+    const valSdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", "val-0.yaml"), "utf8");
+    expect(valSdl).toContain(`TS_TUNNEL_PEER=16657:${after["sentry-0"]}:26656`);
     // ...and the sentry's loopback tunnel entry is left exactly alone —
     // rewriting 127.0.0.1 to a tailnet IP would undo the tunnel design
     expect(w.services.ssh.configPeers.get(sentryId)).toContain(`${nodeIds["val-0"]}@127.0.0.1:27000`);
     expect(w.services.ssh.configPeers.get(sentryId)).toContain(`${after["sentry-0"]}:26656`);
+    w.db.close();
+  }, 120_000);
+
+  it("rebuilds a validator's peers that name the validator itself, through the dial-out tunnel", async () => {
+    // the live testnet shape after a reset: val-0's line named only val-0,
+    // so it never dialed its sentry, and the sentry's redial backoff left
+    // the public RPC frozen for hours while val-0 signed the chain alone
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const valId = `${val.ssh_host}:${val.ssh_port}`;
+    const nodeIds = w.db.stepOutput<{ nodeIds: Record<string, string> }>("fl", "generate-keys")!
+      .nodeIds;
+    w.services.ssh.configPeers.set(valId, `${nodeIds["val-0"]}@127.0.0.1:26656`);
+    // an SDL from before the validator tunnel existed
+    const sdlPath = path.join(w.work, "launches/fl/sdl", "val-0.yaml");
+    fs.writeFileSync(
+      sdlPath,
+      fs.readFileSync(sdlPath, "utf8").replace(/^.*TS_TUNNEL_PEER=.*\n/m, ""),
+    );
+    expect(fs.readFileSync(sdlPath, "utf8")).not.toContain("TS_TUNNEL_PEER=");
+    const from = w.services.ssh.execLog.length;
+
+    w.fleet.requestRepair(launch, val);
+    expect((await driveOps(w)).status).toBe("completed");
+
+    expect(w.services.ssh.configPeers.get(valId)).toBe(`${nodeIds["sentry-0"]}@127.0.0.1:16657`);
+    expect(fs.readFileSync(sdlPath, "utf8")).toContain(
+      `TS_TUNNEL_PEER=16657:${sentry.tailnet_ip}:26656`,
+    );
+    const later = w.services.ssh.execLog.slice(from);
+    // the tunnel is opened now (the env re-creates it on later restarts),
+    // and the validator restarted onto the new line
+    expect(
+      later.some((e) => e.target === valId && e.command.includes(`TCP-LISTEN:16657`)),
+    ).toBe(true);
+    expect(later.some((e) => e.target === valId && e.command.includes("pkill -x sparkdreamd"))).toBe(
+      true,
+    );
     w.db.close();
   }, 120_000);
 
@@ -2538,5 +2603,21 @@ describe("rewriteTailnetIps", () => {
     );
     expect(rewriteTailnetIps("nothing here", map)).toBe("nothing here");
     expect(rewriteTailnetIps("a=100.64.0.1", new Map())).toBe("a=100.64.0.1");
+  });
+});
+
+describe("validatorPeersProblem", () => {
+  const spec = withDefaults(testnetSpec());
+  const ids = { "val-0": "aaa", "sentry-0": "sss" };
+
+  it("accepts the dial-out tunnel and a public endpoint", () => {
+    expect(validatorPeersProblem(spec, "val-0", "sss@127.0.0.1:16657", ids)).toBeNull();
+    expect(validatorPeersProblem(spec, "val-0", "sss@provider.example.com:31234", ids)).toBeNull();
+  });
+
+  it("flags a line naming the validator itself, a missing sentry, or an undialable tailnet IP", () => {
+    expect(validatorPeersProblem(spec, "val-0", "aaa@127.0.0.1:26656", ids)).toMatch(/itself/);
+    expect(validatorPeersProblem(spec, "val-0", "", ids)).toMatch(/no entry for sentry-0/);
+    expect(validatorPeersProblem(spec, "val-0", "sss@100.64.0.22:26656", ids)).toMatch(/tailnet IP/);
   });
 });

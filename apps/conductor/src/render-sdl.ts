@@ -7,6 +7,7 @@ import {
   type NodeRef,
   type Topology,
 } from "@sparkdream/launch-spec";
+import { VAL_PEER_TUNNEL_PORT } from "./node-ops.js";
 import { networkSdlPath } from "./vendor.js";
 
 /** Akash pricing denom per target network (§12.7: repo SDLs price in uact). */
@@ -65,7 +66,18 @@ export function renderNodeSdl(input: RenderSdlInput): void {
       );
     });
   } else {
-    svc.env = env;
+    // The validator dials its first sentry too, through a local proxy
+    // (userspace tailscale cannot dial a tailnet IP from a normal socket).
+    // With only the sentry dialing in, a link that drops while the
+    // validator is down waits out the sentry's exponential redial backoff,
+    // hours after the validator is back.
+    svc.env = env.filter((e: string) => !e.startsWith("TS_TUNNEL_"));
+    const s = topology.validatorSentries[node.index]?.[0];
+    if (s !== undefined) {
+      svc.env.push(
+        `TS_TUNNEL_PEER=${VAL_PEER_TUNNEL_PORT}:${input.placeholder.tailnetIp(`sentry-${s}`)}:26656`,
+      );
+    }
   }
 
   // Public chain endpoints (§4 topology.publicEndpoints): sentry-0 serves

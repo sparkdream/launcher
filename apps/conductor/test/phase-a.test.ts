@@ -229,7 +229,9 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     const valSdl = fs.readFileSync(path.join(dirs.sdl, "val-0.yaml"), "utf8");
     expect(valSdl).toContain(`image: ${s.images.sparkdreamd}`);
     expect(valSdl).toContain("size: 50Gi");
-    expect(valSdl).not.toContain("TS_TUNNEL_");
+    // the validator dials its first sentry itself (val-0 → sentry-0)
+    expect(valSdl).toContain("TS_TUNNEL_PEER=16657:{{TAILNET_IP:sentry-0}}:26656");
+    expect(valSdl.match(/TS_TUNNEL_/g)).toHaveLength(1);
 
     // bundles: softsign validators keep their consensus key, no keyring leaks
     const listing = execFileSync("tar", ["tzf", path.join(dirs.bundles, "val-0.tgz")]).toString();

@@ -117,6 +117,9 @@ export class AwaitUser extends Error {
     readonly step: string,
     readonly reason: string,
     readonly wallet?: WalletRequest,
+    /** Accounts to send money to (relayer keys), one row each, so the pause
+     *  card can offer a copy button and a wallet send per row. */
+    readonly funding?: unknown[],
   ) {
     super(reason);
   }
@@ -290,7 +293,14 @@ export async function runLaunch(
         return { status: "awaiting-signature", failedStep: step.name };
       }
       if (cause instanceof AwaitUser) {
-        db.stepWaiting(launchId, step.name, cause.reason, cause.wallet);
+        // a pause with funding rows stores both under one object; one with a
+        // wallet request only keeps the bare WalletRequest it always stored
+        db.stepWaiting(
+          launchId,
+          step.name,
+          cause.reason,
+          cause.funding?.length ? { wallet: cause.wallet, funding: cause.funding } : cause.wallet,
+        );
         db.setLaunchStatus(launchId, "paused");
         return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
       }

@@ -44,7 +44,7 @@ import { linkFederationPeers, linkRelayer } from "./steps/relayer-link.js";
 import { reconcileSessions, type SessionRole } from "./sessions.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { fleetResolver } from "./verifier.js";
-import { deploymentInfoWithRetry, ingressHost, pushManifest } from "./steps/phase-ef.js";
+import { deploymentInfoWithRetry, ingressHost, pushManifest, wireValidatorPeers } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
 import {
@@ -137,9 +137,9 @@ function tunnelPeers(spec: LaunchSpec, key: string): Map<number, string> {
   const topo = resolveTopology(spec);
   const peers = new Map<number, string>();
   if (key.startsWith("val-")) {
-    // join mode bakes an own-sentry witness + peer tunnel (see the persist
-    // step); a fresh-launch validator has neither, and an absent entry
-    // simply matches nothing.
+    // every validator dials its first sentry through a peer tunnel; join
+    // mode adds an own-sentry witness. An absent entry simply matches
+    // nothing.
     const s = topo.validatorSentries[Number(key.split("-")[1])]?.[0];
     if (s !== undefined) {
       peers.set(WITNESS_RPC_PORT, `sentry-${s}`);
@@ -245,6 +245,73 @@ function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
   const node = row.key.startsWith("val-") || row.key.startsWith("sentry-");
   const service = node ? "sparkdreamd" : (descriptorFor(row.key)?.shellService ?? row.key);
   return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq, 1, 1, service));
+}
+
+/**
+ * A validator SDL with its own-sentry tunnels set: the outbound p2p proxy
+ * every validator dials its first sentry through, plus the light-client
+ * witness a joining validator state-syncs against. Text is returned
+ * unchanged when it already carries exactly these entries, so a convergent
+ * caller does not re-serialize the YAML into a new manifest hash.
+ */
+export function withValidatorTunnelEnv(text: string, sentryIp: string, witness: boolean): string {
+  const want = [`TS_TUNNEL_PEER=${VAL_PEER_TUNNEL_PORT}:${sentryIp}:26656`];
+  if (witness) want.unshift(`TS_TUNNEL_WITNESS=${WITNESS_RPC_PORT}:${sentryIp}:26657`);
+  const doc = yaml.load(text) as any;
+  const svc = doc?.services?.sparkdreamd;
+  if (!svc) return text;
+  const current: string[] = svc.env ?? [];
+  if (want.every((w) => current.includes(w))) return text;
+  svc.env = current
+    .filter((e) => !e.startsWith("TS_TUNNEL_WITNESS=") && !e.startsWith("TS_TUNNEL_PEER="))
+    .concat(want);
+  return yaml.dump(doc, { lineWidth: 120 });
+}
+
+/**
+ * Why a validator's persistent_peers cannot reach its sentries, or null when
+ * it can. Re-aiming addresses fixes none of these: the line names the
+ * validator itself (collect-gentxs on a reset wrote exactly that), leaves
+ * out one of its sentries, or reaches its first sentry at a bare tailnet IP,
+ * which userspace tailscale cannot dial, so only the sentry's own redial
+ * (and its backoff) ever restores the link.
+ */
+export function validatorPeersProblem(
+  spec: LaunchSpec,
+  key: string,
+  peers: string,
+  nodeIds: Record<string, string>,
+): string | null {
+  const entries = peers.split(",").map((e) => e.trim()).filter(Boolean);
+  const idOf = (e: string) => e.split("@")[0] ?? "";
+  const own = nodeIds[key];
+  if (own && entries.some((e) => idOf(e) === own)) return "persistent_peers names the validator itself";
+  const sentries = resolveTopology(spec).validatorSentries[Number(key.split("-")[1])] ?? [];
+  for (const [i, s] of sentries.entries()) {
+    const id = nodeIds[`sentry-${s}`];
+    if (!id) continue;
+    const entry = entries.find((e) => idOf(e) === id);
+    if (!entry) return `persistent_peers has no entry for sentry-${s}`;
+    if (i === 0 && /@100\./.test(entry)) {
+      return `sentry-${s} is peered at a tailnet IP the validator cannot dial`;
+    }
+  }
+  return null;
+}
+
+/** A sentry's provider-forwarded public p2p endpoint, read from its lease. */
+async function sentryPublicP2p(
+  ctx: StepCtx,
+  s: number,
+): Promise<{ host: string; port: number } | undefined> {
+  const row = componentRow(ctx, `sentry-${s}`);
+  try {
+    const status = await ctx.services.provider.leaseStatus(loadCert(ctx), row.host_uri, row.dseq, 1, 1);
+    return extractForwardedPort(status, 26656);
+  } catch {
+    // no forwarded p2p (or no status): the mesh path is the fallback
+    return undefined;
+  }
 }
 
 function sdlPathFor(ctx: StepCtx, key: string): string {
@@ -1458,44 +1525,17 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       }
 
       const topo = resolveTopology(spec);
-      const publicPeered = new Set<number>();
       if (isValidator) {
-        // patch own config's sentry placeholders — public endpoint first
-        // (same rationale as patch-validator-peers), tailnet IP fallback
-        for (const s of topo.validatorSentries[valIndex] ?? []) {
-          const sentryRow = componentRow(ctx, `sentry-${s}`);
-          const sentryIp = sentryRow.tailnet_ip;
-          if (!sentryIp) throw new Error(`sentry-${s} has no recorded tailnet IP`);
-          const token = placeholder.tailnetIp(`sentry-${s}`);
-          try {
-            const status = await ctx.services.provider.leaseStatus(
-              loadCert(ctx), sentryRow.host_uri, sentryRow.dseq, 1, 1,
-            );
-            const pub = extractForwardedPort(status, 26656);
-            const probe = await ctx.services.ssh.exec(
-              target,
-              `nc -zw 4 ${pub.host} ${pub.port} >/dev/null 2>&1 && echo open || echo closed`,
-              { quick: true },
-            );
-            if (probe.stdout.includes("open")) {
-              // cover both the placeholder form and an already-substituted
-              // tailnet form (bundles re-packaged after a launch carry IPs)
-              await ctx.services.ssh.exec(
-                target,
-                `sed -i 's|${token}:26656|${pub.host}:${pub.port}|g; ` +
-                  `s|@${sentryIp}:26656|@${pub.host}:${pub.port}|g' ${NODE_HOME}/config/config.toml`,
-              );
-              ctx.log(`${key}: peering with sentry-${s} over its public endpoint ${pub.host}:${pub.port} (no relay)`);
-              publicPeered.add(s);
-            }
-          } catch {
-            // no forwarded p2p or probe failure — tailnet fallback below
-          }
-          await ctx.services.ssh.exec(
-            target,
-            `sed -i 's|${token}|${sentryIp}|g' ${NODE_HOME}/config/config.toml`,
-          );
-        }
+        // own peers: public endpoint first, else the dial-out tunnel to the
+        // first sentry. The whole line is written, since the bundle this
+        // node booted from may carry any stale form of it.
+        await wireValidatorPeers(
+          ctx,
+          key,
+          target,
+          (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
+          (s) => sentryPublicP2p(ctx, s),
+        );
         // §5: relaunching a validator re-wires its sentries' tunnels.
         // socatTunnelCmd self-cleans the port, so no manual pkill (which,
         // unanchored, could kill its own sh wrapper mid-command).
@@ -1516,21 +1556,6 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
             ctx.log(
               `${key}: sentry-${s} unreachable (${e instanceof Error ? e.message : String(e)}); ` +
                 `leaving its tunnel for its own relaunch or repair to re-aim`,
-            );
-          }
-        }
-        if (spec.join) {
-          // join validators with no public path still dial OUT through a
-          // local mesh proxy — the sentry dial-in alone leaves the link
-          // hostage to the sentry dialer's exponential backoff whenever the
-          // validator was down a while
-          const s0 = (topo.validatorSentries[valIndex] ?? [])[0];
-          const sentryIp0 = s0 !== undefined ? componentRow(ctx, `sentry-${s0}`).tailnet_ip : null;
-          if (s0 !== undefined && !publicPeered.has(s0) && sentryIp0) {
-            await ctx.services.ssh.exec(target, socatTunnelCmd(VAL_PEER_TUNNEL_PORT, sentryIp0, 26656));
-            await ctx.services.ssh.exec(
-              target,
-              `sed -i 's|@${sentryIp0}:26656|@127.0.0.1:${VAL_PEER_TUNNEL_PORT}|' ${NODE_HOME}/config/config.toml`,
             );
           }
         }
@@ -1655,25 +1680,13 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         const sdlPath = sdlPathFor(ctx, k);
         let text = fs.readFileSync(sdlPath, "utf8");
         text = text.replace(/WAIT_FOR_CONFIG=true/g, "WAIT_FOR_CONFIG=false");
-        if (k === key && isValidator && spec.join) {
-          // own-sentry witness + outbound peer tunnels (what the configure
-          // step wired over SSH), baked so a container restart re-creates
-          // them — the entrypoint runs every TS_TUNNEL_* env entry
+        if (k === key && isValidator) {
+          // outbound peer tunnel (and, joining, the own-sentry witness) that
+          // the configure step wired over SSH, baked so a container restart
+          // re-creates them: the entrypoint runs every TS_TUNNEL_* env entry
           const s = topo.validatorSentries[valIndex]?.[0];
           const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
-          if (sentryIp) {
-            const doc = yaml.load(text) as any;
-            const svc = doc.services?.sparkdreamd;
-            if (svc) {
-              const env: string[] = (svc.env ?? []).filter(
-                (e: string) => !e.startsWith("TS_TUNNEL_WITNESS=") && !e.startsWith("TS_TUNNEL_PEER="),
-              );
-              env.push(`TS_TUNNEL_WITNESS=${WITNESS_RPC_PORT}:${sentryIp}:26657`);
-              env.push(`TS_TUNNEL_PEER=${VAL_PEER_TUNNEL_PORT}:${sentryIp}:26656`);
-              svc.env = env;
-              text = yaml.dump(doc, { lineWidth: 120 });
-            }
-          }
+          if (sentryIp) text = withValidatorTunnelEnv(text, sentryIp, Boolean(spec.join));
         }
         if (k !== key) {
           // counterpart sentry: re-aim its tunnel for THIS validator at the
@@ -4065,6 +4078,52 @@ const RESUME_PROBE_BLOCKS = 10;
  * change, no hash drift — then prove the validator is signing by watching
  * its signing-info counters advance.
  */
+/**
+ * Run a `sparkdreamd query` on a node against its own local RPC, so the
+ * answer is that node's view of the chain rather than whatever the public
+ * endpoint (a sentry, possibly partitioned) last saw.
+ */
+async function nodeQueryJson(ctx: StepCtx, target: SshTarget, args: string[]): Promise<any> {
+  const quote = (a: string) => `'${a.replace(/'/g, `'\\''`)}'`;
+  const res = await ctx.services.ssh.exec(
+    target,
+    `sparkdreamd ${args.map(quote).join(" ")} --node tcp://127.0.0.1:26657 --output json`,
+    { quick: true },
+  );
+  return JSON.parse(res.stdout);
+}
+
+/**
+ * After a validator is confirmed signing, say so plainly when the public RPC
+ * is not following: the chain is fine, the sentry has lost its validator
+ * link. Informational only, since the validator dials its sentry itself on
+ * a restart and the gap usually closes within a minute.
+ */
+async function notePublicLag(
+  ctx: StepCtx,
+  key: string,
+  target: SshTarget,
+  rpc: string | null,
+): Promise<void> {
+  if (!rpc) return;
+  try {
+    const own = await ctx.services.ssh.exec(target, "wget -qO- http://127.0.0.1:26657/status", { quick: true });
+    const ownHeight = Number(JSON.parse(own.stdout).result.sync_info.latest_block_height);
+    const pub = await ctx.services.rpc.status(rpc);
+    const behind = ownHeight - pub.latestBlockHeight;
+    if (behind > STALLED_BEHIND_BLOCKS) {
+      ctx.log(
+        `the public RPC is ${behind} blocks behind ${key} (${pub.latestBlockHeight} vs ${ownHeight}): ` +
+          "its sentry has lost the link to the validator. It should reconnect now that the " +
+          "validator is back; if it stays behind, restart the sentry, or run repair if " +
+          `${key}'s peers predate its dial-out tunnel.`,
+      );
+    }
+  } catch {
+    // either side unreadable: nothing useful to add
+  }
+}
+
 export function resumeSigningSteps(opId: number, params: ResumeSigningParams, spec: LaunchSpec): StepDef[] {
   const p = (s: string) => `op${opId}:${s}`;
   const v = Number(params.key.split("-")[1]);
@@ -4119,7 +4178,13 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
         const address = keys?.accounts[`op-val-${v}`];
         const pubkey =
           keys?.consensusPubkeys[params.key] ?? spec.topology.validators.consensusPubkeys?.[v];
-        const rpc = await ownRpc(ctx);
+        // Ask the validator's own node, not the public RPC: that is a
+        // sentry, and a sentry cut off from its validator reports "no new
+        // blocks" while the validator signs the chain forward alone (seen
+        // live on a single-validator testnet: the op failed here while
+        // val-0 was 230 blocks ahead of its frozen sentry).
+        const target = rowTarget(ctx, componentRow(ctx, params.key));
+        const query = (args: string[]) => nodeQueryJson(ctx, target, args);
         if (!address || !pubkey) {
           throw new Error(
             `${params.key}: no operator account or consensus pubkey recorded; cannot probe signing`,
@@ -4135,7 +4200,7 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
           // chain — recovery is the unjail op, and making this step fail
           // would only obscure that (same rationale as verify-signing)
           try {
-            const out = await queryJson(["query", "staking", "validator", valoper], rpc);
+            const out = await query(["query", "staking", "validator", valoper]);
             if (Boolean((out.validator ?? out).jailed)) {
               ctx.log(
                 `${params.key} was downtime-jailed during the stall. The process is restarted ` +
@@ -4151,7 +4216,7 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
           }
           let info: any;
           try {
-            const out = await queryJson(["query", "slashing", "signing-info", pubkeyArg], rpc);
+            const out = await query(["query", "slashing", "signing-info", pubkeyArg]);
             info = out.val_signing_info ?? out;
           } catch (e) {
             lastProblem = `signing-info query failed (${String(e).slice(0, 80)})`;
@@ -4182,6 +4247,7 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
           ctx.log(
             `${params.key}: signing confirmed (${seen - missedDelta}/${seen} blocks in the probe window)`,
           );
+          await notePublicLag(ctx, params.key, target, await ownRpc(ctx).catch(() => null));
           ctx.db.setFleetOpStatus(opId, "done");
           return { restarted: true, signing: true };
         }
@@ -4811,8 +4877,23 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           if (!row || row.state !== "active") continue;
           const sdlPath = sdlPathFor(ctx, key);
           if (!fs.existsSync(sdlPath)) continue;
-          const retarget = retargetTunnelEnv(ctx, spec, key, fs.readFileSync(sdlPath, "utf8"));
+          let text = fs.readFileSync(sdlPath, "utf8");
+          const added: string[] = [];
+          if (key.startsWith("val-")) {
+            // validators placed before the dial-out tunnel existed have no
+            // TS_TUNNEL_PEER: give them one, so the peers pass below can
+            // point the validator at it and a restart keeps it
+            const s = resolveTopology(spec).validatorSentries[Number(key.split("-")[1])]?.[0];
+            const sentryIp = s !== undefined ? rows.find((c) => c.key === `sentry-${s}`)?.tailnet_ip : null;
+            if (sentryIp && !/TS_TUNNEL_PEER=/.test(text)) {
+              text = withValidatorTunnelEnv(text, sentryIp, Boolean(spec.join));
+              added.push(`sentry-${s} peer tunnel added`);
+            }
+          }
+          const retarget = retargetTunnelEnv(ctx, spec, key, text);
+          for (const c of added) ctx.log(`${key}: ${c}`);
           for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
+          retarget.changes.push(...added);
           if (retarget.changes.length > 0) fs.writeFileSync(sdlPath, retarget.text);
           const artifacts = sdlArtifacts(loadSdl(sdlPath));
           const wantHash = Buffer.from(artifacts.hash).toString("base64");
@@ -4880,6 +4961,26 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             .catch(() => ({ stdout: "" }));
           const line = /^persistent_peers\s*=\s*"(.*)"/m.exec(got.stdout);
           if (!line) continue;
+          if (key.startsWith("val-")) {
+            const problem = validatorPeersProblem(spec, key, line[1] ?? "", nodeIds);
+            if (problem) {
+              // not an address to re-aim but a line to rebuild: write it the
+              // way a fresh launch would (public endpoint first, else the
+              // dial-out tunnel mesh-env just made sure the SDL carries)
+              ctx.log(`${key}: ${problem}; rewiring its peers`);
+              const wired = await wireValidatorPeers(
+                ctx,
+                key,
+                target,
+                (s) => rows.find((c) => c.key === `sentry-${s}`)?.tailnet_ip,
+                (s) => sentryPublicP2p(ctx, s),
+              );
+              ctx.log(`${key}: persistent_peers = "${wired.peers}"`);
+              await restartNode(ctx.services.ssh, target);
+              repaired.push(key);
+              continue;
+            }
+          }
           const changes: string[] = [];
           const next = (line[1] ?? "")
             .split(",")

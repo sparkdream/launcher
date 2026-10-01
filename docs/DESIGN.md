@@ -484,8 +484,10 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
      fellow sentries) against peer-slot eviction
    - validator `persistent_peers` = `<sentry_node_id>@<SENTRY_TAILNET_IP>:26656`
      — rendered with a placeholder here, resolved in Phase E step 18b
-     (public sentry endpoint when reachable, tailnet IP otherwise; see 18b);
-     `unconditional_peer_ids` pins its sentries
+     (public sentry endpoint when reachable, the dial-out tunnel otherwise;
+     see 18b); `unconditional_peer_ids` pins its sentries. Its SDL carries
+     `TS_TUNNEL_PEER=16657:<first sentry tailnet IP>:26656` (placeholder,
+     resolved by persist-start) so a container restart re-creates that tunnel
    - tunnel port allocation: sentry *s* → validator *v* uses `16656 + v`
      (`TS_TUNNEL_n=<port>:<validator_tailnet_ip>:26656`, IP patched in Phase E)
    - validator quirks baked in: `priv_validator_laddr = tcp://127.0.0.1:26660`
@@ -656,9 +658,19 @@ Per node, parallel where safe:
     step probes the sentry's provider-forwarded public p2p port FROM INSIDE
     the validator's container (`nc -zw 4`) and, when reachable, points the
     peer entry at `<public-host>:<forwarded-port>` — one direct TCP hop.
-    Only unreachable sentries (the validator's provider filters that
-    egress) fall back to the tailnet IP, where the sentry's dial-in tunnel
-    still carries the link. Rationale, learned the expensive way on the
+    An unreachable first sentry (the validator's provider filters that
+    egress) is dialed OUT through a local proxy, `127.0.0.1:16657` → the
+    sentry's p2p port over the mesh (userspace tailscale cannot dial a
+    tailnet IP from a normal socket), so either side can re-establish the
+    link: with the sentry dialing alone, a drop while the validator was
+    down waited out CometBFT's uncapped redial backoff (3^n seconds,
+    giving up after ~25h), which left a testnet's public RPC frozen for
+    hours on 2026-10-01 while its validator signed alone. Further mesh-only
+    sentries stay at their tailnet IP and reach the validator through their
+    own dial-in tunnels. The step writes the whole `persistent_peers` line
+    rather than patching addresses, since a stale home can carry any form
+    of it (the reset's `collect-gentxs` once left a validator naming itself;
+    the genesis build now restores the master's config.toml around it). Rationale, learned the expensive way on the
     first devnet join: Akash providers never allow a direct tailscale path,
     so the mesh rides the headscale DERP relay — ~400-500ms RTT with
     silent stalls that hang a p2p connection until CometBFT's slow
@@ -666,8 +678,8 @@ Per node, parallel where safe:
     bursts and was downtime-jailed five times; on the public path it signs
     ~99.5%. The mesh remains the operational plane (SSH-less management,
     tmkms, witness proxies) — consensus traffic just stops depending on
-    it. The same public-first probe runs in join mode's start-chain and in
-    the relaunch configure step, so relocated validators re-derive the
+    it. The same wiring runs in the relaunch configure step and in the
+    repair op's peers pass, so relocated validators re-derive the
     best path for their new provider. The remaining relay-dependent
     fallback tunnels carry tight TCP keepalives
     (`keepidle=10,keepintvl=5,keepcnt=3`, mirroring the tmkms proxy) so a
@@ -1661,7 +1673,11 @@ treatment:
   deployments (one signature), re-push the manifests. The push restarts those
   containers, and that restart is what re-creates the tunnels on target.
 - **peers** — `persistent_peers` in config.toml on the volume: a validator dialling
-  its sentries, sentries dialling each other, both over the tailnet directly.
+  its sentries, sentries dialling each other. A validator line that names the
+  validator itself, misses one of its sentries, or reaches its first sentry at
+  a bare tailnet IP is rebuilt whole the way step 18b writes it (mesh-env adds
+  the `TS_TUNNEL_PEER` env a pre-tunnel validator lacks); otherwise stale
+  tailnet addresses are re-aimed in place.
   This is an SSH edit plus a process restart; nothing on-chain changes, so no
   hash can drift. Entries are matched by *node id*, so the rewrite is exact:
   a `127.0.0.1` entry (a sentry reaching its validator through a tunnel, which

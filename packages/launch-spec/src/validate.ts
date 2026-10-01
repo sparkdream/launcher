@@ -691,6 +691,9 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         err(at, `a ${p.kind} path to ${end.replace(/^[a-z]+:/, "")} is already listed`);
       }
       ends.add(`${p.kind}/${end}`);
+      if ("fleet" in cp && p.openWhenFunded) {
+        err(`${at}.openWhenFunded`, "only for endpoint counterparties: a fleet's chain is funded by the launcher");
+      }
       if (!("fleet" in cp)) {
         if (cp.chainId === chainId(spec)) {
           err(`${at}.counterparty.chainId`, "a path cannot lead back to this chain");

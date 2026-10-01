@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
+import { fromBech32 } from "@cosmjs/encoding";
 import {
   chainId,
   COMPONENT_KEYS,
@@ -25,6 +26,18 @@ import {
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
 import { RELAYER_ACCOUNT, relayerTunnels, resolveRelayFleet } from "./relayer.js";
+import {
+  cosmjsWithdraw,
+  lowFundsDetail,
+  ownerAddressOn,
+  relayerFunds,
+  withdrawRelayerFunds,
+  type RelayerFunds,
+  type WithdrawDeps,
+} from "./relayer-funds.js";
+
+/** How often the monitor reads the relayer's balances. */
+const RELAYER_FUNDS_EVERY_MS = 15 * 60_000;
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
@@ -57,7 +70,7 @@ import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
-import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
+import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type DeploymentPlan, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
@@ -272,6 +285,10 @@ export interface MastodonSettings {
 export class FleetService {
   /** Last hourly on-chain look at each fleet's session grants. */
   private readonly sessionChecks = new Map<string, number>();
+  /** Last look at each relayer's balances, and the low keys it found. */
+  private readonly relayerFundChecks = new Map<string, { at: number; low: string[] }>();
+  /** How a relayer withdrawal reaches a chain; tests swap in a fake. */
+  withdrawDeps: WithdrawDeps = cosmjsWithdraw;
 
   constructor(
     private readonly db: ConductorDb,
@@ -838,6 +855,15 @@ export class FleetService {
             if (!verdict.healthy) {
               this.db.setComponentHealth(launchId, c.key, "unreachable", details.join("; "));
               return;
+            }
+            // a running hermes with an empty key relays nothing on that chain,
+            // and a transfer sent there waits (its refund too) until topped up
+            if (c.key === "relayer") {
+              const low = await this.relayerLowFunds(launch);
+              if (low.length > 0) {
+                this.db.setComponentHealth(launchId, c.key, "low-gas", [...details, ...low].join("; "));
+                return;
+              }
             }
           }
           this.db.setComponentHealth(launchId, c.key, "healthy", details.join("; "));
@@ -1461,6 +1487,22 @@ export class FleetService {
     if (component.key === "headscale") {
       throw new Error("headscale cannot be re-placed mid-launch (it re-keys the whole mesh)");
     }
+    // send-manifests only re-deploys what the launch's own plan placed. A
+    // component an add-component op brought in (the relayer, say) would be
+    // closed here and never come back, and a finished launch re-running its
+    // steps after an op-driven mixup is exactly when this gets clicked.
+    const plan = this.db.stepOutput<DeploymentPlan>(launch.id, "create-deployments");
+    if (plan && !plan.perNode[component.key]) {
+      const pending = this.db
+        .listSteps(launch.id)
+        .filter((s) => s.status !== "done" && !s.name.startsWith("op"))
+        .map((s) => s.name);
+      throw new Error(
+        `${component.key} was added after the launch, so it can only be relaunched once the launch finishes` +
+          (pending.length > 0 ? ` (in progress: ${pending.join(", ")})` : "") +
+          ". Wait for it to complete, then relaunch.",
+      );
+    }
     // close it first when it is still leased, so the re-place is a genuine
     // move and the escrow comes back; an already-closed deployment (the
     // usual case here) skips straight to the step reset
@@ -1769,6 +1811,47 @@ export class FleetService {
           " — joining the mesh needs it to mint a preauth key",
       );
     }
+  }
+
+  /** Live balance of every relayer key, with what each needs (funds panel). */
+  async relayerFunds(launch: LaunchRow): Promise<RelayerFunds[]> {
+    const waiting = new Set((this.relayerState(launch)?.waiting ?? []).map((w) => w.chainId));
+    return relayerFunds(
+      this.db, this.services.rpc, launch.id, this.spec(launch), launchDirs(this.workRoot, launch.id).secrets, waiting,
+    );
+  }
+
+  /** Keys an opened path depends on that are low or empty, as health detail
+   *  lines. Balances are read at most every RELAYER_FUNDS_EVERY_MS (they are
+   *  remote REST calls, and a key drains over days, not minutes). */
+  private async relayerLowFunds(launch: LaunchRow): Promise<string[]> {
+    const cached = this.relayerFundChecks.get(launch.id);
+    if (cached && Date.now() - cached.at < RELAYER_FUNDS_EVERY_MS) return cached.low;
+    const low = lowFundsDetail(await this.relayerFunds(launch).catch(() => []));
+    this.relayerFundChecks.set(launch.id, { at: Date.now(), low });
+    return low;
+  }
+
+  /** Send a relayer key's whole balance on one chain (less the fee) to `to`,
+   *  by default the owner's own address there. */
+  async withdrawRelayerFunds(
+    launch: LaunchRow,
+    chainId: string,
+    to?: string,
+  ): Promise<{ txHash: string; amount: string; denom: string; to: string }> {
+    const spec = this.spec(launch);
+    const funds = await this.relayerFunds(launch);
+    const key = funds.find((f) => f.chainId === chainId);
+    if (!key) throw new Error(`the relayer has no key on ${chainId}`);
+    const prefix = fromBech32(key.address).prefix;
+    const dest = to?.trim() || ownerAddressOn(launch.owner, prefix);
+    if (!dest) throw new Error(`name an address on ${chainId} to send to`);
+    const out = await withdrawRelayerFunds(
+      this.db, this.services.rpc, launch.id, spec, launchDirs(this.workRoot, launch.id).secrets, chainId, dest,
+      this.withdrawDeps,
+    );
+    this.relayerFundChecks.delete(launch.id);
+    return out;
   }
 
   /** The relayer's addresses and channels from its last link, if any. */

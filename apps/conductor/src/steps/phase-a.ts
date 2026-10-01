@@ -518,8 +518,19 @@ export async function buildGenesisFiles(
     ]);
   }
 
-  // 4. collect + validate, then distribute the final genesis everywhere
+  // 4. collect + validate, then distribute the final genesis everywhere.
+  //    collect-gentxs also rewrites the home's persistent_peers from the
+  //    gentx memos, which name each validator itself at 127.0.0.1:26656, so
+  //    the master validator ends up peering only with itself. On a first
+  //    launch render-configs runs later and overwrites it, but the reset op
+  //    re-runs this on a home already rendered and re-packs it into the
+  //    bundle a relaunch boots from. Seen live: a reset testnet validator
+  //    never dialed its sentry again, and the sentry's backoff left the
+  //    public RPC frozen for hours after a mesh blip.
+  const masterConfig = path.join(master, "config", "config.toml");
+  const configBefore = fs.existsSync(masterConfig) ? fs.readFileSync(masterConfig) : null;
   await sparkdreamd(["genesis", "collect-gentxs", "--home", master]);
+  if (configBefore) fs.writeFileSync(masterConfig, configBefore);
   await sparkdreamd(["genesis", "validate", genesisPath]);
   for (const node of nodes(spec)) {
     if (node.key === masterKey) continue;

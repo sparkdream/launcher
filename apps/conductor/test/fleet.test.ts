@@ -272,10 +272,44 @@ describe("relaunch adapts to the launch state", () => {
     expect((asOp.json() as any).status).toBe("relaunch-started");
     expect((asOp.json() as any).opId).toBeGreaterThan(0);
 
-    // now pretend the launch is still in flight: the SAME action must
-    // re-place through the launch instead, since an op could never run
+    // a finished launch paused by its op (a failed verify, a lease awaiting
+    // a signature) is still finished: a re-click supersedes the op rather
+    // than re-placing through the launch, which would reset every launch
+    // step after send-manifests across the fleet (seen live on an explorer)
     db.setLaunchStatus("fl", "paused");
+    const again = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "relaunch", confirm: true },
+    });
+    expect((again.json() as any).status).toBe("relaunch-started");
+    const ops = db.listFleetOps("fl").filter((o) => o.kind === "relaunch");
+    expect(ops.find((o) => o.id === (asOp.json() as any).opId)!.status).toBe("aborted");
+    expect(db.getStep("fl", "send-manifests")?.status).toBe("done");
+    for (const o of ops) db.setFleetOpStatus(o.id, "aborted");
+
+    // now the launch is genuinely in flight (a launch step not yet done):
+    // the SAME action must re-place through the launch instead, since an op
+    // could never run
+    db.resetStep("fl", allSteps().at(-1)!.name);
     (services.api as any).leaseStates.set(sentry.dseq, "closed");
+
+    // …unless the launch's plan never placed the component (an add-component
+    // op brought it in, like the relayer): send-manifests would not re-deploy
+    // it, so the re-place is refused before anything is closed or reset
+    const plan = db.stepOutput<any>("fl", "create-deployments");
+    const { "sentry-0": _added, ...planned } = plan.perNode;
+    db.stepDone("fl", "create-deployments", { ...plan, perNode: planned });
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/fleet/fl/${sentry.dseq}/actions`,
+      payload: { action: "relaunch", manualBid: true, confirm: true },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect((refused.json() as any).error).toMatch(/added after the launch/);
+    expect(db.getStep("fl", "send-manifests")?.status).toBe("done");
+    expect(db.getBidPick("fl", "sentry-0")).toBeUndefined();
+    db.stepDone("fl", "create-deployments", plan);
     const midLaunch = await app.inject({
       method: "POST",
       url: `/api/fleet/fl/${sentry.dseq}/actions`,
@@ -286,7 +320,7 @@ describe("relaunch adapts to the launch state", () => {
     // covered end-to-end in full-launch.test.ts; here the point is that one
     // action dispatches correctly on launch state.
     expect((midLaunch.json() as any).status).toBe("replacing");
-    expect(db.listFleetOps("fl").filter((o) => o.kind === "relaunch")).toHaveLength(1);
+    expect(db.listFleetOps("fl").filter((o) => o.kind === "relaunch")).toHaveLength(2);
     db.close();
   }, 120_000);
 });
