@@ -241,7 +241,10 @@ function allMeshDependents(ctx: StepCtx, spec: LaunchSpec, key: string): MeshDep
 
 function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
   if (!row.ssh_host || !row.ssh_port) throw new Error(`${row.key}: no SSH endpoint recorded`);
-  return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq));
+  // a service component's lease-shell runs in its own service, not sparkdreamd
+  const node = row.key.startsWith("val-") || row.key.startsWith("sentry-");
+  const service = node ? "sparkdreamd" : (descriptorFor(row.key)?.shellService ?? row.key);
+  return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq, 1, 1, service));
 }
 
 function sdlPathFor(ctx: StepCtx, key: string): string {

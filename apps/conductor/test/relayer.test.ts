@@ -290,6 +290,21 @@ describe("relayer launch", () => {
     db.close();
   }, 120_000);
 
+  it("asks for a small amount, not about 0, on a chain whose gas is free", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    s.token.minGasPrice = "0";
+    services.ssh.unfundedChains.add(chainId(s));
+    const paused = await launch(db, work, services, "fl", s);
+    expect(paused.status).toBe("awaiting-user");
+    expect(paused.reason).toContain(`${chainId(s)}: send a small amount of ${s.token.baseDenom} to sprkdrm1`);
+    expect(paused.reason).toMatch(/gas is free there, but the key needs an account with a balance/);
+    expect(paused.reason).not.toMatch(/about 0 /);
+    db.close();
+  }, 120_000);
+
   it("refuses a genesis balance above the relayer's cap, and warns that the key is hot", () => {
     const over = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
     over.topology.components.relayer!.genesisBalance = "500000000";

@@ -21,7 +21,7 @@ import {
 import { readSecretFile } from "../secrets.js";
 import { patchSentryAppToml, sentryServe } from "../sentry-serve.js";
 import type { SshTarget } from "../services.js";
-import { sshTarget, type SshEndpoints } from "./phase-bcd.js";
+import { nodeShellFallback, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
 import {
   chainIdentity,
   ensurePeerActive,
@@ -60,13 +60,20 @@ export function relayerStatePath(workRoot: string, launchId: string): string {
 }
 
 /** The relayer container's SSH target: from its fleet row once materialized,
- *  else from send-manifests (during the launch itself). */
+ *  else from send-manifests (during the launch itself). Either way with the
+ *  provider's lease-shell as fallback: Hermes only dials out, so a provider
+ *  whose forwarded SSH port is dead still runs it fine (seen live, 2026-10-01). */
 function relayerTarget(ctx: StepCtx): SshTarget {
   const row = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find((c) => c.key === "relayer");
-  if (row?.ssh_host && row.ssh_port) return sshTarget(ctx, row.ssh_host, row.ssh_port);
+  if (row?.ssh_host && row.ssh_port) {
+    return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq, 1, 1, "relayer"));
+  }
   const ep = ctx.output<SshEndpoints>("send-manifests")?.perNode.relayer;
   if (!ep) throw new Error("relayer: no SSH endpoint recorded yet");
-  return sshTarget(ctx, ep.host, ep.port);
+  const entry = ctx.output<DeploymentPlan>("create-deployments")?.perNode.relayer;
+  const a = ctx.output<Assignments>("collect-bids")?.perNode.relayer;
+  const fallback = a && entry ? nodeShellFallback(ctx, a.hostUri, entry.dseq, a.gseq, a.oseq, "relayer") : undefined;
+  return sshTarget(ctx, ep.host, ep.port, fallback);
 }
 
 /** SSH into another fleet's sentry-0 with THAT fleet's key. */
@@ -174,9 +181,14 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
             const address = s.address || chains.find((c) => c.chainId === s.chain)?.address;
             const denom = planned?.gasDenom ?? "its gas denom";
             const cap = planned ? relayerCap(spec, planned) : undefined;
-            const amount = planned ? `about ${suggestedTopUp(planned, cap)} ` : "";
+            const topUp = planned ? suggestedTopUp(planned, cap) : undefined;
+            // a chain with no gas price charges nothing, but the key still
+            // needs an account and a balance: ask for "some", not "about 0"
+            const amount =
+              topUp === undefined ? "" : topUp === 0n ? "a small amount of " : `about ${topUp} `;
             return (
               `${s.chain}: send ${amount}${denom} to ${address}` +
+              (topUp === 0n ? " (gas is free there, but the key needs an account with a balance)" : "") +
               (cap !== undefined ? ` (cap ${cap})` : "") +
               (s.account === false ? " (account not found yet)" : "")
             );

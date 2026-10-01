@@ -1454,13 +1454,15 @@ export function sshTarget(
   };
 }
 
-/** Lease-shell fallback descriptor for a node component (service sparkdreamd). */
+/** Lease-shell fallback descriptor for a deployed component: service
+ *  sparkdreamd for a node, a service component's own (its shellService). */
 export function nodeShellFallback(
   ctx: StepCtx,
   hostUri: string,
   dseq: string,
   gseq = 1,
   oseq = 1,
+  service = "sparkdreamd",
 ): NonNullable<SshTarget["shellFallback"]> {
   const cert = loadCert(ctx);
   return {
@@ -1469,7 +1471,7 @@ export function nodeShellFallback(
     dseq,
     gseq,
     oseq,
-    service: "sparkdreamd",
+    service,
   };
 }
 
