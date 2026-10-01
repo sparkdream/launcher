@@ -699,6 +699,15 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
           `${at}.counterparty.grpc`,
           "the relayer dials this gRPC directly: it must be reachable from the provider, not just from your network",
         );
+        if (cp.dynamicGasPrice && cp.dynamicGasPrice.max < cp.gasPrice) {
+          err(
+            `${at}.counterparty.dynamicGasPrice.max`,
+            `${cp.dynamicGasPrice.max} is below gasPrice (${cp.gasPrice}), the fallback Hermes pays when the fee query fails`,
+          );
+        }
+        if (cp.eventSource === "pull" && cp.ws) {
+          warn(`${at}.counterparty.ws`, "ignored: eventSource pull polls the RPC instead of the websocket");
+        }
         if (p.kind === "federation") {
           warn(
             `${at}.kind`,

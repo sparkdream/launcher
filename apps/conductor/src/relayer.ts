@@ -33,6 +33,9 @@ const DEFAULT_HD_PATH = "m/44'/118'/0'/0/0";
 
 const GRPC_PORT = 9090;
 const RPC_PORT = 26657;
+/** Hermes' gas_multiplier unless an endpoint counterparty sets its own. 1.5
+ *  ran out creating a client on Spark Dream chains (see deploy/relayer). */
+const GAS_MULTIPLIER = 2.5;
 
 /** A tunnel peer in another fleet: `<component>@<launchId>`. Colon-free, so
  *  the TS_TUNNEL_n=<local>:<target>:<remote> env stays unambiguous. */
@@ -141,10 +144,14 @@ export interface RelayChain {
   bech32Prefix: string;
   gasDenom: string;
   gasPrice: number;
+  /** Follow the chain's fee market, never above max (Hermes dynamic_gas_price). */
+  dynamicGasPrice?: { multiplier: number; max: number };
+  gasMultiplier: number;
   hdPath: string;
   trustingPeriod?: string;
   rpc: string;
   grpc: string;
+  eventSource: "push" | "pull";
   ws: string;
   /** LCD, when known: lets relayer-fundcheck see whether the key's account exists. */
   lcd?: string;
@@ -174,9 +181,11 @@ export function relayerCap(spec: LaunchSpec, chain: Pick<RelayChain, "chainId" |
   return undefined;
 }
 
-/** A top-up worth asking for: ~1000 relay txs of gas, never above the cap. */
-export function suggestedTopUp(chain: Pick<RelayChain, "gasPrice">, cap: bigint | undefined): bigint {
-  const gas = BigInt(Math.ceil(chain.gasPrice * RELAY_TX_GAS * TOPUP_TXS));
+/** A top-up worth asking for: ~1000 relay txs of gas, never above the cap.
+ *  On a fee market that is at its max price, the most Hermes will pay. */
+export function suggestedTopUp(chain: Pick<RelayChain, "gasPrice" | "dynamicGasPrice">, cap: bigint | undefined): bigint {
+  const price = Math.max(chain.gasPrice, chain.dynamicGasPrice?.max ?? 0);
+  const gas = BigInt(Math.ceil(price * RELAY_TX_GAS * TOPUP_TXS));
   return cap !== undefined && cap < gas ? cap : gas;
 }
 
@@ -204,9 +213,11 @@ function sparkDreamChain(spec: LaunchSpec, index: number, launchId: string): Rel
     bech32Prefix: spec.network.bech32Prefix,
     gasDenom: spec.token.baseDenom,
     gasPrice: Number(spec.token.minGasPrice),
+    gasMultiplier: GAS_MULTIPLIER,
     hdPath: DEFAULT_HD_PATH,
     rpc: `http://127.0.0.1:${ports.rpc}`,
     grpc: `http://127.0.0.1:${ports.grpc}`,
+    eventSource: "push",
     ws: `ws://127.0.0.1:${ports.rpc}/websocket`,
     ...(spec.topology.publicEndpoints?.api ? { lcd: `https://${spec.topology.publicEndpoints.api}` } : {}),
     launchId,
@@ -237,10 +248,13 @@ export function relayPlan(db: ConductorDb, launchId: string, spec: LaunchSpec): 
           bech32Prefix: cp.bech32Prefix,
           gasDenom: cp.gasDenom,
           gasPrice: cp.gasPrice,
+          ...(cp.dynamicGasPrice ? { dynamicGasPrice: cp.dynamicGasPrice } : {}),
+          gasMultiplier: cp.gasMultiplier ?? GAS_MULTIPLIER,
           hdPath: cp.hdPath,
           ...(cp.trustingPeriod ? { trustingPeriod: cp.trustingPeriod } : {}),
           rpc: cp.rpc,
           grpc: cp.grpc,
+          eventSource: cp.eventSource ?? "push",
           ws: cp.ws ?? `${cp.rpc.replace(/^http/, "ws").replace(/\/$/, "")}/websocket`,
           ...(cp.lcd ? { lcd: cp.lcd } : {}),
         });
@@ -322,7 +336,9 @@ export function renderHermesConfig(plan: RelayPlan, channels?: RelayChannel[]): 
       "type = 'CosmosSdk'",
       `rpc_addr = ${q(c.rpc)}`,
       `grpc_addr = ${q(c.grpc)}`,
-      `event_source = { mode = 'push', url = ${q(c.ws)}, batch_delay = '500ms' }`,
+      c.eventSource === "pull"
+        ? "event_source = { mode = 'pull', interval = '1s', max_retries = 4 }"
+        : `event_source = { mode = 'push', url = ${q(c.ws)}, batch_delay = '500ms' }`,
       "rpc_timeout = '20s'",
       `account_prefix = ${q(c.bech32Prefix)}`,
       `key_name = ${q(RELAYER_KEY_NAME)}`,
@@ -332,8 +348,13 @@ export function renderHermesConfig(plan: RelayPlan, channels?: RelayChannel[]): 
       "default_gas = 200000",
       "max_gas = 4000000",
       `gas_price = { price = ${float(c.gasPrice)}, denom = ${q(c.gasDenom)} }`,
-      // 1.5 runs out creating a client on these chains (see deploy/relayer)
-      "gas_multiplier = 2.5",
+      ...(c.dynamicGasPrice
+        ? [
+            `dynamic_gas_price = { enabled = true, multiplier = ${float(c.dynamicGasPrice.multiplier)}, ` +
+              `max = ${float(c.dynamicGasPrice.max)} }`,
+          ]
+        : []),
+      `gas_multiplier = ${float(c.gasMultiplier)}`,
       "max_msg_num = 30",
       "max_tx_size = 180000",
       "clock_drift = '10s'",

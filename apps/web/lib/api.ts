@@ -656,6 +656,17 @@ export async function postRelink(launchId: string): Promise<{ status: string; op
   return json(await afetch(`/api/fleet/${launchId}/relink`, { method: "POST" }));
 }
 
+/** Replace a running relayer's paths (relayer-paths op): add or drop chains. */
+export async function postRelayerPaths(launchId: string, paths: unknown[]): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/relayer/paths`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paths }),
+    }),
+  );
+}
+
 /** Wipe the chain and restart from a rebuilt genesis on the same
  *  deployments (reset-chain op): the posted spec replaces the stored one. */
 export async function postChainReset(

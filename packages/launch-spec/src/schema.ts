@@ -126,8 +126,28 @@ const relayerEndpointCounterparty = z
     lcd: z.string().url().optional(),
     bech32Prefix: z.string().regex(/^[a-z][a-z0-9]{0,15}$/),
     gasDenom: z.string().min(1),
-    /** Price per gas unit, at least the chain's minimum-gas-prices. */
+    /** Price per gas unit, at least the chain's minimum-gas-prices. With
+     *  dynamicGasPrice it is the fallback when the fee query fails. */
     gasPrice: z.number().positive(),
+    /** Follow the chain's fee market instead of the fixed gasPrice: Hermes
+     *  queries the base fee (Osmosis txfees for osmosis-* and osmo-test-*
+     *  ids, Skip's x/feemarket otherwise), multiplies it, and never pays
+     *  above `max`. For chains with neither module it only ever falls back. */
+    dynamicGasPrice: z
+      .object({
+        multiplier: z.number().min(1).default(1.1),
+        max: z.number().positive(),
+      })
+      .strict()
+      .optional(),
+    /** Gas limit over the simulated gas. Unset, 2.5, as on Spark Dream
+     *  chains: simulation underestimates client creation's store writes
+     *  (about 1.56x once). Fees are charged on the limit, not on use. */
+    gasMultiplier: z.number().min(1).max(10).optional(),
+    /** How Hermes learns of IBC events: push subscribes to the websocket
+     *  (default); pull polls /block_results, for an RPC that serves no
+     *  websocket or a chain whose events the websocket misses. */
+    eventSource: z.enum(["push", "pull"]).optional(),
     /** BIP44 path for the relayer key on this chain (coin type 118 by default). */
     hdPath: z.string().regex(/^m(\/[0-9]+'?)+$/).default("m/44'/118'/0'/0/0"),
     /** Light-client trusting period, below the chain's unbonding time. Unset,

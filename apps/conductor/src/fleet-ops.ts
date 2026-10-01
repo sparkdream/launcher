@@ -93,6 +93,12 @@ export interface UpgradeParams {
   /** Components in rolling order (sentries first, then validators). */
   components: string[];
   image: string;
+  /** Image each component ran when the op was requested: what a node that
+   *  cannot run the new one is rolled back to. Absent on older ops. */
+  previous?: Record<string, string>;
+  /** spec.images before the op recorded the new image, restored on rollback
+   *  so relaunches and resets keep rendering the image that works. */
+  previousSpecImages?: Record<string, string>;
 }
 
 function componentRow(ctx: StepCtx, key: string): FleetComponentRow {
@@ -483,6 +489,47 @@ async function nodeSelfHeight(
   }
 }
 
+/**
+ * Why a freshly swapped node binary cannot run on this chain, read from its
+ * log, or undefined when the log shows no such failure.
+ *
+ * These are the startup failures no amount of waiting fixes: the release
+ * cannot read the chain's stored state (a proto field reused with a new type
+ * and no migration: devnet 2026-09-30, `wrong wireType = 0 for field
+ * MaxTipsSentPerEpoch`), replays it to a different result, or expects a
+ * registered upgrade the chain has not reached. Each surfaces while comet
+ * replays blocks into the app at boot, before the node serves RPC.
+ */
+export function incompatibleReleaseReason(logs: string): string | undefined {
+  const binaryEarly = /BINARY UPDATED BEFORE TRIGGER! UPGRADE "([^"]+)"/.exec(logs);
+  if (binaryEarly) {
+    return (
+      `this release expects the "${binaryEarly[1]}" upgrade, which the chain has not reached ` +
+      "(install it with a halt-height upgrade at that upgrade's height instead)"
+    );
+  }
+  const needed = /UPGRADE "([^"]+)" NEEDED at height/.exec(logs);
+  if (needed) {
+    return `the chain is waiting for the "${needed[1]}" upgrade, which this release does not carry`;
+  }
+  const handshake = /error during handshake: ([^\n]*)/.exec(logs);
+  if (!handshake) return undefined;
+  const detail = handshake[1]!.replace(/\x1b\[[0-9;]*m/g, "").replace(/"\s.*$/, "").trim();
+  if (/wireType|encoding error|decode|unmarshal|proto:/i.test(detail)) {
+    return (
+      "this release cannot read the chain's stored state: its data format changed without " +
+      `a migration (${detail.slice(0, 200)})`
+    );
+  }
+  if (/AppHash|app hash|app_hash/i.test(detail)) {
+    return (
+      "this release computes different results from the chain's history (a state-machine " +
+      `change without an upgrade handler) (${detail.slice(0, 200)})`
+    );
+  }
+  return `the node cannot start on the chain's data with this release (${detail.slice(0, 200)})`;
+}
+
 /** The line cosmos prints on its way down when `halt-height` fires. */
 export function haltLogLine(haltHeight: number): string {
   return `halt per configuration height ${haltHeight}`;
@@ -738,6 +785,79 @@ export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
       },
     },
   ];
+}
+
+/** Params of a "relayer-paths" op: the new paths are already in the spec. */
+export interface RelayerPathsParams {
+  /** The set of fleet counterparties changed, so the relayer's mesh tunnels
+   *  (its deployment's TS_TUNNEL env) must change before it can link. */
+  retunnel: boolean;
+}
+
+/**
+ * Change a running relayer's paths (requestRelayerPaths stored them): when
+ * the fleet counterparties changed, rewrite the relayer's tunnel env in
+ * place (one update tx, manifest re-sent, the container restarts on its
+ * volume, keys and channels kept), then link as a relink does. Linking
+ * opens the new paths' channels, reuses the open ones, and pins Hermes'
+ * packet filter to exactly the paths now in the spec. A dropped path's
+ * channel stays open on chain; Hermes just stops relaying it.
+ */
+export function relayerPathsSteps(opId: number, params: RelayerPathsParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const steps: StepDef[] = [];
+  if (params.retunnel) {
+    steps.push({
+      name: p("tunnels"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const row = componentRow(ctx, "relayer");
+        const tunnels = descriptorFor("relayer")!.tunnels(spec);
+        const env: string[] = [];
+        for (const [i, t] of tunnels.entries()) {
+          const peer = peerRow(ctx.db, ctx.launchId, t.peer);
+          if (!peer?.tailnet_ip) throw new Error(`relayer: ${t.peer} has no recorded tailnet IP to tunnel to`);
+          env.push(`TS_TUNNEL_${i + 1}=${t.local}:${peer.tailnet_ip}:${t.remote}`);
+        }
+        const sdlPath = sdlPathFor(ctx, "relayer");
+        const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+        const svc = doc.services?.relayer;
+        if (!svc) throw new Error("relayer.yaml has no services.relayer");
+        svc.env = [...((svc.env ?? []) as string[]).filter((e) => !e.startsWith("TS_TUNNEL_")), ...env];
+        fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, "relayer.manifest.json"), artifacts.manifestJson);
+        // convergent: a re-run after the signature finds the version on
+        // chain and only re-sends the manifest (unconditionally, as mesh-env
+        // does: skipping it there is how an update lands unapplied)
+        const wantHash = Buffer.from(artifacts.hash).toString("base64");
+        const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+        if (onChain?.hash !== wantHash) {
+          await ctx.requireTx(p("tunnels"), [
+            { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner, dseq: row.dseq }, hash: wantHash } },
+          ]);
+        } else {
+          ctx.db.deletePendingTx(ctx.launchId, p("tunnels"));
+        }
+        await ctx.services.provider.sendManifest(loadCert(ctx), row.host_uri, row.dseq, artifacts.manifestJson);
+        for (const e of env) ctx.log(`relayer: ${e}`);
+        // the update restarts the container: link once it answers again
+        const target = rowTarget(ctx, row);
+        let up = false;
+        for (let i = 0; i < 40 && !up; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          up = await ctx.services.ssh
+            .exec(target, "true", { quick: true })
+            .then(() => true)
+            .catch(() => false);
+        }
+        if (!up) throw new Error("relayer: container never came back after its tunnel update");
+        return { tunnels: env };
+      },
+    });
+  }
+  steps.push(...relinkSteps(opId, spec));
+  return steps;
 }
 
 /** Params of a "mastodon-resize" op: the relaunch's, plus the new size and,
@@ -2344,7 +2464,107 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
   return steps;
 }
 
-/** Rolling upgrade (§5 "Node upgrades"): serial per component, health-gated. */
+/**
+ * Point one component's deployment at `image`: SDL swap, MsgUpdateDeployment
+ * (skipped when the chain already holds that hash), manifest push, row image.
+ * Shared by the upgrade's update step and its rollback.
+ */
+async function swapComponentImage(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  key: string,
+  image: string,
+  txStep: string,
+  extraMsgs: (owner: string) => Promise<Msg[]>,
+): Promise<{ services: string[]; txSkipped: boolean }> {
+  const row = componentRow(ctx, key);
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const sdlPath = sdlPathFor(ctx, key);
+  const sdl = fs.readFileSync(sdlPath, "utf8");
+  // precondition (§5): a gated container would come back down
+  if (sdl.includes("WAIT_FOR_CONFIG=true")) {
+    throw new Error(`${key}: WAIT_FOR_CONFIG still true — run persist-start (step 20b) first`);
+  }
+  // service components read their chain identity from env (the
+  // explorer renders /chain-config.json from it, the frontend serves
+  // /api/config from it) — refresh the current values on upgrade so
+  // installing an image that reads a newly added var also delivers
+  // the var, without needing a chain reset. How is per kind
+  // (descriptor.envRefresh): patched in place so persist-start's
+  // resolved tunnel targets survive, or re-rendered wholesale.
+  refreshComponentEnv(ctx, spec, key, sdlPath);
+  const swapped = setComponentImage(sdlPath, key, image, spec);
+  if (swapped.length === 0) {
+    // nothing in the deployment changes: no tx, no manifest
+    ctx.log(`${key}: no running service uses ${image} yet — recorded in the spec for the next render`);
+    return { services: swapped, txSkipped: true };
+  }
+  // the row shows the component's main image: a side service's
+  // upgrade (Mastodon's bridge) leaves it as it is
+  const mainSwapped =
+    swapped.includes("*") || (descriptorFor(key)?.imageServices ?? []).some((s) => swapped.includes(s));
+  const artifacts = sdlArtifacts(loadSdl(sdlPath));
+  fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+  // convergent, like retarget: a retried op re-walks components an
+  // earlier attempt already updated on-chain, and an update tx whose
+  // hash matches the live version is rejected ("invalid: deployment
+  // hash") — re-send the manifest only for those
+  const wantHash = Buffer.from(artifacts.hash).toString("base64");
+  const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+  if (onChain?.hash === wantHash) {
+    ctx.log(`${key}: on-chain version already matches — skipping update tx`);
+    ctx.db.deletePendingTx(ctx.launchId, txStep);
+  } else {
+    const msgs: Msg[] = [
+      {
+        typeUrl: TypeUrl.UpdateDeployment,
+        value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+      },
+      ...(await extraMsgs(owner)),
+    ];
+    await ctx.requireTx(txStep, msgs);
+  }
+  // The row is written only once the provider has taken the manifest.
+  // Recording it before the push made the fleet claim an image that was
+  // never deployed, which the upgrade button then read as "already on
+  // that version" and refused to re-send (2026-09-18).
+  await pushManifest(
+    ctx,
+    loadCert(ctx),
+    key,
+    row.host_uri,
+    row.dseq,
+    fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
+  );
+  if (mainSwapped) ctx.db.updateComponentRuntime(ctx.launchId, key, { image });
+  return { services: swapped, txSkipped: onChain?.hash === wantHash };
+}
+
+/** A node's verify outcome when it did not come up on the new image. */
+interface UpgradeVerifyOutput {
+  healthy: boolean;
+  /** Plain-words cause, shown in the op's final error. */
+  reason?: string;
+}
+
+/** Output of a node's rollback step when it actually rolled back. */
+interface UpgradeRollbackOutput {
+  rolledBack?: boolean;
+  skipped?: boolean;
+  to?: string;
+  reason?: string;
+}
+
+/** Rolling upgrade (§5 "Node upgrades"): serial per component, health-gated.
+ *
+ *  A chain node that cannot run the new release is put back on the image it
+ *  ran before, and the components after it are left alone. That only happens
+ *  when rolling back is known to be safe: its log names a startup failure no
+ *  wait fixes ({@link incompatibleReleaseReason}), or it never served RPC at
+ *  all, so it cannot have committed a block on the new binary. A node that
+ *  came up but stalls keeps the old behavior (the step fails for the operator
+ *  to judge), since the new binary may already have written state the old one
+ *  cannot read. */
 export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSpec): StepDef[] {
   const steps: StepDef[] = [];
   const stateless = new Map<string, ComponentRef>(
@@ -2356,99 +2576,51 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
     const rank = (k: string) => (stateless.has(k) ? 0 : k.startsWith("val-") ? 2 : 1);
     return rank(a) - rank(b) || a.localeCompare(b);
   });
+  // the component whose rollback ended the rollout, if any
+  const rolledBack = (ctx: StepCtx): { key: string; out: UpgradeRollbackOutput } | undefined => {
+    for (const k of ordered) {
+      const out = ctx.output<UpgradeRollbackOutput>(`op${opId}:${k}:rollback`);
+      if (out?.rolledBack) return { key: k, out };
+    }
+    return undefined;
+  };
 
   for (const key of ordered) {
     const p = (s: string) => `op${opId}:${key}:${s}`;
     const earlier = ordered.slice(0, ordered.indexOf(key));
+    const isNode = !stateless.has(key);
 
     steps.push({
       name: p("update"),
       async run(ctx) {
-        const row = componentRow(ctx, key);
-        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-        const sdlPath = sdlPathFor(ctx, key);
-        const sdl = fs.readFileSync(sdlPath, "utf8");
-        // precondition (§5): a gated container would come back down
-        if (sdl.includes("WAIT_FOR_CONFIG=true")) {
-          throw new Error(`${key}: WAIT_FOR_CONFIG still true — run persist-start (step 20b) first`);
-        }
-        // service components read their chain identity from env (the
-        // explorer renders /chain-config.json from it, the frontend serves
-        // /api/config from it) — refresh the current values on upgrade so
-        // installing an image that reads a newly added var also delivers
-        // the var, without needing a chain reset. How is per kind
-        // (descriptor.envRefresh): patched in place so persist-start's
-        // resolved tunnel targets survive, or re-rendered wholesale.
-        refreshComponentEnv(ctx, spec, key, sdlPath);
-        const swapped = setComponentImage(sdlPath, key, params.image, spec);
-        if (swapped.length === 0) {
-          // nothing in the deployment changes: no tx, no manifest
-          ctx.log(`${key}: no running service uses ${params.image} yet — recorded in the spec for the next render`);
-          return { image: params.image, services: swapped, txSkipped: true };
-        }
-        // the row shows the component's main image: a side service's
-        // upgrade (Mastodon's bridge) leaves it as it is
-        const mainSwapped =
-          swapped.includes("*") || (descriptorFor(key)?.imageServices ?? []).some((s) => swapped.includes(s));
-        const artifacts = sdlArtifacts(loadSdl(sdlPath));
-        fs.writeFileSync(
-          path.join(ctx.dirs.sdl, `${key}.manifest.json`),
-          artifacts.manifestJson,
-        );
-        // convergent, like retarget: a retried op re-walks components an
-        // earlier attempt already updated on-chain, and an update tx whose
-        // hash matches the live version is rejected ("invalid: deployment
-        // hash") — re-send the manifest only for those
-        const wantHash = Buffer.from(artifacts.hash).toString("base64");
-        const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
-        if (onChain?.hash === wantHash) {
-          ctx.log(`${key}: on-chain version already matches — skipping update tx`);
-          ctx.db.deletePendingTx(ctx.launchId, p("update"));
-        } else {
-          const msgs: Msg[] = [
-            {
-              typeUrl: TypeUrl.UpdateDeployment,
-              value: { id: { owner, dseq: row.dseq }, hash: wantHash },
-            },
-          ];
-          // upgrade service fee — flat, once per op, riding the first
-          // update tx that actually happens (skipped components can't
-          // carry it: there's no tx to batch it into)
-          const fee = feeConfig();
+        if (rolledBack(ctx)) return { skipped: true };
+        // upgrade service fee — flat, once per op, riding the first
+        // update tx that actually happens (skipped components can't
+        // carry it: there's no tx to batch it into)
+        const fee = async (owner: string): Promise<Msg[]> => {
+          const cfg = feeConfig();
           const feeDue = earlier.every(
             (k) => ctx.output<{ txSkipped?: boolean }>(`op${opId}:${k}:update`)?.txSkipped,
           );
-          if (feeDue && fee.upgradeFlat > 0) {
-            const coin = await feeCoin(
-              PRICING_DENOM[spec.infra.akashNetwork],
-              String(fee.upgradeFlat),
-              ctx.services.api,
-            );
-            if (coin) msgs.push(sendMsg(owner, fee.address, coin));
-            else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
-          }
-          await ctx.requireTx(p("update"), msgs);
-        }
-        // The row is written only once the provider has taken the manifest.
-        // Recording it before the push made the fleet claim an image that was
-        // never deployed, which the upgrade button then read as "already on
-        // that version" and refused to re-send (2026-09-18).
-        await pushManifest(
-          ctx,
-          loadCert(ctx),
-          key,
-          row.host_uri,
-          row.dseq,
-          fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8"),
-        );
-        if (mainSwapped) ctx.db.updateComponentRuntime(ctx.launchId, key, { image: params.image });
-        return { image: params.image, services: swapped, txSkipped: onChain?.hash === wantHash };
+          if (!feeDue || cfg.upgradeFlat <= 0) return [];
+          const coin = await feeCoin(
+            PRICING_DENOM[spec.infra.akashNetwork],
+            String(cfg.upgradeFlat),
+            ctx.services.api,
+          );
+          if (coin) return [sendMsg(owner, cfg.address, coin)];
+          ctx.log("AKT oracle price unavailable — upgrade fee skipped");
+          return [];
+        };
+        const r = await swapComponentImage(ctx, spec, key, params.image, p("update"), fee);
+        return { image: params.image, ...r };
       },
     });
 
     steps.push({
       name: p("verify"),
-      async run(ctx) {
+      async run(ctx): Promise<UpgradeVerifyOutput & Record<string, unknown>> {
+        if (rolledBack(ctx)) return { healthy: true, skipped: true };
         // service components (§5): the update is just the image swap plus
         // an HTTP health gate on the public domain, when the kind has one
         const comp = stateless.get(key);
@@ -2474,6 +2646,21 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         };
         const cause = (e: unknown) =>
           (e instanceof Error ? e.message : String(e)).slice(0, 200);
+        // whether the node ever answered with a height: one that never did
+        // cannot have committed anything on the new binary
+        let served = false;
+        // a boot that dies at the handshake says why in its log; reading it
+        // every few rounds ends a hopeless wait early
+        const incompatible = async (): Promise<string | undefined> => {
+          try {
+            const logs = await ctx.services.provider.leaseLogs(
+              loadCert(ctx), row.host_uri, row.dseq, 1, 1, HALT_LOG_TAIL,
+            );
+            return incompatibleReleaseReason(logs);
+          } catch {
+            return undefined; // mid-restart: no stream to read yet
+          }
+        };
         for (let i = 0; i < 60; i++) {
           if (key.startsWith("sentry-")) {
             // a sentry proves itself over its public RPC — height progress
@@ -2481,6 +2668,7 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
             try {
               const url = await nodeRpcUrl(ctx, row.host_uri, row.dseq);
               const a = await ctx.services.rpc.status(url);
+              served = true;
               await ctx.services.sleep(3000);
               const b = await ctx.services.rpc.status(url);
               if (b.latestBlockHeight > a.latestBlockHeight) return { healthy: true };
@@ -2506,6 +2694,7 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
                 return Number(/latest_block_height."?:?"?(\d+)/.exec(r.stdout)?.[1]);
               };
               const a = await inContainerHeight();
+              if (Number.isFinite(a)) served = true;
               await ctx.services.sleep(3000);
               const b = await inContainerHeight();
               if (Number.isFinite(b) && b > a) return { healthy: true };
@@ -2518,11 +2707,45 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
               note(`in-container rpc probe failed: ${cause(e)}`);
             }
           }
+          if (!served && i % 6 === 5) {
+            const reason = await incompatible();
+            if (reason) return { healthy: false, reason };
+          }
           await ctx.services.sleep(5000);
+        }
+        if (!served) {
+          const reason =
+            (await incompatible()) ??
+            `it never came up on the new image (last: ${lastNote || "no probe ran"})`;
+          return { healthy: false, reason };
         }
         throw new Error(
           `${key} did not come back healthy after upgrade (last: ${lastNote || "no probe ran"})`,
         );
+      },
+    });
+
+    if (!isNode) continue;
+    steps.push({
+      name: p("rollback"),
+      async run(ctx): Promise<UpgradeRollbackOutput> {
+        const verify = ctx.output<UpgradeVerifyOutput>(p("verify"));
+        if (!verify || verify.healthy) return { skipped: true };
+        // rows made before images were recorded carry none; chain nodes
+        // render from the spec's sparkdreamd image, so that is what ran
+        const prev = params.previous?.[key] ?? params.previousSpecImages?.sparkdreamd;
+        if (!prev || prev === params.image) {
+          throw new Error(
+            `${key} cannot run ${params.image}: ${verify.reason}. The image it ran before is ` +
+              "not recorded, so it was not rolled back; upgrade it back to its previous version.",
+          );
+        }
+        ctx.log(`${key}: ${verify.reason}; rolling back to ${prev}`);
+        await swapComponentImage(ctx, spec, key, prev, p("rollback"), async () => []);
+        // the op recorded the new image in the spec at request time; put the
+        // old one back so relaunches and resets render what actually works
+        restoreSpecImages(ctx, params.image, params.previousSpecImages);
+        return { rolledBack: true, to: prev, reason: verify.reason ?? "it failed its health check" };
       },
     });
   }
@@ -2530,6 +2753,19 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
   steps.push({
     name: `op${opId}:finish`,
     async run(ctx) {
+      const rb = rolledBack(ctx);
+      if (rb) {
+        // the op stays open on this error so it is seen; retrying it only
+        // repeats this message (every component step skips once one rolled
+        // back), so nothing can push the image any further
+        const untouched = ordered.slice(ordered.indexOf(rb.key) + 1);
+        throw new Error(
+          `Upgrade to ${params.image} stopped and rolled back: ${rb.key} could not run it, because ${rb.out.reason}. ` +
+            `${rb.key} is back on ${rb.out.to}` +
+            (untouched.length > 0 ? `; ${untouched.join(", ")} not touched` : "") +
+            ". Abort this operation to dismiss it.",
+        );
+      }
       ctx.db.setFleetOpStatus(opId, "done");
       return { upgraded: ordered, image: params.image };
     },
@@ -2541,6 +2777,68 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
 export interface HaltUpgradeParams {
   image: string;
   haltHeight: number;
+  /** Image each chain node ran when the op was requested (rollback target).
+   *  Absent on older ops. */
+  previous?: Record<string, string>;
+  /** spec.images before the op recorded the new image. */
+  previousSpecImages?: Record<string, string>;
+}
+
+/**
+ * Move every chain node to `image` in one batched MsgUpdateDeployment, then
+ * push the manifests and record the image on each row. The halt upgrade's
+ * swap, and its rollback's.
+ */
+async function swapNodeImages(
+  ctx: StepCtx,
+  rows: FleetComponentRow[],
+  image: (row: FleetComponentRow) => string,
+  txStep: string,
+  extraMsgs: (owner: string) => Promise<Msg[]>,
+): Promise<string[]> {
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const msgs: Msg[] = [];
+  const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
+  for (const row of rows) {
+    const sdlPath = sdlPathFor(ctx, row.key);
+    let sdl = fs.readFileSync(sdlPath, "utf8");
+    sdl = sdl.replace(/image: .*/g, `image: ${image(row)}`);
+    fs.writeFileSync(sdlPath, sdl);
+    const artifacts = sdlArtifacts(loadSdl(sdlPath));
+    const json = artifacts.manifestJson;
+    fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), json);
+    manifests.push({ row, json });
+    msgs.push({
+      typeUrl: TypeUrl.UpdateDeployment,
+      value: {
+        id: { owner, dseq: row.dseq },
+        hash: Buffer.from(artifacts.hash).toString("base64"),
+      },
+    });
+  }
+  msgs.push(...(await extraMsgs(owner)));
+  // one batched tx: all nodes move together
+  await ctx.requireTx(txStep, msgs);
+  const cert = loadCert(ctx);
+  for (const { row, json } of manifests) {
+    await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+    ctx.db.updateComponentRuntime(ctx.launchId, row.key, { image: image(row) });
+  }
+  return manifests.map((m) => m.row.key);
+}
+
+/** Put the op's recorded spec images back where the op replaced them. */
+function restoreSpecImages(
+  ctx: StepCtx,
+  image: string,
+  previousSpecImages: Record<string, string> | undefined,
+): void {
+  const stored = JSON.parse(ctx.db.getLaunch(ctx.launchId)!.spec_json) as LaunchSpec;
+  const images = stored.images as Record<string, string | undefined>;
+  for (const [k, v] of Object.entries(previousSpecImages ?? {})) {
+    if (images[k] === image) images[k] = v;
+  }
+  ctx.db.setLaunchSpec(ctx.launchId, JSON.stringify(stored));
 }
 
 /**
@@ -2641,57 +2939,58 @@ export function haltUpgradeSteps(
     {
       name: p("update-all"),
       async run(ctx) {
-        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-        const msgs: Msg[] = [];
-        const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
-        for (const row of nodeRows(ctx)) {
-          const sdlPath = sdlPathFor(ctx, row.key);
-          let sdl = fs.readFileSync(sdlPath, "utf8");
-          sdl = sdl.replace(/image: .*/g, `image: ${params.image}`);
-          fs.writeFileSync(sdlPath, sdl);
-          const artifacts = sdlArtifacts(loadSdl(sdlPath));
-          const json = artifacts.manifestJson;
-          fs.writeFileSync(path.join(ctx.dirs.sdl, `${row.key}.manifest.json`), json);
-          manifests.push({ row, json });
-          msgs.push({
-            typeUrl: TypeUrl.UpdateDeployment,
-            value: {
-              id: { owner, dseq: row.dseq },
-              hash: Buffer.from(artifacts.hash).toString("base64"),
-            },
-          });
-        }
-        // upgrade service fee — flat, once per op, on this batched update
-        const fee = feeConfig();
-        if (fee.upgradeFlat > 0) {
-          const coin = await feeCoin(
-            PRICING_DENOM[spec.infra.akashNetwork],
-            String(fee.upgradeFlat),
-            ctx.services.api,
-          );
-          if (coin) msgs.push(sendMsg(owner, fee.address, coin));
-          else ctx.log("AKT oracle price unavailable — upgrade fee skipped");
-        }
-        // one batched tx: all nodes move to the new binary together
-        await ctx.requireTx(p("update-all"), msgs);
-        const cert = loadCert(ctx);
-        for (const { row, json } of manifests) {
-          await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
-          ctx.db.updateComponentRuntime(ctx.launchId, row.key, { image: params.image });
-        }
-        return { updated: manifests.map((m) => m.row.key) };
+        const updated = await swapNodeImages(
+          ctx,
+          nodeRows(ctx),
+          () => params.image,
+          p("update-all"),
+          async (owner) => {
+            // upgrade service fee — flat, once per op, on this batched update
+            const fee = feeConfig();
+            if (fee.upgradeFlat <= 0) return [];
+            const coin = await feeCoin(
+              PRICING_DENOM[spec.infra.akashNetwork],
+              String(fee.upgradeFlat),
+              ctx.services.api,
+            );
+            if (coin) return [sendMsg(owner, fee.address, coin)];
+            ctx.log("AKT oracle price unavailable — upgrade fee skipped");
+            return [];
+          },
+        );
+        return { updated };
       },
     },
     {
       name: p("resume-verify"),
-      async run(ctx) {
+      async run(ctx): Promise<{ resumedAt?: number; reason?: string }> {
         // providers restart containers on the new image; WAIT_FOR_CONFIG=false
-        // (step 20b) auto-starts them — chain resumes once >2/3 are back
+        // (step 20b) auto-starts them — chain resumes once >2/3 are back.
+        // highest head seen: once it reaches the halt height the new binary
+        // has committed a block, and rolling back is no longer safe
+        let highest = 0;
+        // a node that dies at boot says why in its log; reading the nodes
+        // every minute ends a hopeless wait early
+        const incompatible = async (): Promise<string | undefined> => {
+          const cert = loadCert(ctx);
+          for (const row of nodeRows(ctx)) {
+            try {
+              const logs = await ctx.services.provider.leaseLogs(
+                cert, row.host_uri, row.dseq, 1, 1, HALT_LOG_TAIL,
+              );
+              const reason = incompatibleReleaseReason(logs);
+              if (reason) return `${row.key}: ${reason}`;
+            } catch {
+              // mid-restart: no stream to read yet
+            }
+          }
+          return undefined;
+        };
         for (let i = 0; i < 240; i++) {
           try {
             const height = await sentryRpcHeight(ctx);
+            if (height !== undefined) highest = Math.max(highest, height);
             if (height !== undefined && height > params.haltHeight) {
-              ctx.db.setFleetOpStatus(opId, "done");
               return { resumedAt: height };
             }
           } catch {
@@ -2699,9 +2998,84 @@ export function haltUpgradeSteps(
             // only once the provider has restarted it on the new image — the
             // loop is the retry, not a reason to fail the op
           }
+          if (highest < params.haltHeight && i % 12 === 11) {
+            const reason = await incompatible();
+            if (reason) return { reason };
+          }
           await ctx.services.sleep(5000);
         }
+        if (highest < params.haltHeight) {
+          return {
+            reason:
+              (await incompatible()) ??
+              `the chain never got past the halt height ${params.haltHeight} on the new image`,
+          };
+        }
         throw new Error("chain did not resume after the coordinated upgrade");
+      },
+    },
+    {
+      name: p("rollback"),
+      async run(ctx) {
+        const verify = ctx.output<{ resumedAt?: number; reason?: string }>(p("resume-verify"));
+        if (!verify?.reason) return { skipped: true };
+        // the new binary never committed a block (the head stayed below the
+        // halt height), and halt-clear already reset the setting, so the old
+        // binary picks the chain up exactly where it halted
+        const rows = nodeRows(ctx);
+        const fallback = params.previousSpecImages?.sparkdreamd;
+        const target = (row: FleetComponentRow) => params.previous?.[row.key] ?? fallback;
+        const missing = rows.filter((r) => !target(r) || target(r) === params.image);
+        if (missing.length > 0) {
+          throw new Error(
+            `the nodes cannot run ${params.image}: ${verify.reason}. The image ` +
+              `${missing.map((r) => r.key).join(", ")} ran before is not recorded, so nothing ` +
+              "was rolled back; upgrade the nodes back to their previous version.",
+          );
+        }
+        ctx.log(`${verify.reason}; rolling every node back`);
+        await swapNodeImages(ctx, rows, (row) => target(row)!, p("rollback"), async () => []);
+        restoreSpecImages(ctx, params.image, params.previousSpecImages);
+        // the chain only runs again once the old binary is back on enough
+        // power; wait for it so the op's closing message can say so
+        let resumedAt: number | undefined;
+        for (let i = 0; i < 120 && resumedAt === undefined; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          try {
+            const h = await sentryRpcHeight(ctx);
+            if (h !== undefined && h >= params.haltHeight) resumedAt = h;
+          } catch {
+            // restarting on the old image
+          }
+        }
+        return {
+          rolledBack: true,
+          to: [...new Set(rows.map((r) => target(r)!))].join(", "),
+          reason: verify.reason,
+          ...(resumedAt !== undefined ? { resumedAt } : {}),
+        };
+      },
+    },
+    {
+      name: p("finish"),
+      async run(ctx) {
+        const rb = ctx.output<{ rolledBack?: boolean; to?: string; reason?: string; resumedAt?: number }>(
+          p("rollback"),
+        );
+        if (rb?.rolledBack) {
+          // the op stays open on this error so it is seen; a retry only
+          // repeats it
+          throw new Error(
+            `Upgrade to ${params.image} stopped and rolled back: ${rb.reason}. Every node is back ` +
+              `on ${rb.to}` +
+              (rb.resumedAt !== undefined
+                ? ` and the chain resumed (height ${rb.resumedAt})`
+                : ", but the chain has not resumed yet: check the nodes") +
+              ". Abort this operation to dismiss it.",
+          );
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { resumedAt: ctx.output<{ resumedAt?: number }>(p("resume-verify"))?.resumedAt };
       },
     },
   ];
@@ -4668,6 +5042,7 @@ function buildSteps(
     }
     if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
     if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
+    if (op.kind === "relayer-paths") steps.push(...relayerPathsSteps(op.id, params, spec));
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
     if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));

@@ -153,6 +153,11 @@ topology:
     #         gasDenom: uosmo
     #         gasPrice: 0.025
     #         maxBalance: "5000000"
+    #         # optional: follow Osmosis' fee market up to max (gasPrice is the fallback),
+    #         # poll instead of the websocket, and a gas limit margin (default 2.5)
+    #         # dynamicGasPrice: { multiplier: 1.1, max: 0.1 }
+    #         # eventSource: pull
+    #         # gasMultiplier: 1.5
     # Mastodon instance (web + sidekiq, streaming, postgres, redis in one
     # deployment). Its domain is permanent (ActivityPub ids embed it); DNS
     # needs the domain and streaming.<domain>. The owner's password shows up
@@ -4510,6 +4515,52 @@ export default function Page() {
                                         }}
                                       >
                                         relink
+                                      </button>
+                                      <button
+                                        className="btn"
+                                        title="Change the chains the relayer relays to: takes topology.components.relayer.paths from the spec editor. New paths get their channels opened; dropped ones stop being relayed (their channels stay open on chain). A new or dropped fleet counterparty updates the relayer's deployment (one signature)."
+                                        onClick={async () => {
+                                          try {
+                                            const deployed = (await getLaunch(f.launchId)).spec as any;
+                                            const current: Array<{ id: string }> =
+                                              deployed?.topology?.components?.relayer?.paths ?? [];
+                                            const edited = (yaml.load(specText) as any)?.topology?.components?.relayer?.paths;
+                                            if (!Array.isArray(edited)) {
+                                              // nothing to take yet: start the editor from this fleet's spec
+                                              if (!confirmDraftOverwrite()) return;
+                                              updateSpec(yaml.dump(deployed, { lineWidth: 120 }));
+                                              window.alert(
+                                                "The editor now holds this fleet's spec. Edit topology.components.relayer.paths " +
+                                                  "(see the example spec for a path's fields), then click paths… again.",
+                                              );
+                                              return;
+                                            }
+                                            const before = current.map((p) => p.id);
+                                            const after = edited.map((p: { id?: string }) => String(p?.id));
+                                            const added = after.filter((id: string) => !before.includes(id));
+                                            const dropped = before.filter((id) => !after.includes(id));
+                                            if (
+                                              !window.confirm(
+                                                [
+                                                  `Relayer paths: ${before.join(", ") || "(none)"} → ${after.join(", ") || "(none)"}`,
+                                                  ...(added.length ? [`Added (channels opened): ${added.join(", ")}`] : []),
+                                                  ...(dropped.length ? [`Dropped (no longer relayed, channels stay open): ${dropped.join(", ")}`] : []),
+                                                  "",
+                                                  "A new chain's relayer key needs gas money there: the op pauses with the address to fund. Apply?",
+                                                ].join("\n"),
+                                              )
+                                            ) {
+                                              return;
+                                            }
+                                            const { postRelayerPaths } = await import("../lib/api");
+                                            await postRelayerPaths(f.launchId, edited);
+                                            openLaunch(f.launchId);
+                                          } catch (e) {
+                                            setError(String(e));
+                                          }
+                                        }}
+                                      >
+                                        paths…
                                       </button>
                                     </>
                                   )}

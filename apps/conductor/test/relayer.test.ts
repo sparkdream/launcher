@@ -15,6 +15,7 @@ import {
   renderHermesConfig,
   renderRelayManifest,
   resolveRelayFleet,
+  suggestedTopUp,
   type RelayChannel,
 } from "../src/relayer.js";
 import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
@@ -43,6 +44,17 @@ const osmosis: RelayerPath = {
     gasPrice: 0.025,
     hdPath: "m/44'/118'/0'/0/0",
   },
+};
+
+const osmosisMarket: RelayerPath = {
+  ...osmosis,
+  counterparty: {
+    ...osmosis.counterparty,
+    gasPrice: 0.0025,
+    dynamicGasPrice: { multiplier: 1.2, max: 0.1 },
+    eventSource: "pull",
+    gasMultiplier: 1.5,
+  } as RelayerPath["counterparty"],
 };
 
 function spec(name: string, headscale: Record<string, unknown>, paths: RelayerPath[] = []): LaunchSpec {
@@ -116,6 +128,10 @@ describe("relayer rendering", () => {
     expect(before).not.toMatch(/price = [0-9]+,/);
     // no trusting_period for chains that did not set one: Hermes derives it
     expect(before).not.toContain("trusting_period");
+    // fixed price, push events and the 2.5 margin unless the counterparty says otherwise
+    expect(before).not.toContain("dynamic_gas_price");
+    expect(before).not.toContain("mode = 'pull'");
+    expect(before.match(/gas_multiplier = 2\.5/g)).toHaveLength(2);
 
     const channels: RelayChannel[] = [
       {
@@ -155,6 +171,31 @@ function ibcHermes(): string | null {
   }
 }
 
+describe("relayer on a fee-market chain", () => {
+  it("follows the fee market, polls instead of the websocket, and takes its own gas margin", () => {
+    const db = new ConductorDb(path.join(tmp(), "state.db"));
+    const plan = relayPlan(db, "self", spec("sparkdream", { domain: "hs.example" }, [osmosisMarket]));
+    const text = renderHermesConfig(plan);
+    const [own, osmo] = text.split("[[chains]]").slice(1);
+    expect(osmo).toContain("dynamic_gas_price = { enabled = true, multiplier = 1.2, max = 0.1 }");
+    expect(osmo).toContain("gas_price = { price = 0.0025, denom = 'uosmo' }");
+    expect(osmo).toContain("event_source = { mode = 'pull', interval = '1s', max_retries = 4 }");
+    expect(osmo).toContain("gas_multiplier = 1.5");
+    // this fleet's chain keeps its fixed price, the websocket and 2.5
+    expect(own).not.toContain("dynamic_gas_price");
+    expect(own).toContain("event_source = { mode = 'push', url = 'ws://127.0.0.1:26657/websocket'");
+    expect(own).toContain("gas_multiplier = 2.5");
+    db.close();
+  });
+
+  it("asks for a top-up at the dynamic price's max, still under the cap", () => {
+    // 1000 txs x 300k gas: 750000 at the fixed 0.0025, 30000000 at max 0.1
+    expect(suggestedTopUp({ gasPrice: 0.0025 }, undefined)).toBe(750_000n);
+    expect(suggestedTopUp({ gasPrice: 0.0025, dynamicGasPrice: { multiplier: 1.1, max: 0.1 } }, undefined)).toBe(30_000_000n);
+    expect(suggestedTopUp({ gasPrice: 0.0025, dynamicGasPrice: { multiplier: 1.1, max: 0.1 } }, 5_000_000n)).toBe(5_000_000n);
+  });
+});
+
 describe("relayer config against a real Hermes", () => {
   const hermes = ibcHermes();
   it.skipIf(!hermes)("hermes config validate accepts the rendered config, before and after pinning", () => {
@@ -173,6 +214,7 @@ describe("relayer config against a real Hermes", () => {
     for (const [name, text] of [
       ["open.toml", renderHermesConfig(plan)],
       ["pinned.toml", renderHermesConfig(plan, pinned)],
+      ["market.toml", renderHermesConfig(relayPlan(db, "self", spec("sparkdream", { domain: "hs.example" }, [osmosisMarket])))],
     ] as const) {
       const file = path.join(dir, name);
       fs.writeFileSync(file, text);
@@ -409,6 +451,67 @@ describe("relayer between two fleets", () => {
         (e) => e.target === `${relayer.ssh_host}:${relayer.ssh_port}` && e.command.includes("kill 1"),
       ),
     ).toBe(true);
+    db.close();
+  }, 180_000);
+
+  it("changes a running relayer's paths: a new fleet counterparty retunnels in place, an endpoint change only relinks", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const fleet = new FleetService(db, services, work);
+    const specA = spec("sparkdream", { domain: "hs.example" });
+    const a = await launch(db, work, services, "fleet-a", specA);
+    if (a.status !== "completed") throw new Error(explain(db, "fleet-a"));
+    fleet.materialize("fleet-a");
+    const specB = spec("sparkdreamtwo", { reuseFleet: "fleet-a", domain: "hs.example" }, [osmosis]);
+    const b = await launch(db, work, services, "fleet-b", specB);
+    if (b.status !== "completed") throw new Error(explain(db, "fleet-b"));
+    fleet.materialize("fleet-b");
+    const relayer = db.listFleetComponents("fleet-b").find((c) => c.key === "relayer")!;
+    const sentryA = db.listFleetComponents("fleet-a").find((c) => c.key === "sentry-0")!;
+    const run = async () => {
+      const signer = new FakeSigner();
+      const res = await runWithSigner(
+        db,
+        "fleet-b",
+        specB,
+        work,
+        [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
+        services,
+        signer,
+      );
+      if (res.status !== "completed") throw new Error(explain(db, "fleet-b"));
+      return signer.signed.flat().map((m) => m.typeUrl);
+    };
+
+    // add a transfer path to fleet A, by name: a new tunnel, one update tx
+    const xferA: RelayerPath = { id: "xfer-a", kind: "transfer", counterparty: { fleet: "sparkdream" } };
+    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis, xferA]);
+    expect(JSON.parse(db.listFleetOps("fleet-b", "active")[0]!.params_json)).toEqual({ retunnel: true });
+    const stored = JSON.parse(db.getLaunch("fleet-b")!.spec_json) as LaunchSpec;
+    expect(stored.topology.components.relayer!.paths[1]!.counterparty).toEqual({ fleet: "fleet-a" });
+    expect(() => fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis])).toThrow(/busy with a relayer-paths op/);
+    const opens = services.ssh.relayOpens;
+    const signed = await run();
+    expect(signed.filter((t) => /MsgUpdateDeployment/.test(t))).toHaveLength(1);
+    const sdl = fs.readFileSync(path.join(work, "launches", "fleet-b", "sdl", "relayer.yaml"), "utf8");
+    expect(sdl).toContain(`TS_TUNNEL_3=9091:${sentryA.tailnet_ip}:9090`);
+    expect(sdl).toContain(`TS_TUNNEL_4=26658:${sentryA.tailnet_ip}:26657`);
+    // A's sentry opened its gRPC for the tunnel; the new channel opened
+    const aId = `${sentryA.ssh_host}:${sentryA.ssh_port}`;
+    expect(services.ssh.appToml.get(aId)).toContain('address = "0.0.0.0:9090"');
+    expect(services.ssh.relayOpens).toBeGreaterThan(opens);
+    const state = fleet.relayerState(db.getLaunch("fleet-b")!)!;
+    expect(state.channels.map((c) => c.id)).toEqual(["osmo", "xfer-a"]);
+    expect(db.listFleetOps("fleet-b").find((o) => o.kind === "relayer-paths")!.status).toBe("done");
+
+    // drop the Osmosis path: same tunnels, so no signature, just a relink
+    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [xferA]);
+    expect(JSON.parse(db.listFleetOps("fleet-b", "active")[0]!.params_json)).toEqual({ retunnel: false });
+    expect(await run()).toEqual([]);
+    const config = services.ssh.files.get(`${relayer.ssh_host}:${relayer.ssh_port}|/data/relayer/config.toml`)!;
+    expect(config).not.toContain("osmo-test-5");
+    expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toEqual(["xfer-a"]);
     db.close();
   }, 180_000);
 

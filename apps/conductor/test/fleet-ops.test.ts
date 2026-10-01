@@ -748,6 +748,80 @@ describe("rolling upgrade op", () => {
     expect(row.image).toBe(before);
   }, 120_000);
 
+  it("rolls a sentry back when the new release cannot read the chain's state, and stops there", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v9.9.9";
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const val = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const specImageBefore = JSON.parse(launch.spec_json).images.sparkdreamd;
+    // devnet 2026-09-30: the new binary dies at the handshake on every boot,
+    // so the sentry never serves RPC and its log says why
+    let swapped = false;
+    const realStatus = w.services.rpc.status.bind(w.services.rpc);
+    w.services.rpc.status = async (url: string) => {
+      if (swapped) throw new Error("fetch failed");
+      return realStatus(url);
+    };
+    w.services.provider.leaseLogs = async () =>
+      swapped
+        ? "Error: error during handshake: error on replay: collections: encoding error: value " +
+          "decode: proto: wrong wireType = 0 for field MaxTipsSentPerEpoch\n"
+        : "";
+    const realPush = w.services.provider.sendManifest.bind(w.services.provider);
+    w.services.provider.sendManifest = async (...args: Parameters<typeof realPush>) => {
+      await realPush(...args);
+      // the new image is live once its manifest lands; the rollback's puts it back
+      swapped = args[3]?.includes(image) ?? false;
+    };
+    const opId = w.fleet.requestUpgrade(launch, ["sentry-0", "val-0"], image);
+    const sigsBefore = w.signer.signed.length;
+
+    const result = await driveOps(w);
+    const finish = `op${opId}:finish`;
+    expect(result.failedStep, w.db.getStep("fl", result.failedStep ?? "")?.error ?? "").toBe(finish);
+    const error = w.db.getStep("fl", finish)!.error!;
+    expect(error).toContain("cannot read the chain's stored state");
+    expect(error).toContain("MaxTipsSentPerEpoch");
+    const was = sentry.image ?? specImageBefore;
+    expect(error).toContain(`back on ${was}`);
+    expect(error).toContain("val-0 not touched");
+    // two txs: the update, then the rollback; val-0 never got one
+    expect(w.signer.signed.length - sigsBefore).toBe(2);
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(was);
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!.image).toBe(val.image);
+    const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl/sentry-0.yaml"), "utf8");
+    expect(sdl).toContain(`image: ${was}`);
+    expect(sdl).not.toContain(image);
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.sparkdreamd).toBe(specImageBefore);
+
+    // retrying only repeats the message: nothing moves toward the bad image
+    const again = await driveOps(w);
+    expect(again.failedStep).toBe(finish);
+    expect(w.signer.signed.length - sigsBefore).toBe(2);
+    await w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("aborted");
+  }, 120_000);
+
+  it("rolls a node back that never serves RPC on the new image, even with nothing in its log", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v9.9.9";
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    w.services.rpc.status = async () => {
+      throw new Error("fetch failed");
+    };
+    const opId = w.fleet.requestUpgrade(launch, ["sentry-0"], image);
+
+    const result = await driveOps(w);
+    const finish = `op${opId}:finish`;
+    expect(result.failedStep, w.db.getStep("fl", result.failedStep ?? "")?.error ?? "").toBe(finish);
+    expect(w.db.getStep("fl", finish)!.error).toContain("never came up on the new image");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.image).toBe(
+      sentry.image ?? JSON.parse(launch.spec_json).images.sparkdreamd,
+    );
+  }, 120_000);
+
   it("fails a sentry whose height stalls, reporting the last probe result", async () => {
     const w = await launched();
     const launch = w.db.getLaunch("fl")!;
@@ -2192,6 +2266,85 @@ describe("halt-height upgrade", () => {
       expect(c.image).toBe(image);
     }
     expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 120_000);
+
+  it("rolls every node back when the new binary cannot read the halted chain's state", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v9.9.9";
+    const nodes = () => w.db.listFleetComponents("fl").filter((c) => /^(val|sentry)-/.test(c.key));
+    const specImageBefore = JSON.parse(launch.spec_json).images.sparkdreamd;
+    const was = new Map(nodes().map((c) => [c.key, c.image ?? specImageBefore]));
+    // the new binary dies at the handshake on every boot: no node serves
+    // RPC while it runs, and each one's log says why
+    const onNew = new Set<string>();
+    const realStatus = w.services.rpc.status.bind(w.services.rpc);
+    w.services.rpc.status = async (url: string) => {
+      if (onNew.size > 0) throw new Error("fetch failed");
+      return realStatus(url);
+    };
+    const realLogs = w.services.provider.leaseLogs.bind(w.services.provider);
+    w.services.provider.leaseLogs = async (...args: Parameters<typeof realLogs>) =>
+      onNew.has(args[2])
+        ? "Error: error during handshake: error on replay: collections: encoding error: value " +
+          "decode: proto: wrong wireType = 0 for field MaxTipsSentPerEpoch\n"
+        : realLogs(...args);
+    const realPush = w.services.provider.sendManifest.bind(w.services.provider);
+    w.services.provider.sendManifest = async (...args: Parameters<typeof realPush>) => {
+      await realPush(...args);
+      if (args[3]?.includes(image)) onNew.add(args[2]);
+      else onNew.delete(args[2]);
+    };
+    const opId = w.fleet.requestHaltUpgrade(launch, image, 10);
+    const sigsBefore = w.signer.signed.length;
+
+    const result = await driveOps(w);
+    const finish = `op${opId}:finish`;
+    expect(result.failedStep, w.db.getStep("fl", result.failedStep ?? "")?.error ?? "").toBe(finish);
+    const error = w.db.getStep("fl", finish)!.error!;
+    expect(error).toContain("cannot read the chain's stored state");
+    expect(error).toContain("the chain resumed");
+    // two batched txs: the swap, then the swap back
+    expect(w.signer.signed.length - sigsBefore).toBe(2);
+    for (const c of nodes()) {
+      expect(c.image).toBe(was.get(c.key));
+      const sdl = fs.readFileSync(path.join(w.work, "launches/fl/sdl", `${c.key}.yaml`), "utf8");
+      expect(sdl).not.toContain(image);
+    }
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).images.sparkdreamd).toBe(specImageBefore);
+    // halt-height stays cleared: the old binary is not sent back into a halt
+    expect(w.services.ssh.haltedNodes()).toEqual([]);
+
+    const again = await driveOps(w);
+    expect(again.failedStep).toBe(finish);
+    expect(w.signer.signed.length - sigsBefore).toBe(2);
+    w.db.close();
+  }, 120_000);
+
+  it("does not roll back once the new binary has committed past the halt height", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v9.9.9";
+    // after the swap the chain makes block 10 on the new binary, then stalls
+    // there: the new binary wrote state, so going back is not safe
+    let swapped = false;
+    const realStatus = w.services.rpc.status.bind(w.services.rpc);
+    w.services.rpc.status = async (url: string) =>
+      swapped ? { latestBlockHeight: 10, catchingUp: false } : realStatus(url);
+    const realPush = w.services.provider.sendManifest.bind(w.services.provider);
+    w.services.provider.sendManifest = async (...args: Parameters<typeof realPush>) => {
+      await realPush(...args);
+      if (args[3]?.includes(image)) swapped = true;
+    };
+    const opId = w.fleet.requestHaltUpgrade(launch, image, 10);
+
+    const result = await driveOps(w);
+    expect(result.failedStep).toBe(`op${opId}:resume-verify`);
+    expect(w.db.getStep("fl", `op${opId}:resume-verify`)!.error).toContain("did not resume");
+    for (const c of w.db.listFleetComponents("fl").filter((x) => /^(val|sentry)-/.test(x.key))) {
+      expect(c.image).toBe(image);
+    }
     w.db.close();
   }, 120_000);
 

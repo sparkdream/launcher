@@ -1501,6 +1501,24 @@ monitor records each node's running version (RPC `/abci_info`), and the
 dashboard warns on mixed versions lingering past an upgrade or on an
 attempted downgrade.
 
+**Rollback**: both flows record the image every chain node ran when the op
+was requested, and put the nodes back on it (one more signature) when the
+new release cannot run on the chain. That happens only when it is known to
+be safe, meaning the new binary never committed a block: its log names a
+startup failure no wait fixes (the stored state no longer decodes, replay
+diverges, or an upgrade name mismatch; `incompatibleReleaseReason`), or it
+never came up at all (rolling: the node never served RPC; coordinated: the
+chain head never reached the halt height). The rolling flow rolls back the
+failing node and leaves the rest untouched; the coordinated flow swaps
+every node back in one batched tx, and since halt-clear already reset
+`halt-height`, the old binary resumes the chain where it halted. A node
+that came up and then stalled is not rolled back, because the new binary
+may already have written state the old one cannot read. Either way the op
+ends on an error that says what happened, and aborting it dismisses it.
+Seen live 2026-09-30: v1.0.48 reused x/rep param field numbers with new
+types and no migration, so the rolling flow's first sentry died at the
+handshake (`wrong wireType = 0 for field MaxTipsSentPerEpoch`).
+
 ### Chain reset (day-2)
 
 For state-breaking upgrades (and devnet iteration generally): wipe all

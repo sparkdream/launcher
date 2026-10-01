@@ -1358,6 +1358,25 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return state;
   });
 
+  // replace a running relayer's paths (relayer-paths op): add or drop a
+  // chain it relays to; the relayer links to the new set
+  app.post("/api/fleet/:launchId/relayer/paths", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { paths?: RelayerPath[] };
+    if (!Array.isArray(body.paths)) return reply.status(400).send({ error: "paths (an array) is required" });
+    try {
+      const opId = fleet.requestRelayerPaths(launch, body.paths);
+      // the op's steps are built from the spec just written
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "relayer-paths-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   // re-link the relayer (relink op): after anything that wiped IBC state on
   // either end — a chain reset here or on a counterparty fleet
   app.post("/api/fleet/:launchId/relink", async (req, reply) => {

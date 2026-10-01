@@ -751,6 +751,22 @@ describe("stateless components", () => {
       ]),
     );
     expect(validateSpec(withRelayer([])).errors.some((e) => e.path === "topology.components.relayer.paths")).toBe(true);
+
+    const market = validateSpec(
+      withRelayer([
+        {
+          id: "osmo",
+          kind: "transfer",
+          counterparty: { ...osmo, dynamicGasPrice: { max: 0.01 }, eventSource: "pull", ws: "wss://rpc.example/websocket" },
+        },
+      ]),
+    );
+    expect(market.errors.map((e) => e.path)).toEqual(["topology.components.relayer.paths.0.counterparty.dynamicGasPrice.max"]);
+    expect(market.warnings.some((w) => w.path === "topology.components.relayer.paths.0.counterparty.ws")).toBe(true);
+    const fine = validateSpec(
+      withRelayer([{ id: "osmo", kind: "transfer", counterparty: { ...osmo, dynamicGasPrice: { max: 0.1 }, gasMultiplier: 1.3 } }]),
+    );
+    expect(fine.errors).toEqual([]);
   });
 
   it("disabled components derive to nothing and need no LCD", () => {

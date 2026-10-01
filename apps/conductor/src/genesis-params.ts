@@ -248,7 +248,9 @@ export function applyGenesisMembers(
       zeroed_at: 0,
       zeroed_count: 0,
       last_decay_epoch: 0,
-      tips_given_this_epoch: 0,
+      // no tip counter: v1.0.48 turned field 19 from a count
+      // (tips_given_this_epoch) into an amount (tips_sent_this_epoch), and
+      // leaving it out reads as zero under either shape
       last_tip_epoch: 0,
       completed_interims_count: 0,
       completed_initiatives_count: 0,

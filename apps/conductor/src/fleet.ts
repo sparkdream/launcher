@@ -24,7 +24,7 @@ import {
   type RelayerPath,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
-import { RELAYER_ACCOUNT, resolveRelayFleet } from "./relayer.js";
+import { RELAYER_ACCOUNT, relayerTunnels, resolveRelayFleet } from "./relayer.js";
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
@@ -62,7 +62,7 @@ import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
 import { imageRepo } from "./fleet-ops.js";
-import type { AddComponentParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, ResetChainParams, RetargetParams } from "./fleet-ops.js";
+import type { AddComponentParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -1833,6 +1833,44 @@ export class FleetService {
   }
 
   /**
+   * Replace a running relayer's paths (add a chain, drop one): the spec
+   * takes them, checked as adding the relayer checks them, and a
+   * "relayer-paths" op links the relayer to them. A new or dropped fleet
+   * counterparty changes the relayer's mesh tunnels, which the op updates
+   * in place first (one signature); endpoint counterparties are dialed
+   * directly, so changing only those needs none.
+   */
+  requestRelayerPaths(launch: LaunchRow, paths: RelayerPath[]): number {
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "relayer");
+    if (!row || row.state !== "active") throw new Error("this fleet has no active relayer");
+    const busy = this.db.listFleetOps(launch.id, "active").find((o) => {
+      if (o.kind === "relink" || o.kind === "relayer-paths") return true;
+      try {
+        return (JSON.parse(o.params_json) as { key?: string }).key === "relayer";
+      } catch {
+        return false;
+      }
+    });
+    if (busy) throw new Error(`the relayer is busy with a ${busy.kind} op: finish or abort it first`);
+    const current = this.spec(launch);
+    const spec = this.spec(launch);
+    spec.topology.components.relayer = { ...spec.topology.components.relayer!, paths };
+    Object.assign(spec, withDefaults(spec as unknown as LaunchSpecInput));
+    for (const p of spec.topology.components.relayer!.paths) {
+      if ("fleet" in p.counterparty) {
+        p.counterparty.fleet = resolveRelayFleet(this.db, spec, launch.owner, p.counterparty.fleet, launch.id);
+      }
+    }
+    const { errors } = validateSpec(spec);
+    if (errors.length > 0) {
+      throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    }
+    const retunnel = JSON.stringify(relayerTunnels(current)) !== JSON.stringify(relayerTunnels(spec));
+    this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    return this.db.createFleetOp(launch.id, "relayer-paths", { retunnel } satisfies RelayerPathsParams);
+  }
+
+  /**
    * Add a service component to a running fleet (or bring back a closed one):
    * enable it in the stored spec, re-validate, and start an add-component op
    * that renders, opens the sentries for it and places it. The component is
@@ -2284,8 +2322,29 @@ export class FleetService {
   }
 
   requestUpgrade(launch: LaunchRow, components: string[], image: string): number {
+    const before = this.imagesBefore(launch, (key) => components.includes(key));
     this.recordSpecImage(launch, components, image);
-    return this.db.createFleetOp(launch.id, "upgrade", { components, image });
+    const params: UpgradeParams = { components, image, ...before };
+    return this.db.createFleetOp(launch.id, "upgrade", params);
+  }
+
+  /** What the components run now, captured before an upgrade changes
+   *  anything: the op rolls nodes back to it when the new release cannot
+   *  run there. */
+  private imagesBefore(
+    launch: LaunchRow,
+    include: (key: string) => boolean,
+  ): { previous: Record<string, string>; previousSpecImages: Record<string, string> } {
+    const previous: Record<string, string> = {};
+    for (const c of this.db.listFleetComponents(launch.id)) {
+      if (c.state === "active" && include(c.key) && c.image) previous[c.key] = c.image;
+    }
+    const previousSpecImages = Object.fromEntries(
+      Object.entries(this.spec(launch).images as Record<string, string | undefined>).filter(
+        (e): e is [string, string] => typeof e[1] === "string",
+      ),
+    );
+    return { previous, previousSpecImages };
   }
 
   /**
@@ -2395,8 +2454,10 @@ export class FleetService {
   /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */
   requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number): number {
     if (isServicesFleet(this.spec(launch))) throw new Error("a services fleet runs no chain to upgrade");
+    const before = this.imagesBefore(launch, (key) => /^(val|sentry)-/.test(key));
     this.recordSpecImage(launch, ["val-0"], image); // halt-upgrade swaps every node
-    return this.db.createFleetOp(launch.id, "halt-upgrade", { image, haltHeight });
+    const params: HaltUpgradeParams = { image, haltHeight, ...before };
+    return this.db.createFleetOp(launch.id, "halt-upgrade", params);
   }
 
   /**
