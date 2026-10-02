@@ -504,7 +504,7 @@ async function activateByWallet(
 // Actors for launcher fleets
 
 /** The founder account the launcher generated (it holds the key), if any. */
-function founderAccount(spec: LaunchSpec): string | undefined {
+export function founderAccount(spec: LaunchSpec): string | undefined {
   const founder = spec.accounts.initial.find(
     (a) => a.generate && typeof a.council === "object" && a.council.founder,
   );

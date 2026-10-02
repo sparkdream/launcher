@@ -103,14 +103,20 @@ const componentToggle = z.object({
 /**
  * The far end of a relay path: another fleet on this launcher (resolved at
  * launch creation to its chain id, prefix, gas denom and sentry-0, and
- * reached over the shared mesh), or any chain named by its endpoints.
+ * reached over the shared mesh or its public ports), or any chain named by
+ * its endpoints.
  */
 const relayerFleetCounterparty = z
   .object({
     /** Launch id or unique network name of a fleet on this launcher. It must
-     *  share this fleet's mesh (one of the two reuses the other's headscale),
-     *  since its sentry's gRPC is only reachable over the tailnet. */
+     *  be on the same wallet and Akash network and have finished launching. */
     fleet: z.string().min(1),
+    /** How the relayer reaches that fleet's sentry-0. mesh: tunnels over the
+     *  shared tailnet. public: the sentry's provider-forwarded gRPC and RPC
+     *  ports, which the launcher opens on that fleet when linking; the only
+     *  way to a sister chain on another mesh. Unset, the launcher picks: mesh
+     *  when the fleets share one, public otherwise. */
+    via: z.enum(["mesh", "public"]).optional(),
   })
   .strict();
 
@@ -505,13 +511,15 @@ export const launchSpecSchema = z.object({
   kind: z.enum(["chain", "services"]).default("chain"),
 
   /**
-   * Other wallets on this launcher allowed to use this services fleet: their
-   * chain fleets may link a standalone bridge to its Mastodon (and copy its
-   * stored SMTP password into a fleet of their own). The fleet's own wallet
-   * always may. For one person's several wallets (a devnet one and a
-   * testnet one sharing one instance); the list is the owner's explicit
-   * opt-in, since a linking fleet's bridge setup reaches into this fleet's
-   * deployment with this fleet's certificate.
+   * Other wallets on this launcher allowed to use this fleet. For a services
+   * fleet, their chain fleets may link a standalone bridge to its Mastodon
+   * (and copy its stored SMTP password into a fleet of their own). For a
+   * chain fleet, their relayers may relay to its chain: federation and
+   * transfers between sister chains, with this fleet's founder key signing
+   * its end of a federation peer. The fleet's own wallet always may. For one
+   * person's several wallets (a devnet one and a testnet one); the list is
+   * the owner's explicit opt-in, since the linking fleet's setup reaches
+   * into this fleet's deployment with this fleet's certificate and keys.
    */
   sharing: z
     .object({ wallets: z.array(z.string().regex(/^akash1[02-9ac-hj-np-z]{38,58}$/, "an akash1... address")).max(32) })

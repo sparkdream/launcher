@@ -918,11 +918,24 @@ chain given by its endpoints.
   - on a counterparty fleet's sentry, over SSH with that fleet's key, when
     linking;
   - on any sentry another fleet's relayer dials, at relaunch (`relayedBy`).
-- **Same mesh.** The tunnels only work over one tailnet, so a fleet
-  counterparty must share this fleet's mesh (`reuseFleet` in either direction,
-  or both borrowing a third fleet's). `resolveRelayFleet` checks this at launch
-  creation and at add-component, together with same wallet, same Akash network
-  and "finished launching". It then rewrites the reference to the launch id.
+- **Mesh or public route.** A fleet counterparty's `via` says how the
+  relayer reaches its sentry-0. `resolveRelayCounterparty` settles it at
+  launch creation, add-component and a paths change, together with the
+  other checks (this wallet's fleet or one that shares with it through
+  `sharing.wallets`, same Akash network, finished launching) and rewrites the
+  reference to the launch id:
+  - **mesh** (the default when both fleets share one tailnet: `reuseFleet` in
+    either direction, or both borrowing a third fleet's): the tunnels above.
+  - **public** (the only way to a sister chain on another mesh): the
+    sentry-0's provider-forwarded ports. RPC is forwarded already; the first
+    link opens gRPC (`openPublicGrpc`): app.toml binds it beyond localhost,
+    the sentry's SDL gains a global 9090 expose, one MsgUpdateDeployment, and
+    the manifest push re-creates that sentry once. The forwarded gRPC and RPC
+    are read from lease status and stored in the `relay-public:<launch>`
+    setting, keyed by the sentry's dseq. Only the deployment's wallet can sign
+    that update: for a sister fleet of another wallet, the link queues a
+    `public-grpc` op on that fleet (the monitor starts it, and it waits for
+    that wallet's signature in that fleet's panel) and pauses until it ran.
   Endpoint counterparties are dialed directly, so their gRPC must be public.
 - **Keys and gas.** One mnemonic (`relayer` in `mnemonics.json`) gives an
   address on every chain, each with its own prefix and HD path. The own-chain
@@ -968,7 +981,24 @@ chain given by its endpoints.
 - **Counterparty moves.** When a fleet relaunches its sentry-0, relaunch's
   mesh-client pass also re-aims every other fleet's relayer that tunnels to it:
   env rewrite, update tx and manifest push, as for this fleet's own mesh
-  components.
+  components. A relayer on the public route notices on the monitor's tick
+  instead: the stored endpoint's dseq no longer matches that sentry-0, so it
+  queues a relink, which reads the new forwarded ports (the relaunched
+  sentry keeps its 9090 expose, since relaunch reuses the stored SDL).
+- **Settings editor** (the relayer card's "settings…"). Edits the paths and
+  the Spark Dream key cap without spec YAML: the current connections with
+  their channels, peers and funding state; "Add connection" (content
+  federation with a Spark Dream sister chain, ticking a companion transfer
+  path by default, or token transfers) from the sister fleets this wallet may
+  relay to (`GET /api/fleet/:id/relayer/settings`, with each one's route),
+  well-known chains (`CHAIN_PRESETS`: Osmosis testnet and mainnet, Cosmos Hub,
+  Noble, mainnets defaulting to `openWhenFunded`), or any chain by URL
+  (`POST /api/relayer/detect` reads the chain id from RPC `/status` and, from
+  the LCD, the address prefix, minimum gas price, x/federation and
+  x/identity, so federation is only offered to a Spark Dream chain). Review
+  lists in plain words what applying does (channels, federation peers and who
+  signs each end, a public route's signature, funding) before the paths op
+  starts. A cap change alone is saved without an op.
 - **Health.** The relayer has no domain, so the monitor probes the container
   over SSH (descriptor `probe`): hermes running, not linked yet, or linked
   with hermes down. A chain reset queues a `relink` op behind itself, since

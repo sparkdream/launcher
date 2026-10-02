@@ -711,13 +711,115 @@ export async function postRelink(launchId: string): Promise<{ status: string; op
   return json(await afetch(`/api/fleet/${launchId}/relink`, { method: "POST" }));
 }
 
-/** Replace a running relayer's paths (relayer-paths op): add or drop chains. */
-export async function postRelayerPaths(launchId: string, paths: unknown[]): Promise<{ status: string; opId: number }> {
+/** Replace a running relayer's paths (relayer-paths op): add or drop chains.
+ *  With maxBalance, the Spark Dream key cap too; a cap change alone saves
+ *  without an op (status "relayer-settings-saved", no opId). */
+export async function postRelayerPaths(
+  launchId: string,
+  paths: unknown[],
+  maxBalance?: string,
+): Promise<{ status: string; opId?: number }> {
   return json(
     await afetch(`/api/fleet/${launchId}/relayer/paths`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ paths }),
+      body: JSON.stringify(maxBalance !== undefined ? { paths, maxBalance } : { paths }),
+    }),
+  );
+}
+
+/** A path's far end given by endpoints (the spec's endpoint counterparty). */
+export interface EndpointCounterparty {
+  chainId: string;
+  rpc: string;
+  grpc: string;
+  ws?: string;
+  lcd?: string;
+  bech32Prefix: string;
+  gasDenom: string;
+  gasPrice: number;
+  dynamicGasPrice?: { multiplier: number; max: number };
+  gasMultiplier?: number;
+  eventSource?: "push" | "pull";
+  hdPath?: string;
+  trustingPeriod?: string;
+  maxBalance?: string;
+}
+
+/** One relayer path as the spec holds it. */
+export interface RelayerPathSpec {
+  id: string;
+  kind: "transfer" | "federation";
+  counterparty: { fleet: string; via?: "mesh" | "public" } | EndpointCounterparty;
+  openWhenFunded?: boolean;
+}
+
+/** A fleet on this launcher a path could lead to. */
+export interface SisterFleet {
+  launchId: string;
+  name: string;
+  displayName: string;
+  chainId: string;
+  networkType: string;
+  /** mesh: over the shared tailnet; public: over its sentry's forwarded
+   *  ports, opened by the first link (one signature). */
+  route: "mesh" | "public";
+  eligible: boolean;
+  reason?: string;
+  /** The launcher holds its founder key (signs its end of a federation peer). */
+  founderHeld: boolean;
+  /** Its wallet, when not this fleet's (it shared with this one): that wallet
+   *  signs opening its gRPC, in its own panel. */
+  otherWallet?: string;
+}
+
+export interface ChainPreset {
+  id: string;
+  label: string;
+  /** Real money pays this chain's gas. */
+  paid: boolean;
+  symbol: string;
+  counterparty: EndpointCounterparty;
+}
+
+/** Everything the relayer settings editor starts from. */
+export interface RelayerSettings {
+  chainId: string;
+  /** The launcher holds this chain's founder key (signs its federation peer). */
+  founderHeld: boolean;
+  symbol: string;
+  decimals: number;
+  paths: RelayerPathSpec[];
+  maxBalance: string | null;
+  genesisBalance: string | null;
+  state: RelayerState | null;
+  sisters: SisterFleet[];
+  presets: ChainPreset[];
+  peerPolicy: { contentTypes: string[]; ratePerEpoch: number; reputation: boolean; requireReview: boolean };
+}
+
+export async function getRelayerSettings(launchId: string): Promise<RelayerSettings> {
+  return json(await afetch(`/api/fleet/${launchId}/relayer/settings`));
+}
+
+/** What a chain's endpoints say about it (the settings editor's Detect). */
+export interface DetectedChain {
+  chainId: string;
+  bech32Prefix?: string;
+  gasDenom?: string;
+  gasPrice?: number;
+  /** Runs x/federation: a Spark Dream chain. */
+  federation: boolean;
+  identity?: string;
+  notes: string[];
+}
+
+export async function detectChain(rpc: string, lcd?: string): Promise<DetectedChain> {
+  return json(
+    await afetch("/api/relayer/detect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(lcd ? { rpc, lcd } : { rpc }),
     }),
   );
 }

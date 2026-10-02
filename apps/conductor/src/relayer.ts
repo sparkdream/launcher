@@ -13,6 +13,7 @@ import {
 import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import type { Tunnel } from "./components/types.js";
 import { readSecretFile, writeSecretFile } from "./secrets.js";
+import { mayUseFleet } from "./bridge-target.js";
 
 /**
  * The relayer component: one Hermes process relaying every path in
@@ -48,14 +49,61 @@ export function parseFleetPeer(peer: string): { key: string; launchId?: string }
   return at < 0 ? { key: peer } : { key: peer.slice(0, at), launchId: peer.slice(at + 1) };
 }
 
-/** Distinct fleet counterparties, in path order. Their index fixes their
- *  tunnel ports, so the order must not depend on anything but the spec. */
+/** Distinct fleet counterparties reached over the mesh, in path order. Their
+ *  index fixes their tunnel ports, so the order must not depend on anything
+ *  but the spec. */
 export function relayFleets(spec: LaunchSpec): string[] {
   const out: string[] = [];
   for (const p of relayerPaths(spec)) {
-    if ("fleet" in p.counterparty && !out.includes(p.counterparty.fleet)) out.push(p.counterparty.fleet);
+    const cp = p.counterparty;
+    if ("fleet" in cp && cp.via !== "public" && !out.includes(cp.fleet)) out.push(cp.fleet);
   }
   return out;
+}
+
+/** Distinct fleet counterparties reached over their sentry's public ports
+ *  (a sister chain on another mesh), in path order. */
+export function publicRelayFleets(spec: LaunchSpec): string[] {
+  const out: string[] = [];
+  for (const p of relayerPaths(spec)) {
+    const cp = p.counterparty;
+    if ("fleet" in cp && cp.via === "public" && !out.includes(cp.fleet)) out.push(cp.fleet);
+  }
+  return out;
+}
+
+/** Where a fleet's sentry-0 answers publicly for relayers on other meshes:
+ *  its provider-forwarded gRPC and RPC, read from lease status when a link
+ *  opened them. Keyed by that sentry's dseq, since a relaunch moves both. */
+export interface PublicRelayEndpoint {
+  dseq: string;
+  grpc: string;
+  rpc: string;
+}
+
+const publicEndpointSetting = (launchId: string) => `relay-public:${launchId}`;
+
+export function savePublicRelayEndpoint(db: ConductorDb, launchId: string, ep: PublicRelayEndpoint): void {
+  db.setSetting(publicEndpointSetting(launchId), JSON.stringify(ep));
+}
+
+/** The stored public endpoint of a fleet's sentry-0, if it is still that
+ *  sentry's (a relaunched sentry-0 answers on other ports). */
+/** True when a public endpoint was recorded for a sentry-0 that has since
+ *  moved to another deployment: relayers using it dial dead ports. */
+export function publicRelayEndpointStale(db: ConductorDb, launchId: string): boolean {
+  const raw = db.getSetting(publicEndpointSetting(launchId));
+  if (!raw) return false;
+  const sentry = db.listFleetComponents(launchId).find((c) => c.key === "sentry-0");
+  return Boolean(sentry && sentry.state !== "closed" && sentry.dseq !== (JSON.parse(raw) as PublicRelayEndpoint).dseq);
+}
+
+export function publicRelayEndpoint(db: ConductorDb, launchId: string): PublicRelayEndpoint | undefined {
+  const raw = db.getSetting(publicEndpointSetting(launchId));
+  if (!raw) return undefined;
+  const ep = JSON.parse(raw) as PublicRelayEndpoint;
+  const sentry = db.listFleetComponents(launchId).find((c) => c.key === "sentry-0");
+  return sentry && sentry.dseq === ep.dseq ? ep : undefined;
 }
 
 /** Local ports the relayer reaches chain `i` on: 0 is this fleet's own
@@ -82,12 +130,53 @@ function specOf(launch: LaunchRow): LaunchSpec {
   return withDefaults(JSON.parse(launch.spec_json));
 }
 
+/** The mesh a fleet's components join: either fleet borrows the other's
+ *  headscale, or both borrow a third's. A launch not created yet is its own. */
+function meshOf(launchId: string | undefined, spec: LaunchSpec): string | undefined {
+  return spec.topology.headscale.reuseFleet ?? launchId;
+}
+
+/** Whether two fleets share a mesh, so the relayer can tunnel to the other's sentry. */
+export function sameMesh(db: ConductorDb, spec: LaunchSpec, selfId: string | undefined, otherId: string): boolean {
+  const other = db.getLaunch(otherId);
+  return Boolean(other) && meshOf(otherId, specOf(other!)) === meshOf(selfId, spec);
+}
+
+/**
+ * Resolve a fleet counterparty in place: its reference becomes the launch id
+ * and its route is settled. A fleet on this fleet's mesh is tunnelled to
+ * unless the path asks for public; one on another mesh can only be reached
+ * over its sentry's public ports, so asking for mesh there is refused.
+ */
+export function resolveRelayCounterparty(
+  db: ConductorDb,
+  spec: LaunchSpec,
+  owner: string,
+  cp: { fleet: string; via?: "mesh" | "public" | undefined },
+  selfId?: string,
+): void {
+  const id = resolveRelayFleet(db, spec, owner, cp.fleet, selfId);
+  cp.fleet = id;
+  if (sameMesh(db, spec, selfId, id)) {
+    if (cp.via !== "public") delete cp.via;
+    return;
+  }
+  if (cp.via === "mesh") {
+    throw new Error(
+      `relayer path to "${id}": that fleet is on a different mesh, so its sentry can only be reached ` +
+        `over its public ports (via: public), or set topology.headscale.reuseFleet to share one mesh`,
+    );
+  }
+  cp.via = "public";
+}
+
 /**
  * Resolve a path's fleet reference (launch id or unique network name) to the
- * launch id, checking the other fleet is one this relayer can reach: same
- * wallet and Akash network, finished launching, and on the same mesh — its
- * sentry's gRPC is only reachable over the tailnet. Throws with a
- * user-facing message otherwise.
+ * launch id, checking the other fleet is one this relayer can relay to: this
+ * wallet's or shared with it (sharing.wallets), on the same Akash network,
+ * finished launching, with a running sentry-0.
+ * Throws with a user-facing message otherwise. The route (mesh or public) is
+ * resolveRelayCounterparty's to settle.
  */
 export function resolveRelayFleet(
   db: ConductorDb,
@@ -115,8 +204,8 @@ export function resolveRelayFleet(
   if (!target) throw new Error(`${at}: no such fleet on this launcher`);
   if (target.id === selfId) throw new Error(`${at}: a fleet cannot relay to itself`);
   if (target.status === "aborted") throw new Error(`${at}: that fleet was shut down`);
-  if ((target.owner ?? "") !== (owner ?? "")) {
-    throw new Error(`${at}: that fleet belongs to a different wallet`);
+  if (!mayUseFleet(target, owner)) {
+    throw new Error(`${at}: that fleet belongs to a different wallet (its owner can add this wallet to its sharing list)`);
   }
   const other = specOf(target);
   if (other.infra.akashNetwork !== spec.infra.akashNetwork) {
@@ -124,14 +213,6 @@ export function resolveRelayFleet(
   }
   if (db.getStep(target.id, "finalize")?.status !== "done") {
     throw new Error(`${at}: that fleet has not finished launching`);
-  }
-  // one mesh: either fleet borrows the other's headscale, or both borrow a third's
-  const meshOf = (id: string | undefined, s: LaunchSpec) => s.topology.headscale.reuseFleet ?? id;
-  if (meshOf(target.id, other) !== meshOf(selfId, spec)) {
-    throw new Error(
-      `${at}: that fleet is on a different mesh — its sentry's gRPC is only reachable over the tailnet, ` +
-        `so set topology.headscale.reuseFleet to share one mesh between the two fleets`,
-    );
   }
   const sentry = db.listFleetComponents(target.id).find((c) => c.key === "sentry-0");
   if (!sentry || sentry.state === "closed") throw new Error(`${at}: that fleet has no running sentry-0`);
@@ -224,22 +305,39 @@ function sparkDreamChain(spec: LaunchSpec, index: number, launchId: string): Rel
   };
 }
 
+/** A Spark Dream fleet on another mesh, as the relayer reaches it: over its
+ *  sentry-0's provider-forwarded ports. */
+function publicSparkDreamChain(spec: LaunchSpec, launchId: string, ep: PublicRelayEndpoint | undefined): RelayChain {
+  const rpc = ep?.rpc ?? "";
+  return {
+    ...sparkDreamChain(spec, 0, launchId),
+    rpc,
+    grpc: ep?.grpc ?? "",
+    ws: rpc ? `${rpc.replace(/^http/, "ws")}/websocket` : "",
+  };
+}
+
 /** Everything the relayer needs to know, resolved against the launcher's db. */
 export function relayPlan(db: ConductorDb, launchId: string, spec: LaunchSpec): RelayPlan {
   const own = sparkDreamChain(spec, 0, launchId);
   const chains: RelayChain[] = [own];
-  const fleets = relayFleets(spec);
-  fleets.forEach((id, i) => {
+  const fleetSpec = (id: string) => {
     const launch = db.getLaunch(id);
     if (!launch) throw new Error(`relayer counterparty fleet ${id} is gone from this launcher`);
-    chains.push(sparkDreamChain(specOf(launch), i + 1, id));
-  });
+    return specOf(launch);
+  };
+  relayFleets(spec).forEach((id, i) => chains.push(sparkDreamChain(fleetSpec(id), i + 1, id)));
+  for (const id of publicRelayFleets(spec)) {
+    // the link opens these ports before rendering anything; until then (or
+    // once its sentry moved) the chain is known but has nowhere to dial
+    chains.push(publicSparkDreamChain(fleetSpec(id), id, publicRelayEndpoint(db, id)));
+  }
   const paths: RelayPlanPath[] = [];
   for (const p of relayerPaths(spec)) {
     const cp = p.counterparty;
     let b: string;
     if ("fleet" in cp) {
-      b = chains[fleets.indexOf(cp.fleet) + 1]!.chainId;
+      b = chains.find((c) => c.launchId === cp.fleet)!.chainId;
     } else {
       b = cp.chainId;
       if (!chains.some((c) => c.chainId === cp.chainId)) {
@@ -409,15 +507,17 @@ export async function relayerAddress(mnemonic: string, chain: Pick<RelayChain, "
   return account!.address;
 }
 
-/** Fleets whose relayer dials this launch's sentry-0, so it must keep serving
- *  gRPC even though its own spec asks for none. */
+/** Fleets whose relayer dials this launch's sentry-0 (over the mesh or its
+ *  public ports), so it must keep serving gRPC even though its own spec asks
+ *  for none. */
 export function relayedBy(db: ConductorDb, launchId: string): string[] {
   return db
     .listLaunches()
     .filter((l) => {
       if (l.id === launchId || l.status === "aborted") return false;
       try {
-        return relayFleets(specOf(l)).includes(launchId);
+        const s2 = specOf(l);
+        return [...relayFleets(s2), ...publicRelayFleets(s2)].includes(launchId);
       } catch {
         return false;
       }

@@ -48,6 +48,7 @@ import {
   type SpecPrefill,
 } from "../lib/api";
 import { FundingRows } from "./relayer-funds";
+import { RelayerSettingsModal } from "./relayer-settings";
 import {
   connectKeplr,
   DEFAULT_CHAIN,
@@ -135,7 +136,9 @@ topology:
     # IBC relayer (Hermes): one process, any number of paths. kind transfer
     # moves tokens (ICS-20); kind federation carries x/federation content to
     # a sister Spark Dream chain. A counterparty is another fleet on this
-    # launcher (sharing this fleet's mesh) or any chain by its endpoints.
+    # launcher (over the shared mesh, or its sentry's public ports when it
+    # runs its own) or any chain by its endpoints. Once launched, the
+    # relayer card's settings… edits these without YAML.
     # The relayer's key sits on its provider (Hermes cannot use a session
     # key): fund it with gas money only. maxBalance caps what the launcher
     # asks for on Spark Dream chains; set one per endpoint chain too.
@@ -409,6 +412,8 @@ export default function Page() {
       setRelayerFundsView(null);
     }
   }, []);
+  // the relayer settings editor: which fleet's relayer is open in it
+  const [relayerSettingsFor, setRelayerSettingsFor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [balances, setBalances] = useState<Coin[] | null>(null);
   const [bme, setBme] = useState<BmeInfo | null>(null);
@@ -2678,6 +2683,24 @@ export default function Page() {
         </section>
       )}
 
+      {relayerSettingsFor && (
+        <RelayerSettingsModal
+          launchId={relayerSettingsFor}
+          onClose={() => setRelayerSettingsFor(null)}
+          onError={(m) => setError(m)}
+          onApplied={(result) => {
+            const id = relayerSettingsFor;
+            setRelayerSettingsFor(null);
+            if (result.opId !== undefined) {
+              showToast("relayer changes started: follow them in the Launch panel");
+              openLaunch(id);
+            } else {
+              showToast("relayer settings saved");
+            }
+          }}
+        />
+      )}
+
       {relayerFundsView && (
         <div className="modal-scrim" onClick={() => setRelayerFundsView(null)}>
           <div className="modal" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
@@ -3839,15 +3862,19 @@ export default function Page() {
                         join bundle
                       </button>
                     )}
-                    {!chainFleet && !shutDown && (
+                    {!shutDown && (
                       <button
                         className="btn"
-                        title="Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
+                        title={
+                          chainFleet
+                            ? "Other Akash wallets on this launcher whose relayers may relay to this chain (your devnet and testnet wallets, say): content federation and transfers between sister chains. This fleet's own wallet always may. Removing a wallet stops new links; relayers already linked keep running."
+                            : "Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
+                        }
                         onClick={async () => {
                           try {
                             const current: string[] = ((await getLaunch(f.launchId)).spec as any)?.sharing?.wallets ?? [];
                             const input = window.prompt(
-                              "Wallets this services fleet is shared with (comma separated; empty for none):",
+                              `Wallets this ${chainFleet ? "chain" : "services"} fleet is shared with (comma separated; empty for none):`,
                               current.join(", "),
                             );
                             if (input === null) return;
@@ -4600,49 +4627,10 @@ export default function Page() {
                                       </button>
                                       <button
                                         className="btn"
-                                        title="Change the chains the relayer relays to: takes topology.components.relayer.paths from the spec editor. New paths get their channels opened; dropped ones stop being relayed (their channels stay open on chain). A new or dropped fleet counterparty updates the relayer's deployment (one signature)."
-                                        onClick={async () => {
-                                          try {
-                                            const deployed = (await getLaunch(f.launchId)).spec as any;
-                                            const current: Array<{ id: string }> =
-                                              deployed?.topology?.components?.relayer?.paths ?? [];
-                                            const edited = (yaml.load(specText) as any)?.topology?.components?.relayer?.paths;
-                                            if (!Array.isArray(edited)) {
-                                              // nothing to take yet: start the editor from this fleet's spec
-                                              if (!confirmDraftOverwrite()) return;
-                                              updateSpec(yaml.dump(deployed, { lineWidth: 120 }));
-                                              window.alert(
-                                                "The editor now holds this fleet's spec. Edit topology.components.relayer.paths " +
-                                                  "(see the example spec for a path's fields), then click paths… again.",
-                                              );
-                                              return;
-                                            }
-                                            const before = current.map((p) => p.id);
-                                            const after = edited.map((p: { id?: string }) => String(p?.id));
-                                            const added = after.filter((id: string) => !before.includes(id));
-                                            const dropped = before.filter((id) => !after.includes(id));
-                                            if (
-                                              !window.confirm(
-                                                [
-                                                  `Relayer paths: ${before.join(", ") || "(none)"} → ${after.join(", ") || "(none)"}`,
-                                                  ...(added.length ? [`Added (channels opened): ${added.join(", ")}`] : []),
-                                                  ...(dropped.length ? [`Dropped (no longer relayed, channels stay open): ${dropped.join(", ")}`] : []),
-                                                  "",
-                                                  "A new chain's relayer key needs gas money there: the op pauses with the address to fund. Apply?",
-                                                ].join("\n"),
-                                              )
-                                            ) {
-                                              return;
-                                            }
-                                            const { postRelayerPaths } = await import("../lib/api");
-                                            await postRelayerPaths(f.launchId, edited);
-                                            openLaunch(f.launchId);
-                                          } catch (e) {
-                                            setError(String(e));
-                                          }
-                                        }}
+                                        title="The chains this relayer connects to: content federation with Spark Dream sister chains and token transfers. Add or remove connections, then review what applying does."
+                                        onClick={() => setRelayerSettingsFor(f.launchId)}
                                       >
-                                        paths…
+                                        settings…
                                       </button>
                                     </>
                                   )}

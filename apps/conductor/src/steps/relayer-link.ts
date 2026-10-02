@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import yaml from "js-yaml";
 import { relayerPaths, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { FleetComponentRow } from "../db.js";
 import { AwaitUser, launchDirs, type StepCtx, type StepDef } from "../engine.js";
@@ -8,7 +9,10 @@ import { restartNode } from "../node-ops.js";
 import {
   ensureRelayerMnemonic,
   fleetPeer,
+  publicRelayFleets,
   relayerAddress,
+  savePublicRelayEndpoint,
+  type PublicRelayEndpoint,
   relayerCap,
   suggestedTopUp,
   relayPlan,
@@ -21,7 +25,19 @@ import {
 import { readSecretFile } from "../secrets.js";
 import { patchSentryAppToml, sentryServe } from "../sentry-serve.js";
 import type { SshTarget } from "../services.js";
-import { nodeShellFallback, sshTarget, type Assignments, type DeploymentPlan, type SshEndpoints } from "./phase-bcd.js";
+import {
+  extractForwardedPort,
+  loadCertAt,
+  nodeShellFallback,
+  sshTarget,
+  waitLeaseStatus,
+  type Assignments,
+  type DeploymentPlan,
+  type SshEndpoints,
+} from "./phase-bcd.js";
+import { pushManifest } from "./phase-ef.js";
+import { loadSdl, sdlArtifacts } from "../akash/sdl-groups.js";
+import { TypeUrl } from "../akash/messages.js";
 import {
   chainIdentity,
   ensurePeerActive,
@@ -113,6 +129,129 @@ async function openCounterpartySentries(ctx: StepCtx, plan: RelayPlan): Promise<
   }
 }
 
+/** A sentry SDL that also forwards gRPC (9090) publicly; unchanged when it does. */
+export function withPublicGrpc(text: string): string {
+  const doc = yaml.load(text) as any;
+  const expose: any[] | undefined = doc?.services?.sparkdreamd?.expose;
+  if (!expose) throw new Error("sentry SDL has no sparkdreamd expose list");
+  if (expose.some((e) => e.port === 9090)) return text;
+  expose.push({ port: 9090, as: 9090, proto: "tcp", to: [{ global: true }] });
+  return yaml.dump(doc, { lineWidth: 120 });
+}
+
+/**
+ * Open fleet `id`'s sentry-0 to relayers on other meshes: app.toml binds
+ * gRPC beyond localhost (restarting the node only when that changed), the
+ * sentry's SDL gains a global 9090 expose, and once the chain holds that
+ * version the manifest push re-creates the container onto it. Then the
+ * forwarded gRPC and RPC ports are read from lease status and stored, keyed
+ * by that sentry's dseq, for relayPlan. The provider calls use that fleet's
+ * own certificate, since its wallet owns the deployment.
+ *
+ * Convergent: an SDL already exposing gRPC whose version is on chain signs
+ * nothing, and a provider already forwarding it is not pushed to. Only the
+ * deployment's owner can sign the update: in a step of that fleet (its own
+ * public-grpc op, or a relayer of the same wallet) `requireTx` asks for it;
+ * from another wallet's relayer, `signOutside` is called instead and must
+ * not return.
+ */
+export async function openPublicGrpc(
+  ctx: StepCtx,
+  id: string,
+  txStep: string,
+  signOutside?: () => never,
+): Promise<PublicRelayEndpoint> {
+  const other = ctx.db.getLaunch(id);
+  if (!other) throw new Error(`relayer counterparty fleet ${id} is gone`);
+  const label = fleetPeer("sentry-0", id);
+  const row = (ctx.db.listFleetComponents(id) as FleetComponentRow[]).find((c) => c.key === "sentry-0");
+  if (!row || row.state === "closed") throw new Error(`fleet ${id} has no running sentry-0 to relay through`);
+  const target = id === ctx.launchId ? ownSentryTarget(ctx, row) : foreignSentryTarget(ctx, id);
+  const serve = { ...sentryServe(JSON.parse(other.spec_json) as LaunchSpec), grpc: true };
+  if (await patchSentryAppToml(ctx, label, target, serve)) {
+    await restartNode(ctx.services.ssh, target);
+  }
+  const sdlDir = launchDirs(ctx.workRoot, id).sdl;
+  const sdlPath = path.join(sdlDir, "sentry-0.yaml");
+  const text = fs.readFileSync(sdlPath, "utf8");
+  const next = withPublicGrpc(text);
+  if (next !== text) {
+    fs.writeFileSync(sdlPath, next);
+    ctx.log(`${label}: exposing gRPC publicly for relayers on other meshes`);
+  }
+  const artifacts = sdlArtifacts(loadSdl(sdlPath));
+  fs.writeFileSync(path.join(sdlDir, "sentry-0.manifest.json"), artifacts.manifestJson);
+  const wantHash = Buffer.from(artifacts.hash).toString("base64");
+  const onChain = await ctx.services.api.deploymentInfo(other.owner, row.dseq);
+  if (onChain?.hash !== wantHash) {
+    if (signOutside) signOutside();
+    await ctx.requireTx(txStep, [
+      { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner: other.owner, dseq: row.dseq }, hash: wantHash } },
+    ]);
+  } else {
+    ctx.db.deletePendingTx(ctx.launchId, txStep);
+  }
+
+  const cert = loadCertAt(launchDirs(ctx.workRoot, id).secrets);
+  let status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
+  let grpc: { host: string; port: number };
+  try {
+    grpc = extractForwardedPort(status, 9090);
+  } catch {
+    // the provider still runs the manifest from before the expose
+    await pushManifest(ctx, cert, label, row.host_uri, row.dseq, artifacts.manifestJson);
+    status = await waitLeaseStatus(ctx, cert, row.host_uri, row.dseq, 1, 1, { forwardedPort: 9090 });
+    grpc = extractForwardedPort(status, 9090);
+  }
+  const rpc = extractForwardedPort(status, 26657);
+  const ep: PublicRelayEndpoint = {
+    dseq: row.dseq,
+    grpc: `http://${grpc.host}:${grpc.port}`,
+    rpc: `http://${rpc.host}:${rpc.port}`,
+  };
+  savePublicRelayEndpoint(ctx.db, id, ep);
+  ctx.log(`${label}: serving relayers over its public ports (gRPC ${grpc.host}:${grpc.port}, RPC ${rpc.host}:${rpc.port})`);
+  return ep;
+}
+
+/** This fleet's own sentry-0, with its own key. */
+function ownSentryTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
+  if (!row.ssh_host || !row.ssh_port) throw new Error("sentry-0 has no SSH endpoint recorded");
+  return sshTarget(ctx, row.ssh_host, row.ssh_port, nodeShellFallback(ctx, row.host_uri, row.dseq));
+}
+
+/**
+ * A sister fleet on another mesh (path `via: public`) is reached over its
+ * sentry-0's provider-forwarded ports, since the relayer's tailnet is not
+ * that fleet's: open them (openPublicGrpc). A sister fleet of another wallet
+ * signs its own deployment update: the first time, this queues a public-grpc
+ * op on that fleet (the monitor starts it, and it waits there for that
+ * wallet's signature) and pauses until it has run.
+ */
+async function exposePublicSentries(ctx: StepCtx, stepName: string, spec: LaunchSpec): Promise<void> {
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  for (const id of publicRelayFleets(spec)) {
+    const other = ctx.db.getLaunch(id);
+    if (!other) throw new Error(`relayer counterparty fleet ${id} is gone`);
+    const foreign = (other.owner ?? "") !== (owner ?? "");
+    await openPublicGrpc(ctx, id, `${stepName}:public-grpc:${id}`, foreign ? () => askOwnerToOpen(ctx, stepName, id) : undefined);
+  }
+}
+
+function askOwnerToOpen(ctx: StepCtx, stepName: string, id: string): never {
+  const other = ctx.db.getLaunch(id)!;
+  const name = (JSON.parse(other.spec_json) as LaunchSpec).network.name;
+  const queued = ctx.db.listFleetOps(id, "active").some((o) => o.kind === "public-grpc");
+  if (!queued) ctx.db.createFleetOp(id, "public-grpc", { for: ctx.launchId });
+  throw new AwaitUser(
+    stepName,
+    `${name} is on another mesh, so this relayer reaches it over its sentry's public ports, and opening its ` +
+      `gRPC changes ${name}'s deployment: only its wallet (${other.owner}) can sign that. Connect that wallet, ` +
+      `open ${name} in the Launch panel and sign the request waiting there (it restarts that sentry once), then ` +
+      "resume here.",
+  );
+}
+
 /**
  * Link the relayer to every chain in its paths (§5 relayer): configure and
  * key it, wait until every key can pay gas, open each path's clients,
@@ -122,6 +261,8 @@ async function openCounterpartySentries(ctx: StepCtx, plan: RelayPlan): Promise<
  * relaunched relayer all run the same thing.
  */
 export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSpec): Promise<RelayerLinkOutput> {
+  // before the plan: a public route's endpoints are only known once opened
+  await exposePublicSentries(ctx, stepName, spec);
   const plan = relayPlan(ctx.db, ctx.launchId, spec);
   const mnemonic = await ensureRelayerMnemonic(ctx.dirs.secrets);
   const chains = await Promise.all(

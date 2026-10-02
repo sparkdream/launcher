@@ -40,7 +40,7 @@ import { renderComponentSdl } from "./render-component-sdl.js";
 import { descriptorFor, setServiceEnv } from "./components/index.js";
 import { patchSentryAppToml, sentryServe } from "./sentry-serve.js";
 import { fleetPeer, peerRow, relayedBy } from "./relayer.js";
-import { linkFederationPeers, linkRelayer } from "./steps/relayer-link.js";
+import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
 import { reconcileSessions, type SessionRole } from "./sessions.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { fleetResolver } from "./verifier.js";
@@ -852,6 +852,26 @@ export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
         const out = await linkFederationPeers(ctx, peers, spec);
         ctx.db.setFleetOpStatus(opId, "done");
         return out;
+      },
+    },
+  ];
+}
+
+/**
+ * Open this fleet's sentry-0 gRPC to relayers on other meshes ("public-grpc"
+ * op): queued by another wallet's relayer linking to this fleet, since only
+ * this fleet's wallet can sign its deployment update. The relayer resumes
+ * once this is done.
+ */
+export function publicGrpcSteps(opId: number): StepDef[] {
+  const name = `op${opId}:public-grpc`;
+  return [
+    {
+      name,
+      async run(ctx) {
+        const ep = await openPublicGrpc(ctx, ctx.launchId, name);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return ep;
       },
     },
   ];
@@ -5146,6 +5166,7 @@ function buildSteps(
     }
     if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
     if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
+    if (op.kind === "public-grpc") steps.push(...publicGrpcSteps(op.id));
     if (op.kind === "relayer-paths") steps.push(...relayerPathsSteps(op.id, params, spec));
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));

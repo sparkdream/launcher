@@ -516,8 +516,12 @@ describe("sharing a services fleet with other wallets", () => {
 
     const add = () => fleet.requestAddComponent(db.getLaunch("fl")!, "bridge", { settings: { target: { fleet: "zenith-commons" } } });
     expect(add).toThrow(/does not share it with this one/);
-    // only a services fleet shares, and not with its own wallet
-    expect(() => fleet.setSharing(db.getLaunch("fl")!, [TESTNET])).toThrow(/only a services fleet/);
+    // a fleet never lists its own wallet; a chain fleet shares too (other
+    // wallets' relayers may then relay to it), and can stop sharing
+    expect(fleet.setSharing(db.getLaunch("fl")!, [TESTNET])).toEqual([TESTNET]);
+    expect(JSON.parse(db.getLaunch("fl")!.spec_json).sharing).toEqual({ wallets: [TESTNET] });
+    expect(fleet.setSharing(db.getLaunch("fl")!, [])).toEqual([]);
+    expect(JSON.parse(db.getLaunch("fl")!.spec_json).sharing).toBeUndefined();
     expect(fleet.setSharing(db.getLaunch("svc")!, [DEVNET, TESTNET])).toEqual([DEVNET]);
     expect(JSON.parse(db.getLaunch("svc")!.spec_json).sharing).toEqual({ wallets: [DEVNET] });
 

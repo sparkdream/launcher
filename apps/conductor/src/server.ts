@@ -67,7 +67,9 @@ import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
 import { BackupError, BackupService } from "./backup.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "./fleet-ops.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
-import { resolveRelayFleet } from "./relayer.js";
+import { resolveRelayCounterparty } from "./relayer.js";
+import { CHAIN_PRESETS, defaultPeerPolicySummary, detectChain, sisterFleets } from "./relayer-settings.js";
+import { founderAccount } from "./peering.js";
 import { resolveVerifierTarget } from "./verifier.js";
 import { resolveBridgeTarget } from "./bridge-target.js";
 import { servicesSteps } from "./services-steps.js";
@@ -235,6 +237,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             const l = deps.db.getLaunch(other);
             if (l) drive(other, JSON.parse(l.spec_json));
           }
+          // another wallet's relayer asked this fleet to open its gRPC
+          if (fleet.undrivenPublicGrpc(launch.id)) drive(launch.id, JSON.parse(launch.spec_json));
+          // a sister fleet's sentry moved: re-read its public ports
+          if (fleet.queueStaleRelayLink(launch.id)) drive(launch.id, JSON.parse(launch.spec_json));
           // daemon session keys renew unattended: local signing, no wallet
           if (await fleet.sessionsDue(launch.id).catch(() => false)) {
             if (fleet.requestSessions(launch) !== undefined) drive(launch.id, JSON.parse(launch.spec_json));
@@ -444,18 +450,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     }
     // relayer paths to other fleets: resolve each reference to its launch id
-    // (the relayer's tunnels and funding are keyed by it) and check the
-    // fleet is reachable — same wallet, launched, on this fleet's mesh
+    // (the relayer's tunnels and funding are keyed by it), check the fleet
+    // can be relayed to, and route it: mesh when shared, public otherwise
     const relayer = spec.topology.components.relayer;
     for (const [i, p] of (relayer?.enabled ? relayer.paths : []).entries()) {
       if (!("fleet" in p.counterparty)) continue;
       try {
-        p.counterparty.fleet = resolveRelayFleet(
-          deps.db,
-          spec,
-          requestOwner(req, body.owner) ?? "",
-          p.counterparty.fleet,
-        );
+        resolveRelayCounterparty(deps.db, spec, requestOwner(req, body.owner) ?? "", p.counterparty);
       } catch (e) {
         return reply.status(400).send({
           error: "validation",
@@ -1384,6 +1385,48 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return state;
   });
 
+  // everything the relayer settings editor starts from: the stored paths and
+  // caps, what the last link opened, the sister fleets a path could lead to
+  // (with their route), well-known chains, and a federation peer's policy
+  app.get("/api/fleet/:launchId/relayer/settings", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const spec = withDefaults(JSON.parse(launch.spec_json));
+    const relayer = spec.topology.components.relayer;
+    return {
+      chainId: chainId(spec),
+      // the launcher signs this chain's end of a federation peer itself
+      founderHeld: founderAccount(spec) !== undefined,
+      symbol: spec.token.displayDenom,
+      decimals: spec.token.exponent,
+      paths: relayer?.paths ?? [],
+      maxBalance: relayer?.maxBalance ?? null,
+      genesisBalance: relayer?.genesisBalance ?? null,
+      state: fleet.relayerState(launch) ?? null,
+      sisters: sisterFleets(deps.db, launchId, launch.owner),
+      presets: CHAIN_PRESETS,
+      peerPolicy: defaultPeerPolicySummary(),
+    };
+  });
+
+  // probe a chain from its endpoints for the settings editor: chain id,
+  // prefix, gas price, and whether it is a Spark Dream chain (x/federation)
+  app.post("/api/relayer/detect", async (req, reply) => {
+    const body = (req.body ?? {}) as { rpc?: string; lcd?: string };
+    const isUrl = (u: unknown): u is string => typeof u === "string" && /^https?:\/\/\S+$/.test(u);
+    if (!isUrl(body.rpc)) return reply.status(400).send({ error: "rpc (an http(s) URL) is required" });
+    if (body.lcd !== undefined && body.lcd !== "" && !isUrl(body.lcd)) {
+      return reply.status(400).send({ error: "lcd must be an http(s) URL" });
+    }
+    try {
+      return await detectChain(deps.services.rpc, body.rpc, body.lcd || undefined);
+    } catch (e) {
+      return reply.status(422).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   // every relayer key with its live balance, its cap, what a top-up should
   // be, and how the browser's Keplr can send it (the funds panel)
   app.get("/api/fleet/:launchId/relayer/funds", async (req, reply) => {
@@ -1417,10 +1460,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const launch = deps.db.getLaunch(launchId);
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
-    const body = (req.body ?? {}) as { paths?: RelayerPath[] };
+    const body = (req.body ?? {}) as { paths?: RelayerPath[]; maxBalance?: string };
     if (!Array.isArray(body.paths)) return reply.status(400).send({ error: "paths (an array) is required" });
+    if (body.maxBalance !== undefined && typeof body.maxBalance !== "string") {
+      return reply.status(400).send({ error: "maxBalance must be a string of base units" });
+    }
     try {
-      const opId = fleet.requestRelayerPaths(launch, body.paths);
+      const opId = fleet.requestRelayerPaths(
+        launch,
+        body.paths,
+        body.maxBalance !== undefined ? { maxBalance: body.maxBalance } : {},
+      );
+      if (opId === undefined) return { status: "relayer-settings-saved" };
       // the op's steps are built from the spec just written
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
       return { status: "relayer-paths-started", opId };

@@ -25,7 +25,7 @@ import {
   type RelayerPath,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
-import { RELAYER_ACCOUNT, relayerTunnels, resolveRelayFleet } from "./relayer.js";
+import { publicRelayEndpointStale, publicRelayFleets, RELAYER_ACCOUNT, relayerTunnels, resolveRelayCounterparty } from "./relayer.js";
 import {
   cosmjsWithdraw,
   lowFundsDetail,
@@ -1777,13 +1777,13 @@ export class FleetService {
   }
 
   /**
-   * Set the wallets a services fleet is shared with (sharing.wallets): their
-   * chain fleets may link bridges to its Mastodon. Owner only (the route
-   * checks); a chain fleet has nothing to share this way. Removing a wallet
-   * does not undo bridges already linked; it stops new links and re-links.
+   * Set the wallets a fleet is shared with (sharing.wallets): their chain
+   * fleets may link bridges to a services fleet's Mastodon, and their
+   * relayers may relay to a chain fleet. Owner only (the route checks).
+   * Removing a wallet does not undo links already made; it stops new links
+   * and re-links.
    */
   setSharing(launch: LaunchRow, wallets: string[]): string[] {
-    if (!isServicesFleet(this.spec(launch))) throw new Error("only a services fleet is shared with other wallets");
     const list = [...new Set(wallets.map((w) => w.trim()).filter(Boolean))].filter((w) => w !== launch.owner);
     const stored = JSON.parse(launch.spec_json);
     if (list.length > 0) stored.sharing = { wallets: list };
@@ -1923,7 +1923,11 @@ export class FleetService {
    * in place first (one signature); endpoint counterparties are dialed
    * directly, so changing only those needs none.
    */
-  requestRelayerPaths(launch: LaunchRow, paths: RelayerPath[]): number {
+  requestRelayerPaths(
+    launch: LaunchRow,
+    paths: RelayerPath[],
+    opts: { maxBalance?: string } = {},
+  ): number | undefined {
     const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "relayer");
     if (!row || row.state !== "active") throw new Error("this fleet has no active relayer");
     const busy = this.db.listFleetOps(launch.id, "active").find((o) => {
@@ -1937,11 +1941,15 @@ export class FleetService {
     if (busy) throw new Error(`the relayer is busy with a ${busy.kind} op: finish or abort it first`);
     const current = this.spec(launch);
     const spec = this.spec(launch);
-    spec.topology.components.relayer = { ...spec.topology.components.relayer!, paths };
+    spec.topology.components.relayer = {
+      ...spec.topology.components.relayer!,
+      paths,
+      ...(opts.maxBalance !== undefined ? { maxBalance: opts.maxBalance } : {}),
+    };
     Object.assign(spec, withDefaults(spec as unknown as LaunchSpecInput));
     for (const p of spec.topology.components.relayer!.paths) {
       if ("fleet" in p.counterparty) {
-        p.counterparty.fleet = resolveRelayFleet(this.db, spec, launch.owner, p.counterparty.fleet, launch.id);
+        resolveRelayCounterparty(this.db, spec, launch.owner, p.counterparty, launch.id);
       }
     }
     const { errors } = validateSpec(spec);
@@ -1950,7 +1958,45 @@ export class FleetService {
     }
     const retunnel = JSON.stringify(relayerTunnels(current)) !== JSON.stringify(relayerTunnels(spec));
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    // a cap change alone is the launcher's own bookkeeping (funding prompts,
+    // the over-cap flag): nothing on the relayer changes, so no relink
+    const samePaths =
+      JSON.stringify(current.topology.components.relayer?.paths ?? []) ===
+      JSON.stringify(spec.topology.components.relayer!.paths);
+    if (samePaths) return undefined;
     return this.db.createFleetOp(launch.id, "relayer-paths", { retunnel } satisfies RelayerPathsParams);
+  }
+
+  /**
+   * Queue a relink when a sister fleet this relayer reaches over its public
+   * ports moved its sentry-0 (a relaunch hands out new forwarded ports, and
+   * Hermes keeps dialing the old ones). The relink reads the new ports from
+   * lease status. Called by the monitor; true when it queued one to drive.
+   */
+  /**
+   * A public-grpc op another wallet's relayer queued on this fleet: it has
+   * never run (no request drives it), so the monitor starts it, and it then
+   * waits in this fleet's panel for this fleet's wallet to sign. True when
+   * there is one to drive.
+   */
+  undrivenPublicGrpc(launchId: string): boolean {
+    const started = new Set(this.db.listSteps(launchId).map((s) => s.name));
+    return this.db
+      .listFleetOps(launchId, "active")
+      .some((o) => o.kind === "public-grpc" && !started.has(`op${o.id}:public-grpc`));
+  }
+
+  queueStaleRelayLink(launchId: string): boolean {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return false;
+    const spec = this.spec(launch);
+    if (!spec.topology.components.relayer?.enabled) return false;
+    const row = this.db.listFleetComponents(launchId).find((c) => c.key === "relayer");
+    if (row?.state !== "active") return false;
+    if (!publicRelayFleets(spec).some((id) => publicRelayEndpointStale(this.db, id))) return false;
+    if (this.db.listFleetOps(launchId, "active").length > 0) return false;
+    this.db.createFleetOp(launchId, "relink", {});
+    return true;
   }
 
   /**
@@ -2026,10 +2072,10 @@ export class FleetService {
     if (key === "bridge" && bridge?.enabled) {
       bridge.target = resolveBridgeTarget(this.db, launch.owner, bridge.target.fleet, launch.id);
     }
-    // fleet counterparties become launch ids, checked for reachability
+    // fleet counterparties become launch ids, checked and routed (mesh or public)
     for (const p of spec.topology.components.relayer?.enabled ? spec.topology.components.relayer.paths : []) {
       if ("fleet" in p.counterparty) {
-        p.counterparty.fleet = resolveRelayFleet(this.db, spec, launch.owner, p.counterparty.fleet, launch.id);
+        resolveRelayCounterparty(this.db, spec, launch.owner, p.counterparty, launch.id);
       }
     }
     const { errors } = validateSpec(spec);

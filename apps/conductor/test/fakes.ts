@@ -274,6 +274,11 @@ export class FakeProviderGateway {
           // P2P is global on sentries (§5 "Public peering") — the source of
           // external_address and the join bundle's peer strings
           { host: ep.host, port: 26656, externalPort: ep.port + 20000 },
+          // gRPC only once a pushed manifest exposes it (a relayer's public
+          // route to a sister fleet on another mesh)
+          ...(this.lastManifest.get(dseq)?.includes('"port":9090')
+            ? [{ host: ep.host, port: 9090, externalPort: ep.port + 30000 }]
+            : []),
         ],
       },
     };

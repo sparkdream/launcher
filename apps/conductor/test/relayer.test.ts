@@ -13,15 +13,23 @@ import {
   relayerTunnels,
   relayPlan,
   renderHermesConfig,
+  publicRelayEndpoint,
+  publicRelayEndpointStale,
   renderRelayManifest,
+  resolveRelayCounterparty,
   resolveRelayFleet,
+  savePublicRelayEndpoint,
   suggestedTopUp,
   type RelayChannel,
 } from "../src/relayer.js";
 import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
 import { fundAmount, fundStatus, lowWater, ownerAddressOn } from "../src/relayer-funds.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
+import { detectChain, parseMinGasPrice, sisterFleets } from "../src/relayer-settings.js";
 import { chainStub, withStub } from "./chain-stub.js";
+
+const OWNER_A = "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w";
+const OWNER_B = "akash1kss2m5m0tlqasu22zlntjvvpgahgkmvs7dq95l";
 
 const tmpDirs: string[] = [];
 function tmp(): string {
@@ -782,14 +790,238 @@ describe("relayer between two fleets", () => {
     if (a.status !== "completed") throw new Error(explain(db, "fleet-a"));
     new FleetService(db, services, work).materialize("fleet-a");
 
-    // its own mesh: A's sentry gRPC is not on this tailnet
+    // its own mesh: reachable only over A's sentry's public ports
     const alone = spec("sparkdreamtwo", { domain: "hs2.example" });
-    expect(() => resolveRelayFleet(db, alone, "akash1owner", "sparkdream")).toThrow(/different mesh/);
+    const viaPublic: { fleet: string; via?: "mesh" | "public" } = { fleet: "sparkdream" };
+    resolveRelayCounterparty(db, alone, "akash1owner", viaPublic);
+    expect(viaPublic).toEqual({ fleet: "fleet-a", via: "public" });
+    // asking for the mesh there is refused, since there is no shared tailnet
+    expect(() => resolveRelayCounterparty(db, alone, "akash1owner", { fleet: "sparkdream", via: "mesh" })).toThrow(
+      /different mesh/,
+    );
     // somebody else's fleet
     const shared = spec("sparkdreamtwo", { reuseFleet: "fleet-a", domain: "hs.example" });
     expect(() => resolveRelayFleet(db, shared, "akash1other", "fleet-a")).toThrow(/different wallet/);
     expect(() => resolveRelayFleet(db, shared, "akash1owner", "nope")).toThrow(/no such fleet/);
     expect(resolveRelayFleet(db, shared, "akash1owner", "sparkdream")).toBe("fleet-a");
+    // on a shared mesh the route is the tunnel, unless public is asked for
+    const viaMesh: { fleet: string; via?: "mesh" | "public" } = { fleet: "sparkdream", via: "mesh" };
+    resolveRelayCounterparty(db, shared, "akash1owner", viaMesh);
+    expect(viaMesh).toEqual({ fleet: "fleet-a" });
     db.close();
   }, 120_000);
+
+  it("relays to a sister fleet on another mesh over its sentry's public ports", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const fleet = new FleetService(db, services, work);
+    const specA = spec("sparkdream", { domain: "hs.example" });
+    const a = await launch(db, work, services, "fleet-a", specA);
+    if (a.status !== "completed") throw new Error(explain(db, "fleet-a"));
+    fleet.materialize("fleet-a");
+    // fleet B runs its own headscale: no tailnet in common with A
+    const specB = spec("sparkdreamtwo", { domain: "hs2.example" }, [osmosis]);
+    const b = await launch(db, work, services, "fleet-b", specB);
+    if (b.status !== "completed") throw new Error(explain(db, "fleet-b"));
+    fleet.materialize("fleet-b");
+    const sentryA = db.listFleetComponents("fleet-a").find((c) => c.key === "sentry-0")!;
+    const relayer = db.listFleetComponents("fleet-b").find((c) => c.key === "relayer")!;
+
+    // the settings editor offers A, routed publicly
+    const sisters = sisterFleets(db, "fleet-b", "akash1owner");
+    expect(sisters).toEqual([
+      expect.objectContaining({ launchId: "fleet-a", route: "public", eligible: true, chainId: chainId(specA) }),
+    ]);
+
+    const xferA: RelayerPath = { id: "xfer-a", kind: "transfer", counterparty: { fleet: "sparkdream" } };
+    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis, xferA]);
+    const stored = JSON.parse(db.getLaunch("fleet-b")!.spec_json) as LaunchSpec;
+    expect(stored.topology.components.relayer!.paths[1]!.counterparty).toEqual({ fleet: "fleet-a", via: "public" });
+    // no tunnel to a sentry on another tailnet, so nothing to retunnel
+    expect(JSON.parse(db.listFleetOps("fleet-b", "active")[0]!.params_json)).toEqual({ retunnel: false });
+
+    const signer = new FakeSigner();
+    const res = await runWithSigner(
+      db,
+      "fleet-b",
+      stored,
+      work,
+      [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
+      services,
+      signer,
+    );
+    if (res.status !== "completed") throw new Error(explain(db, "fleet-b"));
+
+    // A's sentry: gRPC bound beyond localhost, and forwarded by its provider
+    // after one update of A's deployment (same wallet)
+    const aId = `${sentryA.ssh_host}:${sentryA.ssh_port}`;
+    expect(services.ssh.appToml.get(aId)).toContain('address = "0.0.0.0:9090"');
+    const sdlA = fs.readFileSync(path.join(work, "launches", "fleet-a", "sdl", "sentry-0.yaml"), "utf8");
+    expect(sdlA).toMatch(/port: 9090/);
+    const updates = signer.signed.flat().filter((m) => /MsgUpdateDeployment/.test(m.typeUrl));
+    expect(updates).toHaveLength(1);
+    expect(JSON.stringify(updates[0])).toContain(sentryA.dseq);
+
+    // Hermes dials A's forwarded ports; the relayer's env has no tunnel to A
+    const ep = publicRelayEndpoint(db, "fleet-a")!;
+    expect(ep.dseq).toBe(sentryA.dseq);
+    expect(ep.grpc).toMatch(/^http:\/\/[^:]+:\d+$/);
+    const config = services.ssh.files.get(`${relayer.ssh_host}:${relayer.ssh_port}|/data/relayer/config.toml`)!;
+    expect(config).toContain(`grpc_addr = '${ep.grpc}'`);
+    expect(config).toContain(`rpc_addr = '${ep.rpc}'`);
+    const sdlB = fs.readFileSync(path.join(work, "launches", "fleet-b", "sdl", "relayer.yaml"), "utf8");
+    expect(sdlB).not.toContain(`${sentryA.tailnet_ip}:9090`);
+    expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toContain("xfer-a");
+
+    // A's sentry moving to another deployment strands those ports: the
+    // monitor queues a relink, once
+    expect(fleet.queueStaleRelayLink("fleet-b")).toBe(false);
+    savePublicRelayEndpoint(db, "fleet-a", { ...ep, dseq: "1" });
+    expect(publicRelayEndpointStale(db, "fleet-a")).toBe(true);
+    expect(fleet.queueStaleRelayLink("fleet-b")).toBe(true);
+    expect(db.listFleetOps("fleet-b", "active").map((o) => o.kind)).toEqual(["relink"]);
+    expect(fleet.queueStaleRelayLink("fleet-b")).toBe(false);
+    db.close();
+  }, 240_000);
+
+  it("asks a sister fleet of another wallet to sign opening its gRPC, then links", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const fleet = new FleetService(db, services, work);
+    // fleet A is another wallet's, shared with this one; its own mesh
+    const specA = { ...spec("sparkdream", { domain: "hs.example" }), sharing: { wallets: [OWNER_B] } } as LaunchSpec;
+    db.createLaunch("fleet-a", JSON.stringify(specA), OWNER_A);
+    const a = await runWithSigner(db, "fleet-a", specA, work, allSteps(), services, new FakeSigner());
+    if (a.status !== "completed") throw new Error(explain(db, "fleet-a"));
+    fleet.materialize("fleet-a");
+    const specB = spec("sparkdreamtwo", { domain: "hs2.example" }, [osmosis]);
+    db.createLaunch("fleet-b", JSON.stringify(specB), OWNER_B);
+    const b = await runWithSigner(db, "fleet-b", specB, work, allSteps(), services, new FakeSigner());
+    if (b.status !== "completed") throw new Error(explain(db, "fleet-b"));
+    fleet.materialize("fleet-b");
+    const sentryA = db.listFleetComponents("fleet-a").find((c) => c.key === "sentry-0")!;
+
+    expect(sisterFleets(db, "fleet-b", OWNER_B)).toEqual([
+      expect.objectContaining({ launchId: "fleet-a", route: "public", eligible: true, otherWallet: OWNER_A }),
+    ]);
+    // a fleet that does not share with this wallet is not listed at all
+    expect(sisterFleets(db, "fleet-a", OWNER_A)).toEqual([]);
+
+    const fed: RelayerPath = { id: "fed-a", kind: "transfer", counterparty: { fleet: "sparkdream" } };
+    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis, fed]);
+    const runB = (signer = new FakeSigner()) =>
+      runWithSigner(
+        db,
+        "fleet-b",
+        JSON.parse(db.getLaunch("fleet-b")!.spec_json),
+        work,
+        [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
+        services,
+        signer,
+      );
+    const signerB = new FakeSigner();
+    const parked = await runB(signerB);
+    // only A's wallet can sign A's deployment update: B waits, A gets an op
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.reason).toContain(OWNER_A);
+    expect(signerB.signed.flat().some((m) => /MsgUpdateDeployment/.test(m.typeUrl))).toBe(false);
+    expect(db.listFleetOps("fleet-a", "active").map((o) => o.kind)).toEqual(["public-grpc"]);
+    expect(fleet.undrivenPublicGrpc("fleet-a")).toBe(true);
+
+    // A's op runs under A's wallet: one update of A's sentry deployment,
+    // which moves its on-chain version
+    const signerA = new FakeSigner();
+    signerA.onSigned = (msgs) => {
+      for (const m of msgs) {
+        if (/MsgUpdateDeployment/.test(m.typeUrl)) {
+          services.api.deploymentHashes.set(String((m.value as any).id.dseq), (m.value as any).hash);
+        }
+      }
+    };
+    const ranA = await runWithSigner(
+      db,
+      "fleet-a",
+      specA,
+      work,
+      [...buildPreLaunchOpSteps(db, "fleet-a"), ...allSteps(), ...buildOpSteps(db, "fleet-a")],
+      services,
+      signerA,
+    );
+    if (ranA.status !== "completed") throw new Error(explain(db, "fleet-a"));
+    const updates = signerA.signed.flat().filter((m) => /MsgUpdateDeployment/.test(m.typeUrl));
+    expect(updates).toHaveLength(1);
+    expect(JSON.stringify(updates[0])).toContain(OWNER_A);
+    expect(fleet.undrivenPublicGrpc("fleet-a")).toBe(false);
+    expect(publicRelayEndpoint(db, "fleet-a")!.dseq).toBe(sentryA.dseq);
+
+    // B resumes and links over A's public ports, signing nothing of A's
+    const resumed = await runB();
+    if (resumed.status !== "completed") throw new Error(explain(db, "fleet-b"));
+    expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toContain("fed-a");
+    db.close();
+  }, 240_000);
+
+  it("saves a key cap change without relinking", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const fleet = new FleetService(db, services, work);
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    const r = await launch(db, work, services, "fl", s);
+    if (r.status !== "completed") throw new Error(explain(db, "fl"));
+    fleet.materialize("fl");
+    const stored = JSON.parse(db.getLaunch("fl")!.spec_json) as LaunchSpec;
+    const paths = stored.topology.components.relayer!.paths;
+    expect(fleet.requestRelayerPaths(db.getLaunch("fl")!, paths, { maxBalance: "50000000" })).toBeUndefined();
+    expect(db.listFleetOps("fl", "active")).toHaveLength(0);
+    const after = JSON.parse(db.getLaunch("fl")!.spec_json) as LaunchSpec;
+    expect(after.topology.components.relayer!.maxBalance).toBe("50000000");
+    // a cap under the genesis balance is refused like any invalid spec
+    expect(() => fleet.requestRelayerPaths(db.getLaunch("fl")!, paths, { maxBalance: "1" })).toThrow(/genesisBalance/);
+    db.close();
+  }, 120_000);
+});
+
+describe("relayer settings", () => {
+  it("detects a Spark Dream chain from its endpoints", async () => {
+    const texts = new Map<string, string>([
+      ["rpc.sister.example/status", JSON.stringify({ result: { node_info: { network: "sister-1" } } })],
+      ["/cosmos/auth/v1beta1/bech32", JSON.stringify({ bech32_prefix: "sprkdrm" })],
+      [
+        "/cosmos/base/node/v1beta1/config",
+        JSON.stringify({ minimum_gas_price: "0.025000000000000000uspark.sister" }),
+      ],
+      ["/sparkdream/federation/v1/params", JSON.stringify({ params: { max_bridges_per_peer: "1000" } })],
+      ["/sparkdream/identity/v1/chain-identity", JSON.stringify({ identity: { chain_human_name: "Sister" } })],
+    ]);
+    const rpc = {
+      getText: async (url: string) => {
+        for (const [k, v] of texts) if (url.includes(k)) return v;
+        throw new Error(`HTTP 501 for ${url}`);
+      },
+    } as never;
+    expect(await detectChain(rpc, "https://rpc.sister.example/", "https://lcd.sister.example")).toEqual({
+      chainId: "sister-1",
+      bech32Prefix: "sprkdrm",
+      gasDenom: "uspark.sister",
+      gasPrice: 0.025,
+      federation: true,
+      identity: "Sister",
+      notes: [],
+    });
+    // no LCD: the chain id alone, with a note on what to fill in
+    const bare = await detectChain(rpc, "https://rpc.sister.example");
+    expect(bare.chainId).toBe("sister-1");
+    expect(bare.federation).toBe(false);
+    expect(bare.notes[0]).toMatch(/no LCD/);
+    await expect(detectChain(rpc, "https://nowhere.example")).rejects.toThrow(/did not answer/);
+  });
+
+  it("reads a node's minimum gas price, native denom first", () => {
+    expect(parseMinGasPrice("0.005000000000000000uatom")).toEqual({ denom: "uatom", price: 0.005 });
+    expect(parseMinGasPrice("0.01ibc/ABC,0.1uusdc")).toEqual({ denom: "uusdc", price: 0.1 });
+    expect(parseMinGasPrice("")).toBeUndefined();
+  });
 });
