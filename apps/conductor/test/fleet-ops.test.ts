@@ -1873,6 +1873,62 @@ describe("headscale relaunch op", () => {
   }, 240_000);
 });
 
+describe("minimum gas price", () => {
+  it("fixes a fee pasted into the per-gas field: spec, bundles and live nodes, then repair keeps it", async () => {
+    // the testnet's shape on 2026-10-02: spec and bundles said 25000 (a fee
+    // copied into the per-gas field), val-0 had been hand-fixed to 0.025, and
+    // a relaunched sentry booted the bundle's 25000 back
+    const w = await launched();
+    const launch = () => w.db.getLaunch("fl")!;
+    const denom = JSON.parse(launch().spec_json).token.baseDenom as string;
+    const bad = `25000${denom}`;
+    const good = `0.025${denom}`;
+    const stored = JSON.parse(launch().spec_json);
+    stored.token.minGasPrice = "25000";
+    w.db.setLaunchSpec("fl", JSON.stringify(stored));
+    const rows = w.db.listFleetComponents("fl");
+    const idOf = (key: string) => {
+      const r = rows.find((c) => c.key === key)!;
+      return `${r.ssh_host}:${r.ssh_port}`;
+    };
+    const setLive = (key: string, value: string) =>
+      w.services.ssh.appToml.set(
+        idOf(key),
+        (w.services.ssh.appToml.get(idOf(key)) ?? "").replace(/^minimum-gas-prices = .*$/m, `minimum-gas-prices = "${value}"`),
+      );
+    const live = (key: string) => /^minimum-gas-prices = "(.*)"$/m.exec(w.services.ssh.appToml.get(idOf(key)) ?? "")?.[1];
+    setLive("sentry-0", bad);
+    setLive("val-0", good);
+    const home = (key: string) => path.join(w.work, "launches/fl/nodes", key, "config/app.toml");
+    fs.writeFileSync(home("sentry-0"), fs.readFileSync(home("sentry-0"), "utf8").replace(/^minimum-gas-prices = .*$/m, `minimum-gas-prices = "${bad}"`));
+
+    // the fleet card says what is wrong, and a fee is refused as a price
+    expect(() => w.fleet.requestGasPrice(launch(), "25000")).toThrow(/price per gas unit, not a fee/);
+
+    const from = w.services.ssh.execLog.length;
+    w.fleet.requestGasPrice(launch(), "0.025");
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(JSON.parse(launch().spec_json).token.minGasPrice).toBe("0.025");
+    expect(live("sentry-0")).toBe(good);
+    expect(live("val-0")).toBe(good);
+    // only the node whose value changed restarted: val-0 kept signing
+    const restarts = w.services.ssh.execLog.slice(from).filter((e) => e.command.includes("pkill -x sparkdreamd"));
+    expect(restarts.map((e) => e.target)).toEqual([idOf("sentry-0")]);
+    // the bundle a relaunch boots from carries the corrected value
+    const bundled = execFileSync("tar", ["-xzOf", path.join(w.work, "launches/fl/bundles/sentry-0.tgz"), "config/app.toml"], {
+      encoding: "utf8",
+    });
+    expect(bundled).toContain(`minimum-gas-prices = "${good}"`);
+
+    // a later hand edit drifts a node again: repair brings it back
+    setLive("val-0", bad);
+    w.fleet.requestRepair(launch(), rows.find((c) => c.key === "val-0")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(live("val-0")).toBe(good);
+    w.db.close();
+  }, 180_000);
+});
+
 describe("repair op", () => {
   it("re-reads live addresses the launcher never saw, then re-aims env and peers at them", async () => {
     // The live shape: the fleet moved onto new tailnet addresses with the
@@ -2619,5 +2675,12 @@ describe("validatorPeersProblem", () => {
     expect(validatorPeersProblem(spec, "val-0", "aaa@127.0.0.1:26656", ids)).toMatch(/itself/);
     expect(validatorPeersProblem(spec, "val-0", "", ids)).toMatch(/no entry for sentry-0/);
     expect(validatorPeersProblem(spec, "val-0", "sss@100.64.0.22:26656", ids)).toMatch(/tailnet IP/);
+    // a relaunched sentry's old public endpoint, against its current one
+    expect(
+      validatorPeersProblem(spec, "val-0", "sss@provider.old.example:30845", ids, { 0: "provider.new.example:30140" }),
+    ).toMatch(/public endpoint is now provider\.new\.example:30140/);
+    expect(
+      validatorPeersProblem(spec, "val-0", "sss@provider.new.example:30140", ids, { 0: "provider.new.example:30140" }),
+    ).toBeNull();
   });
 });

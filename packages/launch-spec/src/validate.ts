@@ -993,6 +993,8 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
   if (spec.token.minGasPrice === "0" && mainnet) {
     warn("token.minGasPrice", "zero min gas price on mainnet invites spam");
   }
+  const gasPriceProblem = minGasPriceProblem(spec.token.minGasPrice, spec.token.baseDenom, spec.token.exponent);
+  if (gasPriceProblem) err("token.minGasPrice", gasPriceProblem);
 
   // stateSync serving at genesis is meaningless (no snapshots exist yet) —
   // a joined fleet syncs into a live chain, where serving makes sense
@@ -1140,3 +1142,28 @@ function validateServicesFleet(
   }
 }
 
+
+/**
+ * A per-gas-unit minimum gas price at or above this is a fee pasted into the
+ * wrong field. Real values sit near 0.025; at 1, a minimal 200k-gas
+ * transaction already costs 200,000 base units. Same bound as the chain
+ * repo's deploy/config CI check (crossnetwork/chain_env_test.go), whose
+ * chain.env once carried "25000<denom>" on every network: copied into specs,
+ * it made a testnet charge 5,000 SPARK per transaction, twice.
+ */
+export const MAX_MIN_GAS_PRICE = 1;
+
+/** Why a minGasPrice is not a plausible price per gas unit, or null. */
+export function minGasPriceProblem(value: string, baseDenom: string, exponent = 6): string | null {
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(value)) return "must be a decimal number of base units per gas unit, e.g. 0.025";
+  const price = Number(value);
+  if (price < MAX_MIN_GAS_PRICE) return null;
+  const perTx = Math.round(price * 200_000);
+  const display = perTx / 10 ** exponent;
+  const guess = price / 10 ** exponent;
+  return (
+    `${value} is a price per gas unit, not a fee: a 200,000-gas transaction would cost ${perTx.toLocaleString("en-US")} ` +
+    `${baseDenom} (${display.toLocaleString("en-US")} whole tokens). Use a value below ${MAX_MIN_GAS_PRICE}, ` +
+    `typically 0.025 (0 on a devnet)${guess < MAX_MIN_GAS_PRICE && guess > 0 ? `; ${guess} if this was meant in whole tokens` : ""}`
+  );
+}

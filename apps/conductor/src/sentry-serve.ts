@@ -68,6 +68,65 @@ export function applySentryServe(app: string, serve: SentryServe): string {
   return out;
 }
 
+/** What every node's app.toml must say for minimum-gas-prices: the spec's
+ *  per-gas-unit price in the base denom. Shared by render and convergence,
+ *  so the two can never disagree. */
+export function nodeMinGasPrices(spec: Pick<LaunchSpec, "token">): string {
+  return `${spec.token.minGasPrice}${spec.token.baseDenom}`;
+}
+
+/**
+ * Set app.toml's top-level minimum-gas-prices (it sits above every section).
+ * Throws when the line is absent: a node config without it has drifted.
+ */
+export function applyMinGasPrices(app: string, value: string): string {
+  const lines = app.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\[/.test(lines[i]!)) break;
+    if (/^minimum-gas-prices\s*=/.test(lines[i]!)) {
+      lines[i] = `minimum-gas-prices = "${value}"`;
+      return lines.join("\n");
+    }
+  }
+  throw new Error("app.toml has no top-level minimum-gas-prices");
+}
+
+/** The minimum-gas-prices an app.toml sets, if any. */
+export function readMinGasPrices(app: string): string | undefined {
+  return /^minimum-gas-prices\s*=\s*"([^"]*)"/m.exec(app)?.[1];
+}
+
+/**
+ * Converge a live node's app.toml over SSH: the spec's minimum-gas-prices
+ * on every node, and what `serve` opens on a sentry. Returns whether the
+ * file changed; the caller decides whether the node needs a restart to pick
+ * it up (a relaunched node that has not started yet does not).
+ */
+export async function patchNodeAppToml(
+  ctx: StepCtx,
+  key: string,
+  target: SshTarget,
+  want: { serve?: SentryServe; minGasPrices?: string },
+): Promise<boolean> {
+  const file = `${NODE_HOME}/config/app.toml`;
+  const current = (await ctx.services.ssh.exec(target, `cat ${file}`, { quick: true })).stdout;
+  let wanted = want.serve ? applySentryServe(current, want.serve) : current;
+  if (want.minGasPrices !== undefined) wanted = applyMinGasPrices(wanted, want.minGasPrices);
+  if (wanted === current) return false;
+  const local = path.join(ctx.dirs.root, `${key}.app.toml.serve`);
+  fs.writeFileSync(local, wanted);
+  await ctx.services.ssh.upload(target, local, file);
+  fs.rmSync(local, { force: true });
+  const before = readMinGasPrices(current);
+  if (want.minGasPrices !== undefined && before !== want.minGasPrices) {
+    ctx.log(`${key}: minimum-gas-prices ${before ?? "(unset)"} → ${want.minGasPrices}`);
+  }
+  if (want.serve && applySentryServe(current, want.serve) !== current) {
+    ctx.log(`${key}: app.toml opened for the fleet's components`);
+  }
+  return true;
+}
+
 /**
  * Apply `serve` to a live sentry's app.toml over SSH. Returns whether the
  * file changed; the caller decides whether the node needs a restart to pick
@@ -79,14 +138,5 @@ export async function patchSentryAppToml(
   target: SshTarget,
   serve: SentryServe,
 ): Promise<boolean> {
-  const file = `${NODE_HOME}/config/app.toml`;
-  const current = (await ctx.services.ssh.exec(target, `cat ${file}`, { quick: true })).stdout;
-  const wanted = applySentryServe(current, serve);
-  if (wanted === current) return false;
-  const local = path.join(ctx.dirs.root, `${key}.app.toml.serve`);
-  fs.writeFileSync(local, wanted);
-  await ctx.services.ssh.upload(target, local, file);
-  fs.rmSync(local, { force: true });
-  ctx.log(`${key}: app.toml opened for the fleet's components`);
-  return true;
+  return patchNodeAppToml(ctx, key, target, { serve });
 }

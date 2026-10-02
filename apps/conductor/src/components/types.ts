@@ -16,6 +16,10 @@ export interface RenderInput {
     tailnetIp: (nodeKey: string) => string;
     tsAuthkey: (nodeKey: string) => string;
   };
+  /** Public REST APIs of the chains this chain relays with, by chain id
+   *  (sisterChainApis): the frontend's federation form reads a peer chain's
+   *  identity from them. */
+  peerChains?: Record<string, string>;
   /** Current tailnet IP of a tunnel peer in ANOTHER fleet (`key@launchId`).
    *  Those fleets are already running, so their addresses are known at render
    *  time; this fleet's own peers stay placeholders until persist-start. */

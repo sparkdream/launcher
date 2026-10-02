@@ -49,6 +49,7 @@ import {
 } from "../lib/api";
 import { FundingRows } from "./relayer-funds";
 import { RelayerSettingsModal } from "./relayer-settings";
+import { PeerSetupRoutes } from "./peer-setup";
 import {
   connectKeplr,
   DEFAULT_CHAIN,
@@ -84,6 +85,7 @@ token:
   displayDenom: SPARK
   # dreamDenom: udream.sparkdreamdev  # udream. + baseDenom's suffix unless set
   # dreamDisplayDenom: DREAM
+  # minGasPrice: "0.025"   # per GAS UNIT in baseDenom, not a fee (profile default)
 accounts:
   initial:
     - name: treasury
@@ -2408,6 +2410,7 @@ export default function Page() {
             // relayer keys to fund: copy each address, or send from Keplr here
             <FundingRows rows={waitingStep.funding} toast={showToast} onError={(m) => setError(m)} />
           )}
+          {waitingStep.peerSetup && <PeerSetupRoutes setup={waitingStep.peerSetup} toast={showToast} />}
           {waitingStep.wallet && (
             // a transaction the launcher holds no key for: the user's wallet signs it here
             <div style={{ display: "grid", gap: 8 }}>
@@ -2453,9 +2456,9 @@ export default function Page() {
                   }
                 }}
               >
-                Sign with Keplr
+                {waitingStep.peerSetup ? "Sign the next step with Keplr" : "Sign with Keplr"}
               </button>
-              {waitingStep.wallet.cli && (
+              {waitingStep.wallet.cli && !waitingStep.peerSetup && (
                 <details>
                   <summary className="dim-note">Key not in a browser wallet? Show the CLI commands</summary>
                   <pre style={{ whiteSpace: "pre-wrap" }}>{waitingStep.wallet.cli}</pre>
@@ -2472,7 +2475,9 @@ export default function Page() {
             className="btn"
             onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
           >
-            {waitingStep.wallet
+            {waitingStep.peerSetup
+              ? "Done elsewhere? Resume now"
+              : waitingStep.wallet
               ? "Signed another way, resume"
               : waitingStep.funding?.length
                 ? "Funded, resume"
@@ -3913,10 +3918,35 @@ export default function Page() {
                     {chainFleet && !shutDown && active.length > 0 && (
                       <button
                         className="btn"
-                        title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
+                        title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node, and every node's minimum gas price is brought back to the spec's. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
                         onClick={() => fleetAction(f.launchId, active[0]!.dseq, "repair")}
                       >
                         repair fleet
+                      </button>
+                    )}
+                    {chainFleet && !shutDown && active.length > 0 && f.minGasPrice !== undefined && (
+                      <button
+                        className={`btn${f.gasPriceProblem ? " amber" : ""}`}
+                        title={`The minimum gas price every node accepts, per gas unit in ${f.gasDenom ?? "the base denom"} (now ${f.minGasPrice}). Sets it in the fleet's spec, the bundles a relaunch boots from, and each live node's app.toml; only nodes whose value changes restart, sentries first. Node config, not consensus: no reset or upgrade.`}
+                        onClick={async () => {
+                          const input = window.prompt(
+                            `Minimum gas price for ${f.chainId}, per gas unit in ${f.gasDenom ?? "the base denom"} ` +
+                              `(now ${f.minGasPrice}; typically 0.025, or 0 on a devnet). A fee for a 200,000-gas ` +
+                              "transaction is this times 200,000.",
+                            f.gasPriceProblem ? "0.025" : f.minGasPrice,
+                          );
+                          if (input === null || input.trim() === f.minGasPrice) return;
+                          try {
+                            const { postGasPrice } = await import("../lib/api");
+                            await postGasPrice(f.launchId, input.trim());
+                            showToast(`setting the minimum gas price to ${input.trim()}: follow it in the Launch panel`);
+                            openLaunch(f.launchId);
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        }}
+                      >
+                        gas price…
                       </button>
                     )}
                     {chainFleet && !shutDown && active.length > 0 && (
@@ -4066,6 +4096,11 @@ export default function Page() {
                           </button>
                         </span>
                       ))}
+                    {f.gasPriceProblem && !shutDown && (
+                      <span className="dim-note" style={{ flexBasis: "100%", color: "var(--amber-text)" }}>
+                        Minimum gas price {f.minGasPrice} {f.gasDenom}: {f.gasPriceProblem}. Fix it with gas price….
+                      </span>
+                    )}
                     {prefs && (prefs.avoid.length > 0 || prefs.prefer.length > 0) && (
                       <span
                         className="pref-summary"

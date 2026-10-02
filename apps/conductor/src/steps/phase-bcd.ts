@@ -1499,8 +1499,11 @@ export async function nodeRpcUrl(
   dseq: string,
   gseq = 1,
   oseq = 1,
+  /** The deployment owner's certificate, when the lease is another fleet's:
+   *  a provider answers lease status only to its owner (404 otherwise). */
+  cert: Certificate = loadCert(ctx),
 ): Promise<string> {
-  const status = await ctx.services.provider.leaseStatus(loadCert(ctx), hostUri, dseq, gseq, oseq);
+  const status = await ctx.services.provider.leaseStatus(cert, hostUri, dseq, gseq, oseq);
   const ep = extractForwardedPort(status, 26657);
   return `http://${ep.host}:${ep.port}`;
 }

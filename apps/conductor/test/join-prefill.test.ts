@@ -30,7 +30,7 @@ function bundle(overrides: Record<string, unknown> = {}) {
       baseDenom: "uspark.sparkdream",
       displayDenom: "SPARK",
       exponent: 6,
-      minGasPrice: "25000",
+      minGasPrice: "0.025",
       dreamDisplayDenom: "DREAM",
     },
     image: "sparkdreamnft/sparkdreamd:v1.0.33",
@@ -103,7 +103,7 @@ describe("joinSpecFromBundle: bundle only", () => {
     expect(s.network).toMatchObject({ name: "sparkdream-test-join", bech32Prefix: "sprkdrm" });
     expect(s.network.chainIdSuffix).toBeUndefined();
     expect(s.token.baseDenom).toBe("uspark.sparkdream");
-    expect(s.token.minGasPrice).toBe("25000");
+    expect(s.token.minGasPrice).toBe("0.025");
     expect(s.images.sparkdreamd).toBe("sparkdreamnft/sparkdreamd:v1.0.33");
     expect(s.topology.validators).toEqual({ count: 1, operators: "generated" });
     expect(s.accounts.initial).toEqual([]);
@@ -112,6 +112,15 @@ describe("joinSpecFromBundle: bundle only", () => {
     const check = checkSpec(spec);
     expect(check.errors).toEqual([]);
     expect(notes.join("\n")).toMatch(/headscale\.example\.com/);
+  });
+
+  it("flags a bundle whose gas price is a fee, not a price per gas unit", () => {
+    // bundles exported before the check could carry the old chain.env value
+    const { spec } = joinSpecFromBundle(
+      bundle({ token: { ...bundle().token, minGasPrice: "25000" } }),
+    );
+    const issue = checkSpec(spec).errors.find((e) => e.path === "token.minGasPrice");
+    expect(issue?.message).toMatch(/price per gas unit, not a fee/);
   });
 
   it("carries the mainnet hardening rules when the chain id reads as mainnet", () => {

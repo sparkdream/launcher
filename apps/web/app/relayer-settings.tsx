@@ -468,7 +468,7 @@ function AddConnection({
                 ? s.reason
                 : s.route === "mesh"
                   ? "same mesh"
-                  : `different mesh: via its public ports (one signature${s.otherWallet ? " from its wallet" : ""})`}
+                  : "different mesh: via its sentry's public ports"}
             </span>
           </button>
         ))}
@@ -521,10 +521,10 @@ function AddConnection({
               {sister.route === "public" && (
                 <div className="dim-note">
                   {sister.name} is on another mesh: the relayer reaches it over its sentry-0&apos;s public ports.
-                  The first link opens its gRPC and restarts that sentry once.{" "}
-                  {sister.otherWallet
-                    ? `That changes its deployment, so its own wallet (${sister.otherWallet}) signs, in ${sister.name}'s panel; the link waits for it.`
-                    : "One signature."}
+                  A deployment only gets a new port when it is created, so unless that sentry already forwards
+                  gRPC, the link pauses until you relaunch it
+                  {sister.otherWallet ? ` with its own wallet (${sister.otherWallet})` : ""} (it syncs from its
+                  validator on the new provider).
                 </div>
               )}
               {federation && (

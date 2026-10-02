@@ -210,6 +210,15 @@ export class FakeProviderGateway {
         );
       }
     }
+    // a lease forwards the ports its deployment was created with: a later
+    // manifest asking for another is refused (seen live on 2026-10-02)
+    const first = this.lastManifest.get(dseq);
+    if (manifestJson && first && !first.includes('"port":9090') && manifestJson.includes('"port":9090')) {
+      throw new Error(
+        `provider PUT /deployment/${dseq}/manifest: HTTP 422 manifest cross-validation error: group "dcloud": ` +
+          'service "sparkdreamd": resource ID 1: over-utilized PORT endpoints',
+      );
+    }
     if (manifestJson) this.lastManifest.set(dseq, manifestJson);
     const gated = manifestJson?.includes("WAIT_FOR_CONFIG=")
       ? manifestJson.includes("WAIT_FOR_CONFIG=true")
@@ -861,6 +870,16 @@ export class FakeSsh {
 
   async upload(target: SshTarget, localPath: string, remotePath?: string): Promise<void> {
     if (!fs.existsSync(localPath)) throw new Error(`upload source missing: ${localPath}`);
+    // a node-data bundle carries the node's rendered app.toml: what the
+    // node runs from here on, as on a real container after tar xzf
+    if (remotePath === "/tmp/node-data.tgz" && localPath.endsWith(".tgz")) {
+      try {
+        const app = execFileSync("tar", ["-xzOf", localPath, "config/app.toml"], { encoding: "utf8" });
+        if (app) this.appToml.set(this.id(target), app);
+      } catch {
+        // a test bundle without one: the template default stands
+      }
+    }
     if (remotePath?.endsWith("/config/app.toml")) {
       this.appToml.set(this.id(target), fs.readFileSync(localPath, "utf8"));
     }

@@ -39,7 +39,7 @@ import { fetchJoinGenesis, resolveStateSyncTrust } from "./join.js";
 import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
-import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress } from "../relayer.js";
+import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress, sisterChainApis } from "../relayer.js";
 import { descriptor } from "../components/index.js";
 import { BRIDGE_OPERATOR } from "../components/mastodon-secrets.js";
 import { ensureBridgeOperatorKey } from "./mastodon.js";
@@ -620,6 +620,7 @@ export const renderSdlsStep: StepDef = {
       const outPath = path.join(ctx.dirs.sdl, `${component.key}.yaml`);
       renderComponentSdl({
         spec: ctx.spec,
+        peerChains: sisterChainApis(ctx.db, ctx.launchId, ctx.spec),
         component,
         sshPublicKey: keys.sshPublicKey,
         outPath,

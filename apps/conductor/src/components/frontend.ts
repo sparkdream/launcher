@@ -46,6 +46,11 @@ function render(input: RenderInput) {
   ];
   const explorer = explorerUrl(spec);
   if (explorer) env.push(`EXPLORER_URL=${explorer}`);
+  // where each chain this one relays with answers, for the federation form
+  // (a peer's chain identity is read from its API; the chain records none)
+  if (input.peerChains && Object.keys(input.peerChains).length > 0) {
+    env.push(`PEER_CHAINS=${JSON.stringify(input.peerChains)}`);
+  }
   return {
     frontend: {
       service: {

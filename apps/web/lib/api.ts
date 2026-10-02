@@ -120,6 +120,9 @@ export interface StepView {
   wallet?: WalletRequest;
   /** Accounts to send money to before the step can go on (relayer keys). */
   funding?: FundingRequest[];
+  /** A federation peer's remaining setup on a chain whose committee key the
+   *  launcher does not hold: the ways to finish it elsewhere. */
+  peerSetup?: PeerSetup;
 }
 
 /** How the launcher's Keplr can send to a relayer key: a launcher fleet's
@@ -153,6 +156,25 @@ export interface RelayerFunds extends FundingRequest {
 
 /** A transaction on a fleet's chain the launcher cannot sign itself (it
  *  holds no key allowed to): the user's wallet signs it in the pause card. */
+/** A federation peer's remaining setup on another chain (conductor
+ *  peering.ts PeerSetup). The launcher resumes by itself once that chain
+ *  shows the work done, whichever way it was done. */
+export interface PeerSetup {
+  chainId: string;
+  chainLabel: string;
+  peerId: string;
+  remaining: string[];
+  /** Self-contained bash for the computer holding a committee member key. */
+  script: string;
+  /** That chain's frontend, prefilled. */
+  links?: { register?: string; policy?: string; activate?: string };
+  /** The register form's values, spelled out. */
+  registerHint?: string;
+  /** What to enter in the frontend's policy form. */
+  policyHint?: string;
+  resumeAt?: number;
+}
+
 export interface WalletRequest {
   title: string;
   chain: {
@@ -389,6 +411,11 @@ export interface FleetSummary {
     chainId: string;
     /** softsign | tmkms — signer-related actions are gated on this. */
     keyMode: string;
+    /** Chain fleets: token.minGasPrice (per gas unit, in gasDenom), and why
+     *  it is implausible when it is (a fee in the per-gas field). */
+    minGasPrice?: string;
+    gasDenom?: string;
+    gasPriceProblem?: string;
     components: ComponentView[];
     ops: Array<{
       id: number;
@@ -702,6 +729,18 @@ export async function postRelayerWithdraw(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chainId, ...(to ? { to } : {}) }),
+    }),
+  );
+}
+
+/** Correct a chain fleet's minimum gas price (gas-price op): the spec, the
+ *  relaunch bundles and every live node. */
+export async function postGasPrice(launchId: string, minGasPrice: string): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/gas-price`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ minGasPrice }),
     }),
   );
 }

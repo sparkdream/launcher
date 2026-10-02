@@ -163,14 +163,13 @@ export function describeChanges(
       const route = p.counterparty.via ?? s?.route;
       if (route === "public" && !publicBefore.has(p.counterparty.fleet) && !exposed.has(p.counterparty.fleet)) {
         exposed.add(p.counterparty.fleet);
-        const signer = s?.otherWallet
-          ? `one signature from its own wallet (${s.otherWallet}) in its panel`
-          : "one signature";
+        const wallet = s?.otherWallet ? ` with its own wallet (${s.otherWallet})` : "";
         lines.push({
           tone: "note",
           text:
-            `${s?.name ?? chain} is on another mesh: its sentry-0's gRPC is opened publicly (${signer}, ` +
-            "and that sentry restarts once)",
+            `${s?.name ?? chain} is on another mesh, so the relayer reaches it over its sentry-0's public ports. ` +
+            `Unless that sentry already forwards gRPC, the link pauses until you relaunch it${wallet}: a port ` +
+            "only comes with a new deployment",
         });
       }
       continue;

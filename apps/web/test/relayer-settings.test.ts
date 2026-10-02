@@ -79,8 +79,9 @@ describe("relayer settings helpers", () => {
     expect(lines).toContain("add: Opens a federation channel to sparkdream-test-1 (SparkdreamTest)");
     expect(lines).toContain("add: Opens a transfer channel to sparkdream-test-1 (SparkdreamTest)");
     expect(lines.some((l) => /committee proposal on sparkdream-dev-1 \(your founder vote\)/.test(l))).toBe(true);
-    // the public route is announced once, though two paths use it
-    expect(lines.filter((l) => /opened publicly \(one signature/.test(l))).toHaveLength(1);
+    // the public route (and the relaunch it may need) is announced once,
+    // though two paths use it
+    expect(lines.filter((l) => /relaunch it/.test(l))).toHaveLength(1);
     expect(lines.some((l) => /Relay fees between sister chains come back/.test(l))).toBe(true);
   });
 
@@ -90,7 +91,7 @@ describe("relayer settings helpers", () => {
     ];
     const after = [...before, ...sisterPaths(sister(), { federation: true, alsoTransfer: false, taken: ["sparkdream-test"] })];
     const text = describeChanges(before, after, ctx).map((l) => l.text).join("\n");
-    expect(text).not.toMatch(/opened publicly/);
+    expect(text).not.toMatch(/relaunch it/);
   });
 
   it("flags drops, a paid chain waiting for funds, and a cap change", () => {

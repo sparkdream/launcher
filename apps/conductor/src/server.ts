@@ -141,9 +141,13 @@ function nameFleetUniquely(db: ConductorDb, spec: LaunchSpecInput): void {
 
 /** A waiting step's stored extras: a bare WalletRequest, or the funding
  *  rows (relayer keys to send to) with an optional request beside them. */
-function waitingExtras(stored: any): { wallet?: unknown; funding?: unknown[] } {
-  if (stored && Array.isArray(stored.funding)) {
-    return { funding: stored.funding, ...(stored.wallet ? { wallet: stored.wallet } : {}) };
+function waitingExtras(stored: any): { wallet?: unknown; funding?: unknown[]; peerSetup?: unknown } {
+  if (stored && (Array.isArray(stored.funding) || stored.peerSetup)) {
+    return {
+      ...(stored.wallet ? { wallet: stored.wallet } : {}),
+      ...(Array.isArray(stored.funding) ? { funding: stored.funding } : {}),
+      ...(stored.peerSetup ? { peerSetup: stored.peerSetup } : {}),
+    };
   }
   return { wallet: stored };
 }
@@ -229,6 +233,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const timer = setInterval(async () => {
       // launches are independent — sweep them concurrently so one hung
       // provider can't delay every other fleet's health refresh
+      // a launch paused on a federation peer's setup elsewhere resumes by
+      // itself once that chain shows the work done (peerSetupReady)
+      await Promise.all(
+        deps.db
+          .listLaunches()
+          .filter((l) => l.status === "paused" && !running.has(l.id))
+          .map(async (launch) => {
+            if (await fleet.peerSetupReady(launch.id).catch(() => false)) {
+              drive(launch.id, JSON.parse(launch.spec_json));
+            }
+          }),
+      );
       await Promise.all(
         deps.db.listCompletedLaunches().map(async (launch) => {
           await fleet.tick(launch.id).catch(() => {});
@@ -1475,6 +1491,26 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       // the op's steps are built from the spec just written
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
       return { status: "relayer-paths-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // correct a chain fleet's minimum gas price (gas-price op): the spec, the
+  // relaunch bundles and every live node's app.toml
+  app.post("/api/fleet/:launchId/gas-price", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as { minGasPrice?: unknown };
+    if (typeof body.minGasPrice !== "string") {
+      return reply.status(400).send({ error: "minGasPrice (a decimal string, per gas unit) is required" });
+    }
+    try {
+      const opId = fleet.requestGasPrice(launch, body.minGasPrice);
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "gas-price-started", opId };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

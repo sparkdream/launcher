@@ -20,6 +20,8 @@ export {
   withDefaults,
   validateSpec,
   checkSpec,
+  minGasPriceProblem,
+  MAX_MIN_GAS_PRICE,
   unknownKeyIssues,
   WALLET_LOGIN_MIN_VERSION,
   imageBefore,

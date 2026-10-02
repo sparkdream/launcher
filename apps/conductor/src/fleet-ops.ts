@@ -38,8 +38,8 @@ import {
 import { sparkdreamd } from "./exec.js";
 import { renderComponentSdl } from "./render-component-sdl.js";
 import { descriptorFor, setServiceEnv } from "./components/index.js";
-import { patchSentryAppToml, sentryServe } from "./sentry-serve.js";
-import { fleetPeer, peerRow, relayedBy } from "./relayer.js";
+import { applyMinGasPrices, nodeMinGasPrices, patchNodeAppToml, patchSentryAppToml, readMinGasPrices, sentryServe } from "./sentry-serve.js";
+import { fleetPeer, peerRow, relayedBy, sisterChainApis } from "./relayer.js";
 import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
 import { reconcileSessions, type SessionRole } from "./sessions.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
@@ -281,6 +281,10 @@ export function validatorPeersProblem(
   key: string,
   peers: string,
   nodeIds: Record<string, string>,
+  /** Each sentry's current public p2p endpoint ("host:port"), when known: an
+   *  entry naming any other public address dials a deployment that is gone
+   *  (a sentry relaunch moves it; seen live 2026-10-02). */
+  publicP2p: Record<number, string | undefined> = {},
 ): string | null {
   const entries = peers.split(",").map((e) => e.trim()).filter(Boolean);
   const idOf = (e: string) => e.split("@")[0] ?? "";
@@ -294,6 +298,11 @@ export function validatorPeersProblem(
     if (!entry) return `persistent_peers has no entry for sentry-${s}`;
     if (i === 0 && /@100\./.test(entry)) {
       return `sentry-${s} is peered at a tailnet IP the validator cannot dial`;
+    }
+    const addr = entry.slice(entry.indexOf("@") + 1);
+    const pub = publicP2p[s];
+    if (pub && !/^(127\.0\.0\.1|100\.)/.test(addr) && addr !== pub) {
+      return `sentry-${s} is peered at ${addr}, but its public endpoint is now ${pub}`;
     }
   }
   return null;
@@ -777,6 +786,7 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
       }
       renderComponentSdl({
         spec,
+        peerChains: sisterChainApis(ctx.db, ctx.launchId, spec),
         component,
         sshPublicKey: keys.sshPublicKey,
         outPath: sdlPathFor(ctx, key),
@@ -859,9 +869,10 @@ export function relinkSteps(opId: number, spec: LaunchSpec): StepDef[] {
 
 /**
  * Open this fleet's sentry-0 gRPC to relayers on other meshes ("public-grpc"
- * op): queued by another wallet's relayer linking to this fleet, since only
- * this fleet's wallet can sign its deployment update. The relayer resumes
- * once this is done.
+ * op). Earlier builds queued it from another wallet's relayer for an
+ * in-place deployment update, which providers refuse (a lease's ports are
+ * fixed when it is created); it now only prepares the sentry and records
+ * the endpoint when the lease already forwards gRPC.
  */
 export function publicGrpcSteps(opId: number): StepDef[] {
   const name = `op${opId}:public-grpc`;
@@ -869,13 +880,26 @@ export function publicGrpcSteps(opId: number): StepDef[] {
     {
       name,
       async run(ctx) {
-        const ep = await openPublicGrpc(ctx, ctx.launchId, name);
+        // Never a pause: a gRPC port comes with a new deployment only, so
+        // what this op cannot do is a relaunch of sentry-0, which runs
+        // after it (ops run in order) and must not wait behind it
+        let relaunch: string | undefined;
+        const ep = await openPublicGrpc(ctx, ctx.launchId, (msg) => {
+          relaunch = msg;
+          throw new RelaunchNeeded();
+        }).catch((e) => {
+          if (e instanceof RelaunchNeeded) return undefined;
+          throw e;
+        });
+        if (relaunch) ctx.log(relaunch);
         ctx.db.setFleetOpStatus(opId, "done");
-        return ep;
+        return ep ?? { relaunchNeeded: true };
       },
     },
   ];
 }
+
+class RelaunchNeeded extends Error {}
 
 /** Params of a "relayer-paths" op: the new paths are already in the spec. */
 export interface RelayerPathsParams {
@@ -999,6 +1023,7 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
         if (!keys) throw new Error("generate-keys output missing");
         renderComponentSdl({
           spec: sized,
+          peerChains: sisterChainApis(ctx.db, ctx.launchId, sized),
           component,
           sshPublicKey: keys.sshPublicKey,
           outPath: sdlPathFor(ctx, key),
@@ -1467,6 +1492,10 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // the sentry to open more (its LCD) — converge on the current spec
       // before the node first starts
       if (key.startsWith("sentry-")) await ensureSentryServes(ctx, spec, key, target);
+      // the bundle carries the app.toml rendered at launch: a gas price
+      // corrected since (or hand-edited on the old node) would otherwise come
+      // back with the relaunch, as a 25000 one did on 2026-10-02
+      await patchNodeAppToml(ctx, key, target, { minGasPrices: nodeMinGasPrices(spec) });
       if (spec.join) {
         // join fleets: the bundle's [statesync] block still carries the
         // launch-time trust anchor, long outside the light-client trust
@@ -1617,7 +1646,21 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         for (const depKey of dependents) {
           const row = componentRow(ctx, depKey);
           if (!row.tailnet_ip) continue; // not reachable/placed right now
-          if (close.oldTailnetIp) {
+          if (depKey.startsWith("val-")) {
+            // A validator's line is rebuilt whole: it may name this sentry's
+            // old PUBLIC endpoint (public-first peering), which a tailnet-IP
+            // sed never matches, leaving the validator dialing a closed
+            // deployment (seen live 2026-10-02). Its dial-out tunnel's env is
+            // re-aimed by the persist step below, whose manifest push
+            // restarts it onto that.
+            await wireValidatorPeers(
+              ctx,
+              depKey,
+              rowTarget(ctx, row),
+              (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
+              (s) => sentryPublicP2p(ctx, s),
+            );
+          } else if (close.oldTailnetIp) {
             await ctx.services.ssh.exec(
               rowTarget(ctx, row),
               `sed -i 's|${close.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
@@ -1692,6 +1735,19 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       const topo = resolveTopology(spec);
       const targets: string[] = [key];
       if (isValidator) targets.push(...(topo.validatorSentries[valIndex] ?? []).map((s) => `sentry-${s}`));
+      // a relaunched sentry moved: the validators that dial it first carry
+      // its old address in their peer-tunnel env, and a container restart
+      // would re-create that dead tunnel. Re-aimed in this same tx.
+      const dialers = isValidator
+        ? []
+        : Array.from({ length: spec.topology.validators.count }, (_, v) => v)
+            .filter((v) => topo.validatorSentries[v]?.[0] === Number(key.split("-")[1]))
+            .map((v) => `val-${v}`)
+            .filter((k) => {
+              const row = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find((c) => c.key === k);
+              return row?.state === "active" && fs.existsSync(sdlPathFor(ctx, k));
+            });
+      targets.push(...dialers);
 
       const msgs: Msg[] = [];
       const manifests: Array<{ row: FleetComponentRow; json: string }> = [];
@@ -1708,7 +1764,9 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
           if (sentryIp) text = withValidatorTunnelEnv(text, sentryIp, Boolean(spec.join));
         }
-        if (k !== key) {
+        if (dialers.includes(k)) {
+          text = withValidatorTunnelEnv(text, cfg.tailnetIp, Boolean(spec.join));
+        } else if (k !== key) {
           // counterpart sentry: re-aim its tunnel for THIS validator at the
           // new tailnet IP (placeholder form covers never-persisted SDLs)
           text = text
@@ -1759,7 +1817,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // subtly corrupt state whose first block panics ("invalid denom"),
       // i.e. a deterministic crash loop. Observed live twice; a restore
       // from a stable sentry executed cleanly.
-      const counterparts = manifests.filter((m) => m.row.key !== key);
+      const counterparts = manifests.filter((m) => m.row.key !== key && !dialers.includes(m.row.key));
       // A counterpart whose provider will not answer is logged and dropped
       // from the ordering below rather than failing the op. That ordering
       // exists to keep a sentry serving at the head while the validator
@@ -1799,6 +1857,20 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       }
       for (const { row: r, json } of manifests.filter((m) => m.row.key === key)) {
         await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
+      }
+      // the dialing validators last: their restart re-creates the peer
+      // tunnel at the relaunched sentry, which is up by now. An unreachable
+      // provider is logged, not fatal: repair's mesh-env re-pushes it
+      for (const { row: r, json } of manifests.filter((m) => dialers.includes(m.row.key))) {
+        try {
+          await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
+          ctx.log(`${r.key}: peer tunnel re-aimed at ${cfg.tailnetIp}`);
+        } catch (e) {
+          ctx.log(
+            `${r.key}: manifest push failed (${e instanceof Error ? e.message : String(e)}); ` +
+              "its peer tunnel still names the old address until repair re-pushes it",
+          );
+        }
       }
       // Every manifest pushed above re-created a container, and a re-created
       // container answers SSH on a different forwarded port: probing without
@@ -3298,6 +3370,7 @@ function rerenderComponentSdl(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPa
   if (!component) throw new Error(`${key} is disabled in the spec — cannot re-render its SDL`);
   renderComponentSdl({
     spec,
+    peerChains: sisterChainApis(ctx.db, ctx.launchId, spec),
     component,
     sshPublicKey: keys.sshPublicKey,
     outPath: sdlPath,
@@ -4743,6 +4816,89 @@ export function forceRedeploySteps(
  * So: a component already pointing at the current address is left alone, its
  * container is never restarted, and a re-run of a finished op does nothing.
  */
+/**
+ * Bring every node's minimum-gas-prices to the spec's, everywhere it lives:
+ * the launcher's node homes (re-packing the bundles a relaunch boots from
+ * when one changed) and each live node's app.toml, sentries before
+ * validators, restarting only the nodes whose file changed. It is node
+ * config, not consensus, so nodes can differ for a moment without harm.
+ *
+ * Exists because the value drifted three ways at once on the testnet: the
+ * spec held a fee pasted into the per-gas field (25000), the live nodes had
+ * been hand-corrected to 0.025, and a relaunch booted the July bundle and
+ * brought 25000 back on the public sentry.
+ */
+export async function convergeGasPrice(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+): Promise<{ want: string; homes: string[]; nodes: string[]; unreachable: string[] }> {
+  const want = nodeMinGasPrices(spec);
+  const homes: string[] = [];
+  for (const node of nodes(spec)) {
+    const file = path.join(ctx.dirs.node(node.key), "config", "app.toml");
+    if (!fs.existsSync(file)) continue;
+    const current = fs.readFileSync(file, "utf8");
+    const next = applyMinGasPrices(current, want);
+    if (next === current) continue;
+    fs.writeFileSync(file, next);
+    homes.push(node.key);
+    ctx.log(`${node.key}: launcher copy minimum-gas-prices ${readMinGasPrices(current) ?? "(unset)"} → ${want}`);
+  }
+  if (homes.length > 0 && fs.existsSync(ctx.dirs.bundles)) await packageNodeDataStep.run(ctx);
+
+  const rows = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).filter(
+    (r) => r.state === "active" && r.ssh_host && /^(sentry|val)-/.test(r.key),
+  );
+  // sentries first: a validator restart is a pause in signing, keep it last
+  rows.sort((a, b) => Number(b.key.startsWith("sentry-")) - Number(a.key.startsWith("sentry-")));
+  const changed: string[] = [];
+  const unreachable: string[] = [];
+  for (const row of rows) {
+    const target = rowTarget(ctx, row);
+    try {
+      if (await patchNodeAppToml(ctx, row.key, target, { minGasPrices: want })) {
+        await restartNode(ctx.services.ssh, target);
+        changed.push(row.key);
+      }
+    } catch (e) {
+      unreachable.push(row.key);
+      ctx.log(`${row.key}: could not converge minimum-gas-prices (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+  if (homes.length === 0 && changed.length === 0 && unreachable.length === 0) {
+    ctx.log(`every node already runs minimum-gas-prices ${want}`);
+  }
+  return { want, homes, nodes: changed, unreachable };
+}
+
+/** Params of a "gas-price" op: the new value is already in the spec. */
+export interface GasPriceParams {
+  minGasPrice: string;
+  previous: string;
+}
+
+/** Apply a corrected token.minGasPrice to a running fleet (fleet action
+ *  "gas price…"): convergeGasPrice, against the spec just stored. */
+export function gasPriceSteps(opId: number, spec: LaunchSpec): StepDef[] {
+  const name = `op${opId}:converge`;
+  return [
+    {
+      name,
+      async run(ctx) {
+        const out = await convergeGasPrice(ctx, spec);
+        if (out.unreachable.length > 0) {
+          throw new Error(
+            `could not reach ${out.unreachable.join(", ")} to set minimum-gas-prices ${out.want}: retry once ` +
+              "they answer (relaunch converges a node too)",
+          );
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return out;
+      },
+    },
+  ];
+}
+
 export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec): StepDef[] {
   const p = (s: string) => `op${opId}:${s}`;
   const meshKeys = [
@@ -4982,7 +5138,12 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           const line = /^persistent_peers\s*=\s*"(.*)"/m.exec(got.stdout);
           if (!line) continue;
           if (key.startsWith("val-")) {
-            const problem = validatorPeersProblem(spec, key, line[1] ?? "", nodeIds);
+            const publicP2p: Record<number, string | undefined> = {};
+            for (const s of resolveTopology(spec).validatorSentries[Number(key.split("-")[1])] ?? []) {
+              const ep = await sentryPublicP2p(ctx, s).catch(() => undefined);
+              publicP2p[s] = ep ? `${ep.host}:${ep.port}` : undefined;
+            }
+            const problem = validatorPeersProblem(spec, key, line[1] ?? "", nodeIds, publicP2p);
             if (problem) {
               // not an address to re-aim but a line to rebuild: write it the
               // way a fresh launch would (public endpoint first, else the
@@ -5040,6 +5201,14 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         }
         if (repaired.length === 0) ctx.log("every peer entry already names its node's current address");
         return { repaired };
+      },
+    },
+    {
+      name: p("gas-price"),
+      async run(ctx) {
+        // node config drifts quietly (hand edits, a relaunch from an old
+        // bundle): every node back to the spec's minimum-gas-prices
+        return convergeGasPrice(ctx, spec);
       },
     },
     {
@@ -5167,6 +5336,7 @@ function buildSteps(
     if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
     if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
     if (op.kind === "public-grpc") steps.push(...publicGrpcSteps(op.id));
+    if (op.kind === "gas-price") steps.push(...gasPriceSteps(op.id, spec));
     if (op.kind === "relayer-paths") steps.push(...relayerPathsSteps(op.id, params, spec));
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));

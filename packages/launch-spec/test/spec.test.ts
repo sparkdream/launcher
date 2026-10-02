@@ -4,6 +4,7 @@ import {
   checkSpec,
   grpcRequired,
   lcdRequired,
+  minGasPriceProblem,
   resolveTopology,
   serviceComponents,
   tunnelPort,
@@ -574,6 +575,29 @@ describe("validateSpec", () => {
     spec.security.sshPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF00 kob@laptop";
     spec.providers.policy.preference = [AKASH_A];
     expect(validateSpec(spec).errors).toEqual([]);
+  });
+});
+
+describe("token.minGasPrice", () => {
+  it("refuses a fee pasted into the per-gas-unit field", () => {
+    // the chain repo's old chain.env value: 25000 per gas unit charged
+    // 5,000 SPARK for a 200k-gas transaction
+    const bad = withDefaults(testnetSpecInput({ token: { baseDenom: "uspark.sparkdreamtest", displayDenom: "SPARK", minGasPrice: "25000" } }));
+    const issue = validateSpec(bad).errors.find((e) => e.path === "token.minGasPrice");
+    expect(issue?.message).toMatch(/price per gas unit, not a fee/);
+    expect(issue?.message).toContain("5,000,000,000 uspark.sparkdreamtest");
+    expect(issue?.message).toContain("0.025 if this was meant in whole tokens");
+    expect(validateSpec(withDefaults(testnetSpecInput({ token: { minGasPrice: "1" } }))).errors.map((e) => e.path)).toContain(
+      "token.minGasPrice",
+    );
+  });
+
+  it("accepts real per-gas prices", () => {
+    for (const v of ["0", "0.025", "0.5"]) {
+      expect(minGasPriceProblem(v, "uspark")).toBeNull();
+      const s = withDefaults(testnetSpecInput({ token: { minGasPrice: v } }));
+      expect(validateSpec(s).errors.map((e) => e.path)).not.toContain("token.minGasPrice");
+    }
   });
 });
 

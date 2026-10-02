@@ -927,15 +927,19 @@ chain given by its endpoints.
   - **mesh** (the default when both fleets share one tailnet: `reuseFleet` in
     either direction, or both borrowing a third fleet's): the tunnels above.
   - **public** (the only way to a sister chain on another mesh): the
-    sentry-0's provider-forwarded ports. RPC is forwarded already; the first
-    link opens gRPC (`openPublicGrpc`): app.toml binds it beyond localhost,
-    the sentry's SDL gains a global 9090 expose, one MsgUpdateDeployment, and
-    the manifest push re-creates that sentry once. The forwarded gRPC and RPC
-    are read from lease status and stored in the `relay-public:<launch>`
-    setting, keyed by the sentry's dseq. Only the deployment's wallet can sign
-    that update: for a sister fleet of another wallet, the link queues a
-    `public-grpc` op on that fleet (the monitor starts it, and it waits for
-    that wallet's signature in that fleet's panel) and pauses until it ran.
+    sentry-0's provider-forwarded ports. RPC is forwarded already; gRPC needs
+    a 9090 expose, and a lease forwards only the ports its deployment was
+    created with: a deployment update adding one is refused by the provider
+    ("over-utilized PORT endpoints", 2026-10-02), after its tx has already
+    moved the on-chain version. So the link (`openPublicGrpc`) binds gRPC
+    beyond localhost in app.toml, writes the expose into the stored SDL, and,
+    when the running lease forwards no gRPC, pauses asking for a relaunch of
+    that sentry-0 (by that fleet's own wallet when it is another's), which
+    deploys the stored SDL. Once forwarded, the gRPC and RPC endpoints are read
+    from lease status and stored in the `relay-public:<launch>` setting, keyed
+    by the sentry's dseq. A sentry relaunch also re-aims its validator's
+    running dial-out tunnel; the validator's deployment env keeps the old
+    address until a repair.
   Endpoint counterparties are dialed directly, so their gRPC must be public.
 - **Keys and gas.** One mnemonic (`relayer` in `mnemonics.json`) gives an
   address on every chain, each with its own prefix and HD path. The own-chain
@@ -1035,9 +1039,29 @@ alone, because rebinding is remove + re-register.
 generated it (`accounts.initial` with `generate` and `council.founder`),
 through `sparkdreamd tx sign`/`broadcast` from that launch's master keyring.
 That covers the other fleet on a fleet-to-fleet path too. With no such key
-(an external founder, or a counterparty chain given by endpoints), the step
-pauses and writes the exact messages for that chain's committee to
-`<launch>/peering/`, then continues once the chain reports them done.
+(an external founder, or a counterparty chain given by endpoints),
+`ensurePeerByWallet` reads where the peer stands and pauses **once per
+chain** with everything left (a `PeerSetup`), finishable three ways:
+
+1. **Keplr here**, when this browser's wallet holds a committee member of
+   that chain: the pause's WalletRequest is the next transaction (register
+   and policy go out as one, since a member signs both directly; then the
+   activation proposal, the vote, the execute), and signing resumes the op.
+2. **Another computer**: one self-contained bash script (messages inline,
+   only `KEY` to edit) that sends every remaining transaction, looks the
+   proposal id up on the chain, and retries execution until the committee's
+   minimum execution period has passed.
+3. **That chain's frontend** (a launcher fleet's sparkdream-ui): prefilled
+   links into its federation page, `?register=1&peer_id=…&channel=…
+   &transfer_channel=…&peer_api=…&identity=<base64url>` for the register
+   form (sparkdream-ui v1.0.77 and later fill in the transfer channel and
+   fetch the peer's chain identity), then `?policy=<peer>` and
+   `?activate=<peer>`.
+
+Whichever route is used, the monitor resumes the op by itself: it reads the
+peer through the chain's REST API every tick (`peerProgress`: registered,
+policy set, status) and drives the launch once that differs from what the
+pause recorded, or once an accepted activation's execution time has passed.
 
 ### Mastodon (component `mastodon`)
 
@@ -1713,6 +1737,34 @@ treatment:
   a `127.0.0.1` entry (a sentry reaching its validator through a tunnel, which
   the env pass owns) and a public hostname (a join-mode peer, deliberately off
   the mesh) are both left alone — rewriting either would undo the design.
+- **gas-price** — `minimum-gas-prices` in every node's app.toml, and in the
+  launcher's node copies and relaunch bundles, brought back to the spec's
+  `token.minGasPrice` (`convergeGasPrice`; sentries first, only changed nodes
+  restart).
+
+### Minimum gas price
+
+`token.minGasPrice` is a price **per gas unit** in the base denom (0.025 is
+typical, 0 on a devnet), not a fee. The chain repo's `chain.env` once carried
+`MIN_GAS_PRICES="25000<denom>"` on every network, a `--fees` amount pasted
+into the per-gas field: at 200,000 gas that charges 5,000 whole tokens per
+transaction. Copied into the testnet's spec, it bit twice: the live nodes were
+hand-corrected to 0.025, and on 2026-10-02 a sentry relaunch booted the launch
+bundle and brought 25000 back on the public RPC (and the relayer's funding and
+Hermes config read the same wrong price). Guarded now at every layer:
+
+- **Validation:** `minGasPriceProblem` refuses a price at or above
+  `MAX_MIN_GAS_PRICE` (1, the chain repo's own CI bound) wherever a spec is
+  checked (launch, ops, join specs), naming what a transaction would cost and
+  the likely intended value. The fleet card shows the same message for a
+  stored spec that predates the check.
+- **gas price…** (fleet action, op `gas-price`): sets the value on a running
+  fleet and converges it everywhere it lives (`convergeGasPrice`): the spec,
+  the node copies, the re-packed bundles and each live node.
+- **Relaunch:** writes the spec's value into the relaunched node's app.toml
+  before it starts, whatever the bundle says.
+- **Repair:** the `gas-price` pass above catches hand edits and any other
+  drift.
 
 Like restore, repair's steps compose **before** the launch's own rather than
 after (`PRE_LAUNCH_OP_KINDS`). A fleet dialling dead addresses does not gossip,

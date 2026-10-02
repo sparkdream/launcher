@@ -7,7 +7,7 @@ import {
   type NodeRef,
   type Topology,
 } from "@sparkdream/launch-spec";
-import { applySentryServe, sentryServe } from "./sentry-serve.js";
+import { applySentryServe, nodeMinGasPrices, sentryServe } from "./sentry-serve.js";
 import { templatePath } from "./vendor.js";
 
 /**
@@ -113,7 +113,7 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
 
   const vars: Record<string, string> = {
     CHAIN_ID: chainId(spec),
-    MIN_GAS_PRICES: `${spec.token.minGasPrice}${spec.token.baseDenom}`,
+    MIN_GAS_PRICES: nodeMinGasPrices(spec),
     SNAPSHOT_INTERVAL: String(spec.infra.sentrySettings.snapshotInterval),
     SNAPSHOT_KEEP_RECENT: String(spec.infra.sentrySettings.snapshotKeepRecent),
     // Peer vars are replaced whole-line below (templates hold a single peer

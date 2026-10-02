@@ -531,3 +531,33 @@ export function peerRow(db: ConductorDb, launchId: string, peer: string): FleetC
   const { key, launchId: other } = parseFleetPeer(peer);
   return (db.listFleetComponents(other ?? launchId) as FleetComponentRow[]).find((c) => c.key === key);
 }
+
+/**
+ * Public REST APIs of the chains this fleet's chain relays with, by chain id:
+ * fleets its own relayer reaches, fleets whose relayer reaches it, and
+ * endpoint counterparties that name an LCD. Handed to its frontend
+ * (PEER_CHAINS), whose federation register form fetches a peer chain's
+ * identity from it: nothing on chain records where a peer's API answers.
+ */
+export function sisterChainApis(db: ConductorDb, launchId: string, spec: LaunchSpec): Record<string, string> {
+  const out: Record<string, string> = {};
+  const addFleet = (id: string) => {
+    const launch = db.getLaunch(id);
+    if (!launch || launch.status === "aborted") return;
+    let other: LaunchSpec;
+    try {
+      other = specOf(launch);
+    } catch {
+      return;
+    }
+    const api = other.topology.publicEndpoints?.api;
+    if (api) out[chainId(other)] = `https://${api}`;
+  };
+  for (const id of [...relayFleets(spec), ...publicRelayFleets(spec)]) addFleet(id);
+  for (const id of relayedBy(db, launchId)) addFleet(id);
+  for (const p of relayerPaths(spec)) {
+    const cp = p.counterparty;
+    if (!("fleet" in cp) && cp.lcd) out[cp.chainId] = cp.lcd.replace(/\/+$/, "");
+  }
+  return out;
+}

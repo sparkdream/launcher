@@ -19,6 +19,7 @@ import {
   resolveRelayCounterparty,
   resolveRelayFleet,
   savePublicRelayEndpoint,
+  sisterChainApis,
   suggestedTopUp,
   type RelayChannel,
 } from "../src/relayer.js";
@@ -26,6 +27,8 @@ import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-l
 import { fundAmount, fundStatus, lowWater, ownerAddressOn } from "../src/relayer-funds.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 import { detectChain, parseMinGasPrice, sisterFleets } from "../src/relayer-settings.js";
+import { fleetRpc } from "../src/peering.js";
+import { launchDirs } from "../src/engine.js";
 import { chainStub, withStub } from "./chain-stub.js";
 
 const OWNER_A = "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w";
@@ -811,7 +814,33 @@ describe("relayer between two fleets", () => {
     db.close();
   }, 120_000);
 
-  it("relays to a sister fleet on another mesh over its sentry's public ports", async () => {
+  /** Relaunch fleet `id`'s sentry-0 the way the fleet panel does, under that
+   *  fleet's own signer; returns the new row. */
+  async function relaunchSentry(
+    db: ConductorDb,
+    fleet: FleetService,
+    services: ReturnType<typeof fakeServices>,
+    work: string,
+    id: string,
+  ) {
+    const old = db.listFleetComponents(id).find((c) => c.key === "sentry-0")!;
+    await fleet.requestRelaunch(db.getLaunch(id)!, old);
+    services.api.leaseStates.set(old.dseq, "closed");
+    services.ssh.failHosts.add(`${old.ssh_host}:${old.ssh_port}`);
+    const moved = await runWithSigner(
+      db,
+      id,
+      JSON.parse(db.getLaunch(id)!.spec_json),
+      work,
+      [...buildPreLaunchOpSteps(db, id), ...allSteps(), ...buildOpSteps(db, id)],
+      services,
+      new FakeSigner(),
+    );
+    if (moved.status !== "completed") throw new Error(explain(db, id));
+    return db.listFleetComponents(id).find((c) => c.key === "sentry-0")!;
+  }
+
+  it("relays to a sister fleet on another mesh over its sentry's public ports, after a relaunch gives it one", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
@@ -829,8 +858,7 @@ describe("relayer between two fleets", () => {
     const relayer = db.listFleetComponents("fleet-b").find((c) => c.key === "relayer")!;
 
     // the settings editor offers A, routed publicly
-    const sisters = sisterFleets(db, "fleet-b", "akash1owner");
-    expect(sisters).toEqual([
+    expect(sisterFleets(db, "fleet-b", "akash1owner")).toEqual([
       expect.objectContaining({ launchId: "fleet-a", route: "public", eligible: true, chainId: chainId(specA) }),
     ]);
 
@@ -841,41 +869,67 @@ describe("relayer between two fleets", () => {
     // no tunnel to a sentry on another tailnet, so nothing to retunnel
     expect(JSON.parse(db.listFleetOps("fleet-b", "active")[0]!.params_json)).toEqual({ retunnel: false });
 
+    const runB = (signer = new FakeSigner()) =>
+      runWithSigner(
+        db,
+        "fleet-b",
+        JSON.parse(db.getLaunch("fleet-b")!.spec_json),
+        work,
+        [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
+        services,
+        signer,
+      );
+    // A's running sentry forwards no gRPC, and a lease cannot gain a port:
+    // the link asks for a relaunch instead of updating the deployment
     const signer = new FakeSigner();
-    const res = await runWithSigner(
-      db,
-      "fleet-b",
-      stored,
-      work,
-      [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
-      services,
-      signer,
-    );
-    if (res.status !== "completed") throw new Error(explain(db, "fleet-b"));
-
-    // A's sentry: gRPC bound beyond localhost, and forwarded by its provider
-    // after one update of A's deployment (same wallet)
+    const parked = await runB(signer);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.reason).toMatch(/Relaunch sentry-0 on sparkdream/);
+    expect(signer.signed.flat().some((m) => /MsgUpdateDeployment/.test(m.typeUrl))).toBe(false);
     const aId = `${sentryA.ssh_host}:${sentryA.ssh_port}`;
     expect(services.ssh.appToml.get(aId)).toContain('address = "0.0.0.0:9090"');
     const sdlA = fs.readFileSync(path.join(work, "launches", "fleet-a", "sdl", "sentry-0.yaml"), "utf8");
     expect(sdlA).toMatch(/port: 9090/);
-    const updates = signer.signed.flat().filter((m) => /MsgUpdateDeployment/.test(m.typeUrl));
-    expect(updates).toHaveLength(1);
-    expect(JSON.stringify(updates[0])).toContain(sentryA.dseq);
 
+    // the relaunch deploys that SDL: the new lease forwards gRPC, and the
+    // fresh sentry still serves it beyond localhost (B relays to it)
+    const sentryA2 = await relaunchSentry(db, fleet, services, work, "fleet-a");
+    expect(services.ssh.appToml.get(`${sentryA2.ssh_host}:${sentryA2.ssh_port}`)).toContain('address = "0.0.0.0:9090"');
+    // A's validator dials the moved sentry again through its peer proxy
+    const valA = db.listFleetComponents("fleet-a").find((c) => c.key === "val-0")!;
+    expect(
+      services.ssh.execLog.some(
+        (e) => e.target === `${valA.ssh_host}:${valA.ssh_port}` && e.command.includes(`TCP-LISTEN:16657`) && e.command.includes(sentryA2.tailnet_ip!),
+      ),
+    ).toBe(true);
+
+    const resumed = await runB();
+    if (resumed.status !== "completed") throw new Error(explain(db, "fleet-b"));
     // Hermes dials A's forwarded ports; the relayer's env has no tunnel to A
     const ep = publicRelayEndpoint(db, "fleet-a")!;
-    expect(ep.dseq).toBe(sentryA.dseq);
+    expect(ep.dseq).toBe(sentryA2.dseq);
     expect(ep.grpc).toMatch(/^http:\/\/[^:]+:\d+$/);
     const config = services.ssh.files.get(`${relayer.ssh_host}:${relayer.ssh_port}|/data/relayer/config.toml`)!;
     expect(config).toContain(`grpc_addr = '${ep.grpc}'`);
     expect(config).toContain(`rpc_addr = '${ep.rpc}'`);
     const sdlB = fs.readFileSync(path.join(work, "launches", "fleet-b", "sdl", "relayer.yaml"), "utf8");
-    expect(sdlB).not.toContain(`${sentryA.tailnet_ip}:9090`);
+    expect(sdlB).not.toContain(`${sentryA2.tailnet_ip}:9090`);
     expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toContain("xfer-a");
 
-    // A's sentry moving to another deployment strands those ports: the
-    // monitor queues a relink, once
+    // each side's frontend learns where the other chain's API answers
+    // (PEER_CHAINS), in both directions: B relays to A, so A lists B too
+    const withApi = (sp: LaunchSpec, api: string) =>
+      ({ ...sp, topology: { ...sp.topology, publicEndpoints: { api, rpc: `rpc.${api}` } } }) as LaunchSpec;
+    db.setLaunchSpec("fleet-a", JSON.stringify(withApi(JSON.parse(db.getLaunch("fleet-a")!.spec_json), "api-a.example")));
+    db.setLaunchSpec("fleet-b", JSON.stringify(withApi(JSON.parse(db.getLaunch("fleet-b")!.spec_json), "api-b.example")));
+    const specAnow = JSON.parse(db.getLaunch("fleet-a")!.spec_json) as LaunchSpec;
+    const specBnow = JSON.parse(db.getLaunch("fleet-b")!.spec_json) as LaunchSpec;
+    expect(sisterChainApis(db, "fleet-a", specAnow)).toEqual({ [chainId(specB)]: "https://api-b.example" });
+    // the Osmosis path names no LCD, so it is not listed
+    expect(sisterChainApis(db, "fleet-b", specBnow)).toEqual({ [chainId(specA)]: "https://api-a.example" });
+
+    // A's sentry moving again strands those ports: the monitor queues a
+    // relink, once
     expect(fleet.queueStaleRelayLink("fleet-b")).toBe(false);
     savePublicRelayEndpoint(db, "fleet-a", { ...ep, dseq: "1" });
     expect(publicRelayEndpointStale(db, "fleet-a")).toBe(true);
@@ -883,9 +937,9 @@ describe("relayer between two fleets", () => {
     expect(db.listFleetOps("fleet-b", "active").map((o) => o.kind)).toEqual(["relink"]);
     expect(fleet.queueStaleRelayLink("fleet-b")).toBe(false);
     db.close();
-  }, 240_000);
+  }, 300_000);
 
-  it("asks a sister fleet of another wallet to sign opening its gRPC, then links", async () => {
+  it("names the sister fleet's own wallet for the relaunch when it is another wallet's", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
@@ -901,7 +955,6 @@ describe("relayer between two fleets", () => {
     const b = await runWithSigner(db, "fleet-b", specB, work, allSteps(), services, new FakeSigner());
     if (b.status !== "completed") throw new Error(explain(db, "fleet-b"));
     fleet.materialize("fleet-b");
-    const sentryA = db.listFleetComponents("fleet-a").find((c) => c.key === "sentry-0")!;
 
     expect(sisterFleets(db, "fleet-b", OWNER_B)).toEqual([
       expect.objectContaining({ launchId: "fleet-a", route: "public", eligible: true, otherWallet: OWNER_A }),
@@ -909,9 +962,9 @@ describe("relayer between two fleets", () => {
     // a fleet that does not share with this wallet is not listed at all
     expect(sisterFleets(db, "fleet-a", OWNER_A)).toEqual([]);
 
-    const fed: RelayerPath = { id: "fed-a", kind: "transfer", counterparty: { fleet: "sparkdream" } };
-    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis, fed]);
-    const runB = (signer = new FakeSigner()) =>
+    const xfer: RelayerPath = { id: "xfer-a", kind: "transfer", counterparty: { fleet: "sparkdream" } };
+    fleet.requestRelayerPaths(db.getLaunch("fleet-b")!, [osmosis, xfer]);
+    const runB = () =>
       runWithSigner(
         db,
         "fleet-b",
@@ -919,49 +972,39 @@ describe("relayer between two fleets", () => {
         work,
         [...buildPreLaunchOpSteps(db, "fleet-b"), ...allSteps(), ...buildOpSteps(db, "fleet-b")],
         services,
-        signer,
+        new FakeSigner(),
       );
-    const signerB = new FakeSigner();
-    const parked = await runB(signerB);
-    // only A's wallet can sign A's deployment update: B waits, A gets an op
+    const parked = await runB();
     expect(parked.status).toBe("awaiting-user");
-    expect(parked.reason).toContain(OWNER_A);
-    expect(signerB.signed.flat().some((m) => /MsgUpdateDeployment/.test(m.typeUrl))).toBe(false);
-    expect(db.listFleetOps("fleet-a", "active").map((o) => o.kind)).toEqual(["public-grpc"]);
-    expect(fleet.undrivenPublicGrpc("fleet-a")).toBe(true);
+    expect(parked.reason).toContain(`with its wallet (${OWNER_A})`);
+    // nothing is queued on A: the relaunch is its owner's to start
+    expect(db.listFleetOps("fleet-a", "active")).toEqual([]);
 
-    // A's op runs under A's wallet: one update of A's sentry deployment,
-    // which moves its on-chain version
-    const signerA = new FakeSigner();
-    signerA.onSigned = (msgs) => {
-      for (const m of msgs) {
-        if (/MsgUpdateDeployment/.test(m.typeUrl)) {
-          services.api.deploymentHashes.set(String((m.value as any).id.dseq), (m.value as any).hash);
-        }
-      }
-    };
-    const ranA = await runWithSigner(
-      db,
-      "fleet-a",
-      specA,
-      work,
-      [...buildPreLaunchOpSteps(db, "fleet-a"), ...allSteps(), ...buildOpSteps(db, "fleet-a")],
-      services,
-      signerA,
-    );
-    if (ranA.status !== "completed") throw new Error(explain(db, "fleet-a"));
-    const updates = signerA.signed.flat().filter((m) => /MsgUpdateDeployment/.test(m.typeUrl));
-    expect(updates).toHaveLength(1);
-    expect(JSON.stringify(updates[0])).toContain(OWNER_A);
-    expect(fleet.undrivenPublicGrpc("fleet-a")).toBe(false);
-    expect(publicRelayEndpoint(db, "fleet-a")!.dseq).toBe(sentryA.dseq);
-
-    // B resumes and links over A's public ports, signing nothing of A's
+    await relaunchSentry(db, fleet, services, work, "fleet-a");
     const resumed = await runB();
     if (resumed.status !== "completed") throw new Error(explain(db, "fleet-b"));
-    expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toContain("fed-a");
+    expect(fleet.relayerState(db.getLaunch("fleet-b")!)!.channels.map((c) => c.id)).toContain("xfer-a");
+
+    // the federation peer setup reaches A's chain through A's lease, which
+    // answers only to A's certificate (B's got a 404 live, 2026-10-02)
+    // every fake fleet gets the same certificate: mark A's so the two differ
+    const certAPath = path.join(work, "launches", "fleet-a", "secrets", "akash-cert.pem");
+    fs.writeFileSync(certAPath, fs.readFileSync(certAPath, "utf8").replace("FAKE", "FAKE-FLEET-A"));
+    const certA = fs.readFileSync(certAPath, "utf8");
+    const certB = fs.readFileSync(path.join(work, "launches", "fleet-b", "secrets", "akash-cert.pem"), "utf8");
+    const seen: string[] = [];
+    const leaseStatus = services.provider.leaseStatus.bind(services.provider);
+    services.provider.leaseStatus = async (cert: any, ...rest: any[]) => {
+      seen.push(cert.certPem);
+      return (leaseStatus as any)(cert, ...rest);
+    };
+    const ctxB = { db, launchId: "fleet-b", workRoot: work, services, dirs: launchDirs(work, "fleet-b") } as any;
+    expect(await fleetRpc(ctxB, "fleet-a")).toMatch(/^http:\/\//);
+    expect(await fleetRpc(ctxB, "fleet-b")).toMatch(/^http:\/\//);
+    expect(certA).not.toBe(certB);
+    expect(seen).toEqual([certA, certB]);
     db.close();
-  }, 240_000);
+  }, 300_000);
 
   it("saves a key cap change without relinking", async () => {
     const work = tmp();

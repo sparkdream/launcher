@@ -30,14 +30,10 @@ import {
   loadCertAt,
   nodeShellFallback,
   sshTarget,
-  waitLeaseStatus,
   type Assignments,
   type DeploymentPlan,
   type SshEndpoints,
 } from "./phase-bcd.js";
-import { pushManifest } from "./phase-ef.js";
-import { loadSdl, sdlArtifacts } from "../akash/sdl-groups.js";
-import { TypeUrl } from "../akash/messages.js";
 import {
   chainIdentity,
   ensurePeerActive,
@@ -141,67 +137,57 @@ export function withPublicGrpc(text: string): string {
 
 /**
  * Open fleet `id`'s sentry-0 to relayers on other meshes: app.toml binds
- * gRPC beyond localhost (restarting the node only when that changed), the
- * sentry's SDL gains a global 9090 expose, and once the chain holds that
- * version the manifest push re-creates the container onto it. Then the
- * forwarded gRPC and RPC ports are read from lease status and stored, keyed
- * by that sentry's dseq, for relayPlan. The provider calls use that fleet's
- * own certificate, since its wallet owns the deployment.
+ * gRPC beyond localhost (restarting the node only when that changed), and
+ * the forwarded gRPC and RPC ports are read from lease status and stored,
+ * keyed by that sentry's dseq, for relayPlan. Provider calls use that
+ * fleet's own certificate, since its wallet owns the deployment.
  *
- * Convergent: an SDL already exposing gRPC whose version is on chain signs
- * nothing, and a provider already forwarding it is not pushed to. Only the
- * deployment's owner can sign the update: in a step of that fleet (its own
- * public-grpc op, or a relayer of the same wallet) `requireTx` asks for it;
- * from another wallet's relayer, `signOutside` is called instead and must
- * not return.
+ * A lease forwards only the ports it was created with: a deployment update
+ * that adds one is refused by the provider ("over-utilized PORT endpoints",
+ * seen live 2026-10-02, and the update tx had already moved the on-chain
+ * version, leaving the deployment unable to take any manifest). So when the
+ * lease has no forwarded gRPC this only writes the 9090 expose into the
+ * stored SDL, which a relaunch of sentry-0 deploys with, and calls
+ * `needRelaunch`, which must not return.
  */
 export async function openPublicGrpc(
   ctx: StepCtx,
   id: string,
-  txStep: string,
-  signOutside?: () => never,
+  needRelaunch: (message: string) => never,
 ): Promise<PublicRelayEndpoint> {
   const other = ctx.db.getLaunch(id);
   if (!other) throw new Error(`relayer counterparty fleet ${id} is gone`);
+  const otherSpec = JSON.parse(other.spec_json) as LaunchSpec;
   const label = fleetPeer("sentry-0", id);
   const row = (ctx.db.listFleetComponents(id) as FleetComponentRow[]).find((c) => c.key === "sentry-0");
   if (!row || row.state === "closed") throw new Error(`fleet ${id} has no running sentry-0 to relay through`);
   const target = id === ctx.launchId ? ownSentryTarget(ctx, row) : foreignSentryTarget(ctx, id);
-  const serve = { ...sentryServe(JSON.parse(other.spec_json) as LaunchSpec), grpc: true };
+  const serve = { ...sentryServe(otherSpec), grpc: true };
   if (await patchSentryAppToml(ctx, label, target, serve)) {
     await restartNode(ctx.services.ssh, target);
   }
-  const sdlDir = launchDirs(ctx.workRoot, id).sdl;
-  const sdlPath = path.join(sdlDir, "sentry-0.yaml");
+  const sdlPath = path.join(launchDirs(ctx.workRoot, id).sdl, "sentry-0.yaml");
   const text = fs.readFileSync(sdlPath, "utf8");
   const next = withPublicGrpc(text);
   if (next !== text) {
+    // the next deployment of sentry-0 (its relaunch) forwards gRPC; the
+    // running one is not touched, so its on-chain version stays its own
     fs.writeFileSync(sdlPath, next);
-    ctx.log(`${label}: exposing gRPC publicly for relayers on other meshes`);
-  }
-  const artifacts = sdlArtifacts(loadSdl(sdlPath));
-  fs.writeFileSync(path.join(sdlDir, "sentry-0.manifest.json"), artifacts.manifestJson);
-  const wantHash = Buffer.from(artifacts.hash).toString("base64");
-  const onChain = await ctx.services.api.deploymentInfo(other.owner, row.dseq);
-  if (onChain?.hash !== wantHash) {
-    if (signOutside) signOutside();
-    await ctx.requireTx(txStep, [
-      { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner: other.owner, dseq: row.dseq }, hash: wantHash } },
-    ]);
-  } else {
-    ctx.db.deletePendingTx(ctx.launchId, txStep);
+    ctx.log(`${label}: stored SDL now exposes gRPC for relayers on other meshes`);
   }
 
   const cert = loadCertAt(launchDirs(ctx.workRoot, id).secrets);
-  let status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
+  const status = await ctx.services.provider.leaseStatus(cert, row.host_uri, row.dseq, 1, 1);
   let grpc: { host: string; port: number };
   try {
     grpc = extractForwardedPort(status, 9090);
   } catch {
-    // the provider still runs the manifest from before the expose
-    await pushManifest(ctx, cert, label, row.host_uri, row.dseq, artifacts.manifestJson);
-    status = await waitLeaseStatus(ctx, cert, row.host_uri, row.dseq, 1, 1, { forwardedPort: 9090 });
-    grpc = extractForwardedPort(status, 9090);
+    const wallet = other.owner === ctx.db.getLaunch(ctx.launchId)?.owner ? "" : ` with its wallet (${other.owner})`;
+    needRelaunch(
+      `${otherSpec.network.name}'s sentry-0 has no public gRPC port, and a deployment only gets one when it is ` +
+        `created. Relaunch sentry-0 on ${otherSpec.network.name}${wallet}: the relaunch deploys the stored SDL, ` +
+        "which now forwards gRPC (the sentry syncs from its validator on the new provider). Then resume here.",
+    );
   }
   const rpc = extractForwardedPort(status, 26657);
   const ep: PublicRelayEndpoint = {
@@ -223,33 +209,15 @@ function ownSentryTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
 /**
  * A sister fleet on another mesh (path `via: public`) is reached over its
  * sentry-0's provider-forwarded ports, since the relayer's tailnet is not
- * that fleet's: open them (openPublicGrpc). A sister fleet of another wallet
- * signs its own deployment update: the first time, this queues a public-grpc
- * op on that fleet (the monitor starts it, and it waits there for that
- * wallet's signature) and pauses until it has run.
+ * that fleet's: open them (openPublicGrpc), pausing for a relaunch of that
+ * sentry when its deployment forwards no gRPC yet.
  */
 async function exposePublicSentries(ctx: StepCtx, stepName: string, spec: LaunchSpec): Promise<void> {
-  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
   for (const id of publicRelayFleets(spec)) {
-    const other = ctx.db.getLaunch(id);
-    if (!other) throw new Error(`relayer counterparty fleet ${id} is gone`);
-    const foreign = (other.owner ?? "") !== (owner ?? "");
-    await openPublicGrpc(ctx, id, `${stepName}:public-grpc:${id}`, foreign ? () => askOwnerToOpen(ctx, stepName, id) : undefined);
+    await openPublicGrpc(ctx, id, (message) => {
+      throw new AwaitUser(stepName, message);
+    });
   }
-}
-
-function askOwnerToOpen(ctx: StepCtx, stepName: string, id: string): never {
-  const other = ctx.db.getLaunch(id)!;
-  const name = (JSON.parse(other.spec_json) as LaunchSpec).network.name;
-  const queued = ctx.db.listFleetOps(id, "active").some((o) => o.kind === "public-grpc");
-  if (!queued) ctx.db.createFleetOp(id, "public-grpc", { for: ctx.launchId });
-  throw new AwaitUser(
-    stepName,
-    `${name} is on another mesh, so this relayer reaches it over its sentry's public ports, and opening its ` +
-      `gRPC changes ${name}'s deployment: only its wallet (${other.owner}) can sign that. Connect that wallet, ` +
-      `open ${name} in the Launch panel and sign the request waiting there (it restarts that sentry once), then ` +
-      "resume here.",
-  );
 }
 
 /**
@@ -512,6 +480,7 @@ export async function linkFederationPeers(
         ibcChannelId: ch.a.channel,
         ...(xfer ? { ibcTransferChannelId: xfer.a.channel } : {}),
         ...(remoteIdentity ? { peerIdentity: remoteIdentity } : {}),
+        ...(remote.wallet?.rest ? { peerApi: remote.wallet.rest } : {}),
         policy: sparkDreamPeerPolicy(),
       }),
     );
@@ -523,6 +492,7 @@ export async function linkFederationPeers(
         ibcChannelId: ch.b.channel,
         ...(xfer ? { ibcTransferChannelId: xfer.b.channel } : {}),
         ...(ownIdentity ? { peerIdentity: ownIdentity } : {}),
+        ...(own.wallet?.rest ? { peerApi: own.wallet.rest } : {}),
         policy: sparkDreamPeerPolicy(),
       }),
     );

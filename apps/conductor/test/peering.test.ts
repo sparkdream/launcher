@@ -5,7 +5,15 @@ import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { encodedToEncodeObjects } from "@sparkdream/akash-tx";
 import { AwaitUser, WALLET_SIGNER, type StepCtx, type WalletRequest } from "../src/engine.js";
-import { ensurePeerActive, policyDrift, sparkDreamPeerPolicy, type ChainActor, type PeerTarget } from "../src/peering.js";
+import {
+  ensurePeerActive,
+  peerProgress,
+  policyDrift,
+  sparkDreamPeerPolicy,
+  type ChainActor,
+  type PeerSetup,
+  type PeerTarget,
+} from "../src/peering.js";
 import { activityPubPeerPolicy, BRIDGE_AUTHOR_FIELDS } from "../src/steps/mastodon.js";
 import { chainStub, withStub } from "./chain-stub.js";
 
@@ -110,7 +118,7 @@ describe("ensurePeerActive", () => {
     expect(done.status).toBe("PEER_STATUS_ACTIVE");
   });
 
-  it("with a public endpoint, asks the committee's wallet for each stage in turn: register, policy, propose, vote, execute", async () => {
+  it("with a public endpoint, asks the committee's wallet for register and policy in one transaction, then propose, vote, execute", async () => {
     const stub = chainStub();
     const PUBLIC = "https://rpc.phoenix.example";
     stub.edit((s) => (s.aliases = { [PUBLIC]: "http://phoenix" }));
@@ -120,7 +128,10 @@ describe("ensurePeerActive", () => {
         chainId: "phoenix-1", chainName: "phoenix", rpc: PUBLIC, rest: "https://api.phoenix.example",
         bech32Prefix: "sprkdrm", denom: "uspark", displayDenom: "SPARK", decimals: 6, gasPrice: 0.025,
       },
+      frontend: "https://app.phoenix.example",
     };
+    const withApi: PeerTarget = { ...target, peerApi: "https://api.aurora.example" };
+    const setups: PeerSetup[] = [];
     const MEMBER = "sprkdrm1member";
     const asked: string[] = [];
     // what the web UI does: fill the wallet's address in, sign, broadcast
@@ -134,12 +145,13 @@ describe("ensurePeerActive", () => {
 
     let done: unknown;
     for (let i = 0; i < 8 && !done; i++) {
-      const res = await withStub(stub, () => ensurePeerActive(ctx(), "s", chain, target)).catch((e) => e);
+      const res = await withStub(stub, () => ensurePeerActive(ctx(), "s", chain, withApi)).catch((e) => e);
       if (!(res instanceof AwaitUser)) {
         done = res;
         break;
       }
       expect(res.wallet).toBeDefined();
+      setups.push(res.peerSetup as PeerSetup);
       expect(res.wallet!.chain.rpc).toBe(PUBLIC);
       expect(res.wallet!.signerRole).toMatch(/Operations Committee/);
       expect(res.wallet!.cli).toContain("sparkdreamd tx sign");
@@ -155,7 +167,44 @@ describe("ensurePeerActive", () => {
       signInWallet(res.wallet!);
     }
     expect(done).toMatchObject({ peerId: "aurora-1", status: "PEER_STATUS_ACTIVE" });
-    expect(asked).toEqual(["MsgRegisterPeer", "MsgUpdatePeerPolicy", "MsgSubmitProposal", "MsgVoteProposal", "MsgExecuteProposal"]);
+    expect(asked).toEqual(["MsgRegisterPeer", "MsgSubmitProposal", "MsgVoteProposal", "MsgExecuteProposal"]);
+
+    // every pause says what is left, and how to finish it elsewhere
+    const [first, , , last] = setups;
+    expect(first!.remaining).toHaveLength(4);
+    expect(first!.remaining[0]).toMatch(/register aurora-1 .* and set its federation policy/);
+    expect(last!.remaining).toEqual(["execute the activation once its minimum execution period has passed"]);
+    expect(first!.rest).toBe("https://api.phoenix.example");
+    expect(first!.progress).toBe("0|0|none");
+    // the script runs as is on another computer: messages inline, valid bash
+    expect(first!.script).toContain('"@type":"/sparkdream.federation.v1.MsgRegisterPeer"');
+    expect(first!.script).toContain('"@type":"/sparkdream.federation.v1.MsgUpdatePeerPolicy"');
+    expect(first!.script).toContain("MsgResumePeer");
+    expect(first!.script).toContain("PROPOSAL_STATUS_EXECUTED");
+    expect(first!.script).not.toContain(chain.outDir);
+    const script = path.join(tmp(), "peer.sh");
+    fs.writeFileSync(script, first!.script);
+    execFileSync("bash", ["-n", script]);
+    // the frontend links carry everything the register form needs
+    const register = new URL(first!.links!.register!);
+    expect(register.origin + register.pathname).toBe("https://app.phoenix.example/federation");
+    expect(Object.fromEntries(register.searchParams)).toMatchObject({
+      register: "1",
+      peer_id: "aurora-1",
+      channel: "channel-1",
+      transfer_channel: "channel-0",
+      peer_api: "https://api.aurora.example",
+    });
+    expect(JSON.parse(Buffer.from(register.searchParams.get("identity")!, "base64url").toString())).toEqual(
+      target.peerIdentity,
+    );
+    expect(first!.registerHint).toBe(
+      "peer id aurora-1, type Spark Dream, IBC channel channel-1 (this chain's end of the federation channel to aurora-1), " +
+        "transfer channel channel-0, peer chain API https://api.aurora.example",
+    );
+    expect(first!.links!.policy).toBe("https://app.phoenix.example/federation?policy=aurora-1");
+    expect(first!.links!.activate).toBe("https://app.phoenix.example/federation?activate=aurora-1");
+    expect(last!.links).toEqual({ activate: "https://app.phoenix.example/federation?activate=aurora-1" });
     // everything signed by the member's wallet, nothing by the launcher
     expect(stub.state().log.every((l) => l.from === MEMBER)).toBe(true);
     expect(stub.state().chains["http://phoenix"]!.peers["aurora-1"]!.authority ?? MEMBER).toBe(MEMBER);
@@ -186,8 +235,28 @@ describe("ensurePeerActive", () => {
     const err = await withStub(stub, () => ensurePeerActive(ctx(), "s", chain, target)).catch((e) => e);
     expect(err).toBeInstanceOf(AwaitUser);
     expect(err.wallet).toBeUndefined();
-    expect(err.reason).toMatch(/proposal 4 .* can be executed from .* resume then/);
+    expect(err.reason).toMatch(/proposal 4 .* can be executed from .* resumes then by itself/);
+    // the monitor resumes it at the execution time
+    expect((err.peerSetup as PeerSetup).resumeAt).toBe(later);
+    expect((err.peerSetup as PeerSetup).script).toContain("ID='4'");
   }, 30_000);
+
+  it("reads a peer's progress through the chain's REST API, the same way the pause recorded it", async () => {
+    const bodies = new Map<string, string>([
+      ["/get_peer/aurora-1", JSON.stringify({ peer: { id: "aurora-1", status: "PEER_STATUS_PENDING" } })],
+      ["/get_peer_policy/aurora-1", JSON.stringify({ policy: { inbound_content_types: ["blog_post"] } })],
+    ]);
+    const rpc = {
+      getText: async (url: string) => {
+        for (const [k, v] of bodies) if (url.endsWith(k)) return v;
+        throw new Error(`HTTP 404 for ${url}`);
+      },
+    } as never;
+    expect(await peerProgress(rpc, "https://api.phoenix.example/", "aurora-1")).toBe("1|1|PEER_STATUS_PENDING");
+    expect(await peerProgress(rpc, "https://api.phoenix.example", "nobody")).toBe("0|0|none");
+    const down = { getText: async () => { throw new Error("ECONNREFUSED"); } } as never;
+    expect(await peerProgress(down, "https://api.phoenix.example", "aurora-1")).toBeUndefined();
+  });
 
   it("does not overturn a suspension", async () => {
     const stub = chainStub();

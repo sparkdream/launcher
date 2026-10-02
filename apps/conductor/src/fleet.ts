@@ -10,6 +10,7 @@ import {
   frozenResetViolations,
   isComponentKey,
   isServicesFleet,
+  minGasPriceProblem,
   fleetBridge,
   imageBefore,
   mastodonLoginDomain,
@@ -25,6 +26,7 @@ import {
   type RelayerPath,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
+import { peerProgress, type PeerSetup } from "./peering.js";
 import { publicRelayEndpointStale, publicRelayFleets, RELAYER_ACCOUNT, relayerTunnels, resolveRelayCounterparty } from "./relayer.js";
 import {
   cosmjsWithdraw,
@@ -75,7 +77,7 @@ import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
 import { imageRepo } from "./fleet-ops.js";
-import type { AddComponentParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
+import type { AddComponentParams, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -178,6 +180,11 @@ export interface FleetView {
   chainId: string;
   /** softsign | tmkms — the UI gates signer-related actions on this. */
   keyMode: string;
+  /** Chain fleets: token.minGasPrice (per gas unit, base denom), and why it
+   *  is implausible when it is (a fee pasted into the per-gas field). */
+  minGasPrice?: string;
+  gasDenom?: string;
+  gasPriceProblem?: string;
   components: ComponentView[];
   ops: Array<{
     id: number;
@@ -666,6 +673,17 @@ export class FleetService {
         // join-aware: a joined fleet runs the LIVE chain, not name-suffix
         chainId: chainId(spec),
         keyMode: spec.security.keyMode,
+        // per gas unit, base denom; the card warns when it is really a fee
+        ...(isServicesFleet(spec)
+          ? {}
+          : (() => {
+              const problem = minGasPriceProblem(spec.token.minGasPrice, spec.token.baseDenom, spec.token.exponent);
+              return {
+                minGasPrice: spec.token.minGasPrice,
+                gasDenom: spec.token.baseDenom,
+                ...(problem ? { gasPriceProblem: problem } : {}),
+              };
+            })()),
         components,
         ops: this.db.listFleetOps(launch.id).map((o) => ({
           id: o.id,
@@ -1904,6 +1922,28 @@ export class FleetService {
     return this.db.createFleetOp(launch.id, "sessions", { force });
   }
 
+  /**
+   * Correct a running chain fleet's token.minGasPrice (a price per gas unit
+   * in the base denom) and converge every node to it: the stored spec, the
+   * launcher's node copies and relaunch bundles, and each live node's
+   * app.toml ("gas-price" op). Refuses a value that is a fee, not a price.
+   */
+  requestGasPrice(launch: LaunchRow, minGasPrice: string): number {
+    const value = minGasPrice.trim();
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) throw new Error("a services fleet runs no chain");
+    const problem = minGasPriceProblem(value, spec.token.baseDenom, spec.token.exponent);
+    if (problem) throw new Error(`token.minGasPrice: ${problem}`);
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: set the gas price once it is done");
+    }
+    const previous = spec.token.minGasPrice;
+    const stored = JSON.parse(launch.spec_json);
+    stored.token = { ...stored.token, minGasPrice: value };
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    return this.db.createFleetOp(launch.id, "gas-price", { minGasPrice: value, previous } satisfies GasPriceParams);
+  }
+
   /** Re-link an active relayer: reopen whatever a chain reset closed and
    *  restart Hermes on the current channels. */
   requestRelink(launch: LaunchRow): number {
@@ -1984,6 +2024,32 @@ export class FleetService {
     return this.db
       .listFleetOps(launchId, "active")
       .some((o) => o.kind === "public-grpc" && !started.has(`op${o.id}:public-grpc`));
+  }
+
+  /**
+   * A launch paused on a federation peer's setup on another chain (a
+   * PeerSetup pause) whose chain has moved on since: the peer registered,
+   * its policy set, or it went active, through a script or the chain's
+   * frontend rather than this panel; or an accepted activation reached its
+   * execution time. The monitor then resumes it, so finishing elsewhere
+   * needs no trip back to click Resume. True when it should be driven.
+   */
+  async peerSetupReady(launchId: string): Promise<boolean> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "paused") return false;
+    const step = this.db.listSteps(launchId).find((st) => st.status === "waiting" && st.wallet_json);
+    if (!step) return false;
+    let setup: PeerSetup | undefined;
+    try {
+      setup = (JSON.parse(step.wallet_json!) as { peerSetup?: PeerSetup }).peerSetup;
+    } catch {
+      return false;
+    }
+    if (!setup) return false;
+    if (setup.resumeAt) return Date.now() / 1000 >= setup.resumeAt;
+    if (!setup.rest) return false;
+    const now = await peerProgress(this.services.rpc, setup.rest, setup.peerId);
+    return now !== undefined && now !== setup.progress;
   }
 
   queueStaleRelayLink(launchId: string): boolean {

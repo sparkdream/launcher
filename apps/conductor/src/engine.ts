@@ -120,6 +120,11 @@ export class AwaitUser extends Error {
     /** Accounts to send money to (relayer keys), one row each, so the pause
      *  card can offer a copy button and a wallet send per row. */
     readonly funding?: unknown[],
+    /** A federation peer's remaining setup on a chain whose committee key the
+     *  launcher does not hold: the ways to finish it elsewhere (CLI script,
+     *  the chain's frontend) and what the monitor watches to resume by
+     *  itself (peering.ts PeerSetup). */
+    readonly peerSetup?: unknown,
   ) {
     super(reason);
   }
@@ -299,7 +304,13 @@ export async function runLaunch(
           launchId,
           step.name,
           cause.reason,
-          cause.funding?.length ? { wallet: cause.wallet, funding: cause.funding } : cause.wallet,
+          cause.funding?.length || cause.peerSetup
+            ? {
+                wallet: cause.wallet,
+                ...(cause.funding?.length ? { funding: cause.funding } : {}),
+                ...(cause.peerSetup ? { peerSetup: cause.peerSetup } : {}),
+              }
+            : cause.wallet,
         );
         db.setLaunchStatus(launchId, "paused");
         return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
