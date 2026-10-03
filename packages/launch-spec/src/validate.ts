@@ -440,6 +440,13 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       err(`infra.resources.${role}.storage.persistent`, "persistent storage is required");
     }
   }
+  for (const key of Object.keys(spec.infra.nodeSizes ?? {})) {
+    const [kind, index] = key.split("-");
+    const count = kind === "val" ? spec.topology.validators.count : spec.topology.sentries.count;
+    if (Number(index) >= count) {
+      err(`infra.nodeSizes.${key}`, `${key} is not one of this fleet's nodes`);
+    }
+  }
 
   // Topology & mapping
   if (S === 0) {

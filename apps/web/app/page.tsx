@@ -10,6 +10,8 @@ import {
   COMPONENT_KINDS,
   defaultLoginDomain,
   isComponentKey,
+  NODE_SIZES,
+  type NodeSize,
   type LaunchSpec,
   type SpecCheck,
 } from "@sparkdream/launch-spec";
@@ -17,6 +19,7 @@ import yaml from "js-yaml";
 import { EDITOR, openLaunchFor } from "../lib/open-launch";
 import { resetSource } from "../lib/reset-spec";
 import { specPathLine } from "../lib/spec-lines";
+import { bidModeOf, roleSizeOf, setBidMode, setRoleSize, type BidMode, type NodeRoleName } from "../lib/spec-edit";
 import {
   createLaunch,
   exportLauncherBackup,
@@ -294,6 +297,12 @@ const progressTitle = (p: OpProgress): string =>
   (p.elapsedSeconds === undefined ? "" : `, running ${duration(p.elapsedSeconds)}`) +
   `. Updated ${new Date(p.updatedAt).toLocaleTimeString()}. ` +
   "The work runs on the node itself: closing this page does not stop it.";
+
+/** Bytes as GiB, one decimal under 10 ("7.8 GiB", "42 GiB"). */
+function gib(bytes: number): string {
+  const g = bytes / 1024 ** 3;
+  return `${g < 10 ? g.toFixed(1) : Math.round(g)} GiB`;
+}
 
 /** "3h 12m" / "12m" / "45s" — coarse on purpose, these are estimates. */
 const duration = (seconds: number): string => {
@@ -949,6 +958,28 @@ export default function Page() {
     };
   }, [heightTargets]);
 
+  // how full each node's data volume is: it fills over days, so once a
+  // minute is plenty (the conductor caches the read for as long)
+  useEffect(() => {
+    if (heightTargets.length === 0) return;
+    let stop = false;
+    const tick = async () => {
+      const { getComponentDisk } = await import("../lib/api");
+      await Promise.all(
+        heightTargets.map(async ({ launchId, dseq }) => {
+          const d = await getComponentDisk(launchId, dseq).catch(() => null);
+          if (d && !stop) setNodeDisks((m) => ({ ...m, [dseq]: d }));
+        }),
+      );
+    };
+    tick();
+    const t = setInterval(tick, 60_000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [heightTargets]);
+
   // compute-network balances + BME mint state (console-air's mint & burn
   // flow, §mint): deployments on mainnet are paid in uact, acquired by
   // burning uakt via MsgMintACT — settled asynchronously by the BME ledger
@@ -1209,7 +1240,8 @@ export default function Page() {
   const specDream: string = specDoc?.token?.dreamDisplayDenom ?? "DREAM";
   const specVals: number = specDoc?.topology?.validators?.count ?? 1;
   const specSents: number = specDoc?.topology?.sentries?.count ?? 0;
-  const specManualBid: boolean = specDoc?.providers?.policy?.manualBid === true;
+  const specBidMode: BidMode = bidModeOf(specDoc);
+  const specRoleSize = (role: NodeRoleName) => roleSizeOf(specDoc, role);
   const specAccounts: string[] = Array.isArray(specDoc?.accounts?.initial)
     ? specDoc.accounts.initial.map((a: any) => String(a?.name ?? "?"))
     : [];
@@ -1245,21 +1277,13 @@ export default function Page() {
       const m = typeof current === "string" ? current.match(/^u[a-z]{2,5}\.(.+)$/) : null;
       if (m && /^[A-Za-z]{2,5}$/.test(v)) doc.token.dreamDenom = `u${v.toLowerCase()}.${m[1]}`;
     });
-  // providers.policy.manualBid (§6.6): off means the selection policy leases
-  // the bid it picks; on means every deployment of the launch parks with its
-  // bids listed and waits to be chosen
-  const setSpecManualBid = (v: boolean) =>
-    patchSpec((doc) => {
-      const providers = { ...(doc.providers ?? {}) };
-      const policy = { ...(providers.policy ?? {}) };
-      if (v) policy.manualBid = true;
-      else delete policy.manualBid;
-      // leave no empty scaffolding behind when the toggle goes back off
-      if (Object.keys(policy).length > 0) providers.policy = policy;
-      else delete providers.policy;
-      if (Object.keys(providers).length > 0) doc.providers = providers;
-      else delete doc.providers;
-    });
+  // who picks the bids at launch (§6.6), and how big each node role is:
+  // edited in place so the YAML keeps its comments (a join draft's notes)
+  const applySpecEdit = (out: string | undefined) => {
+    if (out !== undefined) updateSpec(out);
+  };
+  const setSpecBidMode = (mode: Exclude<BidMode, "custom">) => applySpecEdit(setBidMode(specText, mode));
+  const setSpecRoleSize = (role: NodeRoleName, size: NodeSize) => applySpecEdit(setRoleSize(specText, role, size));
   const setSpecCount = (kind: "validators" | "sentries", delta: number) =>
     patchSpec((doc) => {
       doc.topology = doc.topology ?? {};
@@ -1360,6 +1384,7 @@ export default function Page() {
   );
   // live sentry block heights, keyed by dseq, polled every 3s
   const [liveHeights, setLiveHeights] = useState<Record<string, import("../lib/api").NodeHeight>>({});
+  const [nodeDisks, setNodeDisks] = useState<Record<string, import("../lib/api").NodeDisk>>({});
   // per-launch provider avoid/prefer lists, keyed by launchId
   const [providerPrefs, setProviderPrefs] = useState<
     Record<string, { avoid: string[]; prefer: string[]; names: Record<string, string> }>
@@ -1420,7 +1445,7 @@ export default function Page() {
       amount?: string;
       haltHeight?: number;
       manualBid?: boolean;
-      size?: "small" | "standard";
+      size?: "small" | "standard" | "large";
       peers?: string[];
       registrations?: "open" | "approved" | "none";
       walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
@@ -1675,7 +1700,9 @@ export default function Page() {
 
   // the launch's await-signer step and any op's *:await-signer gate both
   // mean "the signer needs you" — the setup panel opens on its own (§5 step 19)
-  const awaitingSigner = (name?: string) => name === "await-signer" || name?.endsWith(":await-signer");
+  // A node resize's start-node only waits on a tmkms validator's signer.
+  const awaitingSigner = (name?: string) =>
+    name === "await-signer" || name?.endsWith(":await-signer") || (isTmkms && name?.endsWith(":start-node"));
   useEffect(() => {
     if (awaitingSigner(waitingStep?.name) && launchId) void showTmkms(launchId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2190,12 +2217,79 @@ export default function Page() {
 
   const bidSeg = (
     <div className="seg fill">
-      <button className={specManualBid ? "" : "on"} onClick={() => setSpecManualBid(false)}>
-        automatic
-      </button>
-      <button className={specManualBid ? "on" : ""} onClick={() => setSpecManualBid(true)}>
-        pick each bid
-      </button>
+      {(
+        [
+          ["auto", "automatic", "The selection policy leases the bid it picks for every deployment."],
+          ["nodes", "pick node bids", "The validators and sentries pause with their bids listed for you to choose; the mesh and service components place themselves."],
+          ["every", "pick every bid", "Every deployment pauses with its bids listed for you to choose."],
+        ] as const
+      ).map(([mode, label, title]) => (
+        <button
+          key={mode}
+          className={specBidMode === mode ? "on" : ""}
+          title={title}
+          onClick={() => setSpecBidMode(mode)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  // one tier for every node of a role (infra.roleSizes); "custom" lights no
+  // button, since hand-edited resources match none of them
+  const sizeSeg = (role: NodeRoleName) => (
+    <div className="seg fill">
+      {(["small", "standard", "large"] as const).map((size) => {
+        const r = NODE_SIZES[size][role];
+        return (
+          <button
+            key={size}
+            className={specRoleSize(role) === size ? "on" : ""}
+            title={`${r.cpu} CPU, ${r.memory} RAM, ${r.storage.data} chain data`}
+            onClick={() => setSpecRoleSize(role, size)}
+          >
+            {size}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  const bidNote = (mode: BidMode) =>
+    mode === "every"
+      ? "Every deployment will pause with its bids listed for you to choose from, starting with the VPN mesh and then the whole node batch at once. The launch waits at each pause until you pick."
+      : mode === "nodes"
+        ? "The validators and sentries will pause with their bids listed for you to choose from; the mesh and service components place themselves. The launch waits until you pick."
+        : mode === "custom"
+          ? "The spec picks bids per component in a way these buttons do not describe (providers.components in the YAML)."
+          : null;
+
+  // the node sizes and bid choice, in the views that have no form fields
+  // for them (the YAML editor, which a join draft opens in)
+  const launchSettings = (
+    <div className="sub-card" style={{ marginTop: 12 }}>
+      <div className="two-col narrow">
+        <div>
+          <div className="f-label">Validator size</div>
+          {sizeSeg("validator")}
+        </div>
+        <div>
+          <div className="f-label">Sentry size</div>
+          {sizeSeg("sentry")}
+        </div>
+        <div>
+          <div className="f-label">
+            Provider selection <span className="hint">· who picks the bids</span>
+          </div>
+          {bidSeg}
+        </div>
+      </div>
+      {bidNote(specBidMode) && (
+        <div className="dim-note" style={{ marginTop: 10 }}>
+          {bidNote(specBidMode)}
+        </div>
+      )}
     </div>
   );
 
@@ -3179,16 +3273,26 @@ export default function Page() {
                     </div>
                     <div>
                       <div className="f-label">
+                        Validator size <span className="hint">· CPU, memory, chain data</span>
+                      </div>
+                      {sizeSeg("validator")}
+                    </div>
+                    <div>
+                      <div className="f-label">
+                        Sentry size <span className="hint">· a public sentry may need large</span>
+                      </div>
+                      {sizeSeg("sentry")}
+                    </div>
+                    <div>
+                      <div className="f-label">
                         Provider selection <span className="hint">· who picks the bids</span>
                       </div>
                       {bidSeg}
                     </div>
                   </div>
-                  {specManualBid && (
+                  {bidNote(specBidMode) && (
                     <div className="dim-note" style={{ marginTop: 10 }}>
-                      Every deployment will pause with its bids listed for you to choose from,
-                      starting with the VPN mesh and then the whole node batch at once. The launch
-                      waits at each pause until you pick.
+                      {bidNote(specBidMode)}
                     </div>
                   )}
                   <div style={{ marginTop: 18 }}>
@@ -3273,7 +3377,11 @@ export default function Page() {
                       {specVals} validator{specVals === 1 ? "" : "s"} · {specSents}{" "}
                       {specSents === 1 ? "sentry" : "sentries"} · {specAccounts.length} accounts
                     </span>
-                    {specManualBid && <span className="chip plain">you pick every bid</span>}
+                    <span className="chip plain">
+                      validators {specRoleSize("validator")} · sentries {specRoleSize("sentry")}
+                    </span>
+                    {specBidMode === "every" && <span className="chip plain">you pick every bid</span>}
+                    {specBidMode === "nodes" && <span className="chip plain">you pick the node bids</span>}
                   </div>
                   <div className="sub-card" style={{ marginTop: 16, padding: "18px 20px" }}>
                     <div className="cost-head">
@@ -3356,10 +3464,23 @@ export default function Page() {
                           {counter(specSents, "sentries")}
                         </div>
                         <div>
+                          <div className="f-label">Validator size</div>
+                          {sizeSeg("validator")}
+                        </div>
+                        <div>
+                          <div className="f-label">Sentry size</div>
+                          {sizeSeg("sentry")}
+                        </div>
+                        <div>
                           <div className="f-label">Provider selection</div>
                           {bidSeg}
                         </div>
                       </div>
+                      {bidNote(specBidMode) && (
+                        <div className="dim-note" style={{ marginTop: 10 }}>
+                          {bidNote(specBidMode)}
+                        </div>
+                      )}
                       <div className="dim-note" style={{ marginTop: 12 }}>
                         Tokens, accounts and service images keep the spec's current values.
                         Switch to YAML for full control.
@@ -3369,6 +3490,8 @@ export default function Page() {
                   {viewMode === "yaml" && (
                     <>
                       {specTextarea(280)}
+                      {/* a services fleet has no nodes to size or place */}
+                      {!servicesDraft && specDoc && launchSettings}
                       <div className="spec-btns">
                         <label className="btn">
                           Import spec
@@ -4158,14 +4281,19 @@ export default function Page() {
                         key: o.params.key ?? "component",
                         dseq: o.params.offeredBids!.dseq,
                         bids: o.params.offeredBids!.bids,
+                        reason: o.params.offeredBids!.reason,
                         target: { opId: o.id } as { opId: number } | { key: string },
-                        retry: "abandon the operation and relaunch for a fresh set",
+                        retry:
+                          o.kind === "node-resize"
+                            ? "abandon the operation and resize again for a fresh set"
+                            : "abandon the operation and relaunch for a fresh set",
                       })),
                     ...f.bidPicks.map((p) => ({
                       id: `launch-${p.key}`,
                       key: p.key,
                       dseq: p.dseq,
                       bids: p.bids,
+                      reason: undefined as string | undefined,
                       target: { key: p.key } as { opId: number } | { key: string },
                       retry: "resume the launch to draw a fresh set",
                     })),
@@ -4179,6 +4307,31 @@ export default function Page() {
                             {o.retry}.
                           </span>
                         </div>
+                        {o.reason && (
+                          <div className="bid-row">
+                            <span className="bid-host">
+                              {o.key}: {o.reason}. Lease the selection policy's pick, or a bid of
+                              your own below.
+                            </span>
+                            {(() => {
+                              const auto = o.bids.find((b) => b.autoPick);
+                              return (
+                                <button
+                                  className="btn amber"
+                                  disabled={!auto}
+                                  title={
+                                    auto
+                                      ? "Lease the bid the selection policy picks (price, uptime, audit and anti-affinity rules)."
+                                      : "The selection policy accepts none of these bids: pick one below."
+                                  }
+                                  onClick={() => void chooseBid(f.launchId, o.target, "auto")}
+                                >
+                                  {auto ? `auto-lease (${auto.hostUri.replace(/^https?:\/\//, "")})` : "auto-lease (none accepted)"}
+                                </button>
+                              );
+                            })()}
+                          </div>
+                        )}
                         {o.bids.length === 0 && (
                           <div className="dim-note">
                             No usable bids (bidders missing from the provider list cannot be
@@ -4236,6 +4389,15 @@ export default function Page() {
                     const version = c.image?.split(":").pop();
                     const pref = providerPrefOf(f.launchId, c.provider);
                     const height = liveHeights[c.dseq];
+                    const disk = nodeDisks[c.dseq];
+                    // a full volume stops the node: amber from 80%, red from 90%
+                    const diskColor = !disk
+                      ? undefined
+                      : disk.percentUsed >= 90
+                        ? "var(--red-text)"
+                        : disk.percentUsed >= 80
+                          ? "var(--amber-text)"
+                          : undefined;
                     return (
                       <div key={rowKey} className="fleet-comp">
                         <div
@@ -4249,6 +4411,14 @@ export default function Page() {
                               {roleLabel(c.key)}
                               {version ? ` · ${version}` : ""}
                               {c.state !== "active" ? ` · ${c.state}` : ""}
+                              {disk && c.state === "active" && (
+                                <span
+                                  style={diskColor ? { color: diskColor } : undefined}
+                                  title={`chain data volume: ${gib(disk.freeBytes)} free of ${gib(disk.totalBytes)}`}
+                                >
+                                  {` · ${gib(disk.freeBytes)} free`}
+                                </span>
+                              )}
                             </div>
                           </div>
                           <div className="provider" title={c.provider}>
@@ -4297,6 +4467,20 @@ export default function Page() {
                               {c.image && (
                                 <span>
                                   image <span className="v">{c.image}</span>
+                                </span>
+                              )}
+                              {c.size && (
+                                <span>
+                                  size <span className="v">{c.size}</span>
+                                </span>
+                              )}
+                              {disk && (
+                                <span title={`read ${new Date(disk.checkedAt).toLocaleTimeString()}`}>
+                                  chain data{" "}
+                                  <span className="v" style={diskColor ? { color: diskColor } : undefined}>
+                                    {gib(disk.freeBytes)} free of {gib(disk.totalBytes)} ({disk.percentUsed}% used)
+                                  </span>
+                                  {disk.percentUsed >= 80 && " · resize… to a larger size"}
                                 </span>
                               )}
                               {c.tailnetIp && (
@@ -4404,6 +4588,34 @@ export default function Page() {
                                   </button>
                                   {/^(val|sentry)-/.test(c.key) && (
                                     <>
+                                      <button
+                                        className="btn amber"
+                                        title="Move this node to a deployment of another size. Akash cannot resize a running deployment, so a new one is created beside this node (on the same provider when it bids) and syncs the whole chain while this node keeps running; then it takes over this node's identity, with about a minute of downtime. A validator's signing state moves with it, so it cannot double-sign."
+                                        onClick={() => {
+                                          const role = c.key.startsWith("val-") ? "validator" : "sentry";
+                                          const sizes = (["small", "standard", "large"] as const).filter((s) => s !== c.size);
+                                          const size = window.prompt(
+                                            `Resize ${c.key} (now ${c.size ?? "unknown"}) to which size?\n` +
+                                              (["small", "standard", "large"] as const)
+                                                .map((s) => {
+                                                  const r = NODE_SIZES[s][role];
+                                                  return `  ${s.padEnd(9)}${r.cpu} CPU, ${r.memory} RAM, ${r.storage.data} data${s === c.size ? "  (current)" : ""}`;
+                                                })
+                                                .join("\n"),
+                                            sizes.includes("large") ? "large" : sizes[0],
+                                          )?.trim();
+                                          if (!size) return;
+                                          if (size !== "small" && size !== "standard" && size !== "large") {
+                                            setError('size must be "small", "standard" or "large"');
+                                            return;
+                                          }
+                                          // the conductor answers with what the move will do and
+                                          // risk, which fleetAction asks to confirm
+                                          fleetAction(f.launchId, c.dseq, "resize", { size });
+                                        }}
+                                      >
+                                        resize…
+                                      </button>
                                       <button
                                         className="btn"
                                         title="Rebuild block history from archive files uploaded to this node: stops sparkdreamd, runs replay-from-archive in the background (its output stays on the node, so nothing floods the log viewer), then starts the node on the restored state. Upload the blocks_*.jsonl.gz files, or one .tar.gz of them, first."

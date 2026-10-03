@@ -791,6 +791,28 @@ export const launchSpecSchema = z.object({
       validator: roleResources,
       sentry: roleResources,
     }),
+    /**
+     * Per-node size ("small" | "standard" | "large", by node key such as
+     * "sentry-0" or "val-1"), overriding `resources` for that one node. A
+     * deployment's resources are fixed on Akash, so the fleet view's resize
+     * action moves a running node to a new deployment and records the size
+     * here once it holds the node.
+     */
+    nodeSizes: z
+      .record(z.string().regex(/^(val|sentry)-[0-9]+$/, "node key like val-0 or sentry-1"), z.enum(["small", "standard", "large"]))
+      .optional(),
+    /**
+     * Size of every validator / sentry ("small" | "standard" | "large"),
+     * overriding `resources` for the role; a node's own nodeSizes entry
+     * still wins. What the launch wizard's size pickers set.
+     */
+    roleSizes: z
+      .object({
+        validator: z.enum(["small", "standard", "large"]).optional(),
+        sentry: z.enum(["small", "standard", "large"]).optional(),
+      })
+      .strict()
+      .optional(),
     sentrySettings: z.object({
       pruning: z.enum(["default", "nothing", "everything", "custom"]),
       snapshotInterval: z.number().int().min(0),

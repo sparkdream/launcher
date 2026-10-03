@@ -15,6 +15,18 @@ const componentsOn = {
 };
 
 describe("launch cost estimate", () => {
+  it("prices a node of another size on a row of its own", () => {
+    const est = estimateLaunchCost(
+      testnetSpec({ topology: componentsOn, infra: { nodeSizes: { "sentry-0": "large" } } } as never),
+    );
+    expect(est.perRole.filter((r) => /^(validators|sentries)/.test(r.role))).toEqual([
+      { role: "validators", count: 2, unitLowUsd: 5.05, unitHighUsd: 10.1 },
+      // 4cpu + 16Gi + 5Gi eph + 50Gi beta3 = 6.4 + 12.8 + 0.1 + 2.0
+      { role: "sentries (large)", count: 1, unitLowUsd: 10.65, unitHighUsd: 21.3 },
+      { role: "sentries (standard)", count: 1, unitLowUsd: 5.01, unitHighUsd: 10.02 },
+    ]);
+  });
+
   it("prices every deployment from the stock bid-script rates as a low–high range", () => {
     const est = estimateLaunchCost(testnetSpec({ topology: componentsOn }));
     // stock rates: $1.60/thread, $0.80/GB mem, $0.02/GB ephemeral,

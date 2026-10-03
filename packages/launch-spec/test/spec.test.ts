@@ -5,6 +5,9 @@ import {
   grpcRequired,
   lcdRequired,
   minGasPriceProblem,
+  NODE_SIZES,
+  nodeResources,
+  nodeSize,
   resolveTopology,
   serviceComponents,
   tunnelPort,
@@ -127,6 +130,37 @@ describe("validateSpec", () => {
     const res = validateSpec(spec);
     expect(res.ok).toBe(false);
     expect(res.errors[0]!.path).toBe("infra.resources.sentry.storage.persistent");
+  });
+
+  it("sizes nodes one at a time, standard being the role default", () => {
+    const spec = testnetSpec({ infra: { nodeSizes: { "sentry-0": "large" } } } as never);
+    expect(validateSpec(spec).errors).toEqual([]);
+    expect(nodeSize(spec, "sentry-0")).toBe("large");
+    expect(nodeResources(spec, "sentry-0")).toEqual(NODE_SIZES.large.sentry);
+    // no entry: the role's resources, which the profile sets to standard
+    expect(nodeSize(spec, "val-0")).toBe("standard");
+    expect(nodeResources(spec, "val-0")).toEqual(spec.infra.resources.validator);
+    // hand-edited resources that match no tier read as custom
+    spec.infra.resources.validator.memory = "12Gi";
+    expect(nodeSize(spec, "val-0")).toBe("custom");
+  });
+
+  it("sizes a whole role, a node's own size still winning", () => {
+    const spec = testnetSpec({
+      topology: { validators: { count: 2 }, sentries: { count: 2 } },
+      infra: { roleSizes: { validator: "large" }, nodeSizes: { "val-1": "small" } },
+    } as never);
+    expect(validateSpec(spec).errors).toEqual([]);
+    expect(nodeSize(spec, "val-0")).toBe("large");
+    expect(nodeResources(spec, "val-0")).toEqual(NODE_SIZES.large.validator);
+    expect(nodeSize(spec, "val-1")).toBe("small");
+    expect(nodeSize(spec, "sentry-0")).toBe("standard");
+  });
+
+  it("refuses a size for a node the fleet does not have", () => {
+    const spec = testnetSpec({ infra: { nodeSizes: { "val-7": "small" } } } as never);
+    const res = validateSpec(spec);
+    expect(res.errors.map((e) => e.path)).toContain("infra.nodeSizes.val-7");
   });
 
   it("mainnet requires headscale backup and warns on softsign", () => {

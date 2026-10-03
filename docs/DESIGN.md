@@ -391,6 +391,13 @@ infra:
     # the data volume mounts at /root/.sparkdream (matches the source SDLs;
     # TS_STATE_DIR lives on it, so tailnet identity survives restarts).
     # persistent is required for validators and sentries
+  roleSizes: { validator: large }     # size tier for every node of a role
+                                     # (the launch wizard's size pickers)
+  nodeSizes: { sentry-0: large }      # per-node size tier (small | standard |
+                                     # large), overriding resources for that
+                                     # node; standard = the profile defaults.
+                                     # The fleet view's resize… sets it (§5
+                                     # "Node resize")
   sentrySettings: { pruning: default, snapshotInterval: 1000, stateSync: false }
                                      # stateSync serving stays off at genesis
                                      # (no snapshots exist yet); snapshot
@@ -1881,6 +1888,119 @@ also clears `priv_validator_state.json`, the file that prevents signing
 twice at one height (tmkms keeps that watermark on the signer, out of
 the reset's reach). Node key, consensus key and the address book
 survive, so the node keeps its identity and its peers.
+
+### Node resize (day-2)
+
+Fleet row "resize…" on a validator or sentry, op `node-resize`
+(`node-resize.ts`). Three tiers (`NODE_SIZES` in `@sparkdream/launch-spec`),
+per role:
+
+| tier | validator | sentry |
+|---|---|---|
+| small | 1 CPU, 4Gi, 20Gi data | 1 CPU, 4Gi, 10Gi data |
+| standard | 1 CPU, 8Gi, 50Gi data | 2 CPU, 8Gi, 8Gi data |
+| large | 2 CPU, 16Gi, 100Gi data | 4 CPU, 16Gi, 50Gi data |
+
+`standard` is exactly the profile default, so fleets launched before tiers
+existed read as standard. The resolved size of each node is
+`infra.nodeSizes[key]`, else `infra.roleSizes[role]`, else the tier its
+role's `infra.resources` matches, else `custom` (hand-edited resources);
+`render-sdl` and the cost estimate read the per-node value
+(`nodeResources`).
+
+**At launch** the wizard's Configure step, the form view, and a settings box
+under the YAML editor (where a join draft opens) offer a size per role
+(`infra.roleSizes`, dropping that role's `nodeSizes` entries) and who picks
+the bids: automatic, the node bids only (`providers.components.validators`
+and `.sentries` `manualBid`), or every bid (`providers.policy.manualBid`).
+These edits go through `apps/web/lib/spec-edit.ts`, which edits the YAML
+document in place so its comments (a join prefill's notes) survive.
+
+**Disk.** `GET /api/fleet/:launchId/:dseq/disk` reads `df -Pk` of the node
+home (the data volume) through lease-shell, cached a minute per dseq. The
+fleet view polls it once a minute and shows the free space on each node row
+(amber from 80% used, red from 90%) and the full figures in its details.
+
+Akash fixes a deployment's resources, so a resize is a new deployment. A
+relaunch-style close-then-replay would leave the node down for the whole
+replay, which grows with the chain. The op instead **syncs first, then cuts
+over**, and it **full-syncs** (block 1 onward from the fleet's own nodes)
+rather than state-syncing: a state-synced node holds no blocks below its
+snapshot, and on a launcher-genesis fleet the fleet's nodes are the chain's
+full history, which later relaunches replay from. Join fleets state-sync, as
+their relaunches do.
+
+1. `render`: the node's current SDL with the new compute resources (text
+   edit, `withNodeResources`), its `accept:` hosts commented out
+   (`holdAcceptHosts`): a second lease claiming sentry-0's public API/RPC
+   hosts on the same provider could take their traffic over to a node that
+   is still syncing. The bid filter still requires custom-domain support.
+2. `deploy`, `lease`, `manifest`: the relaunch's own steps against that
+   staged SDL; the component row does not move. The lease stays on the
+   current provider (`stayOn`) when it bids and the policy accepts it.
+   Otherwise the step parks with every bid and the reason ("its current
+   provider did not bid", or why its bid was passed over), and the operator
+   either leases the policy's pick ("auto-lease", `bidChoice` provider
+   `auto`) or picks a bid of their own. `auto` is refused for an up-front
+   manual pick, where the operator has already declined the policy.
+3. `stage`: the node bundle goes onto the new volume without the consensus
+   key; config.toml is saved as `config.toml.resize-orig`, then pointed at
+   generated key files (`resize_sync_*`, so the node runs as an anonymous
+   full node under its own node ID), `priv_validator_laddr` cleared, pex
+   off, and `persistent_peers` set to every sentry plus the node being
+   replaced, each through a local tunnel (17100 upwards). The node is
+   started over SSH (the deployment stays in wait mode).
+4. `sync`: polls the new node's status against the fleet's head and
+   publishes height, rate and ETA as op progress, until it is caught up
+   (up to 72h; resuming re-attaches). A node that stops is restarted on the
+   sync config.
+5. `cutover`: waits for the staged node to be at the head again, stops it,
+   then **retires the old node in place**: its config is saved as
+   `config.toml.pre-resize` and pointed at generated `resize_retired_*` key
+   files, and it restarts. The op waits until its status reports another
+   node ID: from then on it signs nothing and the real node ID is free. For
+   a softsign validator, the old node's `priv_validator_state.json` (now
+   final) is read; the staged node gets its launch config back, the
+   consensus key from the bundle, and that watermark, so it can never sign
+   at or below a height the old node signed. A failure before the row
+   moves restores the old node's config and restarts it, and puts the
+   staged node back on its sync config. The row then moves to the new
+   deployment, the SDL (with its hosts back) replaces the component's, and
+   `infra.nodeSizes[key]` is recorded in the stored spec.
+6. `configure`: the relaunch's wiring (`wireMovedNode`): advertised
+   address, tailnet IP, own peers and tunnels, counterparts re-aimed.
+7. `start-node`: started at once over SSH, so the node is down only from
+   the retire to here (about a minute) rather than until persist's
+   signature.
+8. `close-old`: closes the retired old deployment.
+9. The relaunch's `persist` (stopping the SSH-started process cleanly
+   before the push re-creates the container), `await-signer` for tmkms
+   fleets (the validator moved to a new mesh address), and `mesh-clients`.
+
+Guards: chain nodes only, active, launch finished, not already that size,
+no other move of the node in progress and one resize per fleet at a time
+(a relaunch of a node being resized is refused too). The data volume of
+the new size must hold what the node keeps now with 20% room (`du` over
+SSH). The confirmation lists the sync duration and double cost, the cutover
+downtime (softsign: about a minute; tmkms: until the signer is repointed),
+a single-validator chain halting during the cutover, sentry isolation, and
+DNS for sentry-0's public hosts if the provider changes. Other ops queue
+behind the resize while it syncs.
+
+Abort: before the cutover, the staged deployment is closed and the old
+node is un-retired if a failed cutover left it so; the sync wait checks the
+op's status every poll, so it stops within one. While `cutover`,
+`configure` or `start-node` is running the abort is refused: undoing the
+retire while the new node is being given the key could leave both nodes
+signing, or neither. After the cutover, the new deployment is kept (it is
+the node) and the old one closed if still open.
+
+The engine skips the remaining steps of an op aborted during the current
+drive (the step list is fixed per drive), and a step of it that was
+mid-run leaves no row behind. Before this, those steps ran on and mostly
+failed on their deleted inputs.
+The staged dseq is counted as the launcher's own in the fleet view, not as
+an unmanaged deployment.
 
 ### Public peering & the join bundle
 

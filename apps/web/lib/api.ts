@@ -397,6 +397,9 @@ export interface ComponentView {
   /** True when the component runs sshd with a recorded endpoint — eligible
    *  for the upload-file action (nodes + explorer). */
   ssh?: boolean;
+  /** Chain nodes: the size tier they run at ("custom" when hand-edited
+   *  resources match none). */
+  size?: "small" | "standard" | "large" | "custom";
   health?: { status: string; detail: string | null; checked_at: string };
 }
 
@@ -452,7 +455,9 @@ export interface OpParams {
   key?: string;
   manualBid?: boolean;
   bidChoice?: { dseq: string; provider: string };
-  offeredBids?: { dseq: string; bids: OfferedBid[] };
+  /** reason: why the op asked on its own (a resize whose current provider
+   *  is unavailable); leasing the policy's pick is then also a choice. */
+  offeredBids?: { dseq: string; bids: OfferedBid[]; reason?: string };
 }
 
 /** Live position of a long-running op (the archive replay reports one). */
@@ -501,7 +506,8 @@ export type FleetAction =
   /** Wipe a node's chain data and leave it stopped (the empty database a
    *  from-genesis restore replays into). */
   | "reset-data"
-  /** Mastodon: move to a deployment of another size, data and all. */
+  /** Mastodon, or a chain node: move to a deployment of another size, data
+   *  (a node: its synced chain and identity) and all. */
   | "resize"
   /** Mastodon: registrations and wallet sign-in (turning sign-in on or off
    *  moves the instance, as a resize does). */
@@ -525,7 +531,7 @@ export async function postFleetAction(
     archiveDir?: string;
     validate?: boolean;
     endHeight?: number;
-    size?: "small" | "standard";
+    size?: "small" | "standard" | "large";
     peers?: string[];
     registrations?: "open" | "approved" | "none";
     walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
@@ -895,6 +901,19 @@ export async function getComponentHeight(
   dseq: string,
 ): Promise<NodeHeight> {
   return json(await afetch(`/api/fleet/${launchId}/${dseq}/height`));
+}
+
+/** A chain node's data volume, as `df` reports it. */
+export interface NodeDisk {
+  totalBytes: number;
+  usedBytes: number;
+  freeBytes: number;
+  percentUsed: number;
+  checkedAt: string;
+}
+
+export async function getComponentDisk(launchId: string, dseq: string): Promise<NodeDisk> {
+  return json(await afetch(`/api/fleet/${launchId}/${dseq}/disk`));
 }
 
 /** Abandon a stuck op (e.g. relaunch on a broken provider). */

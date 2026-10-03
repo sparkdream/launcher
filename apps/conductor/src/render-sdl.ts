@@ -3,6 +3,7 @@ import yaml from "js-yaml";
 import {
   headscaleDomain,
   tunnelPort,
+  nodeResources,
   type LaunchSpec,
   type NodeRef,
   type Topology,
@@ -105,7 +106,7 @@ export function renderNodeSdl(input: RenderSdlInput): void {
 
   const resources = doc.profiles?.compute?.sparkdreamd?.resources;
   if (!resources) throw new Error("vendored SDL has no compute profile resources");
-  const roleRes = spec.infra.resources[node.role];
+  const roleRes = nodeResources(spec, node.key);
   resources.cpu = { units: roleRes.cpu };
   resources.memory = { size: roleRes.memory };
   resources.storage = [

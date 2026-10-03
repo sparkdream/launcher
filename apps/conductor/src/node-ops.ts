@@ -48,6 +48,19 @@ export function stalled(
 export const NODE_LOG = `${NODE_HOME}/sparkdreamd.log`;
 
 /**
+ * Prints "yes" when a sparkdreamd process is really running, else "no".
+ * Zombies do not count: in wait mode PID 1 is `tail -f /dev/null`, which
+ * never reaps the children it inherits, so a node started over SSH and then
+ * stopped stays in the process table as a zombie that `pgrep` still matches
+ * (seen live 2026-10-03: a resize's cutover waited on one for its whole
+ * stop budget and failed with "would not stop").
+ */
+export const NODE_RUNNING_PROBE =
+  `for p in $(pgrep -x sparkdreamd); do ` +
+  `[ "$(cut -d' ' -f3 /proc/$p/stat 2>/dev/null)" != Z ] && { echo yes; exit 0; }; ` +
+  `done; echo no`;
+
+/**
  * Detached start, logging into the node home (idempotent callers pgrep
  * first). The log is ALSO mirrored to the container's PID-1 stdout via a
  * `tail -F`, so the Akash provider's log stream — what console-air's Logs

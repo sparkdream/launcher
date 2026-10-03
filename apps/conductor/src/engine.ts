@@ -277,11 +277,22 @@ export async function runLaunch(
     },
   };
 
+  // The step list is fixed for the whole drive, so an op aborted while the
+  // drive runs still has its remaining steps in it: skip them, and leave no
+  // row behind for one that was mid-run when the abort came (its inputs are
+  // gone, and a failed row would surface as the launch's error).
+  const abortedOp = (name: string): number | undefined => {
+    const m = /^op(\d+):/.exec(name);
+    if (!m) return undefined;
+    const op = db.listFleetOps(launchId).find((o) => o.id === Number(m[1]));
+    return op?.status === "aborted" ? op.id : undefined;
+  };
   for (const step of steps) {
     const existing = db.getStep(launchId, step.name);
     if (existing?.status === "done") {
       continue;
     }
+    if (abortedOp(step.name) !== undefined) continue;
     log(`run ${step.name}`);
     db.stepStarted(launchId, step.name);
     try {
@@ -290,8 +301,19 @@ export async function runLaunch(
       // data. Null (nothing resolved yet — before prepare-chain-assets
       // materializes, or a pre-M9 launch) falls through to baked behavior.
       const output = await runWithAssets(resolveChainAssets(spec, workRoot), () => step.run(ctx));
+      const gone = abortedOp(step.name);
+      if (gone !== undefined) {
+        db.deleteOpSteps(launchId, gone);
+        continue;
+      }
       db.stepDone(launchId, step.name, output);
     } catch (cause) {
+      const gone = abortedOp(step.name);
+      if (gone !== undefined) {
+        db.deleteOpSteps(launchId, gone);
+        log(`${step.name} stopped: its operation was aborted`);
+        continue;
+      }
       if (cause instanceof AwaitSignature) {
         db.stepWaiting(launchId, step.name, "awaiting signature");
         db.setLaunchStatus(launchId, "paused");

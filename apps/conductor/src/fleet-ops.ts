@@ -56,6 +56,7 @@ import {
 } from "./gentx.js";
 import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, STALLED_BEHIND_BLOCKS, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
+import { nodeResizeSteps } from "./node-resize.js";
 import { readSecretFile } from "./secrets.js";
 import type { SshTarget } from "./services.js";
 
@@ -85,9 +86,14 @@ export interface RelaunchParams {
   /** The pick, once made. Scoped to the deployment the bids belong to — a
    *  later attempt (new dseq) draws new bids, so an old pick never applies. */
   bidChoice?: { dseq: string; provider: string };
-  /** Bids on offer for the pick, refreshed each time the step parks. */
-  offeredBids?: { dseq: string; bids: OfferedBid[] };
+  /** Bids on offer for the pick, refreshed each time the step parks; with a
+   *  reason when the op asked on its own (the policy's pick is then also a
+   *  choice: AUTO_BID). */
+  offeredBids?: { dseq: string; bids: OfferedBid[]; reason?: string };
 }
+
+/** A bidChoice provider meaning "lease what the selection policy picks". */
+export const AUTO_BID = "auto";
 
 export interface UpgradeParams {
   /** Components in rolling order (sentries first, then validators). */
@@ -101,7 +107,7 @@ export interface UpgradeParams {
   previousSpecImages?: Record<string, string>;
 }
 
-function componentRow(ctx: StepCtx, key: string): FleetComponentRow {
+export function componentRow(ctx: StepCtx, key: string): FleetComponentRow {
   const row = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
     (c) => c.key === key,
   );
@@ -239,7 +245,7 @@ function allMeshDependents(ctx: StepCtx, spec: LaunchSpec, key: string): MeshDep
   return out;
 }
 
-function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
+export function rowTarget(ctx: StepCtx, row: FleetComponentRow): SshTarget {
   if (!row.ssh_host || !row.ssh_port) throw new Error(`${row.key}: no SSH endpoint recorded`);
   // a service component's lease-shell runs in its own service, not sparkdreamd
   const node = row.key.startsWith("val-") || row.key.startsWith("sentry-");
@@ -323,7 +329,7 @@ async function sentryPublicP2p(
   }
 }
 
-function sdlPathFor(ctx: StepCtx, key: string): string {
+export function sdlPathFor(ctx: StepCtx, key: string): string {
   return path.join(ctx.dirs.sdl, `${key}.yaml`);
 }
 
@@ -486,7 +492,7 @@ export async function pollSsh(
  * A provider that cannot be read leaves its row alone: an unreachable
  * provider says nothing about whether the recorded endpoint still works.
  */
-async function refreshSshEndpoints(
+export async function refreshSshEndpoints(
   ctx: StepCtx,
   rows: FleetComponentRow[],
 ): Promise<{ corrected: string[]; unreadable: string[] }> {
@@ -515,7 +521,7 @@ async function refreshSshEndpoints(
   return { corrected, unreadable };
 }
 
-async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<number | undefined> {
+export async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<number | undefined> {
   const sentry = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
     (c) => c.key.startsWith("sentry-") && c.state === "active" && c.key !== excludeKey,
   );
@@ -539,7 +545,7 @@ async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<numbe
  * — whether the launcher can still reach the node's shell — and standing in
  * for this one is what turned a moved forwarded port into a failed op.
  */
-async function nodeSelfHeight(
+export async function nodeSelfHeight(
   ctx: StepCtx,
   row: FleetComponentRow,
 ): Promise<number | undefined> {
@@ -719,11 +725,20 @@ async function manualBidChoice(
   open: Bid[],
   providers: Map<string, ProviderInfo>,
   decision: PolicyDecision,
+  /** Why the op is asking when it did not ask for a pick up front; the
+   *  operator may then also leave the choice to the policy (AUTO_BID). */
+  reason?: string,
 ): Promise<Bid> {
   const op = ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId);
   const params = JSON.parse(op?.params_json ?? "{}") as RelaunchParams;
   const choice = params.bidChoice;
-  if (choice && choice.dseq === dseq) {
+  if (choice && choice.dseq === dseq && choice.provider === AUTO_BID) {
+    if (decision.chosen) {
+      ctx.log(`${key}: leasing the policy's pick, ${decision.chosen.bid.id.provider}, as asked`);
+      return decision.chosen;
+    }
+    ctx.log(`${key}: the policy accepts none of the bids on offer now — pick one`);
+  } else if (choice && choice.dseq === dseq) {
     const hit = open.find((b) => b.bid.id.provider === choice.provider);
     if (hit) {
       const why = decision.rejected.find((r) => r.provider === choice.provider)?.reason;
@@ -738,11 +753,17 @@ async function manualBidChoice(
   }
   const offers = describeBids(open, providers, decision);
   const { bidChoice: _dropped, ...rest } = params;
-  ctx.db.updateFleetOpParams(opId, { ...rest, offeredBids: { dseq, bids: offers } });
+  ctx.db.updateFleetOpParams(opId, {
+    ...rest,
+    offeredBids: { dseq, bids: offers, ...(reason ? { reason } : {}) },
+  });
   ctx.log(`${key}: ${offers.length} bid(s) on offer, waiting for a manual pick`);
   throw new AwaitUser(
     stepName,
-    `${key}: pick which bid to lease — the fleet panel lists the ${offers.length} bid(s) on ` +
+    (reason
+      ? `${key}: ${reason}. Lease the selection policy's pick or a bid of your own: `
+      : `${key}: pick which bid to lease — `) +
+      `the fleet panel lists the ${offers.length} bid(s) on ` +
       "this deployment. Bids close a few minutes after they arrive, so if the lease then " +
       "fails, abandon this operation and relaunch to draw a fresh set.",
   );
@@ -1109,9 +1130,269 @@ export function sessionsSteps(opId: number, params: SessionsParams, spec: Launch
 /** Relaunch: close → fresh deploy on a new provider → rewire → guarded start.
  *  Stateless components (§5): no volume, keys, peers, or double-sign risk —
  *  the rewiring and guarded-start steps are replaced by an HTTP health gate. */
-export function relaunchSteps(opId: number, params: RelaunchParams, spec: LaunchSpec): StepDef[] {
+/**
+ * Fill a fresh node volume from the node's launch bundle (same node key, so
+ * the same node ID, §5) and converge what the bundle predates: the sentry's
+ * served endpoints, the gas price, and on a join fleet the state-sync trust
+ * anchor. The relaunch's configure step and a node resize's staging both
+ * start a node this way.
+ */
+export async function prepareNodeHome(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  key: string,
+  target: SshTarget,
+  opts: { withoutSigningKey?: boolean } = {},
+): Promise<void> {
+  const isValidator = key.startsWith("val-");
+  const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
+  // upload node data (same node key → same node ID, §5) — new volume
+  const bundle = path.join(ctx.dirs.bundles, `${key}.tgz`);
+  await ctx.services.ssh.upload(target, bundle, "/tmp/node-data.tgz");
+  await ctx.services.ssh.exec(
+    target,
+    `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME}` +
+      // a softsign bundle carries the consensus key: a node that must not
+      // sign yet gets it only when it takes over (node resize)
+      (opts.withoutSigningKey ? ` && rm -f ${NODE_HOME}/config/priv_validator_key.json /tmp/node-data.tgz` : "") +
+      ` && touch ${NODE_HOME}/.node-data-uploaded`,
+  );
+  // the bundle was rendered at launch; a component added since may need
+  // the sentry to open more (its LCD) — converge on the current spec
+  // before the node first starts
+  if (key.startsWith("sentry-")) await ensureSentryServes(ctx, spec, key, target);
+  // the bundle carries the app.toml rendered at launch: a gas price
+  // corrected since (or hand-edited on the old node) would otherwise come
+  // back with the relaunch, as a 25000 one did on 2026-10-02
+  await patchNodeAppToml(ctx, key, target, { minGasPrices: nodeMinGasPrices(spec) });
+  if (spec.join) {
+    // join fleets: the bundle's [statesync] block still carries the
+    // launch-time trust anchor, long outside the light-client trust
+    // period by relaunch time. The relaunched node starts on an empty
+    // volume and MUST state-sync, so re-resolve a fresh anchor (the
+    // same refresh start-chain performs) and re-enable [statesync] in
+    // case the bundle was packaged with it flipped off.
+    const trust = await resolveStateSyncTrust(ctx);
+    let servers = trust.rpcServers.join(",");
+    if (isValidator) {
+      // own-sentry witness on localhost, same rationale as start-chain:
+      // the bundle RPCs may be unreachable from the NEW provider
+      // (egress filtering killed exactly this relaunch's state sync on
+      // datanode.uk), and the local proxy is provider-agnostic
+      const s = resolveTopology(spec).validatorSentries[valIndex]?.[0];
+      const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
+      if (sentryIp) {
+        await ctx.services.ssh.exec(target, socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657));
+        servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
+      }
+    }
+    await ctx.services.ssh.exec(
+      target,
+      `sed -i 's|^rpc_servers = .*|rpc_servers = "${servers}"|; ` +
+        `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
+        `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|; ` +
+        `/^\\[statesync\\]$/,/^\\[/ s|^enable = false|enable = true|' ${NODE_HOME}/config/config.toml`,
+    );
+    ctx.log(`${key}: state-sync trust anchor refreshed at height ${trust.trustHeight}`);
+  }
+}
+
+/**
+ * Wire a chain node that has just moved to a new deployment into the fleet:
+ * its advertised address (sentries), its tailnet IP on the row and in the
+ * tmkms checklist, its own peers and tunnels, and every counterpart that
+ * named its old address. Returns the node's new tailnet IP.
+ */
+export async function wireMovedNode(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  key: string,
+  target: SshTarget,
+  moved: {
+    deploy: { dseq: string };
+    lease: { hostUri: string; gseq: number; oseq: number };
+    oldTailnetIp: string | null;
+  },
+): Promise<{ tailnetIp: string }> {
+  const isValidator = key.startsWith("val-");
+  const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
+  if (!isValidator) {
+    // advertise-peers: the new lease assigned a new forwarded 26656 —
+    // re-stamp external_address so the sentry keeps advertising a
+    // reachable public peer address (§5 "Public peering"). The uploaded
+    // node data still carries the OLD lease's address, so on failure it
+    // must be blanked, not kept: a stale address gossips a dead endpoint.
+    const { deploy, lease } = moved;
+    let advertised = "";
+    try {
+      const status = await waitLeaseStatus(
+        ctx, loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq,
+        { forwardedPort: 26656, attempts: 6 },
+      );
+      const ep = extractForwardedPort(status, 26656);
+      advertised = `${ep.host}:${ep.port}`;
+    } catch {
+      ctx.log(`${key}: provider forwards no P2P port; clearing the stale external_address`);
+    }
+    await ctx.services.ssh.exec(
+      target,
+      `sed -i 's|^external_address = .*|external_address = "${advertised}"|' ${NODE_HOME}/config/config.toml`,
+    );
+  }
+  // await mesh join → new tailnet IP
+  let ip = "";
+  for (let attempt = 1; attempt <= 30; attempt++) {
+    const res = await ctx.services.ssh.exec(
+      target,
+      `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`,
+    );
+    ip = res.stdout.trim().split("\n")[0] ?? "";
+    if (/^100\./.test(ip)) break;
+    if (attempt === 30) throw new Error(`${key} never joined the mesh after relaunch`);
+    await ctx.services.sleep(5000);
+  }
+  ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
+  // The tmkms setup checklist and the signer panel render addresses from
+  // the launch's await-mesh table, not from the component rows, so a
+  // relaunch that only updated the row left them printing the address
+  // this node just moved off — the operator then repoints the signer at
+  // a dead endpoint. Refresh it here, same as the headscale relaunch.
+  const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(ctx.launchId, "await-mesh");
+  if (launchMesh) {
+    ctx.db.stepDone(ctx.launchId, "await-mesh", { ips: { ...launchMesh.ips, [key]: ip } });
+  }
+
+  const topo = resolveTopology(spec);
+  if (isValidator) {
+    // own peers: public endpoint first, else the dial-out tunnel to the
+    // first sentry. The whole line is written, since the bundle this
+    // node booted from may carry any stale form of it.
+    await wireValidatorPeers(
+      ctx,
+      key,
+      target,
+      (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
+      (s) => sentryPublicP2p(ctx, s),
+    );
+    // §5: relaunching a validator re-wires its sentries' tunnels.
+    // socatTunnelCmd self-cleans the port, so no manual pkill (which,
+    // unanchored, could kill its own sh wrapper mid-command).
+    // A sentry that cannot be reached right now (its provider is gone,
+    // it is mid-relaunch) is logged and skipped rather than failing the
+    // op: this write lands on a DIFFERENT machine, and failing it here
+    // stranded the validator at WAIT_FOR_CONFIG so it never started at
+    // all, over a link that has its own reconcilers. The sentry's own
+    // relaunch re-aims this tunnel when it comes back, and repair's
+    // mesh-env pass re-aims it from the SDL meanwhile, which is the same
+    // tolerance the sentry branch below already applies to its peers.
+    for (const s of topo.validatorSentries[valIndex] ?? []) {
+      const sentryRow = componentRow(ctx, `sentry-${s}`);
+      const port = tunnelPort(valIndex);
+      try {
+        await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
+      } catch (e) {
+        ctx.log(
+          `${key}: sentry-${s} unreachable (${e instanceof Error ? e.message : String(e)}); ` +
+            `leaving its tunnel for its own relaunch or repair to re-aim`,
+        );
+      }
+    }
+  } else {
+    // relaunched sentry: create its own tunnels to current validator IPs
+    const sIndex = Number(key.split("-")[1]);
+    for (const v of topo.sentryValidators[sIndex] ?? []) {
+      const valIp = componentRow(ctx, `val-${v}`).tailnet_ip;
+      if (!valIp) throw new Error(`val-${v} has no recorded tailnet IP`);
+      const port = tunnelPort(v);
+      await ctx.services.ssh.exec(target, socatTunnelCmd(port, valIp));
+    }
+    // sentry mesh: the re-uploaded bundle's config still carries tailnet
+    // placeholders for the OTHER sentries — substitute their current IPs
+    // (same wiring wire-tunnels does on first launch). A fellow sentry
+    // with no recorded IP (e.g. mid-relaunch itself) is skipped: its own
+    // relaunch re-patches this side when it comes back.
+    for (let s2 = 0; s2 < spec.topology.sentries.count; s2++) {
+      if (s2 === sIndex) continue;
+      const otherIp = componentRow(ctx, `sentry-${s2}`).tailnet_ip;
+      if (!otherIp) {
+        ctx.log(`${key}: sentry-${s2} has no recorded tailnet IP yet; leaving its peer entry for its own relaunch to fix`);
+        continue;
+      }
+      await ctx.services.ssh.exec(
+        target,
+        `sed -i 's|${placeholder.tailnetIp(`sentry-${s2}`)}|${otherIp}|g' ${NODE_HOME}/config/config.toml`,
+      );
+    }
+    // §5: relaunching a sentry re-patches its validators' AND fellow
+    // sentries' persistent_peers — the old tailnet IP is dead, and the
+    // sentry mesh link is the only bridge between validator islands.
+    const dependents = [
+      ...(topo.sentryValidators[sIndex] ?? []).map((v) => `val-${v}`),
+      ...Array.from({ length: spec.topology.sentries.count }, (_, s2) => `sentry-${s2}`)
+        .filter((k) => k !== key),
+    ];
+    for (const depKey of dependents) {
+      const row = componentRow(ctx, depKey);
+      if (!row.tailnet_ip) continue; // not reachable/placed right now
+      if (depKey.startsWith("val-")) {
+        // A validator's line is rebuilt whole: it may name this sentry's
+        // old PUBLIC endpoint (public-first peering), which a tailnet-IP
+        // sed never matches, leaving the validator dialing a closed
+        // deployment (seen live 2026-10-02). Its dial-out tunnel's env is
+        // re-aimed by the persist step below, whose manifest push
+        // restarts it onto that.
+        await wireValidatorPeers(
+          ctx,
+          depKey,
+          rowTarget(ctx, row),
+          (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
+          (s) => sentryPublicP2p(ctx, s),
+        );
+      } else if (moved.oldTailnetIp) {
+        await ctx.services.ssh.exec(
+          rowTarget(ctx, row),
+          `sed -i 's|${moved.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
+        );
+      }
+      // peer change requires a process restart (documented in the dialog)
+      await restartNode(ctx.services.ssh, rowTarget(ctx, row));
+    }
+  }
+  return { tailnetIp: ip };
+}
+
+/**
+ * How a relaunch's steps are bent to another op's use. A node resize deploys
+ * its new deployment from a staged SDL beside the running one, and has the
+ * component row move to it only at its own cutover.
+ */
+export interface RelaunchOpts {
+  /** The SDL (and manifest file) the new deployment is created from, when it
+   *  is not the component's own. */
+  staged?: { sdl: (ctx: StepCtx) => string; manifest: (ctx: StepCtx) => string };
+  /** Runs at persist right before this component's own manifest push, which
+   *  re-creates its container. */
+  beforeOwnPush?: (ctx: StepCtx) => Promise<void>;
+  /** Bid only on providers serving custom domains even when the staged SDL
+   *  carries none yet (its hosts are held back until it takes over). */
+  requiresCustomDomain?: (ctx: StepCtx) => boolean | undefined;
+  /** Lease this provider's bid when the policy picks it; otherwise park
+   *  with every bid and let the operator choose between a bid of their own
+   *  and the policy's pick (a resize that would rather stay put). */
+  pickUnlessProvider?: string;
+}
+
+export function relaunchSteps(
+  opId: number,
+  params: RelaunchParams,
+  spec: LaunchSpec,
+  opts: RelaunchOpts = {},
+): StepDef[] {
   const { key } = params;
   const p = (s: string) => `op${opId}:${s}`;
+  const sdlOf = (ctx: StepCtx) => opts.staged?.sdl(ctx) ?? sdlPathFor(ctx, key);
+  const manifestOf = (ctx: StepCtx) =>
+    opts.staged?.manifest(ctx) ?? path.join(ctx.dirs.sdl, `${key}.manifest.json`);
   const isValidator = key.startsWith("val-");
   const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
   const stateless = serviceComponents(spec).find((c) => c.key === key);
@@ -1203,7 +1484,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           return k;
         });
 
-        const sdlPath = sdlPathFor(ctx, key);
+        const sdlPath = sdlOf(ctx);
         let sdl = fs.readFileSync(sdlPath, "utf8");
         sdl = sdl.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${authkey}`);
         // fresh volume must wait for node-data again (no-op for components)
@@ -1217,16 +1498,13 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
         fs.writeFileSync(sdlPath, retarget.text);
       }
-      const sdlPath = sdlPathFor(ctx, key);
+      const sdlPath = sdlOf(ctx);
 
       const artifacts = sdlArtifacts(loadSdl(sdlPath));
       const dseq = await pinnedValue(ctx, `op${opId}-dseq`, async () =>
         String(await ctx.services.api.latestBlockHeight()),
       );
-      fs.writeFileSync(
-        path.join(ctx.dirs.sdl, `${key}.manifest.json`),
-        artifacts.manifestJson,
-      );
+      fs.writeFileSync(manifestOf(ctx), artifacts.manifestJson);
       const msgs: Msg[] = [
         createDeploymentMsg({
           owner,
@@ -1243,7 +1521,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       return {
         dseq,
         requiredStorageClass: artifacts.requiredStorageClass,
-        requiresCustomDomain: artifacts.requiresCustomDomain,
+        requiresCustomDomain: artifacts.requiresCustomDomain || Boolean(opts.requiresCustomDomain?.(ctx)),
       };
     },
   });
@@ -1319,9 +1597,20 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
       // hand-picked: the operator's bid wins over everything above. The
       // relaunch may ask for a pick; the spec may also require one for this
       // component, in which case every placement of it is the operator's.
+      // an op that wants one provider asks when it cannot have it, rather
+      // than leasing wherever the policy lands
+      const stay = opts.pickUnlessProvider;
+      const missedStay =
+        stay !== undefined && decision.chosen?.bid.id.provider !== stay
+          ? open.some((b) => b.bid.id.provider === stay)
+            ? `its current provider's bid was passed over (${
+                decision.rejected.find((r) => r.provider === stay)?.reason ?? "another bid won"
+              })`
+            : "its current provider did not bid"
+          : undefined;
       const chosen =
-        (params.manualBid ?? manualBidRequired(spec, key)) && open.length > 0
-          ? await manualBidChoice(ctx, opId, p("lease"), key, deploy.dseq, open, providers, decision)
+        ((params.manualBid ?? manualBidRequired(spec, key)) || missedStay !== undefined) && open.length > 0
+          ? await manualBidChoice(ctx, opId, p("lease"), key, deploy.dseq, open, providers, decision, missedStay)
           : decision.chosen;
       if (!chosen) {
         // distinguish "market had nothing" from "the bids expired": a bid
@@ -1363,7 +1652,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         price: string;
       }>(p("lease"))!;
       const cert = loadCert(ctx);
-      const manifest = fs.readFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), "utf8");
+      const manifest = fs.readFileSync(manifestOf(ctx), "utf8");
       // reconcile hash drift (e.g. pre-pin re-mints rewrote the manifest
       // after the deployment was signed) — update-in-place keeps the lease
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
@@ -1391,19 +1680,25 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
         lease.oseq,
         wantSsh ? { forwardedPort: 2222 } : {},
       );
-      ctx.db.updateComponentPlacement(ctx.launchId, key, {
-        dseq: deploy.dseq,
-        provider: lease.provider,
-        host_uri: lease.hostUri,
-        price: lease.price,
-        generation: params.generation,
-      });
+      // a staged deployment is not the component yet: the row keeps naming
+      // the running one until the op that staged it cuts over
+      if (!opts.staged) {
+        ctx.db.updateComponentPlacement(ctx.launchId, key, {
+          dseq: deploy.dseq,
+          provider: lease.provider,
+          host_uri: lease.hostUri,
+          price: lease.price,
+          generation: params.generation,
+        });
+      }
       if (!wantSsh) return {};
       const ssh = extractForwardedPort(status, 2222);
-      ctx.db.updateComponentRuntime(ctx.launchId, key, {
-        ssh_host: ssh.host,
-        ssh_port: ssh.port,
-      });
+      if (!opts.staged) {
+        ctx.db.updateComponentRuntime(ctx.launchId, key, {
+          ssh_host: ssh.host,
+          ssh_port: ssh.port,
+        });
+      }
       return ssh;
     },
   });
@@ -1481,196 +1776,13 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
     async run(ctx) {
       const row = componentRow(ctx, key);
       const target = rowTarget(ctx, row);
-      // upload node data (same node key → same node ID, §5) — new volume
-      const bundle = path.join(ctx.dirs.bundles, `${key}.tgz`);
-      await ctx.services.ssh.upload(target, bundle, "/tmp/node-data.tgz");
-      await ctx.services.ssh.exec(
-        target,
-        `mkdir -p ${NODE_HOME} && tar xzf /tmp/node-data.tgz -C ${NODE_HOME} && touch ${NODE_HOME}/.node-data-uploaded`,
-      );
-      // the bundle was rendered at launch; a component added since may need
-      // the sentry to open more (its LCD) — converge on the current spec
-      // before the node first starts
-      if (key.startsWith("sentry-")) await ensureSentryServes(ctx, spec, key, target);
-      // the bundle carries the app.toml rendered at launch: a gas price
-      // corrected since (or hand-edited on the old node) would otherwise come
-      // back with the relaunch, as a 25000 one did on 2026-10-02
-      await patchNodeAppToml(ctx, key, target, { minGasPrices: nodeMinGasPrices(spec) });
-      if (spec.join) {
-        // join fleets: the bundle's [statesync] block still carries the
-        // launch-time trust anchor, long outside the light-client trust
-        // period by relaunch time. The relaunched node starts on an empty
-        // volume and MUST state-sync, so re-resolve a fresh anchor (the
-        // same refresh start-chain performs) and re-enable [statesync] in
-        // case the bundle was packaged with it flipped off.
-        const trust = await resolveStateSyncTrust(ctx);
-        let servers = trust.rpcServers.join(",");
-        if (isValidator) {
-          // own-sentry witness on localhost, same rationale as start-chain:
-          // the bundle RPCs may be unreachable from the NEW provider
-          // (egress filtering killed exactly this relaunch's state sync on
-          // datanode.uk), and the local proxy is provider-agnostic
-          const s = resolveTopology(spec).validatorSentries[valIndex]?.[0];
-          const sentryIp = s !== undefined ? componentRow(ctx, `sentry-${s}`).tailnet_ip : null;
-          if (sentryIp) {
-            await ctx.services.ssh.exec(target, socatTunnelCmd(WITNESS_RPC_PORT, sentryIp, 26657));
-            servers = `http://127.0.0.1:${WITNESS_RPC_PORT},${servers}`;
-          }
-        }
-        await ctx.services.ssh.exec(
-          target,
-          `sed -i 's|^rpc_servers = .*|rpc_servers = "${servers}"|; ` +
-            `s|^trust_height = .*|trust_height = ${trust.trustHeight}|; ` +
-            `s|^trust_hash = .*|trust_hash = "${trust.trustHash}"|; ` +
-            `/^\\[statesync\\]$/,/^\\[/ s|^enable = false|enable = true|' ${NODE_HOME}/config/config.toml`,
-        );
-        ctx.log(`${key}: state-sync trust anchor refreshed at height ${trust.trustHeight}`);
-      }
-      if (!isValidator) {
-        // advertise-peers: the new lease assigned a new forwarded 26656 —
-        // re-stamp external_address so the sentry keeps advertising a
-        // reachable public peer address (§5 "Public peering"). The uploaded
-        // node data still carries the OLD lease's address, so on failure it
-        // must be blanked, not kept: a stale address gossips a dead endpoint.
-        const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
-        const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
-        let advertised = "";
-        try {
-          const status = await waitLeaseStatus(
-            ctx, loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq,
-            { forwardedPort: 26656, attempts: 6 },
-          );
-          const ep = extractForwardedPort(status, 26656);
-          advertised = `${ep.host}:${ep.port}`;
-        } catch {
-          ctx.log(`${key}: provider forwards no P2P port; clearing the stale external_address`);
-        }
-        await ctx.services.ssh.exec(
-          target,
-          `sed -i 's|^external_address = .*|external_address = "${advertised}"|' ${NODE_HOME}/config/config.toml`,
-        );
-      }
-      // await mesh join → new tailnet IP
-      let ip = "";
-      for (let attempt = 1; attempt <= 30; attempt++) {
-        const res = await ctx.services.ssh.exec(
-          target,
-          `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`,
-        );
-        ip = res.stdout.trim().split("\n")[0] ?? "";
-        if (/^100\./.test(ip)) break;
-        if (attempt === 30) throw new Error(`${key} never joined the mesh after relaunch`);
-        await ctx.services.sleep(5000);
-      }
-      ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
-      // The tmkms setup checklist and the signer panel render addresses from
-      // the launch's await-mesh table, not from the component rows, so a
-      // relaunch that only updated the row left them printing the address
-      // this node just moved off — the operator then repoints the signer at
-      // a dead endpoint. Refresh it here, same as the headscale relaunch.
-      const launchMesh = ctx.db.stepOutput<{ ips: Record<string, string> }>(ctx.launchId, "await-mesh");
-      if (launchMesh) {
-        ctx.db.stepDone(ctx.launchId, "await-mesh", { ips: { ...launchMesh.ips, [key]: ip } });
-      }
-
-      const topo = resolveTopology(spec);
-      if (isValidator) {
-        // own peers: public endpoint first, else the dial-out tunnel to the
-        // first sentry. The whole line is written, since the bundle this
-        // node booted from may carry any stale form of it.
-        await wireValidatorPeers(
-          ctx,
-          key,
-          target,
-          (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
-          (s) => sentryPublicP2p(ctx, s),
-        );
-        // §5: relaunching a validator re-wires its sentries' tunnels.
-        // socatTunnelCmd self-cleans the port, so no manual pkill (which,
-        // unanchored, could kill its own sh wrapper mid-command).
-        // A sentry that cannot be reached right now (its provider is gone,
-        // it is mid-relaunch) is logged and skipped rather than failing the
-        // op: this write lands on a DIFFERENT machine, and failing it here
-        // stranded the validator at WAIT_FOR_CONFIG so it never started at
-        // all, over a link that has its own reconcilers. The sentry's own
-        // relaunch re-aims this tunnel when it comes back, and repair's
-        // mesh-env pass re-aims it from the SDL meanwhile, which is the same
-        // tolerance the sentry branch below already applies to its peers.
-        for (const s of topo.validatorSentries[valIndex] ?? []) {
-          const sentryRow = componentRow(ctx, `sentry-${s}`);
-          const port = tunnelPort(valIndex);
-          try {
-            await ctx.services.ssh.exec(rowTarget(ctx, sentryRow), socatTunnelCmd(port, ip));
-          } catch (e) {
-            ctx.log(
-              `${key}: sentry-${s} unreachable (${e instanceof Error ? e.message : String(e)}); ` +
-                `leaving its tunnel for its own relaunch or repair to re-aim`,
-            );
-          }
-        }
-      } else {
-        // relaunched sentry: create its own tunnels to current validator IPs
-        const sIndex = Number(key.split("-")[1]);
-        for (const v of topo.sentryValidators[sIndex] ?? []) {
-          const valIp = componentRow(ctx, `val-${v}`).tailnet_ip;
-          if (!valIp) throw new Error(`val-${v} has no recorded tailnet IP`);
-          const port = tunnelPort(v);
-          await ctx.services.ssh.exec(target, socatTunnelCmd(port, valIp));
-        }
-        // sentry mesh: the re-uploaded bundle's config still carries tailnet
-        // placeholders for the OTHER sentries — substitute their current IPs
-        // (same wiring wire-tunnels does on first launch). A fellow sentry
-        // with no recorded IP (e.g. mid-relaunch itself) is skipped: its own
-        // relaunch re-patches this side when it comes back.
-        for (let s2 = 0; s2 < spec.topology.sentries.count; s2++) {
-          if (s2 === sIndex) continue;
-          const otherIp = componentRow(ctx, `sentry-${s2}`).tailnet_ip;
-          if (!otherIp) {
-            ctx.log(`${key}: sentry-${s2} has no recorded tailnet IP yet; leaving its peer entry for its own relaunch to fix`);
-            continue;
-          }
-          await ctx.services.ssh.exec(
-            target,
-            `sed -i 's|${placeholder.tailnetIp(`sentry-${s2}`)}|${otherIp}|g' ${NODE_HOME}/config/config.toml`,
-          );
-        }
-        // §5: relaunching a sentry re-patches its validators' AND fellow
-        // sentries' persistent_peers — the old tailnet IP is dead, and the
-        // sentry mesh link is the only bridge between validator islands.
-        const close = ctx.output<{ oldTailnetIp: string | null }>(p("close"))!;
-        const dependents = [
-          ...(topo.sentryValidators[sIndex] ?? []).map((v) => `val-${v}`),
-          ...Array.from({ length: spec.topology.sentries.count }, (_, s2) => `sentry-${s2}`)
-            .filter((k) => k !== key),
-        ];
-        for (const depKey of dependents) {
-          const row = componentRow(ctx, depKey);
-          if (!row.tailnet_ip) continue; // not reachable/placed right now
-          if (depKey.startsWith("val-")) {
-            // A validator's line is rebuilt whole: it may name this sentry's
-            // old PUBLIC endpoint (public-first peering), which a tailnet-IP
-            // sed never matches, leaving the validator dialing a closed
-            // deployment (seen live 2026-10-02). Its dial-out tunnel's env is
-            // re-aimed by the persist step below, whose manifest push
-            // restarts it onto that.
-            await wireValidatorPeers(
-              ctx,
-              depKey,
-              rowTarget(ctx, row),
-              (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
-              (s) => sentryPublicP2p(ctx, s),
-            );
-          } else if (close.oldTailnetIp) {
-            await ctx.services.ssh.exec(
-              rowTarget(ctx, row),
-              `sed -i 's|${close.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
-            );
-          }
-          // peer change requires a process restart (documented in the dialog)
-          await restartNode(ctx.services.ssh, rowTarget(ctx, row));
-        }
-      }
-      return { tailnetIp: ip };
+      await prepareNodeHome(ctx, spec, key, target);
+      const close = ctx.output<{ oldTailnetIp: string | null }>(p("close"))!;
+      return wireMovedNode(ctx, spec, key, target, {
+        deploy: ctx.output<{ dseq: string }>(p("deploy"))!,
+        lease: ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!,
+        oldTailnetIp: close.oldTailnetIp,
+      });
     },
   });
 
@@ -1855,6 +1967,7 @@ export function relaunchSteps(opId: number, params: RelaunchParams, spec: Launch
           throw new Error(`${r.key} not back at the head after its persist restart (${lastProblem})`);
         }
       }
+      if (opts.beforeOwnPush) await opts.beforeOwnPush(ctx);
       for (const { row: r, json } of manifests.filter((m) => m.row.key === key)) {
         await ctx.services.provider.sendManifest(cert, r.host_uri, r.dseq, json);
       }
@@ -5341,6 +5454,7 @@ function buildSteps(
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
     if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));
+    if (op.kind === "node-resize") steps.push(...nodeResizeSteps(op.id, params, spec));
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));
     if (op.kind === "retarget") steps.push(...retargetSteps(op.id, params, spec));

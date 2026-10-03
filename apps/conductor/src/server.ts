@@ -732,8 +732,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       walletLogin?: Record<string, unknown>;
       /** bridge-peers (Mastodon): the other servers bridged as their own peers. */
       peers?: string[];
-      /** resize (Mastodon): the size to move the instance to. */
-      size?: "small" | "standard";
+      /** resize: the size to move to (Mastodon: small | standard; a chain
+       *  node: small | standard | large). */
+      size?: "small" | "standard" | "large";
       image?: string;
       components?: string[];
       amount?: string;
@@ -837,7 +838,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
           });
         }
-        const opId = await fleet.requestRelaunch(launch, component, { manualBid: picksBids });
+        let opId: number;
+        try {
+          opId = await fleet.requestRelaunch(launch, component, { manualBid: picksBids });
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
         drive(launchId, spec);
         return { status: "relaunch-started", opId, manualBid: picksBids };
       }
@@ -865,6 +871,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         }
       }
       case "resize": {
+        if (/^(val|sentry)-\d+$/.test(component.key)) {
+          if (body.size !== "small" && body.size !== "standard" && body.size !== "large") {
+            return reply.status(400).send({ error: 'size must be "small", "standard" or "large"' });
+          }
+          // the op runs after the launch's own steps, so a launch still
+          // underway has to finish first (as a relaunch op's would)
+          if (launch.status !== "completed" && !launchStepsDone(launchId, spec)) {
+            return reply.status(409).send({ error: "the launch has not finished: resize its nodes once it has" });
+          }
+          try {
+            const warnings = await fleet.nodeResizeWarnings(launch, component, body.size);
+            if (!body.confirm) {
+              return reply.status(409).send({ warnings, confirmPrompt: `Resize ${component.key} to "${body.size}"?` });
+            }
+            const opId = await fleet.requestNodeResize(launch, component, body.size);
+            drive(launchId, spec);
+            return { status: "resize-started", opId, size: body.size };
+          } catch (e) {
+            return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+          }
+        }
         if (body.size !== "small" && body.size !== "standard") {
           return reply.status(400).send({ error: 'size must be "small" or "standard"' });
         }
@@ -1116,6 +1143,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const h = await fleet.componentHeight(launch, component).catch(() => null);
     if (!h) return reply.status(503).send({ error: "rpc unreachable" });
     return h;
+  });
+
+  // how full a chain node's data volume is (polled about once a minute)
+  app.get("/api/fleet/:launchId/:dseq/disk", async (req, reply) => {
+    const { launchId, dseq } = req.params as { launchId: string; dseq: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const component = deps.db.getFleetComponentByDseq(launchId, dseq);
+    if (!component) return reply.status(404).send({ error: "component not found" });
+    const disk = await fleet.componentDisk(launch, component);
+    if (!disk) return reply.status(503).send({ error: "disk usage unreadable" });
+    return disk;
   });
 
   // the chain's genesis.json (identical for every node)

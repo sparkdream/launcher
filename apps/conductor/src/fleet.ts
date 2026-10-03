@@ -11,6 +11,9 @@ import {
   isComponentKey,
   isServicesFleet,
   minGasPriceProblem,
+  NODE_SIZES,
+  nodeRole,
+  nodeSize,
   fleetBridge,
   imageBefore,
   mastodonLoginDomain,
@@ -23,6 +26,7 @@ import {
   withDefaults,
   type LaunchSpec,
   type LaunchSpecInput,
+  type NodeSize,
   type RelayerPath,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
@@ -76,7 +80,9 @@ import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type Depl
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import { imageRepo } from "./fleet-ops.js";
+import { AUTO_BID, imageRepo } from "./fleet-ops.js";
+import { HANDOVER_STEPS, UNRETIRE_CMD, type NodeResizeParams } from "./node-resize.js";
+import { sizeToBytes } from "./estimate.js";
 import type { AddComponentParams, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
@@ -165,6 +171,9 @@ export interface ComponentView {
    *  i.e. the user can push files to it (nodes + explorer; headscale and the
    *  frontend image run no sshd). */
   ssh: boolean;
+  /** Chain nodes: the size tier they run at ("custom" when hand-edited
+   *  resources match none), which the resize action offers to change. */
+  size?: NodeSize | "custom";
   health?: { status: string; detail: string | null; checked_at: string } | undefined;
 }
 
@@ -276,6 +285,28 @@ export interface NodeHeight {
   source: "node" | "chain";
   signed?: boolean;
   providerError?: string;
+}
+
+/** A chain node's data volume (the persistent mount at the node home). */
+export interface NodeDisk {
+  totalBytes: number;
+  usedBytes: number;
+  freeBytes: number;
+  /** 0-100, as df reports it (used of used + available). */
+  percentUsed: number;
+  checkedAt: string;
+}
+
+/**
+ * Parse `df -Pk <dir>` (POSIX format, 1 KiB blocks): the last line is the
+ * filesystem holding the directory. Undefined when the output is not df's.
+ */
+export function parseDf(stdout: string): Omit<NodeDisk, "checkedAt"> | undefined {
+  const line = stdout.trim().split("\n").at(-1) ?? "";
+  const m = /^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%/.exec(line);
+  if (!m) return undefined;
+  const [total, used, free] = [m[1], m[2], m[3]].map((n) => Number(n) * 1024) as [number, number, number];
+  return { totalBytes: total, usedBytes: used, freeBytes: free, percentUsed: Number(m[4]) };
 }
 
 /** CometBFT consensus address (uppercase hex) of a base64 ed25519 pubkey. */
@@ -445,6 +476,8 @@ export class FleetService {
   private providerDown = new Map<string, { error: string; at: number }>();
   /** dseq → the height probe in flight: concurrent polls share it. */
   private heightInflight = new Map<string, Promise<NodeHeight | null>>();
+  /** Disk reads per dseq: the volume fills over days, so a minute is fresh. */
+  private diskCache = new Map<string, { disk: NodeDisk | null; at: number; probe?: Promise<NodeDisk | null> }>();
 
   /**
    * Current block height of a node's CometBFT RPC — a lightweight probe the
@@ -456,6 +489,36 @@ export class FleetService {
    * inside the container. The resolution is cached so we don't hit the
    * provider on every call.
    */
+  /**
+   * How full a chain node's data volume is, read with `df` through the
+   * provider's lease-shell (the path the height probe uses for validators:
+   * about a second, with no SSH timeout to sit through on a provider whose
+   * forwarded port is dead). Cached for a minute per deployment.
+   */
+  async componentDisk(launch: LaunchRow, component: FleetComponentRow): Promise<NodeDisk | null> {
+    if (!/^(val|sentry)-/.test(component.key)) return null;
+    const cached = this.diskCache.get(component.dseq);
+    if (cached?.probe) return cached.probe;
+    if (cached && Date.now() - cached.at < 60_000) return cached.disk;
+    const probe = this.services.provider
+      .shellExec(this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, "sparkdreamd", [
+        "sh",
+        "-c",
+        `df -Pk ${NODE_HOME} 2>/dev/null`,
+      ])
+      .then((r) => {
+        const df = parseDf(r.stdout);
+        return df ? { ...df, checkedAt: new Date().toISOString() } : null;
+      })
+      .catch(() => null)
+      .then((disk) => {
+        this.diskCache.set(component.dseq, { disk, at: Date.now() });
+        return disk;
+      });
+    this.diskCache.set(component.dseq, { disk: cached?.disk ?? null, at: cached?.at ?? 0, probe });
+    return probe;
+  }
+
   async componentHeight(launch: LaunchRow, component: FleetComponentRow): Promise<NodeHeight | null> {
     // only chain nodes have an RPC; headscale/explorer/frontend do not
     if (!/^(val|sentry)-/.test(component.key)) return null;
@@ -659,12 +722,19 @@ export class FleetService {
             image: c.image,
             tailnetIp: c.tailnet_ip,
             ssh: c.ssh_host != null && c.ssh_port != null,
+            ...(/^(val|sentry)-\d+$/.test(c.key) ? { size: nodeSize(spec, c.key) } : {}),
             health: h
               ? { status: h.status, detail: h.detail, checked_at: h.checked_at }
               : undefined,
           };
         }),
       );
+      // an op's new deployment before the component moves onto it (a node
+      // resize's staged one, for hours) is the launcher's, not unmanaged
+      for (const op of this.db.listFleetOps(launch.id, "active")) {
+        const staged = this.db.stepOutput<{ dseq: string }>(launch.id, `op${op.id}:deploy`);
+        if (staged?.dseq) known.add(staged.dseq);
+      }
       fleets.push({
         launchId: launch.id,
         launchStatus: launch.status,
@@ -1578,6 +1648,14 @@ export class FleetService {
       // mesh) mint a preauth key via headscale on relaunch
       this.assertMeshAlive(launch, `${component.key} cannot relaunch`);
     }
+    const resizing = this.db
+      .listFleetOps(launch.id, "active")
+      .find((o) => o.kind === "node-resize" && JSON.parse(o.params_json).key === component.key);
+    if (resizing) {
+      throw new Error(
+        `${component.key} is being resized (op #${resizing.id}): abort that op first to relaunch it instead`,
+      );
+    }
     const prefs = this.db.providerPrefs(launch.owner);
     // always move OFF the current provider (that's the point of a relaunch),
     // plus the wallet's global avoid list
@@ -1610,6 +1688,122 @@ export class FleetService {
   ): Promise<number> {
     this.assertMastodonIdle(launch, component, "resized");
     return this.queueMastodonMove(launch, component, { size });
+  }
+
+  /**
+   * What a node resize will do and risk, for the confirmation dialog. Also
+   * refuses (throws) what it cannot do: the node already at that size, or a
+   * new size whose data volume cannot hold the chain the node keeps now.
+   */
+  async nodeResizeWarnings(launch: LaunchRow, component: FleetComponentRow, size: NodeSize): Promise<string[]> {
+    const spec = this.spec(launch);
+    this.assertNodeResizable(launch, component, size);
+    const role = nodeRole(component.key);
+    const target = NODE_SIZES[size][role];
+    const warnings: string[] = [];
+    // a full sync brings the whole block history along, so the new data
+    // volume has to hold what this node holds now, with room to grow
+    try {
+      const out = await this.services.ssh.exec(
+        this.sshTargetFor(launch, component),
+        `du -sm ${NODE_HOME}/data 2>/dev/null | cut -f1`,
+        { quick: true },
+      );
+      const usedMb = Number(out.stdout.trim());
+      const capacityMb = sizeToBytes(target.storage.data) / 2 ** 20;
+      if (Number.isFinite(usedMb) && usedMb > 0 && usedMb > capacityMb * 0.8) {
+        throw new Error(
+          `${component.key} holds ${Math.round(usedMb / 1024)} GiB of chain data, more than "${size}" ` +
+            `(${target.storage.data}) can take with room to grow: pick a larger size`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("pick a larger size")) throw e;
+      warnings.push(
+        `could not read how much chain data ${component.key} holds, so whether ${target.storage.data} is ` +
+          "enough was not checked",
+      );
+    }
+    warnings.push(
+      `A new ${size} deployment (${target.cpu} CPU, ${target.memory} RAM, ${target.storage.data} data) is ` +
+        `created beside the running ${component.key} on the same provider (if that provider does not bid ` +
+        "or its bid is passed over, the op pauses for you to lease the selection policy's pick or a bid " +
+        "of your own), and " +
+        (spec.join
+          ? "state-syncs from the chain"
+          : "syncs the whole chain from block 1 off the fleet's own nodes") +
+        " while the current node keeps running. On a long chain this takes hours, both deployments are " +
+        "paid for meanwhile, and the fleet's other operations wait until it is done.",
+    );
+    if (role === "validator") {
+      warnings.push(
+        spec.security.keyMode === "tmkms"
+          ? `At the cutover ${component.key} moves to a new mesh address and signs nothing until your ` +
+              "tmkms signer dials it. Once the sync is done the op pauses BEFORE the cutover to give you " +
+              "the new address to put in tmkms.toml; after the handover (about a minute) it pauses again " +
+              "for you to restart the signer. Be at the signer when you resume: missed blocks count " +
+              "toward downtime jailing."
+          : `At the cutover ${component.key} stops signing for about a minute. Its last signed height ` +
+              "moves to the new node with it, so the new node cannot double-sign.",
+      );
+      if (!spec.join && spec.topology.validators.count === 1) {
+        warnings.push("This chain has a single validator: it produces no blocks during the cutover.");
+      }
+    } else {
+      warnings.push(
+        ...this.sentryIsolationWarnings(spec, component, "during the cutover (about a minute)"),
+      );
+      if (component.key === "sentry-0" && (spec.topology.publicEndpoints?.api || spec.topology.publicEndpoints?.rpc)) {
+        warnings.push(
+          "sentry-0 serves the public API/RPC domains: if the new deployment lands on another provider, " +
+            "their DNS records must be pointed at it.",
+        );
+      }
+    }
+    return warnings;
+  }
+
+  /**
+   * Move a chain node to a deployment of another size (nodeResizeSteps): the
+   * new one syncs beside the running node, then takes over its identity.
+   * The current provider is preferred, so a public sentry's domains keep
+   * their DNS target.
+   */
+  async requestNodeResize(launch: LaunchRow, component: FleetComponentRow, size: NodeSize): Promise<number> {
+    this.assertNodeResizable(launch, component, size);
+    this.assertMeshAlive(launch, `${component.key} cannot be resized`);
+    const prefs = this.db.providerPrefs(launch.owner);
+    return this.db.createFleetOp(launch.id, "node-resize", {
+      key: component.key,
+      generation: component.generation + 1,
+      avoidProviders: prefs.avoid.filter((p) => p !== component.provider),
+      preferProviders: [...new Set([component.provider, ...prefs.prefer])],
+      // a provider on the wallet's avoid list is not one to stay on
+      ...(prefs.avoid.includes(component.provider) ? {} : { stayOn: component.provider }),
+      size,
+    } satisfies NodeResizeParams);
+  }
+
+  private assertNodeResizable(launch: LaunchRow, component: FleetComponentRow, size: NodeSize): void {
+    if (!/^(val|sentry)-\d+$/.test(component.key)) {
+      throw new Error("only chain nodes (validators and sentries) are resized this way");
+    }
+    if (component.state !== "active") throw new Error(`${component.key} is ${component.state}, not active`);
+    const current = nodeSize(this.spec(launch), component.key);
+    if (current === size) throw new Error(`${component.key} is already ${size}`);
+    const active = this.db.listFleetOps(launch.id, "active");
+    const moving = active.find(
+      (o) =>
+        (o.kind === "relaunch" || o.kind === "node-resize") && JSON.parse(o.params_json).key === component.key,
+    );
+    if (moving) throw new Error(`${component.key} is already being moved (op #${moving.id}): finish or abort that op first`);
+    // one at a time: a resize holds the fleet's nodes as its sync source
+    const other = active.find((o) => o.kind === "node-resize");
+    if (other) {
+      throw new Error(
+        `${JSON.parse(other.params_json).key} is being resized (op #${other.id}): resize one node at a time`,
+      );
+    }
   }
 
   private assertMastodonIdle(launch: LaunchRow, component: FleetComponentRow, verb: string): void {
@@ -2172,7 +2366,11 @@ export class FleetService {
     const params = JSON.parse(op.params_json) as RelaunchParams;
     const offers = params.offeredBids;
     if (!offers) throw new Error(`operation ${opId} is not waiting for a bid to be picked`);
-    if (!offers.bids.some((b) => b.provider === provider)) {
+    if (provider === AUTO_BID) {
+      // only where the op asked on its own: an up-front manual pick is the
+      // operator having already declined the policy's choice
+      if (!offers.reason) throw new Error(`operation ${opId} asked for a hand-picked bid`);
+    } else if (!offers.bids.some((b) => b.provider === provider)) {
       throw new Error(`${provider} did not bid on deployment ${offers.dseq}`);
     }
     this.db.updateFleetOpParams(opId, {
@@ -2457,11 +2655,20 @@ export class FleetService {
     const op = this.db.listFleetOps(launch.id).find((o) => o.id === opId);
     if (!op) throw new Error(`op ${opId} not found`);
     if (op.status === "done") throw new Error(`op ${opId} already completed — nothing to abort`);
+    if (op.kind === "node-resize") {
+      const busy = HANDOVER_STEPS.find((s) => this.db.getStep(launch.id, `op${opId}:${s}`)?.status === "running");
+      if (busy) {
+        throw new Error(
+          "the resize is handing the node over to the new deployment right now; aborting mid-way could " +
+            "leave both nodes or neither signing. Wait a minute for that step to finish or fail, then abort",
+        );
+      }
+    }
     // a SIGNED tx is already broadcast — aborting the op cannot recall it
     // (learned live: an op's close was signed moments before the abort, and
     // the abort's cleanup hid the row while the close landed on-chain)
     const signed = this.db.listSignedPendingTxsLike(launch.id, `op${opId}:%`);
-    const warning =
+    let warning =
       signed.length > 0
         ? `already-signed transaction(s) for ${signed.map((s) => s.step).join(", ")} were ` +
           "broadcast before the abort and may still take effect on-chain"
@@ -2481,16 +2688,46 @@ export class FleetService {
     // and its unsigned txs: the signing queue serves oldest-first, so an
     // abandoned op's dead lease request would shadow the close below forever
     this.db.deleteUnsignedPendingTxsLike(launch.id, `op${opId}:%`);
-    if (deploy?.dseq) {
+    let closeDseq = deploy?.dseq;
+    if (op.kind === "node-resize") {
+      this.db.setFleetOpProgress(opId, null);
+      const key = (JSON.parse(op.params_json) as NodeResizeParams).key;
+      const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+      if (row && deploy?.dseq && row.dseq === deploy.dseq) {
+        // past the cutover the new deployment IS the node: keep it, and
+        // close the retired old one instead
+        const pin = path.join(launchDirs(this.workRoot, launch.id).root, `op${opId}-resize-old.pin`);
+        closeDseq = fs.existsSync(pin) ? (JSON.parse(fs.readFileSync(pin, "utf8")) as { dseq: string }).dseq : undefined;
+        if (row.state === "relaunching") this.db.setComponentState(launch.id, key, "active");
+        const note =
+          `the cutover had already happened, so the new deployment stays as ${key}; if the op stopped ` +
+          "before the node was started and wired, run restart and repair on it";
+        warning = warning ? `${warning}; ${note}` : note;
+      } else if (row) {
+        // before it, the old node may have been retired by a cutover that
+        // could not finish: put it back on its own identity
+        try {
+          const target = this.sshTargetFor(launch, row);
+          const out = await this.services.ssh.exec(target, UNRETIRE_CMD);
+          if (out.stdout.includes("restored")) await restartNode(this.services.ssh, target);
+        } catch (e) {
+          const note =
+            `${key} could not be reached to check whether the resize left it retired ` +
+            `(${e instanceof Error ? e.message : String(e)}): restart it and check that it signs`;
+          warning = warning ? `${warning}; ${note}` : note;
+        }
+      }
+    }
+    if (closeDseq) {
       const info = await this.services.api
-        .deploymentInfo(launch.owner, deploy.dseq)
+        .deploymentInfo(launch.owner, closeDseq)
         .catch(() => undefined);
       if (info?.state === "active") {
-        const step = `fleet:close:${deploy.dseq}`;
+        const step = `fleet:close:${closeDseq}`;
         this.db.enqueuePendingTx(
           launch.id,
           step,
-          JSON.stringify([closeDeploymentMsg(launch.owner, deploy.dseq)]),
+          JSON.stringify([closeDeploymentMsg(launch.owner, closeDseq)]),
         );
         return { step, ...(warning ? { warning } : {}) };
       }

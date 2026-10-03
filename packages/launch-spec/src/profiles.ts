@@ -47,7 +47,7 @@ export interface Profile {
   };
 }
 
-interface RoleResources {
+export interface RoleResources {
   cpu: number;
   memory: string;
   storage: { root: string; data: string; persistent: boolean; class: "beta1" | "beta2" | "beta3" };
@@ -82,17 +82,57 @@ const SDAP_IMAGE = `sparkdreamnft/sdap:${VENDORED_CHAIN_VERSION}`;
 // versioned on its own, not with the chain
 const HUB_IMAGE = "sparkdreamnft/hub:v1.0.2";
 
+export type NodeSize = "small" | "standard" | "large";
+
+/**
+ * The sizes a chain node can be given one at a time (infra.nodeSizes, and
+ * the fleet view's resize action). "standard" is exactly the profiles'
+ * per-role default, so a fleet launched before sizes existed reads as
+ * standard without any change to its deployments. A sentry fronting public
+ * endpoints is what usually needs "large"; "small" suits a devnet.
+ */
+export const NODE_SIZES: Record<NodeSize, { validator: RoleResources; sentry: RoleResources }> = {
+  small: {
+    validator: {
+      cpu: 1,
+      memory: "4Gi",
+      storage: { root: "5Gi", data: "20Gi", persistent: true, class: "beta3" },
+    },
+    sentry: {
+      cpu: 1,
+      memory: "4Gi",
+      storage: { root: "5Gi", data: "10Gi", persistent: true, class: "beta3" },
+    },
+  },
+  standard: {
+    validator: {
+      cpu: 1,
+      memory: "8Gi",
+      storage: { root: "5Gi", data: "50Gi", persistent: true, class: "beta3" },
+    },
+    sentry: {
+      cpu: 2,
+      memory: "8Gi",
+      storage: { root: "5Gi", data: "8Gi", persistent: true, class: "beta3" },
+    },
+  },
+  large: {
+    validator: {
+      cpu: 2,
+      memory: "16Gi",
+      storage: { root: "5Gi", data: "100Gi", persistent: true, class: "beta3" },
+    },
+    sentry: {
+      cpu: 4,
+      memory: "16Gi",
+      storage: { root: "5Gi", data: "50Gi", persistent: true, class: "beta3" },
+    },
+  },
+};
+
 const nodeResources = {
-  validator: {
-    cpu: 1,
-    memory: "8Gi",
-    storage: { root: "5Gi", data: "50Gi", persistent: true, class: "beta3" as const },
-  },
-  sentry: {
-    cpu: 2,
-    memory: "8Gi",
-    storage: { root: "5Gi", data: "8Gi", persistent: true, class: "beta3" as const },
-  },
+  validator: NODE_SIZES.standard.validator,
+  sentry: NODE_SIZES.standard.sentry,
 };
 
 /**

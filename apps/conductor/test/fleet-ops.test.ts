@@ -5,10 +5,11 @@ import { execFileSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { toEncodeObject, TypeUrl } from "@sparkdream/akash-tx";
-import { testnetSpec, VENDORED_CHAIN_VERSION, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import yaml from "js-yaml";
+import { NODE_SIZES, testnetSpec, VENDORED_CHAIN_VERSION, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner, type GentxSigner, type StepDef } from "../src/engine.js";
-import { FleetService } from "../src/fleet.js";
+import { FleetService, parseDf } from "../src/fleet.js";
 import {
   buildOpSteps,
   buildPreLaunchOpSteps,
@@ -19,6 +20,7 @@ import {
   withRedeployNonce,
 } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
+import { syncPace, withNodeResources } from "../src/node-resize.js";
 import { fakeServices, FakeSigner, keplrSignAmino, type FakeWorld } from "./fakes.js";
 
 const tmpDirs: string[] = [];
@@ -335,6 +337,445 @@ describe("relaunch op", () => {
     ).toContain("WAIT_FOR_CONFIG=false");
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
+});
+
+describe("node resize op", () => {
+  const sdlOf = (w: World, key: string) => fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", `${key}.yaml`), "utf8");
+  const closedDseqs = (w: World) =>
+    w.signer.signed.flat().filter((m) => m.typeUrl === TypeUrl.CloseDeployment).map((m) => (m.value as any).id.dseq);
+
+  it("syncs a new sentry beside the old one, then takes over its identity", async () => {
+    const w = await launched();
+    // the staged node runs in wait mode, where a stopped node lingers as a
+    // zombie that pgrep still lists (the 2026-10-03 devnet cutover failure)
+    w.services.ssh.leavesZombies = true;
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const oldId = `${before.ssh_host}:${before.ssh_port}`;
+    expect(sdlOf(w, "sentry-0")).toContain("units: 2");
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    const op = w.db.listFleetOps("fl")[0]!;
+    expect(op.status).toBe("done");
+    expect(op.progress_json).toBeNull();
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.state).toBe("active");
+    expect(after.dseq).not.toBe(before.dseq);
+    expect(after.generation).toBe(1);
+    // same provider (preferred, so public domains keep their DNS target)
+    expect(after.provider).toBe(before.provider);
+    expect(after.tailnet_ip).not.toBe(before.tailnet_ip);
+    // the deployment is the large sentry
+    const sdl = sdlOf(w, "sentry-0");
+    expect(sdl).toContain("units: 4");
+    expect(sdl).toContain("size: 16Gi");
+    expect(sdl).toContain("size: 50Gi");
+    expect(sdl).toContain("WAIT_FOR_CONFIG=false");
+    // and the spec says so, for every later render of it
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).infra.nodeSizes).toEqual({ "sentry-0": "large" });
+
+    const newId = `${after.ssh_host}:${after.ssh_port}`;
+    const log = w.services.ssh.execLog;
+    const at = (target: string, re: RegExp) => log.findIndex((e) => e.target === target && re.test(e.command));
+    // it synced under keys of its own, from the fleet's nodes (the old one
+    // included) through local tunnels, while the old node kept running...
+    const syncConfig = at(newId, /resize_sync_node_key/);
+    expect(syncConfig).toBeGreaterThan(-1);
+    expect(at(newId, new RegExp(`socat TCP-LISTEN:17100,.*${before.tailnet_ip!.replace(/\./g, "\\.")}`))).toBeGreaterThan(-1);
+    // ...and became the node only once the old one was retired
+    const retire = at(oldId, /resize_retired_node_key.*printf|printf.*resize_retired_node_key/);
+    const promote = at(newId, /config\.toml\.resize-orig .*config\.toml/);
+    expect(retire).toBeGreaterThan(syncConfig);
+    expect(promote).toBeGreaterThan(retire);
+    expect(w.services.ssh.retired.has(oldId)).toBe(true);
+    // the old deployment is closed after the takeover
+    expect(closedDseqs(w)).toContain(before.dseq);
+    // the fellow sentry's peer entry follows the move
+    const sentry1 = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    expect(
+      log.some(
+        (e) =>
+          e.target === `${sentry1.ssh_host}:${sentry1.ssh_port}` &&
+          e.command.includes(`s|${before.tailnet_ip}|${after.tailnet_ip}|g`),
+      ),
+    ).toBe(true);
+  }, 120_000);
+
+  it("hands a softsign validator's key and last signed height over only after the old node stopped signing", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const oldId = `${before.ssh_host}:${before.ssh_port}`;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "small");
+    expect((await driveOps(w)).status).toBe("completed");
+
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const newId = `${after.ssh_host}:${after.ssh_port}`;
+    const log = w.services.ssh.execLog;
+    const at = (target: string, re: RegExp) => log.findIndex((e) => e.target === target && re.test(e.command));
+    // staged without the consensus key...
+    expect(at(newId, /rm -f \S+\/config\/priv_validator_key\.json/)).toBeGreaterThan(-1);
+    // ...which arrives with the promote, after the old node's retire and
+    // the read of its watermark
+    const retire = at(oldId, /printf.*resize_retired_node_key|resize_retired_node_key.*printf/);
+    const watermark = at(oldId, /^cat \S+priv_validator_state\.json/);
+    const key = at(newId, /tar xzf \/tmp\/node-data\.tgz -C \S+ config\/priv_validator_key\.json/);
+    expect(retire).toBeGreaterThan(-1);
+    expect(watermark).toBeGreaterThan(retire);
+    expect(key).toBeGreaterThan(watermark);
+    expect(w.services.ssh.files.get(`${newId}|/root/.sparkdream/data/priv_validator_state.json`)).toBe(
+      w.services.ssh.signingState,
+    );
+    const cut = w.db.stepOutput<{ watermarkHeight?: number }>("fl", `op${w.db.listFleetOps("fl")[0]!.id}:cutover`);
+    expect(cut?.watermarkHeight).toBe(1000123);
+    // its sentries' tunnels follow it to the new address
+    expect(
+      log.some((e) => e.command.includes("socat TCP-LISTEN:16656") && e.command.includes(after.tailnet_ip!)),
+    ).toBe(true);
+    expect(sdlOf(w, "val-0")).toContain("size: 4Gi");
+  }, 120_000);
+
+  it("keeps sentry-0's public hosts off the new deployment until it takes over", async () => {
+    const w = await launched(specWithComponents());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const pushed: Array<{ dseq: string; json: string }> = [];
+    const send = w.services.provider.sendManifest.bind(w.services.provider);
+    w.services.provider.sendManifest = async (creds, hostUri, dseq, json) => {
+      pushed.push({ dseq, json: json ?? "" });
+      return send(creds, hostUri, dseq, json);
+    };
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    expect((await driveOps(w)).status).toBe("completed");
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const toNew = pushed.filter((m) => m.dseq === after.dseq);
+    // staged without them (a provider would hand the hosts to it mid-sync)...
+    expect(toNew[0]!.json).not.toContain("api.sparkdream.io");
+    // ...and claiming them at persist, once the old deployment is closed
+    expect(toNew.at(-1)!.json).toContain("api.sparkdream.io");
+    expect(toNew.at(-1)!.json).toContain("rpc.sparkdream.io");
+    expect(sdlOf(w, "sentry-0")).not.toContain("resize-held-accept");
+    // and the lease asked for a provider that serves custom domains
+    const deploy = w.db.stepOutput<{ requiresCustomDomain?: boolean }>(
+      "fl",
+      `op${w.db.listFleetOps("fl")[0]!.id}:deploy`,
+    );
+    expect(deploy?.requiresCustomDomain).toBe(true);
+  }, 120_000);
+
+  it("asks when its current provider does not bid: the policy's pick or a bid of the operator's", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const known = new Set(w.db.listFleetComponents("fl").map((c) => c.dseq));
+    const list = w.services.api.listBids.bind(w.services.api);
+    w.services.api.listBids = async (owner, dseq) =>
+      (await list(owner, dseq)).filter((b) => known.has(dseq) || b.bid.id.provider !== before.provider);
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:lease`);
+    expect(parked.reason).toContain("its current provider did not bid");
+    const offers = JSON.parse(w.db.listFleetOps("fl")[0]!.params_json).offeredBids;
+    expect(offers.reason).toBe("its current provider did not bid");
+    const auto = offers.bids.find((b: { autoPick?: boolean }) => b.autoPick);
+    expect(auto).toBeDefined();
+
+    // the operator leaves it to the policy
+    w.fleet.chooseBid(w.db.getLaunch("fl")!, opId, "auto");
+    expect((await driveOps(w)).status).toBe("completed");
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(after.provider).toBe(auto.provider);
+    expect(after.provider).not.toBe(before.provider);
+  }, 120_000);
+
+  it("leaves the policy's pick out of an up-front manual pick", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before, { manualBid: true });
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    expect((await driveOps(w)).status).toBe("awaiting-user");
+    expect(() => w.fleet.chooseBid(w.db.getLaunch("fl")!, opId, "auto")).toThrow(/hand-picked/);
+  }, 120_000);
+
+  it("waits out the sync, publishing its position", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    const progress: unknown[] = [];
+    const set = w.db.setFleetOpProgress.bind(w.db);
+    w.db.setFleetOpProgress = (id, p) => {
+      if (p) progress.push(p);
+      set(id, p);
+    };
+    // the staged container is whichever new SSH endpoint answers the sync
+    // config; make every endpoint not yet seen report catching up for a while
+    const seen = new Set(w.db.listFleetComponents("fl").map((c) => `${c.ssh_host}:${c.ssh_port}`));
+    const exec = w.services.ssh.exec.bind(w.services.ssh);
+    w.services.ssh.exec = async (target, command, opts) => {
+      const id = `${target.host}:${target.port}`;
+      if (!seen.has(id)) {
+        seen.add(id);
+        w.services.ssh.syncingPolls.set(id, 3);
+      }
+      return exec(target, command, opts);
+    };
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(progress.length).toBeGreaterThan(2);
+    expect(progress[0]).toMatchObject({ label: "sentry-1: syncing the large deployment" });
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.progress_json).toBeNull();
+  }, 120_000);
+
+  it("parks a tmkms validator at the signer gate with its new address", async () => {
+    const w = await launched(tmkms1x1());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.signerConnected = false;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    // told the new address BEFORE the old node stops signing...
+    const told = await driveOps(w);
+    expect(told.failedStep).toBe(`op${opId}:prepare-signer`);
+    const stagedIp = w.db.stepOutput<{ stagedIp: string }>("fl", `op${opId}:stage`)!.stagedIp;
+    expect(told.reason).toContain(`tcp://${stagedIp}:26659`);
+    expect(told.reason).toContain("do not restart the signer yet");
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!.dseq).toBe(before.dseq);
+    expect(w.services.ssh.retired.size).toBe(0);
+    // ...and asked to restart it after the handover: a remote-signer node
+    // exits within seconds without its signer (2026-10-03 devnet halt)
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:start-node`);
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    expect(parked.reason).toContain(`tcp://${after.tailnet_ip}:26659`);
+    // it kept starting the node while it waited
+    const newId = `${after.ssh_host}:${after.ssh_port}`;
+    expect(
+      w.services.ssh.execLog.filter((e) => e.target === newId && e.command.includes("sparkdreamd start")).length,
+    ).toBeGreaterThan(0);
+    // no watermark handover: tmkms keeps its own
+    expect(w.services.ssh.execLog.some((e) => /^cat \S+priv_validator_state\.json/.test(e.command))).toBe(false);
+    w.services.ssh.signerConnected = true;
+    expect((await driveOps(w)).status).toBe("completed");
+  }, 120_000);
+
+  it("an abort past the cutover keeps the new deployment, which is the node by then", async () => {
+    const w = await launched(tmkms1x1());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    w.services.ssh.signerConnected = false;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    expect((await driveOps(w)).failedStep).toBe(`op${opId}:prepare-signer`);
+    expect((await driveOps(w)).failedStep).toBe(`op${opId}:start-node`);
+    const moved = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    expect(moved.dseq).not.toBe(before.dseq);
+
+    // parked waiting for the signer, before close-old: the abort closes the
+    // retired old deployment, never the new one
+    const { step } = await w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+    expect(step).toBe(`fleet:close:${before.dseq}`);
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    expect(row.dseq).toBe(moved.dseq);
+    expect(row.state).toBe("active");
+    expect(w.db.getPendingTx("fl", `fleet:close:${moved.dseq}`)).toBeUndefined();
+  }, 120_000);
+
+  it("stops syncing within a poll when aborted, closing the new deployment and nothing else", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    // the staged node syncs forever; the operator aborts on its third poll
+    const seen = new Set(w.db.listFleetComponents("fl").map((c) => `${c.ssh_host}:${c.ssh_port}`));
+    let polls = 0;
+    let abort: Promise<{ step?: string }> | undefined;
+    const exec = w.services.ssh.exec.bind(w.services.ssh);
+    w.services.ssh.exec = async (target, command, opts) => {
+      const id = `${target.host}:${target.port}`;
+      if (!seen.has(id) && command.includes("26657/status")) {
+        w.services.ssh.syncingPolls.set(id, 5);
+        if (++polls === 3) abort = w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+      }
+      return exec(target, command, opts);
+    };
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(polls).toBeLessThan(6);
+    const staged = w.db.stepOutput<{ dseq: string }>("fl", `op${opId}:deploy`);
+    expect(staged).toBeUndefined(); // the op left no step rows behind
+    expect((await abort!).step).toMatch(/^fleet:close:/);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("aborted");
+    expect(w.db.listSteps("fl").some((s) => s.name.startsWith(`op${opId}:`))).toBe(false);
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(row.dseq).toBe(before.dseq);
+    expect(w.services.ssh.retired.size).toBe(0);
+  }, 120_000);
+
+  it("reports a sync that stops advancing instead of watching it for days", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    const seen = new Set(w.db.listFleetComponents("fl").map((c) => `${c.ssh_host}:${c.ssh_port}`));
+    let polls = 0;
+    const exec = w.services.ssh.exec.bind(w.services.ssh);
+    w.services.ssh.exec = async (target, command, opts) => {
+      const id = `${target.host}:${target.port}`;
+      if (!seen.has(id) && command.includes("26657/status")) {
+        polls++;
+        w.services.ssh.stoppedHeights.set(id, 500);
+      }
+      return exec(target, command, opts);
+    };
+    const failed = await driveOps(w);
+    expect(failed.failedStep).toBe(`op${opId}:sync`);
+    expect(w.db.getStep("fl", `op${opId}:sync`)?.error).toMatch(/not advanced past height 500 for 10 minutes/);
+    // ten minutes of 15-second polls, not three days of them
+    expect(polls).toBeLessThan(50);
+  }, 120_000);
+
+  it("refuses an abort while the node is being handed over", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    w.db.stepStarted("fl", `op${opId}:cutover`);
+    await expect(w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId)).rejects.toThrow(/handing the node over/);
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("active");
+  }, 120_000);
+
+  it("restores the old node when it will not retire, and an abort closes only the new deployment", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const oldId = `${before.ssh_host}:${before.ssh_port}`;
+    w.services.ssh.retireIgnored.add(oldId);
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    const opId = w.db.listFleetOps("fl")[0]!.id;
+    const failed = await driveOps(w);
+    expect(failed.status).not.toBe("completed");
+    expect(failed.failedStep).toBe(`op${opId}:cutover`);
+    // the old node got its own config back and still is the component
+    expect(w.services.ssh.execLog.some((e) => e.target === oldId && e.command.includes("echo restored"))).toBe(true);
+    const row = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    expect(row.dseq).toBe(before.dseq);
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).infra?.nodeSizes).toBeUndefined();
+
+    const staged = w.db.stepOutput<{ dseq: string }>("fl", `op${opId}:deploy`)!.dseq;
+    const { step } = await w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+    expect(step).toBe(`fleet:close:${staged}`);
+    expect(w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!.dseq).toBe(before.dseq);
+  }, 120_000);
+
+  it("refuses what it cannot do", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const rows = w.db.listFleetComponents("fl");
+    const sentry0 = rows.find((c) => c.key === "sentry-0")!;
+    const val0 = rows.find((c) => c.key === "val-0")!;
+    const headscale = rows.find((c) => c.key === "headscale")!;
+    await expect(w.fleet.requestNodeResize(launch, sentry0, "standard")).rejects.toThrow(/already standard/);
+    await expect(w.fleet.requestNodeResize(launch, headscale, "large")).rejects.toThrow(/only chain nodes/);
+    // the new data volume must hold the chain the node keeps now
+    w.services.ssh.dataUsageMb.set(`${val0.ssh_host}:${val0.ssh_port}`, 30 * 1024);
+    await expect(w.fleet.nodeResizeWarnings(launch, val0, "small")).rejects.toThrow(/pick a larger size/);
+    expect((await w.fleet.nodeResizeWarnings(launch, val0, "large")).join(" ")).toMatch(/cannot double-sign/);
+    // one at a time, and not under a relaunch
+    await w.fleet.requestNodeResize(launch, sentry0, "large");
+    await expect(w.fleet.requestNodeResize(launch, val0, "large")).rejects.toThrow(/one node at a time/);
+    await expect(w.fleet.requestRelaunch(launch, sentry0)).rejects.toThrow(/being resized/);
+  }, 120_000);
+});
+
+describe("node disk usage", () => {
+  it("parses df's POSIX output, busybox's included", () => {
+    expect(
+      parseDf(
+        "Filesystem           1024-blocks    Used Available Capacity Mounted on\n" +
+          "/dev/rbd3                8191416  6253632   1921400  76% /root/.sparkdream\n",
+      ),
+    ).toEqual({ totalBytes: 8191416 * 1024, usedBytes: 6253632 * 1024, freeBytes: 1921400 * 1024, percentUsed: 76 });
+    expect(parseDf("df: /root/.sparkdream: No such file or directory")).toBeUndefined();
+  });
+
+  it("reads a node's data volume, and only a node's", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const rows = w.db.listFleetComponents("fl");
+    const val0 = rows.find((c) => c.key === "val-0")!;
+    w.services.provider.diskUsedKb.set(val0.dseq, 18 * 1024 * 1024);
+    const disk = await w.fleet.componentDisk(launch, val0);
+    expect(disk).toMatchObject({ percentUsed: 90, freeBytes: 2 * 1024 ** 3, totalBytes: 20 * 1024 ** 3 });
+    // cached: a second read within the minute asks the provider nothing
+    const before = w.services.provider.shellLog.length;
+    await w.fleet.componentDisk(launch, val0);
+    expect(w.services.provider.shellLog.length).toBe(before);
+    expect(await w.fleet.componentDisk(launch, rows.find((c) => c.key === "headscale")!)).toBeNull();
+  }, 120_000);
+});
+
+describe("syncPace", () => {
+  it("times the gap closing, not the node's own speed, over the samples given", () => {
+    // the live devnet numbers: the node at ~8.5 blocks/s, the head moving on
+    const pace = syncPace([
+      { at: 0, height: 119_731, head: 131_319 },
+      { at: 46_600, height: 120_129, head: 131_348 },
+    ]);
+    expect(pace.rate).toBeCloseTo(8.54, 1);
+    // gap 11 219 closing at (11 588 - 11 219) / 46.6s = 7.92/s
+    expect(pace.etaSeconds).toBeCloseTo(1417, -1);
+  });
+
+  it("gives no ETA while the node is falling behind", () => {
+    const pace = syncPace([
+      { at: 0, height: 100, head: 200 },
+      { at: 10_000, height: 105, head: 210 },
+    ]);
+    expect(pace.rate).toBe(0.5);
+    expect(pace.etaSeconds).toBeUndefined();
+  });
+});
+
+describe("withNodeResources", () => {
+  it("rewrites only the compute resources of a rendered node SDL", () => {
+    const sdl = [
+      "services:",
+      "  sparkdreamd:",
+      "    env:",
+      "      - WAIT_FOR_CONFIG=false",
+      "profiles:",
+      "  compute:",
+      "    sparkdreamd:",
+      "      resources:",
+      "        cpu:",
+      "          units: 2",
+      "        memory:",
+      "          size: 8Gi",
+      "        storage:",
+      "          - size: 5Gi",
+      "          - name: data",
+      "            size: 8Gi",
+      "            attributes:",
+      "              persistent: true",
+      "              class: beta3",
+      "  placement:",
+      "    dcloud:",
+      "      pricing:",
+      "        sparkdreamd:",
+      "          denom: uact",
+      "          amount: 100000",
+      "",
+    ].join("\n");
+    const out = withNodeResources(sdl, NODE_SIZES.large.sentry);
+    const doc = yaml.load(out) as any;
+    expect(doc.profiles.compute.sparkdreamd.resources).toEqual({
+      cpu: { units: 4 },
+      memory: { size: "16Gi" },
+      storage: [{ size: "5Gi" }, { name: "data", size: "50Gi", attributes: { persistent: true, class: "beta3" } }],
+    });
+    expect(doc.profiles.placement.dcloud.pricing.sparkdreamd.amount).toBe(100000);
+    expect(out).toContain("- WAIT_FOR_CONFIG=false");
+  });
 });
 
 describe("tmkms validator relaunch", () => {

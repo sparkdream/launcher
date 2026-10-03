@@ -7,7 +7,7 @@ export {
   type RelayerEndpointCounterparty,
   type RelayerPath,
 } from "./schema.js";
-export { profiles, type Profile } from "./profiles.js";
+export { profiles, NODE_SIZES, type Profile, type NodeSize, type RoleResources } from "./profiles.js";
 export {
   RESET_FROZEN_PATHS,
   frozenResetViolations,
@@ -40,6 +40,9 @@ export {
   tunnelPort,
   resolveTopology,
   nodes,
+  nodeRole,
+  nodeResources,
+  nodeSize,
   serviceComponents,
   lcdRequired,
   grpcRequired,

@@ -1,5 +1,6 @@
 import type { LaunchSpec, RelayerPath } from "./schema.js";
 import { COMPONENT_KEYS, COMPONENT_KINDS, componentDomain, type ComponentKey } from "./components.js";
+import { NODE_SIZES, type NodeSize, type RoleResources } from "./profiles.js";
 
 /**
  * sparkdream + suffix 1 → "sparkdream-1" (§4). In join mode the chain
@@ -112,6 +113,42 @@ export function nodes(spec: LaunchSpec): NodeRef[] {
     out.push({ role: "sentry", index: s, key: `sentry-${s}`, moniker: sentryMoniker(spec, s) });
   }
   return out;
+}
+
+/** The role a node key names: "val-N" is a validator, "sentry-N" a sentry. */
+export function nodeRole(key: string): NodeRole {
+  return key.startsWith("val-") ? "validator" : "sentry";
+}
+
+/**
+ * What one node deploys with: its infra.nodeSizes tier, else its role's
+ * infra.roleSizes tier, else its role's infra.resources.
+ */
+export function nodeResources(spec: LaunchSpec, key: string): RoleResources {
+  const role = nodeRole(key);
+  const size = spec.infra.nodeSizes?.[key] ?? spec.infra.roleSizes?.[role];
+  return size ? NODE_SIZES[size][role] : spec.infra.resources[role];
+}
+
+/**
+ * The tier a node runs at: its infra.nodeSizes entry, its role's
+ * infra.roleSizes entry, or the tier its role's
+ * resources match exactly, or "custom" for hand-edited resources that match
+ * none (a resize then moves the node onto a tier).
+ */
+export function nodeSize(spec: LaunchSpec, key: string): NodeSize | "custom" {
+  const role = nodeRole(key);
+  const own = spec.infra.nodeSizes?.[key] ?? spec.infra.roleSizes?.[role];
+  if (own) return own;
+  const res = spec.infra.resources[role];
+  const same = (a: RoleResources) =>
+    a.cpu === res.cpu &&
+    a.memory === res.memory &&
+    a.storage.root === res.storage.root &&
+    a.storage.data === res.storage.data &&
+    a.storage.persistent === res.storage.persistent &&
+    a.storage.class === res.storage.class;
+  return (Object.keys(NODE_SIZES) as NodeSize[]).find((s) => same(NODE_SIZES[s][role])) ?? "custom";
 }
 
 export interface ComponentRef {

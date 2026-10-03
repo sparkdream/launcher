@@ -433,6 +433,9 @@ export class FakeProviderGateway {
     return undefined;
   }
 
+  /** dseq → KiB used on the node's data volume (`df`). */
+  diskUsedKb = new Map<string, number>();
+
   async shellExec(
     _creds: MtlsCredentials,
     _hostUri: string,
@@ -446,6 +449,17 @@ export class FakeProviderGateway {
     this.shellLog.push({ dseq, script });
     if (this.apiDownDseqs.has(dseq)) throw new Error("lease shell: provider reported a failure (pod restarting?)");
     if (cmd[0] === "mastodon-bootstrap") return this.mastodonBootstrap(dseq, cmd.slice(1));
+    // a node's data volume: 20 GiB, a quarter used unless a test says otherwise
+    if (script.startsWith("df -Pk")) {
+      const usedKb = this.diskUsedKb.get(dseq) ?? 5 * 1024 * 1024;
+      const totalKb = 20 * 1024 * 1024;
+      return {
+        stdout:
+          "Filesystem           1024-blocks    Used Available Capacity Mounted on\n" +
+          `/dev/rbd3            ${totalKb} ${usedKb} ${totalKb - usedKb} ${Math.round((usedKb / totalKb) * 100)}% /root/.sparkdream\n`,
+        stderr: "",
+      };
+    }
     const data = this.mastodonData(dseq, script);
     if (data) return data;
     // printing env vars (the bridge's delivered-env check): what the
@@ -575,6 +589,22 @@ export class FakeSsh {
   private relayChannels = new Map<string, unknown>();
   /** Relayer: how many times bringup opened a path afresh. */
   relayOpens = 0;
+  /** Node resize: old nodes running on generated keys since their retire
+   *  restart (their status then reports another node ID). */
+  retired = new Set<string>();
+  /** Nodes that ignore the retire: still the real node after the restart. */
+  retireIgnored = new Set<string>();
+  /** When true, a stopped SSH-started node stays behind as a zombie (wait
+   *  mode, where PID 1 is a `tail` that never reaps). */
+  leavesZombies = false;
+  private zombies = new Set<string>();
+  /** Signing state a node's priv_validator_state.json holds. */
+  signingState = '{"height":"1000123","round":0,"step":3}';
+  /** host:port → `du -sm` of the node's data dir (resize storage guard). */
+  dataUsageMb = new Map<string, number>();
+  /** host:port → polls its status still reports catching up (a resize's
+   *  staged node syncing). */
+  syncingPolls = new Map<string, number>();
   /** Block archive files sitting on a node (restore op), per host:port. */
   archiveFiles = new Map<string, number>();
   /** Nodes holding an uploaded tarball the restore op can unpack. */
@@ -651,6 +681,23 @@ export class FakeSsh {
     }
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
+
+    // --- node resize: retire / un-retire, signing state, data usage ---
+    if (command.includes("resize_retired_node_key") && command.includes("printf")) {
+      if (!this.retireIgnored.has(id)) this.retired.add(id);
+      return ok();
+    }
+    if (command.includes("resize_retired_node_key") && command.includes("echo restored")) {
+      const was = this.retired.delete(id);
+      return ok(was ? "restored" : "");
+    }
+    if (command.startsWith("cat ") && command.includes("priv_validator_state.json")) {
+      return ok(this.signingState);
+    }
+    if (command.startsWith("du -sm")) {
+      const mb = this.dataUsageMb.get(id);
+      return ok(mb === undefined ? "" : String(mb));
+    }
 
     // --- relayer container (deploy/docker/hermes in the chain repo) ---
     const manifest = () =>
@@ -812,9 +859,15 @@ export class FakeSsh {
       const validatorInfo = this.statusConsensusPubkey
         ? `,"validator_info":{"pub_key":{"value":"${this.statusConsensusPubkey}"}}`
         : "";
-      const height = this.stoppedHeights.get(id) ?? this.chain.next();
+      const syncing = this.syncingPolls.get(id) ?? 0;
+      if (syncing > 0) this.syncingPolls.set(id, syncing - 1);
+      const height = syncing > 0 ? 1000 * (10 - syncing) : (this.stoppedHeights.get(id) ?? this.chain.next());
+      // a retired node runs under a node key it generated itself
+      const nodeInfo = this.retired.has(id)
+        ? `"node_info":{"protocol_version":{"p2p":"8","block":"11"},"id":"${"e".repeat(40)}"},`
+        : "";
       return ok(
-        `{"result":{"sync_info":{"latest_block_height":"${height}","catching_up":false}${validatorInfo}}}`,
+        `{"result":{${nodeInfo}"sync_info":{"latest_block_height":"${height}","catching_up":${syncing > 0}}${validatorInfo}}}`,
       );
     }
     if (command.includes("nc -z 127.0.0.1 26660")) {
@@ -846,9 +899,13 @@ export class FakeSsh {
       return ok(v === undefined ? "" : v);
     }
     if (command.includes("pgrep -x sparkdreamd")) {
-      return ok(this.started.has(id) ? "yes" : "no");
+      // a zombie still matches pgrep; only a probe reading /proc/<pid>/stat
+      // tells it from a running node
+      const zombie = this.zombies.has(id) && !command.includes("/stat");
+      return ok(this.started.has(id) || zombie ? "yes" : "no");
     }
     if (command.includes("pkill -x sparkdreamd")) {
+      if (this.leavesZombies && this.started.has(id)) this.zombies.add(id);
       this.started.delete(id);
       return ok();
     }

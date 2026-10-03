@@ -1,5 +1,13 @@
 import path from "node:path";
-import { isServicesFleet, serviceComponents, type LaunchSpec } from "@sparkdream/launch-spec";
+import {
+  isServicesFleet,
+  nodeResources,
+  nodes,
+  nodeSize,
+  serviceComponents,
+  type LaunchSpec,
+  type RoleResources,
+} from "@sparkdream/launch-spec";
 import { loadSdl } from "./akash/sdl-groups.js";
 import { feeConfig } from "./fee.js";
 import { descriptor } from "./components/index.js";
@@ -92,8 +100,31 @@ function sdlResourcesToWorkload(res: any): Workload {
   return w;
 }
 
+/**
+ * One row per role, or per role and size once infra.nodeSizes gives some of
+ * a role's nodes another tier ("sentries (large)").
+ */
+function nodeRoles(
+  spec: LaunchSpec,
+  workload: (r: RoleResources) => Workload,
+): Array<{ role: string; count: number; workloads: Workload[] }> {
+  const rows: Array<{ role: string; size: string; res: RoleResources; count: number }> = [];
+  for (const node of nodes(spec)) {
+    const res = nodeResources(spec, node.key);
+    const same = rows.find((r) => r.role === node.role && JSON.stringify(r.res) === JSON.stringify(res));
+    if (same) same.count++;
+    else rows.push({ role: node.role, size: nodeSize(spec, node.key), res, count: 1 });
+  }
+  const plural = (role: string) => (role === "validator" ? "validators" : "sentries");
+  return rows.map((r) => ({
+    role: rows.filter((o) => o.role === r.role).length > 1 ? `${plural(r.role)} (${r.size})` : plural(r.role),
+    count: r.count,
+    workloads: [workload(r.res)],
+  }));
+}
+
 export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
-  const nodeWorkload = (r: LaunchSpec["infra"]["resources"]["validator"]): Workload => ({
+  const nodeWorkload = (r: RoleResources): Workload => ({
     cpuThreads: r.cpu,
     memoryBytes: sizeToBytes(r.memory),
     ephemeralBytes: sizeToBytes(r.storage.root),
@@ -117,20 +148,7 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
         workloads: descriptor(c.key).resources(spec).map(sdlResourcesToWorkload),
       }))
     : [
-    {
-      role: "validators",
-      count: spec.topology.validators.count,
-      workloads: [nodeWorkload(spec.infra.resources.validator)],
-    },
-    ...(spec.topology.sentries.count > 0
-      ? [
-          {
-            role: "sentries",
-            count: spec.topology.sentries.count,
-            workloads: [nodeWorkload(spec.infra.resources.sentry)],
-          },
-        ]
-      : []),
+    ...nodeRoles(spec, nodeWorkload),
     // a shared mesh (reuseFleet) is deployed and paid for by its owning fleet
     ...(spec.topology.headscale.reuseFleet
       ? []
