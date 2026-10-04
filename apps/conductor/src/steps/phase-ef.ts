@@ -17,6 +17,7 @@ import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT
 import { buildTmkmsSetup, SIGNER_CONNECTED_PROBE, VALIDATOR_STATUS_PROBE, probeSaysConnected, statusConsensusPubkey } from "../tmkms.js";
 import { phaseGSteps } from "./phase-g.js";
 import { resolveStateSyncTrust } from "./join.js";
+import { repointSigner, signerDepsOf, tryManaged } from "../local-signer.js";
 
 const UPLOAD_MARKER = `${NODE_HOME}/.node-data-uploaded`;
 
@@ -365,6 +366,12 @@ export const awaitSignerStep: StepDef = {
     // ready signer's reconnect has to land.
     for (let v = 0; v < ctx.spec.topology.validators.count; v++) {
       const target = nodeTarget(ctx, `val-${v}`);
+      // a signer on the launcher's own machine, adopted for this launch
+      // (local-signer.ts): point it at the validator and restart it
+      const ip = mesh.ips[`val-${v}`];
+      const local = ip
+        ? await tryManaged(signerDepsOf(ctx), (d) => repointSigner(d, `val-${v}`, ip, "launch"))
+        : { managed: false, ok: false, note: "" };
       let connected = false;
       for (let attempt = 0; attempt < 12 && !connected; attempt++) {
         if (attempt > 0) await ctx.services.sleep(5000);
@@ -376,7 +383,8 @@ export const awaitSignerStep: StepDef = {
           "await-signer",
           `connect your tmkms signer(s): the setup checklist below walks through it. ` +
             `Resume once every validator reports its signer connected.\n` +
-            `${Object.values(stanzas).join("\n")}`,
+            `${Object.values(stanzas).join("\n")}` +
+            local.note,
         );
       }
       // spec-pinned key (hardware signer): a connected session is not enough,

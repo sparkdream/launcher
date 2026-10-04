@@ -91,8 +91,15 @@ const s3Backup = z.object({
   bucket: z.string().min(1),
   region: z.string().default("auto"),
   accessKeyId: z.string().min(1),
-  /** Indirection only — never the secret itself. e.g. "env:HEADSCALE_S3_SECRET" */
-  secretRef: z.string().regex(/^env:[A-Z][A-Z0-9_]*$/),
+  /**
+   * Indirection only, never the secret itself: "env:HEADSCALE_S3_SECRET"
+   * (the conductor's environment) or "secret:<name>" (a file in the
+   * launch's secrets directory, which the mesh backup action writes).
+   */
+  secretRef: z.string().regex(/^(env:[A-Z][A-Z0-9_]*|secret:[a-z0-9][a-z0-9-]*)$/),
+  /** Key prefix inside the bucket; one per fleet, so fleets can share a bucket.
+   *  Default: sparkdream-launcher/<chain-id>/headscale. */
+  path: z.string().regex(/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/).optional(),
 });
 
 const componentToggle = z.object({

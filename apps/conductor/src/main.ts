@@ -6,6 +6,9 @@ import { ConductorDb } from "./db.js";
 import { buildServer } from "./server.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
+import { SshSignerHost, SystemdSignerHost } from "./local-signer.js";
+import { AkashUnattendedChain } from "./unattended.js";
+import { CloudflareDns, cloudflareToken } from "./dns.js";
 
 /**
  * Conductor entrypoint. Env:
@@ -22,6 +25,37 @@ const services = productionServices({
   lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
   consoleApi: process.env.CONSOLE_API ?? "https://console-api.akash.network",
 });
+
+/**
+ * AKASH_RPC        CometBFT RPC the launcher signs unattended-recovery txs
+ *                  through (default https://rpc.akashnet.net:443)
+ * AKASH_GAS_PRICE  their gas price (default 0.025uact, the web UI's)
+ */
+services.unattended = new AkashUnattendedChain({
+  lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
+  rpc: process.env.AKASH_RPC ?? "https://rpc.akashnet.net:443",
+  gasPrice: process.env.AKASH_GAS_PRICE ?? "0.025uact",
+});
+
+// a tmkms signer on another machine (ssh_config alias, key auth), e.g. a Pi
+services.remoteSigner = (remote) => new SshSignerHost(services.ssh, remote);
+
+// DNS updates after a move, once a Cloudflare token is set (System panel)
+services.dns = new CloudflareDns(() => cloudflareToken(dataDir));
+
+/**
+ * LOCAL_SIGNER  "off" → never manage a tmkms signer on this machine. On by
+ * default for a launcher run directly on Linux (a container has no systemd
+ * user manager and no view of host processes, so it is off there anyway).
+ */
+if (
+  process.platform === "linux" &&
+  process.env.LOCAL_SIGNER !== "off" &&
+  process.env.LAUNCHER_ON_AKASH !== "true" &&
+  fs.existsSync(`/run/user/${process.getuid?.() ?? 0}/systemd`)
+) {
+  services.localSigner = new SystemdSignerHost();
+}
 
 /**
  * Additional env (M6):

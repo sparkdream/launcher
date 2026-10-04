@@ -772,6 +772,102 @@ export default function Page() {
 
   // launcher backup (machine migration): a passphrase modal drives both the
   // encrypted export and the merge-import
+  // chain-data backups dialog (data-backup / data-restore ops), by launch id
+  const [chainBackupsFor, setChainBackupsFor] = useState<string | null>(null);
+  const chainBackupAction = async (
+    launchId: string,
+    settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+  ) => {
+    setError(null);
+    try {
+      const { postDataBackup, getFleet } = await import("../lib/api");
+      const res = await postDataBackup(launchId, settings);
+      if (res.source) {
+        showToast(`backing up ${res.source}'s chain data: follow it in the Launch panel`);
+        setChainBackupsFor(null);
+        openLaunch(launchId);
+      } else if (wallet) {
+        setFleet(await getFleet(wallet.address));
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const restoreNodeFromBackup = async (
+    f: import("../lib/api").FleetSummary["fleets"][number],
+    key: string,
+  ) => {
+    const usable = (f.dataBackups?.backups ?? []).filter((b) => b.blocker === null);
+    if (usable.length === 0) {
+      setError(`no usable chain-data backup for ${f.name}: take one from "chain backups…" first`);
+      return;
+    }
+    const pick = window.prompt(
+      `Replace ${key}'s chain data with which backup? The node stops (its container restarts held), its ` +
+        "data directory is replaced, and it starts again and syncs from the backup's height to the head. " +
+        "Its keys and signing state stay.\n" +
+        usable
+          .map((b, i) => `  ${i + 1}. height ${b.height}, ${new Date(b.takenAt).toLocaleString()} (from ${b.from})`)
+          .join("\n"),
+      "1",
+    )?.trim();
+    if (!pick) return;
+    const chosen = usable[Number(pick) - 1];
+    if (!chosen) {
+      setError("pick a number from the list");
+      return;
+    }
+    try {
+      const { postDataRestore } = await import("../lib/api");
+      await postDataRestore(f.launchId, key, chosen.name);
+      showToast(`restoring ${key} from height ${chosen.height}: follow it in the Launch panel`);
+      openLaunch(f.launchId);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  // headscale mesh backup form (mesh-backup op)
+  const [meshBackupForm, setMeshBackupForm] = useState<
+    | (import("../lib/api").MeshBackupStorage & { launchId: string; network: string; secret: string; known: boolean })
+    | null
+  >(null);
+  const [meshBackupBusy, setMeshBackupBusy] = useState(false);
+  const openMeshBackup = async (launchId: string, network: string) => {
+    setError(null);
+    let known: import("../lib/api").MeshBackupStorage | null = null;
+    try {
+      const { getMeshBackupStorage } = await import("../lib/api");
+      known = (await getMeshBackupStorage(launchId)).known;
+    } catch {
+      known = null;
+    }
+    setMeshBackupForm({
+      launchId,
+      network,
+      endpoint: known?.endpoint ?? "",
+      bucket: known?.bucket ?? "",
+      region: known?.region ?? "us-west-2",
+      accessKeyId: known?.accessKeyId ?? "",
+      secret: "",
+      known: known !== null,
+    });
+  };
+  const submitMeshBackup = async () => {
+    if (!meshBackupForm) return;
+    setMeshBackupBusy(true);
+    setError(null);
+    try {
+      const { postMeshBackup, getFleet } = await import("../lib/api");
+      const { launchId, endpoint, bucket, region, accessKeyId, secret } = meshBackupForm;
+      await postMeshBackup(launchId, { endpoint, bucket, region, accessKeyId, ...(secret ? { secret } : {}) });
+      setMeshBackupForm(null);
+      if (wallet) setFleet(await getFleet(wallet.address));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMeshBackupBusy(false);
+    }
+  };
   const [backupPrompt, setBackupPrompt] = useState<
     null | { mode: "export" } | { mode: "import"; file: File }
   >(null);
@@ -785,12 +881,60 @@ export default function Page() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const [systemOpen, setSystemOpen] = usePersistedState("launcher.panel.system", false);
-  const [sysFocus, setSysFocus] = useState<"backup" | "assets" | null>(null);
-  const openSystem = (section: "backup" | "assets") => {
+  // Cloudflare DNS token and the wallet's unattended recovery, loaded with the System panel
+  const [dnsSet, setDnsSet] = useState<boolean | null>(null);
+  const [dnsZones, setDnsZones] = useState<string[]>([]);
+  const [dnsToken, setDnsToken] = useState("");
+  const [unattended, setUnattended] = useState<import("../lib/api").UnattendedStatus | null>(null);
+  const [unattendedCap, setUnattendedCap] = useState("");
+  const loadUnattended = useCallback(async (owner: string) => {
+    try {
+      const { getUnattended } = await import("../lib/api");
+      const u = await getUnattended(owner);
+      setUnattended(u);
+      setUnattendedCap(String(Number(u.settings.dailyCap.amount) / 1e6));
+    } catch {
+      setUnattended(null);
+    }
+  }, []);
+  // incident alert channels, loaded when the System panel opens
+  const [alertForm, setAlertForm] = useState<{ topic: string; server: string; webhook: string } | null>(null);
+  const [alertNote, setAlertNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (!systemOpen) return;
+    setAlertNote(null);
+    import("../lib/api")
+      .then(({ getAlertSettings }) => getAlertSettings())
+      .then((a) =>
+        setAlertForm({
+          topic: a.ntfy?.topic ?? "",
+          server: a.ntfy?.server && a.ntfy.server !== "https://ntfy.sh" ? a.ntfy.server : "",
+          webhook: a.webhook ?? "",
+        }),
+      )
+      .catch(() => setAlertForm({ topic: "", server: "", webhook: "" }));
+    import("../lib/api")
+      .then(({ getDnsSettings }) => getDnsSettings())
+      .then((d) => {
+        setDnsSet(d.cloudflare);
+        setDnsZones(d.zones ?? []);
+      })
+      .catch(() => setDnsSet(null));
+    if (wallet) void loadUnattended(wallet.address);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemOpen, wallet?.address]);
+  const [sysFocus, setSysFocus] = useState<"backup" | "assets" | "recovery" | null>(null);
+  const openSystem = (section: "backup" | "assets" | "recovery") => {
     setSettingsOpen(false);
     setSystemOpen(true);
     setSysFocus(section);
   };
+  // the menu entry's block, once the panel has rendered it
+  useEffect(() => {
+    if (!systemOpen || !sysFocus) return;
+    const t = setTimeout(() => document.querySelector(".sys-block.focus")?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+    return () => clearTimeout(t);
+  }, [systemOpen, sysFocus]);
   useEffect(() => {
     if (!settingsOpen) return;
     const onDown = (e: MouseEvent) => {
@@ -833,6 +977,8 @@ export default function Page() {
   const [tmkms, setTmkms] = useState<import("../lib/api").TmkmsSetup | null>(null);
   const [tmkmsId, setTmkmsId] = useState<string | null>(null);
   const [tmkmsStatus, setTmkmsStatus] = useState<import("../lib/api").TmkmsStatus | null>(null);
+  const [localSigner, setLocalSigner] = useState<import("../lib/api").LocalSignerView | null>(null);
+  const [localSignerBusy, setLocalSignerBusy] = useState<string | null>(null);
   // per-validator signing deltas, diffed between status polls: the stall
   // signal (0 new blocks while connected) lives in the delta, not the counters
   const [tmkmsSignDeltas, setTmkmsSignDeltas] = useState<Record<string, { seen: number; missed: number } | null>>({});
@@ -851,6 +997,7 @@ export default function Page() {
     setTmkms(null);
     setTmkmsId(null);
     setTmkmsStatus(null);
+    setLocalSigner(null);
     setTmkmsSignDeltas({});
     tmkmsPrevCounters.current = {};
   };
@@ -1012,6 +1159,30 @@ export default function Page() {
       clearInterval(pt);
     };
   }, [wallet, chain.rest]);
+
+  // the wallet grants (or revokes) unattended recovery: plain Keplr signing
+  // of the msgs the conductor builds for the launcher's key
+  const signUnattended = async (kind: "grant" | "revoke") => {
+    if (!wallet) return;
+    setBusy(kind === "grant" ? "granting unattended recovery in Keplr…" : "revoking unattended recovery in Keplr…");
+    setError(null);
+    try {
+      const { getUnattendedMsgs } = await import("../lib/api");
+      const { msgs } = await getUnattendedMsgs(wallet.address, kind, 30);
+      const client = await SigningStargateClient.connectWithSigner(chain.rpc, wallet.signer, {
+        registry: launcherRegistry(),
+        gasPrice: GasPrice.fromString(`${chain.gasPrice}${chain.denom}`),
+      });
+      const result = await client.signAndBroadcast(wallet.address, msgs.map(toEncodeObject), "auto");
+      if (result.code !== 0) throw new Error(`tx rejected on-chain (code ${result.code}): ${result.rawLog ?? ""}`);
+      showToast(kind === "grant" ? "unattended recovery granted for 30 days" : "unattended recovery revoked");
+      await loadUnattended(wallet.address);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const mint = async () => {
     if (!wallet) return;
@@ -1737,13 +1908,62 @@ export default function Page() {
           })
           .catch(() => {}),
       );
+    const tickLocal = () =>
+      import("../lib/api").then(({ getLocalSigner }) =>
+        getLocalSigner(tmkmsId)
+          .then((v) => {
+            if (!stop) setLocalSigner(v);
+          })
+          .catch(() => {}),
+      );
+    void tickLocal();
+    const tl = setInterval(tickLocal, 10_000);
     void tick();
     const t = setInterval(tick, 10_000);
     return () => {
       stop = true;
       clearInterval(t);
+      clearInterval(tl);
     };
   }, [tmkms, tmkmsId]);
+
+  const runLocalSigner = async (launchId: string, action: "adopt" | "release", key: string, remote?: string) => {
+    const sure =
+      remote
+        ? window.confirm(
+            `Let the launcher manage the tmkms signer for ${key} on ${remote}?\n\n` +
+              `It reaches ${remote} over SSH (your ssh_config entry and key) and finds the tmkms signing for this ` +
+              "chain. If it already runs as a systemd service, that service is used as it is (nothing is stopped); " +
+              "otherwise it is moved under one. From then on the launcher repoints and restarts it after relaunches, " +
+              "resizes, mesh re-keys and chain resets, and restarts it when it loses its session. The state file and " +
+              "the signing key are never touched.",
+          )
+        : action === "adopt"
+        ? window.confirm(
+            `Let the launcher manage the tmkms signer for ${key} on this machine?\n\n` +
+              "It stops the tmkms process you started and runs the same binary and config as a " +
+              "systemd user unit (a few seconds without signing). From then on it repoints and " +
+              "restarts the signer itself after relaunches, resizes, mesh re-keys and chain resets, " +
+              "and restarts it when it loses its session. The state file is never edited.",
+          )
+        : window.confirm(
+            `Stop managing the signer for ${key}? Its systemd unit keeps running; signer pauses ` +
+              "will ask you to repoint and restart it by hand again.",
+          );
+    if (!sure) return;
+    setLocalSignerBusy(key);
+    setError(null);
+    try {
+      const { localSignerAction, getLocalSigner, getFleet } = await import("../lib/api");
+      await localSignerAction(launchId, action, key, remote);
+      if (tmkmsId === launchId) setLocalSigner(await getLocalSigner(launchId));
+      if (wallet) setFleet(await getFleet(wallet.address));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLocalSignerBusy(null);
+    }
+  };
 
   // ---- derived view state for the mission-control layout ----
   // Nothing is known to be open until the account's fleet says which launch
@@ -2697,6 +2917,16 @@ export default function Page() {
                   <span className="mi-sub">Export or import launcher data</span>
                 </span>
               </button>
+              <button className="menu-item" role="menuitem" onClick={() => openSystem("recovery")}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
+                  <path d="M21 3v5h-5" />
+                </svg>
+                <span className="mi-text">
+                  <span className="mi-title">Recovery and alerts</span>
+                  <span className={`mi-sub${dnsSet ? " on" : ""}`}>Cloudflare DNS, unattended signing, alerts</span>
+                </span>
+              </button>
               <button className="menu-item" role="menuitem" onClick={() => openSystem("assets")}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="m7.5 4.27 9 5.15" />
@@ -2837,6 +3067,152 @@ export default function Page() {
         </div>
       )}
 
+      {chainBackupsFor &&
+        (() => {
+          const f = fleet?.fleets.find((x) => x.launchId === chainBackupsFor);
+          const db = f?.dataBackups;
+          if (!f || !db) return null;
+          const sentries = f.components.filter((c) => c.key.startsWith("sentry-") && c.state === "active");
+          const spare = sentries.some((c) => c.key !== "sentry-0");
+          return (
+            <div className="modal-scrim" onClick={() => setChainBackupsFor(null)}>
+              <div className="modal" style={{ maxWidth: 620 }} onClick={(e) => e.stopPropagation()}>
+                <div className="k">Chain-data backups of {f.name}</div>
+                <p className="note">
+                  A sentry&apos;s whole data directory, encrypted with this fleet&apos;s key and streamed to the mesh
+                  backup&apos;s bucket (nothing is written to the node&apos;s disk). The sentry stops for the copy:{" "}
+                  {spare
+                    ? "a sentry other than sentry-0 is used, so the public endpoints stay up."
+                    : "this fleet has only sentry-0, so the public API/RPC and the validator's link go quiet for the copy (add a sentry to avoid that; schedules need one)."}{" "}
+                  The last {3} are kept.
+                </p>
+                {db.backups.length === 0 ? (
+                  <p className="note">No backups yet.</p>
+                ) : (
+                  <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
+                    {db.backups.map((b) => (
+                      <div key={b.name}>
+                        height {b.height} · {new Date(b.takenAt).toLocaleString()} · from {b.from}
+                        {b.blocker && <span style={{ color: "var(--amber-text)" }}> · not restorable: {b.blocker}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: "grid", gap: 8, marginTop: 12, fontSize: 13 }}>
+                  <label>
+                    schedule{" "}
+                    <select
+                      className="field"
+                      style={{ width: "auto", display: "inline-block" }}
+                      value={db.schedule}
+                      disabled={!spare && db.schedule === "off"}
+                      onChange={(e) =>
+                        void chainBackupAction(f.launchId, { schedule: e.target.value as "off" | "daily" | "weekly" })
+                      }
+                    >
+                      <option value="off">off</option>
+                      <option value="daily">daily</option>
+                      <option value="weekly">weekly</option>
+                    </select>
+                    {!spare && <span className="dim-note"> (needs a second sentry)</span>}
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={db.autoRestore}
+                      onChange={(e) => void chainBackupAction(f.launchId, { autoRestore: e.target.checked })}
+                    />{" "}
+                    relaunched and added nodes start from the latest usable backup
+                    <span className="dim-note">
+                      {" "}
+                      (off: they sync the whole chain from their peers; a backup from another genesis or from
+                      before an upgrade is never used either way)
+                    </span>
+                  </label>
+                </div>
+                <div className="actions" style={{ marginTop: 12 }}>
+                  <button
+                    className="btn primary small"
+                    onClick={() => {
+                      if (
+                        !spare &&
+                        !window.confirm(
+                          "Only sentry-0 can be copied: the public API/RPC and the validator's link to the chain stop " +
+                            "for the copy (minutes for a small chain, longer for a big one). Go ahead?",
+                        )
+                      )
+                        return;
+                      void chainBackupAction(f.launchId);
+                    }}
+                  >
+                    Back up now
+                  </button>
+                  <button className="btn" onClick={() => setChainBackupsFor(null)}>
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+      {meshBackupForm && (
+        <div className="modal-scrim" onClick={() => !meshBackupBusy && setMeshBackupForm(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="k">Back up the {meshBackupForm.network} mesh</div>
+            <p className="note">
+              headscale streams its database to this S3 bucket and uploads its keys once, all
+              encrypted with this fleet&apos;s age key before they leave the container. A relaunch on
+              another provider then restores the mesh as it was, instead of re-keying every
+              component. One signature updates the running headscale in place (a few seconds of
+              control-plane restart; existing connections keep working).
+            </p>
+            {(
+              [
+                ["endpoint", "S3 endpoint (https://…)"],
+                ["bucket", "bucket"],
+                ["region", "region"],
+                ["accessKeyId", "access key"],
+              ] as const
+            ).map(([k, label]) => (
+              <input
+                key={k}
+                className="field"
+                placeholder={label}
+                value={meshBackupForm[k]}
+                onChange={(e) => setMeshBackupForm({ ...meshBackupForm, [k]: e.target.value })}
+                style={{ marginBottom: 6 }}
+              />
+            ))}
+            <input
+              className="field"
+              type="password"
+              placeholder={meshBackupForm.known ? "secret key (blank: reuse the stored one)" : "secret key"}
+              value={meshBackupForm.secret}
+              onChange={(e) => setMeshBackupForm({ ...meshBackupForm, secret: e.target.value })}
+            />
+            <div className="actions" style={{ marginTop: 12 }}>
+              <button
+                className="btn primary small"
+                disabled={
+                  meshBackupBusy ||
+                  !meshBackupForm.endpoint ||
+                  !meshBackupForm.bucket ||
+                  !meshBackupForm.accessKeyId ||
+                  (!meshBackupForm.known && !meshBackupForm.secret)
+                }
+                onClick={() => void submitMeshBackup()}
+              >
+                {meshBackupBusy ? "Starting…" : "Turn on backup"}
+              </button>
+              <button className="btn" disabled={meshBackupBusy} onClick={() => setMeshBackupForm(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {backupPrompt && (
         <div className="modal-scrim" onClick={() => !backupBusy && setBackupPrompt(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -2955,6 +3331,217 @@ export default function Page() {
                   </div>
                 )}
               </div>
+              <div className="sys-block">
+                <div className="f-label">Alerts</div>
+                <div className="sys-desc">
+                  Where the launcher tells you a component went down (after about two minutes of
+                  failed checks) and when it is back, with the fix it suggests. ntfy.sh is free:
+                  install its app, subscribe to a topic name only you know, and enter it here. A
+                  webhook gets the same alerts as JSON.
+                </div>
+                {alertForm && (
+                  <div style={{ display: "grid", gap: 6, maxWidth: 420 }}>
+                    <input
+                      className="field"
+                      placeholder="ntfy topic (e.g. a long random name)"
+                      value={alertForm.topic}
+                      onChange={(e) => setAlertForm({ ...alertForm, topic: e.target.value })}
+                    />
+                    <input
+                      className="field"
+                      placeholder="ntfy server (blank: https://ntfy.sh)"
+                      value={alertForm.server}
+                      onChange={(e) => setAlertForm({ ...alertForm, server: e.target.value })}
+                    />
+                    <input
+                      className="field"
+                      placeholder="webhook URL (optional)"
+                      value={alertForm.webhook}
+                      onChange={(e) => setAlertForm({ ...alertForm, webhook: e.target.value })}
+                    />
+                  </div>
+                )}
+                <div className="sys-actions">
+                  <button
+                    className="btn accent-ghost"
+                    onClick={async () => {
+                      if (!alertForm) return;
+                      setError(null);
+                      try {
+                        const { saveAlertSettings } = await import("../lib/api");
+                        await saveAlertSettings({
+                          ...(alertForm.topic.trim()
+                            ? { ntfy: { topic: alertForm.topic.trim(), server: alertForm.server.trim() } }
+                            : {}),
+                          ...(alertForm.webhook.trim() ? { webhook: alertForm.webhook.trim() } : {}),
+                        });
+                        setAlertNote("saved");
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={async () => {
+                      setError(null);
+                      try {
+                        const { sendTestAlert } = await import("../lib/api");
+                        const { failures } = await sendTestAlert();
+                        setAlertNote(failures.length === 0 ? "test alert sent" : failures.join("; "));
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    Send test
+                  </button>
+                  {alertNote && <span className="dim-note">{alertNote}</span>}
+                </div>
+              </div>
+              <div className={`sys-block${sysFocus === "recovery" ? " focus" : ""}`}>
+                <div className="f-label">Cloudflare DNS</div>
+                <div className="sys-desc">
+                  When a move puts a component on another provider, its domains have to point at the new
+                  ingress. With a Cloudflare API token (DNS Edit and Zone Read on the zones your fleets use;
+                  free plans include them) the launcher updates the records itself instead of pausing for you.{" "}
+                  {dnsSet === true
+                    ? `A token is set${dnsZones.length > 0 ? `; it reaches ${dnsZones.join(", ")}` : ""}.`
+                    : dnsSet === false
+                      ? "No token is set."
+                      : ""}
+                </div>
+                <div className="sys-actions">
+                  <input
+                    className="field"
+                    type="password"
+                    style={{ maxWidth: 320 }}
+                    placeholder={dnsSet ? "replace the token" : "Cloudflare API token"}
+                    value={dnsToken}
+                    onChange={(e) => setDnsToken(e.target.value)}
+                  />
+                  <button
+                    className="btn accent-ghost"
+                    disabled={!dnsToken.trim()}
+                    onClick={async () => {
+                      setError(null);
+                      try {
+                        const { saveCloudflareToken } = await import("../lib/api");
+                        const saved = await saveCloudflareToken(dnsToken.trim());
+                        setDnsSet(saved.cloudflare);
+                        setDnsZones(saved.zones ?? []);
+                        setDnsToken("");
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    Save
+                  </button>
+                  {dnsSet && (
+                    <button
+                      className="btn"
+                      onClick={async () => {
+                        try {
+                          const { saveCloudflareToken } = await import("../lib/api");
+                          setDnsSet((await saveCloudflareToken(null)).cloudflare);
+                          setDnsZones([]);
+                        } catch (e) {
+                          setError(String(e));
+                        }
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              </div>
+              {wallet && unattended && (
+                <div className="sys-block">
+                  <div className="f-label">Unattended recovery</div>
+                  <div className="sys-desc">
+                    Lets the launcher sign the transactions of the recoveries it starts on its own (a fleet&apos;s
+                    auto-recovery), as this wallet: create, update and close deployments and create leases,
+                    nothing else (no transfers). Your wallet grants that to the launcher&apos;s key below for 30
+                    days, plus a fee allowance; new deployments&apos; deposits are capped per day here.
+                  </div>
+                  <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
+                    <div>
+                      launcher key <code>{unattended.grantee}</code>
+                    </div>
+                    <div>
+                      grant:{" "}
+                      {unattended.grants === null ? (
+                        <span className="dim-note">could not be read</span>
+                      ) : unattended.covers.every((t) => unattended.grants!.some((g) => g.msgType === t)) ? (
+                        <span style={{ color: "var(--ok)" }}>
+                          active until{" "}
+                          {new Date(
+                            Math.min(...unattended.grants.map((g) => Date.parse(g.expiration ?? "9999-12-31"))),
+                          ).toLocaleDateString()}
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--amber-text)" }}>not granted</span>
+                      )}
+                      {unattended.allowance && (
+                        <span className="dim-note">
+                          {" "}
+                          · fee allowance{" "}
+                          {unattended.allowance.spendLimit.map((c) => `${Number(c.amount) / 1e6} ${c.denom.replace(/^u/, "").toUpperCase()}`).join(", ")}{" "}
+                          left
+                        </span>
+                      )}
+                    </div>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={unattended.settings.enabled}
+                        onChange={async (e) => {
+                          try {
+                            const { saveUnattended } = await import("../lib/api");
+                            await saveUnattended(wallet.address, { enabled: e.target.checked });
+                            await loadUnattended(wallet.address);
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                      />{" "}
+                      sign auto-recovery transactions with the grant
+                    </label>
+                    <label>
+                      daily deposit cap{" "}
+                      <input
+                        className="field"
+                        style={{ width: 90, display: "inline-block" }}
+                        value={unattendedCap}
+                        onChange={(e) => setUnattendedCap(e.target.value)}
+                        onBlur={async () => {
+                          const v = Number(unattendedCap);
+                          if (!Number.isFinite(v) || v < 0) return;
+                          try {
+                            const { saveUnattended } = await import("../lib/api");
+                            await saveUnattended(wallet.address, { dailyCap: String(Math.round(v * 1e6)) });
+                            await loadUnattended(wallet.address);
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                      />{" "}
+                      ACT <span className="dim-note">({Number(unattended.spentToday) / 1e6} used in the last 24 hours)</span>
+                    </label>
+                  </div>
+                  <div className="sys-actions">
+                    <button className="btn accent-ghost" disabled={busy !== null} onClick={() => void signUnattended("grant")}>
+                      Grant for 30 days
+                    </button>
+                    <button className="btn" disabled={busy !== null} onClick={() => void signUnattended("revoke")}>
+                      Revoke
+                    </button>
+                  </div>
+                </div>
+              )}
               <div className={`sys-block${sysFocus === "assets" ? " focus" : ""}`}>
                 <div className="f-label">Chain asset source</div>
                 <div className="sys-desc">
@@ -4047,6 +4634,84 @@ export default function Page() {
                         repair fleet
                       </button>
                     )}
+                    {chainFleet && !shutDown && active.length > 0 && (
+                      <button
+                        className="btn"
+                        title="Deploy another sentry for this chain on its own provider. With two, losing one sentry no longer cuts its validator off from the chain. The new sentry gets its own keys, joins the mesh, peers with the validator and the other sentries, and syncs the whole chain from its peers (it shows catching-up until it reaches the head). Costs one more lease."
+                        onClick={async () => {
+                          const sentries = f.components.filter((c) => c.key.startsWith("sentry-") && c.state !== "closed").length;
+                          const size = window.prompt(
+                            `Add sentry-${sentries} to ${f.name}? It is deployed on another provider (one more lease and ` +
+                              "deposit, three signatures), then syncs the chain from block 1 off its peers, which can take " +
+                              "hours on a long chain. Size: small, standard or large.",
+                            "standard",
+                          )?.trim();
+                          if (!size) return;
+                          if (size !== "small" && size !== "standard" && size !== "large") {
+                            setError('size must be "small", "standard" or "large"');
+                            return;
+                          }
+                          try {
+                            const { postAddSentry } = await import("../lib/api");
+                            const { key } = await postAddSentry(f.launchId, size);
+                            showToast(`adding ${key}: follow it in the Launch panel`);
+                            openLaunch(f.launchId);
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        }}
+                      >
+                        add sentry…
+                      </button>
+                    )}
+                    {chainFleet && !shutDown && (
+                      <details className="dim-note" style={{ display: "inline-block" }}>
+                        <summary
+                          style={{ cursor: "pointer", color: f.autoRecover.enabled ? "var(--ok)" : undefined }}
+                          title="Recover a component on its own once an outage is confirmed: relaunch it off a dead provider, re-create a dead container, or restart a stuck node. Its transactions are signed with your wallet's unattended-recovery grant (System panel), else they wait for Keplr."
+                        >
+                          auto-recovery: {f.autoRecover.enabled ? "on" : "off"}
+                        </summary>
+                        <div style={{ display: "grid", gap: 2, padding: "4px 0" }}>
+                          {(
+                            [
+                              ["enabled", "recover automatically"],
+                              ["validators", "validators"],
+                              ["sentries", "sentries"],
+                              ["headscale", "headscale (only with its mesh backup)"],
+                              ["services", "explorer, frontend and other services"],
+                            ] as const
+                          ).map(([k, label]) => (
+                            <label key={k} style={{ marginLeft: k === "enabled" ? 0 : 16 }}>
+                              <input
+                                type="checkbox"
+                                checked={f.autoRecover[k]}
+                                disabled={k !== "enabled" && !f.autoRecover.enabled}
+                                onChange={async (e) => {
+                                  try {
+                                    const { saveAutoRecover, getFleet } = await import("../lib/api");
+                                    await saveAutoRecover(f.launchId, { [k]: e.target.checked });
+                                    if (wallet) setFleet(await getFleet(wallet.address));
+                                  } catch (err) {
+                                    setError(String(err));
+                                  }
+                                }}
+                              />{" "}
+                              {label}
+                            </label>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+                    {chainFleet && !shutDown && f.dataBackups && f.meshBackup && (
+                      <button
+                        className="btn"
+                        title="Back up the chain data to the mesh backup's bucket, schedule it, and choose whether relaunched nodes restore from it."
+                        onClick={() => setChainBackupsFor(f.launchId)}
+                      >
+                        chain backups…
+                      </button>
+                    )}
                     {chainFleet && !shutDown && active.length > 0 && f.minGasPrice !== undefined && (
                       <button
                         className={`btn${f.gasPriceProblem ? " amber" : ""}`}
@@ -4219,6 +4884,57 @@ export default function Page() {
                           </button>
                         </span>
                       ))}
+                    {!shutDown &&
+                      f.incidents
+                        .filter((i) => i.closedAt === null)
+                        .map((i) => {
+                          const comp = f.components.find((c) => c.key === i.component);
+                          const label: Record<string, string> = {
+                            relaunch: "relaunch",
+                            "force-redeploy": "force redeploy",
+                            restart: "restart",
+                            unjail: "unjail",
+                            topup: "top up",
+                          };
+                          return (
+                            <span
+                              key={`inc-${i.id}`}
+                              className="dim-note"
+                              style={{ flexBasis: "100%", color: "var(--red-text)" }}
+                              title={i.detail ?? undefined}
+                            >
+                              {i.component} down since {new Date(i.openedAt).toLocaleString()}: {i.cause}.{" "}
+                              {i.action && comp && comp.state !== "closed" && (
+                                <button
+                                  className="btn amber"
+                                  onClick={() => {
+                                    if (i.action === "topup") {
+                                      const amount = window.prompt("Top-up amount (uact):", "5000000");
+                                      if (amount) fleetAction(f.launchId, comp.dseq, "topup", { amount });
+                                    } else if (i.action) {
+                                      fleetAction(f.launchId, comp.dseq, i.action);
+                                    }
+                                  }}
+                                >
+                                  {label[i.action] ?? i.action}
+                                </button>
+                              )}
+                            </span>
+                          );
+                        })}
+                    {!shutDown && f.incidents.some((i) => i.closedAt !== null) && (
+                      <details className="dim-note" style={{ flexBasis: "100%" }}>
+                        <summary>recent outages</summary>
+                        {f.incidents
+                          .filter((i) => i.closedAt !== null)
+                          .map((i) => (
+                            <div key={`past-${i.id}`}>
+                              {i.component}: {new Date(i.openedAt).toLocaleString()} to{" "}
+                              {new Date(i.closedAt!).toLocaleTimeString()}, {i.cause}
+                            </div>
+                          ))}
+                      </details>
+                    )}
                     {f.gasPriceProblem && !shutDown && (
                       <span className="dim-note" style={{ flexBasis: "100%", color: "var(--amber-text)" }}>
                         Minimum gas price {f.minGasPrice} {f.gasDenom}: {f.gasPriceProblem}. Fix it with gas price….
@@ -4536,6 +5252,27 @@ export default function Page() {
                                   <span className="dim-note"> (logs, shell, restart and upload wait on the provider)</span>
                                 </span>
                               )}
+                              {c.key === "headscale" && f.meshBackup !== undefined && (
+                                <span>
+                                  backup{" "}
+                                  {f.meshBackup ? (
+                                    <span className="v">
+                                      {f.meshBackup.bucket}/{f.meshBackup.path}
+                                      {!f.meshBackup.verified && (
+                                        <span className="dim-note" style={{ color: "var(--amber-text)" }}>
+                                          {" "}
+                                          (not verified yet: not trusted for a restore)
+                                        </span>
+                                      )}
+                                    </span>
+                                  ) : (
+                                    <span className="v" style={{ color: "var(--amber-text)" }}>
+                                      none
+                                      <span className="dim-note"> (a relaunch re-keys the whole mesh)</span>
+                                    </span>
+                                  )}
+                                </span>
+                              )}
                               {c.health && (
                                 <span>
                                   health{" "}
@@ -4580,12 +5317,69 @@ export default function Page() {
                                       resume signing
                                     </button>
                                   )}
+                                  {f.localSigner?.managed.includes(c.key) ? (
+                                    <button
+                                      className="btn"
+                                      title="The launcher runs this validator's tmkms signer on this machine and repoints and restarts it by itself. Release it to go back to doing that by hand (the signer keeps running as it is)."
+                                      disabled={localSignerBusy !== null}
+                                      onClick={() => void runLocalSigner(f.launchId, "release", c.key)}
+                                    >
+                                      release signer
+                                    </button>
+                                  ) : f.keyMode === "tmkms" &&
+                                    c.key.startsWith("val-") &&
+                                    f.localSigner?.remote &&
+                                    !f.localSigner.adoptable.includes(c.key) ? (
+                                    <button
+                                      className="btn"
+                                      title="This validator's tmkms signer runs on another machine the launcher can reach over SSH (a Raspberry Pi with the hardware key, say). Let the launcher manage it there: it repoints and restarts it after relaunches, resizes, mesh re-keys and chain resets, and when it loses its session."
+                                      disabled={localSignerBusy !== null}
+                                      onClick={() => {
+                                        const alias = window
+                                          .prompt(
+                                            `Which machine runs ${c.key}'s tmkms signer? Its ssh_config host alias (the launcher uses that entry's address, user and key).`,
+                                            "",
+                                          )
+                                          ?.trim();
+                                        if (alias) void runLocalSigner(f.launchId, "adopt", c.key, alias);
+                                      }}
+                                    >
+                                      {localSignerBusy === c.key ? "taking over…" : "manage signer…"}
+                                    </button>
+                                  ) : f.localSigner?.adoptable.includes(c.key) ? (
+                                    <button
+                                      className="btn"
+                                      title="This validator's tmkms signer runs on the launcher's machine. Let the launcher manage it: it takes over the running tmkms process, then repoints and restarts it after relaunches, resizes, mesh re-keys and chain resets, and when it loses its session."
+                                      disabled={localSignerBusy !== null}
+                                      onClick={() => void runLocalSigner(f.launchId, "adopt", c.key)}
+                                    >
+                                      {localSignerBusy === c.key ? "taking over…" : "manage signer"}
+                                    </button>
+                                  ) : null}
+                                  {c.key === "headscale" && (f.meshBackup === null || f.meshBackup?.verified === false) && (
+                                    <button
+                                      className="btn amber"
+                                      title="Stream headscale's state to an S3 bucket (encrypted) so a relaunch on another provider restores the mesh as it was, instead of re-keying every component."
+                                      onClick={() => void openMeshBackup(f.launchId, f.name)}
+                                    >
+                                      back up mesh…
+                                    </button>
+                                  )}
                                   <button
                                     className="btn"
                                     onClick={() => fleetAction(f.launchId, c.dseq, "restart")}
                                   >
                                     restart
                                   </button>
+                                  {/^(val|sentry)-/.test(c.key) && (f.dataBackups?.backups.length ?? 0) > 0 && (
+                                    <button
+                                      className="btn amber"
+                                      title="Replace this node's chain data with one of the fleet's chain-data backups, in place: the cure for corrupted data or a node stuck on a bad state, without moving it. Its keys and signing state stay."
+                                      onClick={() => void restoreNodeFromBackup(f, c.key)}
+                                    >
+                                      restore from backup…
+                                    </button>
+                                  )}
                                   {/^(val|sentry)-/.test(c.key) && (
                                     <>
                                       <button
@@ -5185,7 +5979,9 @@ export default function Page() {
               <div className="card-title">tmkms signer setup</div>
               <span className="tag">{tmkms.chainId}</span>
               <span className="dim-note" style={{ fontSize: 12 }}>
-                run these on your signer machine, the launcher never touches it
+                {localSigner?.validators.some((v) => v.managed)
+                  ? "the launcher manages the signer on this machine"
+                  : "run these on your signer machine, the launcher never touches it"}
               </span>
               <button className="btn" style={{ marginLeft: "auto" }} onClick={closeTmkms}>
                 close
@@ -5273,6 +6069,55 @@ export default function Page() {
                       </div>
                     );
                   })}
+                  {localSigner?.available &&
+                    localSigner.validators.filter((l) => l.managed || l.adoptable).map((l) => (
+                      <div key={`local-${l.key}`}>
+                        {l.key} signer{l.machine ? ` on ${l.machine}` : " on this machine"}:{" "}
+                        {l.managed ? (
+                          <>
+                            <span style={{ color: l.active ? "var(--ok)" : "var(--amber-text)" }}>
+                              managed{l.active ? "" : " (unit not running)"}
+                            </span>
+                            <span className="dim-note">
+                              {" · "}
+                              <code>{l.unit}</code>
+                            </span>
+                            {l.addrMatches === false && (
+                              <span style={{ color: "var(--amber-text)" }}>
+                                {" · "}points at {l.addr}, the monitor repoints it
+                              </span>
+                            )}
+                            {l.lastAction && (
+                              <span className="dim-note">
+                                {" · "}
+                                {l.lastAction.what}, {new Date(l.lastAction.at).toLocaleString()}
+                              </span>
+                            )}{" "}
+                            <button
+                              className="btn"
+                              disabled={localSignerBusy !== null}
+                              onClick={() => tmkmsId && void runLocalSigner(tmkmsId, "release", l.key)}
+                            >
+                              stop managing
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <span className="dim-note">
+                              its tmkms runs on this machine, not managed: the launcher can repoint and
+                              restart it for you{" "}
+                            </span>
+                            <button
+                              className="btn"
+                              disabled={localSignerBusy !== null}
+                              onClick={() => tmkmsId && void runLocalSigner(tmkmsId, "adopt", l.key)}
+                            >
+                              {localSignerBusy === l.key ? "taking over…" : "manage signer"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    ))}
                   {tmkmsStatus.validators.length > 0 &&
                     tmkmsStatus.validators.every(
                       (v) => v.signerConnected === true && v.pubkeyMatches !== false,

@@ -13,6 +13,8 @@ import type {
 } from "../src/services.js";
 import type { Signer } from "../src/engine.js";
 import { templatePath } from "../src/vendor.js";
+import type { LocalSignerHost, MeshCli, TmkmsProcess } from "../src/local-signer.js";
+import type { AllowanceInfo, GrantInfo, UnattendedChain } from "../src/unattended.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -303,6 +305,10 @@ export class FakeProviderGateway {
   /** headscale users created via lease-shell ("sparkdream" pre-seeded for
    *  tests that mint keys without running configure-headscale first). */
   private hsUsers: string[] = ["sparkdream"];
+  /** Objects the headscale backup scripts wrote: bucket/key. */
+  s3Objects = new Set<string>();
+  /** The bucket refuses the credentials (uploads and litestream both fail). */
+  s3Rejects = false;
   /** External (non-fleet) nodes reported by "headscale nodes list": the
    *  tmkms host, operator laptops. Tests set this to simulate a mesh join. */
   externalMeshNodes: { name: string; ipAddresses: string[]; online: boolean }[] = [];
@@ -480,6 +486,22 @@ export class FakeProviderGateway {
       this.sessionKeys.set(`${dseq}/${_service}`, mnemonic);
       return { stdout: "", stderr: "" };
     }
+    // headscale mesh backup (mesh-backup.ts): runs on the env the container's
+    // manifest gave it; a container running litestream has a replica
+    if (script.includes("state-keys.tar.age") && script.includes("s5cmd") && script.includes(" cp ")) {
+      const env = this.runningEnv(dseq, _service);
+      if (!env.LITESTREAM_S3_BUCKET || !env.AGE_RECIPIENT) throw new Error("lease shell: exit 3: no backup env in this container");
+      if (this.s3Rejects) throw new Error("lease shell: exit 1: ERROR \"cp\": AccessDenied");
+      this.s3Objects.add(`${env.LITESTREAM_S3_BUCKET}/${env.LITESTREAM_S3_PATH}/state-keys.tar.age`);
+      return { stdout: "seeded noise_private.key derp_server_private.key\n", stderr: "" };
+    }
+    if (script.includes("s5cmd") && script.includes(" ls ")) {
+      const env = this.runningEnv(dseq, _service);
+      const prefix = `${env.LITESTREAM_S3_BUCKET}/${env.LITESTREAM_S3_PATH}/`;
+      const keys = [...this.s3Objects].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
+      if (env.LITESTREAM_S3_BUCKET && !this.s3Rejects) keys.push("generations/0a1b2c3d4e5f6a7b/snapshots/00000000.snapshot.lz4");
+      return { stdout: keys.map((k) => `2026/10/03 12:00:00   1024  ${k}\n`).join(""), stderr: "" };
+    }
     if (script.includes("kill 1")) throw new Error("lease shell: connection closed before result");
     if (script.includes("users create")) {
       const name = /users create (\S+)/.exec(script)?.[1];
@@ -602,6 +624,32 @@ export class FakeSsh {
   signingState = '{"height":"1000123","round":0,"step":3}';
   /** host:port → `du -sm` of the node's data dir (resize storage guard). */
   dataUsageMb = new Map<string, number>();
+  /** Chain-data backups: what TOOLS_PROBE reports missing ("" = all there). */
+  backupToolsMissing = "";
+  /** Nodes whose data volume holds a launcher hold file. */
+  holds = new Set<string>();
+  /** Containers restarted under a hold: the entrypoint is waiting, the node is not running. */
+  heldContainers = new Set<string>();
+  containerRestarts = new Map<string, number>();
+  /** The bucket chain-data backups land in: bucket/prefix/name. */
+  s3Objects = new Set<string>();
+  backupFails = false;
+  /** Backup/restore scripts die with their container on these nodes (/tmp emptied, no status). */
+  scriptsDie = new Set<string>();
+  /** Nodes whose container runs in wait mode (PID 1 is a tail). */
+  waitMode = new Set<string>();
+  /** Launcher scripts stopped, by `host:port|name`. */
+  stoppedScripts: string[] = [];
+  backupStatus = new Map<string, string>();
+  restoreStatus = new Map<string, string>();
+  /** node → the backup restored into it. */
+  restoredFrom = new Map<string, string>();
+  private envFile(id: string, file: string): Record<string, string> {
+    const text = this.files.get(`${id}|${file}`) ?? "";
+    const out: Record<string, string> = {};
+    for (const m of text.matchAll(/^export (\w+)='(.*)'$/gm)) out[m[1]!] = m[2]!;
+    return out;
+  }
   /** host:port → polls its status still reports catching up (a resize's
    *  staged node syncing). */
   syncingPolls = new Map<string, number>();
@@ -681,6 +729,69 @@ export class FakeSsh {
     }
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
+
+    // --- chain-data backups (data-backup.ts) and the entrypoint's hold ---
+    if (command.includes("command -v $t")) return ok(this.backupToolsMissing);
+    if (command.includes(".launcher-hold")) {
+      if (command.startsWith("test -f")) return ok(this.holds.has(id) ? "held" : "");
+      if (command.startsWith("rm -f")) {
+        this.holds.delete(id);
+        // the entrypoint's hold loop ends and it starts the node
+        if (this.heldContainers.delete(id)) this.started.add(id);
+        return ok();
+      }
+      this.holds.add(id);
+      return ok();
+    }
+    if (command.includes("kill -TERM 1")) {
+      // the container restarts; under a hold the entrypoint leaves the node stopped
+      this.containerRestarts.set(id, (this.containerRestarts.get(id) ?? 0) + 1);
+      this.started.delete(id);
+      // a new container: /tmp starts empty
+      this.backupStatus.delete(id);
+      this.restoreStatus.delete(id);
+      if (this.holds.has(id)) this.heldContainers.add(id);
+      else this.started.add(id);
+      return ok();
+    }
+    if (command.includes("localhost:26657/status")) {
+      return ok(`{"result":{"sync_info":{"latest_block_height":"${this.chain.next()}"}}}`);
+    }
+    // the PID 1 probe (restartNode, the hold) answers only for wait mode; other
+    // nodes keep the default, which restartNode reads as "node is a child"
+    if (command === "cat /proc/1/comm 2>/dev/null || true" && this.waitMode.has(id)) return ok("tail");
+    const script = /\/tmp\/(sd-backup|sd-restore)\.pid/.exec(command)?.[1];
+    if (script && command.includes("kill -TERM --")) {
+      this.stoppedScripts.push(`${id}|${script}`);
+      (script === "sd-backup" ? this.backupStatus : this.restoreStatus).set(id, "failed");
+      return ok("stopped");
+    }
+    if (script && command.includes("kill -0")) {
+      const status = (script === "sd-backup" ? this.backupStatus : this.restoreStatus).get(id);
+      return ok(`${status || "none"} ${status === "running" ? "alive" : "dead"}`);
+    }
+    if (command.includes("bash /tmp/sd-backup.sh")) {
+      const env = this.envFile(id, "/tmp/sd-backup.env");
+      if (this.started.has(id)) throw new Error("fake: backup taken while the node runs");
+      if (this.scriptsDie.has(id)) this.backupStatus.delete(id);
+      else if (this.backupFails) this.backupStatus.set(id, "failed");
+      else {
+        this.s3Objects.add(`${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`);
+        this.backupStatus.set(id, "done");
+      }
+      return ok();
+    }
+    if (command.includes("bash /tmp/sd-restore.sh")) {
+      const env = this.envFile(id, "/tmp/sd-restore.env");
+      if (this.started.has(id)) throw new Error("fake: restore into a running node");
+      const object = `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`;
+      if (this.scriptsDie.has(id)) this.restoreStatus.delete(id);
+      else if (this.s3Objects.has(object)) {
+        this.restoredFrom.set(id, env.NAME!);
+        this.restoreStatus.set(id, "done");
+      } else this.restoreStatus.set(id, "failed");
+      return ok();
+    }
 
     // --- node resize: retire / un-retire, signing state, data usage ---
     if (command.includes("resize_retired_node_key") && command.includes("printf")) {
@@ -940,7 +1051,7 @@ export class FakeSsh {
     if (remotePath?.endsWith("/config/app.toml")) {
       this.appToml.set(this.id(target), fs.readFileSync(localPath, "utf8"));
     }
-    if (remotePath && /\.(toml|json|mnemonic)$/.test(remotePath)) {
+    if (remotePath && /\.(toml|json|mnemonic|env|age|sh)$/.test(remotePath)) {
       this.files.set(`${this.id(target)}|${remotePath}`, fs.readFileSync(localPath, "utf8"));
     }
   }
@@ -1136,4 +1247,114 @@ export async function keplrSignAmino(
   const signDoc = JSON.parse(signDocJson) as StdSignDoc;
   const { signature } = await wallet.signAmino(address, signDoc);
   return JSON.stringify({ signed: keplrSortObjectByKey(signDoc), signature });
+}
+
+/**
+ * The launcher's own machine for a managed tmkms signer (local-signer.ts):
+ * files, processes, systemd user units and Tailscale CLIs, all in memory.
+ * `onRestart` runs on every (re)start of a unit, which is where a test
+ * decides whether the signer now holds a session (FakeSsh.signerConnected).
+ */
+export class FakeSignerHost implements LocalSignerHost {
+  files = new Map<string, string>();
+  procs: TmkmsProcess[] = [];
+  units = new Map<string, { contents: string; active: boolean }>();
+  restarts: string[] = [];
+  killed: number[] = [];
+  meshUps: { cli: string; args: string[] }[] = [];
+  clis: MeshCli[] = [];
+  onRestart?: (unit: string) => void;
+  private nextPid = 5000;
+
+  async processes() {
+    return this.procs.map((p) => ({ ...p }));
+  }
+  async readFile(file: string) {
+    const text = this.files.get(file);
+    if (text === undefined) throw new Error(`ENOENT: ${file}`);
+    return text;
+  }
+  async writeFile(file: string, text: string) {
+    const prev = this.files.get(file);
+    if (prev !== undefined) this.files.set(`${file}.bak`, prev);
+    this.files.set(file, text);
+  }
+  async exists(file: string) {
+    return this.files.has(file);
+  }
+  async rename(from: string, to: string) {
+    const text = await this.readFile(from);
+    this.files.delete(from);
+    this.files.set(to, text);
+  }
+  async installUnit(unit: string, contents: string) {
+    this.units.set(unit, { contents, active: this.units.get(unit)?.active ?? false });
+  }
+  async unitActive(unit: string) {
+    return this.units.get(unit)?.active ?? false;
+  }
+  private up(unit: string) {
+    const u = this.units.get(unit);
+    if (!u) throw new Error(`Unit ${unit} not found.`);
+    u.active = true;
+    // the unit's process, as /proc would show it; an operator's own unit
+    // (a wrapper script, say) keeps the process the test gave it
+    const exec = /^ExecStart="([^"]+)" start -c "([^"]+)"$/m.exec(u.contents) ?? /^ExecStart=(\S+) start -c (\S+)$/m.exec(u.contents);
+    const cwd = /^WorkingDirectory=(.+)$/m.exec(u.contents)?.[1];
+    if (exec && cwd) {
+      this.procs = this.procs.filter((p) => p.unit !== unit);
+      this.procs.push({ pid: this.nextPid++, bin: exec[1]!, cwd, config: exec[2]!, unit });
+    }
+    this.restarts.push(unit);
+    this.onRestart?.(unit);
+  }
+  async startUnit(unit: string) {
+    this.up(unit);
+  }
+  async restartUnit(unit: string) {
+    this.up(unit);
+  }
+  async stopUnit(unit: string) {
+    const u = this.units.get(unit);
+    if (u) u.active = false;
+    this.procs = this.procs.filter((p) => p.unit !== unit);
+  }
+  async kill(pid: number) {
+    this.killed.push(pid);
+    this.procs = this.procs.filter((p) => p.pid !== pid);
+  }
+  async unitLog() {
+    return "";
+  }
+  async meshClis() {
+    return this.clis;
+  }
+  /** When set, `tailscale up` fails the way exec.ts reports it: with the whole command line. */
+  meshUpFails = false;
+  async meshUp(cli: string, args: string[]) {
+    if (this.meshUpFails) throw new Error(`${cli} ${args.join(" ")} exited 1: backend error`);
+    this.meshUps.push({ cli, args });
+  }
+}
+
+/** Akash authz for unattended recovery (unattended.ts): grants on a map, MsgExec recorded. */
+export class FakeUnattendedChain implements UnattendedChain {
+  grantsByPair = new Map<string, GrantInfo[]>();
+  allowances = new Map<string, AllowanceInfo>();
+  execs: { granter: string; msgs: Msg[] }[] = [];
+  async grants(granter: string, grantee: string): Promise<GrantInfo[]> {
+    return this.grantsByPair.get(`${granter}/${grantee}`) ?? [];
+  }
+  async allowance(granter: string, grantee: string): Promise<AllowanceInfo | null> {
+    return this.allowances.get(`${granter}/${grantee}`) ?? null;
+  }
+  async exec(_mnemonic: string, granter: string, msgs: Msg[]): Promise<string> {
+    this.execs.push({ granter, msgs });
+    return this.execs.length.toString(16).padStart(64, "e");
+  }
+  /** Everything a grant covers, for granter → grantee, expiring in `days`. */
+  grantAll(granter: string, grantee: string, types: readonly string[], days = 30): void {
+    const expiration = new Date(Date.now() + days * 86_400_000).toISOString();
+    this.grantsByPair.set(`${granter}/${grantee}`, types.map((msgType) => ({ msgType, expiration })));
+  }
 }

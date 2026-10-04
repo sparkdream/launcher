@@ -2,7 +2,7 @@ import { descriptorFor } from "../components/index.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { headscaleDomain, isServicesFleet, nodes, serviceComponents } from "@sparkdream/launch-spec";
+import { chainId, headscaleDomain, isServicesFleet, nodes, serviceComponents } from "@sparkdream/launch-spec";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import {
@@ -160,9 +160,38 @@ function headscaleShell(
  * litestream/age env placeholders (the manual flow edits these by hand).
  * Shared by the deploy step and the fleet SDL-download endpoint.
  */
+/** Key prefix a fleet's headscale backup lives under: one per fleet, so a
+ *  bucket can hold several (the vendored SDL's flat "archive" could not). */
+export function headscaleBackupPath(spec: StepCtx["spec"]): string {
+  return spec.topology.headscale.backup?.s3.path ?? `sparkdream-launcher/${chainId(spec)}/headscale`;
+}
+
+/**
+ * The S3 secret a backup's secretRef names: the conductor's environment
+ * (env:NAME) or a file in the launch's secrets directory (secret:name,
+ * which the mesh backup action writes). Undefined when it is not there.
+ */
+export function resolveS3Secret(
+  backup: { s3: { secretRef: string } },
+  secretsDir: string | undefined,
+): string | undefined {
+  const ref = backup.s3.secretRef;
+  if (ref.startsWith("env:")) return process.env[ref.slice(4)];
+  if (!secretsDir) return undefined;
+  const file = path.join(secretsDir, ref.slice("secret:".length));
+  return fs.existsSync(file) ? readSecretFile(file).trim() : undefined;
+}
+
+/** The launch's age identity (private key), from secrets/age.txt. */
+export function ageIdentityAt(secretsDir: string): string | undefined {
+  return readSecretFile(path.join(secretsDir, "age.txt"))
+    .split("\n")
+    .find((l) => l.startsWith("AGE-SECRET-KEY-"));
+}
+
 export function templateHeadscaleSdl(
   spec: StepCtx["spec"],
-  deps: { ageRecipient?: string | undefined; ageIdentity?: string | undefined } = {},
+  deps: { ageRecipient?: string | undefined; ageIdentity?: string | undefined; secretsDir?: string | undefined } = {},
 ): ReturnType<typeof loadSdl> {
   const sdl = loadSdl(path.join(vendorDir(), "mesh", "headscale.sdl.yaml"));
   const domain = headscaleDomain(spec);
@@ -179,18 +208,21 @@ export function templateHeadscaleSdl(
       // a bogus endpoint — the container crash-loops and never turns ready
       svc.env = svc.env.filter((e: string) => !/^(LITESTREAM_|AGE_)/.test(e));
     } else {
-      const secretEnv = backup.s3.secretRef.replace(/^env:/, "");
       const values: Record<string, string | undefined> = {
         LITESTREAM_S3_ENDPOINT: backup.s3.endpoint,
         LITESTREAM_S3_BUCKET: backup.s3.bucket,
+        LITESTREAM_S3_PATH: headscaleBackupPath(spec),
         LITESTREAM_S3_REGION: backup.s3.region,
         LITESTREAM_S3_ACCESS_KEY_ID: backup.s3.accessKeyId,
-        LITESTREAM_S3_SECRET_ACCESS_KEY: process.env[secretEnv],
+        LITESTREAM_S3_SECRET_ACCESS_KEY: resolveS3Secret(backup, deps.secretsDir),
         AGE_RECIPIENT: deps.ageRecipient,
         AGE_IDENTITY: deps.ageIdentity,
       };
       if (!values.LITESTREAM_S3_SECRET_ACCESS_KEY) {
-        throw new Error(`headscale backup: ${backup.s3.secretRef} is not set in the environment`);
+        throw new Error(
+          `headscale backup: ${backup.s3.secretRef} is not set ` +
+            (backup.s3.secretRef.startsWith("env:") ? "in the environment" : "in the launch's secrets"),
+        );
       }
       svc.env = svc.env.map((e: string) => {
         const key = e.split("=")[0]!;
@@ -247,11 +279,8 @@ export const deployHeadscaleStep: StepDef = {
       ageRecipient: backup
         ? ctx.output<{ ageRecipient: string }>("generate-keys")!.ageRecipient
         : undefined,
-      ageIdentity: backup
-        ? readSecretFile(path.join(ctx.dirs.secrets, "age.txt"))
-            .split("\n")
-            .find((l) => l.startsWith("AGE-SECRET-KEY-"))
-        : undefined,
+      ageIdentity: backup ? ageIdentityAt(ctx.dirs.secrets) : undefined,
+      secretsDir: ctx.dirs.secrets,
     });
     // persist the rendered SDL beside the node SDLs (fleet SDL download)
     fs.mkdirSync(ctx.dirs.sdl, { recursive: true });
@@ -511,33 +540,67 @@ export const configureHeadscaleStep: StepDef = {
   },
 };
 
+/*
+ * Headscale backup scripts (mesh-backup.ts). They run INSIDE the headscale
+ * container (its image carries age and s5cmd, the tools the entrypoint
+ * restores with) and read the LITESTREAM_ and AGE_ env its SDL gives it, so
+ * the S3 secret never passes through a command line or the launcher's logs.
+ */
+
+/** Encrypt the static keys with the fleet's age recipient and upload them. */
+export const SEED_STATIC_KEYS_SCRIPT = [
+  "set -e",
+  'test -n "$LITESTREAM_S3_BUCKET" && test -n "$AGE_RECIPIENT" || { echo "no backup env in this container"; exit 3; }',
+  "cd /var/lib/headscale",
+  'test -s noise_private.key || { echo "no noise_private.key yet"; exit 4; }',
+  "FILES=noise_private.key; test -s derp_server_private.key && FILES=\"$FILES derp_server_private.key\"",
+  "T=$(mktemp /tmp/state-keys.XXXXXX)",
+  'tar -czf - $FILES | age -r "$AGE_RECIPIENT" -o "$T"',
+  'AWS_ACCESS_KEY_ID="$LITESTREAM_S3_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$LITESTREAM_S3_SECRET_ACCESS_KEY" ' +
+    'AWS_REGION="$LITESTREAM_S3_REGION" s5cmd --endpoint-url "$LITESTREAM_S3_ENDPOINT" ' +
+    'cp "$T" "s3://$LITESTREAM_S3_BUCKET/$LITESTREAM_S3_PATH/state-keys.tar.age"',
+  'rm -f "$T"',
+  'echo "seeded $FILES"',
+].join("\n");
+
+/** What the fleet's backup prefix holds: one key per line (s5cmd ls). */
+export const LIST_BACKUP_SCRIPT =
+  'AWS_ACCESS_KEY_ID="$LITESTREAM_S3_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$LITESTREAM_S3_SECRET_ACCESS_KEY" ' +
+  'AWS_REGION="$LITESTREAM_S3_REGION" s5cmd --endpoint-url "$LITESTREAM_S3_ENDPOINT" ' +
+  'ls "s3://$LITESTREAM_S3_BUCKET/$LITESTREAM_S3_PATH/*"';
+
+/** Both halves of a usable backup in an s5cmd listing of the prefix. */
+export function backupComplete(listing: string): { archive: boolean; replica: boolean } {
+  return {
+    archive: /state-keys\.tar\.age/.test(listing),
+    // litestream lays a replica out as <path>/generations/<id>/{snapshots,wal}/...
+    replica: /generations\/[0-9a-f]+\/snapshots\//.test(listing),
+  };
+}
+
 export const seedHeadscaleBackupStep: StepDef = {
   name: "seed-headscale-backup",
   async run(ctx) {
     const backup = ctx.spec.topology.headscale.backup;
-    if (!backup || ctx.spec.network.type === "devnet") return { skipped: true };
+    if (!backup) return { skipped: true };
     const hs = ctx.output<HeadscaleOutput>("deploy-headscale")!;
     // a shared mesh is backed up by its owning fleet (validateSpec also
     // rejects backup + reuseFleet, so this is belt-and-suspenders)
     if (hs.reused) return { skipped: true };
-    const stage = path.join(ctx.dirs.root, "headscale-backup");
-    fs.mkdirSync(stage, { recursive: true });
-    // Port of seed-replica.sh: db + noise/DERP keys, validated before upload.
-    // No sshd in the headscale image — files come out base64 over lease-shell.
     const check = await headscaleShell(
       ctx,
       hs,
       `sqlite3 /var/lib/headscale/db.sqlite "SELECT count(*) FROM users"`,
     );
     if (Number(check.stdout.trim()) === 0) throw new Error("refusing to seed: headscale db has no users");
-    for (const f of ["db.sqlite", "noise_private.key"]) {
-      const b64 = await headscaleShell(ctx, hs, `base64 /var/lib/headscale/${f}`);
-      fs.writeFileSync(path.join(stage, f), Buffer.from(b64.stdout.replace(/\s+/g, ""), "base64"));
-    }
-    const keys = ctx.output<{ ageRecipient: string }>("generate-keys")!;
-    const out = path.join(ctx.dirs.secrets, "state-keys.tar.age");
-    await ctx.services.encryptBackup(stage, keys.ageRecipient, out);
-    return { archive: out, uploaded: false /* S3 upload lands with M3 credentials wiring */ };
+    // litestream already streams the database; the static keys it does not
+    // cover go up once, encrypted and uploaded from inside the container
+    // (mesh-backup.ts). This step used to stop at a local archive, so a
+    // relaunch restored the database but minted new keys, locking every
+    // client out of the mesh.
+    const res = await headscaleShell(ctx, hs, SEED_STATIC_KEYS_SCRIPT);
+    ctx.log(`headscale backup: ${res.stdout.trim()} to ${backup.s3.bucket}/${headscaleBackupPath(ctx.spec)}`);
+    return { uploaded: true, path: headscaleBackupPath(ctx.spec) };
   },
 };
 
@@ -864,7 +927,7 @@ export interface SshEndpoints {
  * the deployment itself was healthy on-chain) or a dead TCP path. Distinct
  * from an HTTP error FROM the provider, which means it is up and talking.
  */
-function providerUnreachable(e: unknown): boolean {
+export function providerUnreachable(e: unknown): boolean {
   const s = String((e as { message?: string })?.message ?? e);
   return /EAI_AGAIN|EAI_NONAME|ENOTFOUND|SERVFAIL|getaddrinfo|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ECONNRESET|socket hang up/i.test(
     s,

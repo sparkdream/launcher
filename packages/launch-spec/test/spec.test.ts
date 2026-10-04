@@ -606,7 +606,7 @@ describe("validateSpec", () => {
     expect(res.errors.some((e) => e.path === "providers.policy.preference[2]")).toBe(true);
     expect(res.errors.some((e) => e.path === "providers.policy.preference[0]")).toBe(false);
     expect(res.errors.some((e) => e.path === "security.sshPublicKey")).toBe(true);
-    spec.security.sshPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF00 kob@laptop";
+    spec.security.sshPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF00 user@laptop";
     spec.providers.policy.preference = [AKASH_A];
     expect(validateSpec(spec).errors).toEqual([]);
   });

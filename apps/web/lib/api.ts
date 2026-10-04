@@ -110,6 +110,47 @@ export async function getTmkmsStatus(id: string): Promise<TmkmsStatus> {
   return json(await afetch(`/api/launches/${id}/tmkms/status`));
 }
 
+/** Launcher-managed tmkms signer on the launcher's own machine. */
+export interface LocalSignerView {
+  /** this launcher runs where it can manage a signer at all */
+  available: boolean;
+  validators: Array<{
+    key: string;
+    managed: boolean;
+    /** unmanaged, but a tmkms process on this machine signs for it */
+    adoptable: boolean;
+    /** systemd user unit the signer runs as */
+    unit: string | null;
+    active: boolean | null;
+    config: string | null;
+    /** addr the managed config points at, and whether it is the validator's current one */
+    addr: string | null;
+    addrMatches: boolean | null;
+    /** last thing the launcher did to the signer on its own */
+    lastAction: { at: string; what: string } | null;
+    /** where the managed signer runs: "this machine" or its SSH alias */
+    machine: string | null;
+  }>;
+}
+export async function getLocalSigner(id: string): Promise<LocalSignerView> {
+  return json(await afetch(`/api/launches/${id}/tmkms/local`));
+}
+/** adopt: move the running tmkms under a launcher-owned unit; release: stop managing it. */
+export async function localSignerAction(
+  id: string,
+  action: "adopt" | "release",
+  key: string,
+  remote?: string,
+): Promise<void> {
+  await json(
+    await afetch(`/api/launches/${id}/tmkms/local/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, ...(remote ? { remote } : {}) }),
+    }),
+  );
+}
+
 export interface StepView {
   name: string;
   status: "pending" | "running" | "waiting" | "done" | "error";
@@ -414,6 +455,39 @@ export interface FleetSummary {
     chainId: string;
     /** softsign | tmkms — signer-related actions are gated on this. */
     keyMode: string;
+    /** Present when this launcher can run the fleet's tmkms signer on its own
+     *  machine: validators whose signer it manages, and those whose signer
+     *  runs on this machine unmanaged. */
+    localSigner?: {
+      managed: string[];
+      adoptable: string[];
+      /** the launcher can manage a signer on another machine over SSH */
+      remote: boolean;
+    };
+    /** Fleets with a headscale of their own: where its backup goes, or null
+     *  when it has none. Absent on services fleets and shared meshes. */
+    /** verified: false while back up mesh… has not yet seen the backup land */
+    meshBackup?: { bucket: string; path: string; verified: boolean } | null;
+    /** Chain fleets: recorded chain-data backups (newest first) and their settings. */
+    dataBackups?: {
+      schedule: "off" | "daily" | "weekly";
+      autoRestore: boolean;
+      backups: Array<{ name: string; height: number; takenAt: string; from: string; blocker: string | null }>;
+    };
+    /** Which components recover on their own (off unless turned on). */
+    autoRecover: AutoRecoverPolicy;
+    /** Confirmed outages: open ones first, then the latest resolved. */
+    incidents: Array<{
+      id: number;
+      component: string;
+      status: string;
+      cause: string;
+      /** fleet action that fixes it, if any */
+      action: "relaunch" | "force-redeploy" | "restart" | "unjail" | "topup" | null;
+      detail: string | null;
+      openedAt: string;
+      closedAt: string | null;
+    }>;
     /** Chain fleets: token.minGasPrice (per gas unit, in gasDenom), and why
      *  it is implausible when it is (a fee in the per-gas field). */
     minGasPrice?: string;
@@ -747,6 +821,147 @@ export async function postGasPrice(launchId: string, minGasPrice: string): Promi
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ minGasPrice }),
+    }),
+  );
+}
+
+/** Where incident alerts go (launcher-wide). */
+export interface AlertSettings {
+  ntfy?: { server: string; topic: string };
+  webhook?: string;
+}
+export async function getAlertSettings(): Promise<AlertSettings> {
+  return json(await afetch("/api/alerts"));
+}
+export async function saveAlertSettings(settings: AlertSettings): Promise<AlertSettings> {
+  return json(
+    await afetch("/api/alerts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
+  );
+}
+export async function sendTestAlert(): Promise<{ failures: string[] }> {
+  return json(await afetch("/api/alerts/test", { method: "POST" }));
+}
+
+/** Cloudflare token for DNS updates after a move (launcher-wide). */
+export async function getDnsSettings(): Promise<{ cloudflare: boolean; zones: string[] }> {
+  return json(await afetch("/api/dns"));
+}
+export async function saveCloudflareToken(token: string | null): Promise<{ cloudflare: boolean; zones: string[] }> {
+  return json(
+    await afetch("/api/dns", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    }),
+  );
+}
+
+/** Unattended recovery for one wallet: the launcher's key, the grant on chain, the settings. */
+export interface UnattendedStatus {
+  available: boolean;
+  grantee: string;
+  settings: { enabled: boolean; dailyCap: { denom: string; amount: string } };
+  grants: Array<{ msgType: string; expiration: string | null }> | null;
+  allowance: { spendLimit: Array<{ denom: string; amount: string }>; expiration: string | null } | null;
+  spentToday: string;
+  covers: string[];
+}
+export async function getUnattended(owner: string): Promise<UnattendedStatus> {
+  return json(await afetch(`/api/unattended?owner=${encodeURIComponent(owner)}`));
+}
+/** The msgs the wallet signs to grant (or revoke) unattended recovery. */
+export async function getUnattendedMsgs(owner: string, kind: "grant" | "revoke", days = 30): Promise<{ msgs: Msg[] }> {
+  return json(await afetch(`/api/unattended/msgs?owner=${encodeURIComponent(owner)}&kind=${kind}&days=${days}`));
+}
+export async function saveUnattended(owner: string, s: { enabled?: boolean; dailyCap?: string }): Promise<unknown> {
+  return json(
+    await afetch("/api/unattended/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner, ...s }),
+    }),
+  );
+}
+export interface AutoRecoverPolicy {
+  enabled: boolean;
+  validators: boolean;
+  sentries: boolean;
+  headscale: boolean;
+  services: boolean;
+}
+export async function saveAutoRecover(launchId: string, policy: Partial<AutoRecoverPolicy>): Promise<AutoRecoverPolicy> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/auto-recover`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(policy),
+    }),
+  );
+}
+
+export interface MeshBackupStorage {
+  endpoint: string;
+  bucket: string;
+  region: string;
+  accessKeyId: string;
+}
+/** S3 settings another fleet of this wallet backs up to (never its secret). */
+export async function getMeshBackupStorage(launchId: string): Promise<{ known: MeshBackupStorage | null }> {
+  return json(await afetch(`/api/fleet/${launchId}/mesh-backup`));
+}
+/** Turn on the headscale backup of a running fleet (mesh-backup op). A blank
+ *  secret reuses the one the launcher holds for the same access key. */
+export async function postMeshBackup(
+  launchId: string,
+  storage: MeshBackupStorage & { secret?: string },
+): Promise<{ status: string; opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/mesh-backup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(storage),
+    }),
+  );
+}
+
+/** Back up chain data now (no body), or change the schedule / automatic restore. */
+export async function postDataBackup(
+  launchId: string,
+  settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+): Promise<{ status?: string; opId?: number; source?: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/data-backup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
+  );
+}
+/** Replace a node's chain data with a recorded backup, in place. */
+export async function postDataRestore(launchId: string, key: string, name: string): Promise<{ opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/data-restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, name }),
+    }),
+  );
+}
+
+/** Add a sentry to a running chain fleet (add-sentry op). */
+export async function postAddSentry(
+  launchId: string,
+  size?: "small" | "standard" | "large",
+): Promise<{ status: string; opId: number; key: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/add-sentry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(size ? { size } : {}),
     }),
   );
 }

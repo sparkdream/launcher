@@ -1,4 +1,7 @@
 import type { AkashApi, MtlsCredentials } from "./akash/client.js";
+import type { LocalSignerHost, RemoteHost } from "./local-signer.js";
+import type { UnattendedChain } from "./unattended.js";
+import type { DnsUpdater } from "./dns.js";
 
 /** SSH target for a deployed node (forwarded port from lease status). */
 export interface SshTarget {
@@ -135,4 +138,13 @@ export interface Services {
   /** age-encrypt a directory to outFile for the given recipient. */
   encryptBackup(srcDir: string, recipient: string, outFile: string): Promise<void>;
   sleep(ms: number): Promise<void>;
+  /** The launcher's own machine, when a tmkms signer can be managed on it
+   *  (local-signer.ts). Absent: every signer pause stays the operator's. */
+  localSigner?: LocalSignerHost;
+  /** A signer machine reached over SSH (a Pi with the hardware key). */
+  remoteSigner?: (remote: RemoteHost) => LocalSignerHost;
+  /** Authz queries and MsgExec signing for unattended recovery (unattended.ts). */
+  unattended?: UnattendedChain;
+  /** DNS updates after a move (dns.ts); absent or unconfigured = the operator does them. */
+  dns?: DnsUpdater;
 }

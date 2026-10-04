@@ -123,6 +123,22 @@ headscale is up and configured (~5–10 min later, longer if DNS is manual).
 The UI surfaces each as a blocking banner, so the user can walk away between
 them but not skip them.
 
+**Exception: unattended recovery (opt-in, 2026-10).** A wallet may grant a
+key the conductor holds (one per wallet, `secrets/unattended-<owner>.mnemonic`)
+`GenericAuthorization` for exactly `MsgCreateDeployment`,
+`MsgUpdateDeployment`, `MsgCloseDeployment` and `MsgCreateLease`, plus a fee
+allowance restricted to `MsgExec`, both expiring (30 days from the System
+panel; revocable there). The msgs are built from what the chain holds: a
+renewal revokes the live fee allowance first in the same tx (the feegrant
+module refuses a second one), and a revoke names only the grants still
+there (a missing one fails the whole tx). The conductor then signs, as `MsgExec` with the
+owner as fee granter, only the pending txs of ops that a fleet's
+auto-recovery started (`auto: true` on the op), only those four msg types,
+only for the owner's own deployments, and only while new deployments'
+deposits stay under the wallet's daily cap (`unattended.ts`
+`unattendedBlocker`). The key holds no funds of its own and cannot send
+tokens. See "Unattended recovery" under §5.
+
 ### Dual-mode launcher
 
 Same image, two run modes:
@@ -533,11 +549,34 @@ before acting, so resume is always safe. UI subscribes over WebSocket.
     domain, `kill 1`; `headscale users create`; mint per-node reusable
     preauth keys (one per validator/sentry + one spare `home` key surfaced to
     the user for TMKMS/archive machines).
-11. `seed-headscale-backup` (skippable in devnet) — automated port of
-    `seed-replica.sh`: pull DB + noise/DERP keys over SSH, validate, encrypt
-    with age, upload to S3. The `state-keys.tar.age` archive (noise + DERP
-    private keys, which litestream cannot replicate) is also added to the
-    user's downloadable key bundle.
+11. `seed-headscale-backup` (runs whenever `topology.headscale.backup` is
+    set) — litestream already streams the database (age-encrypted) under the
+    fleet's prefix, `backup.s3.path`, default
+    `sparkdream-launcher/<chain-id>/headscale`, so fleets can share a bucket.
+    This step uploads the static keys litestream cannot replicate (noise +
+    DERP) once, as `<prefix>/state-keys.tar.age`, which the entrypoint
+    restores on a fresh volume. The upload runs inside the headscale
+    container (its image has `age` and `s5cmd`) on the env its SDL carries,
+    so the S3 secret never appears on a command line. Until 2026-10 this
+    step stopped at a local archive, which would have restored the database
+    but not the keys, locking every client out.
+
+    **Turning backup on later** (`mesh-backup` op, headscale row
+    "back up mesh…"): the form takes endpoint, bucket, region, access key
+    and secret. The secret is written to the launch's secrets as
+    `secret:s3-backup` (`secretRef` accepts `env:NAME` or `secret:name`), and
+    a blank secret reuses the one another fleet of the same wallet holds for
+    that access key. Steps: `update` adds the backup env to the running
+    headscale's own SDL (one `MsgUpdateDeployment`, same volume, so its
+    database and keys stay), `seed` uploads the keys as above (a bucket that
+    refuses the credentials pauses with its error), `verify` lists the
+    prefix until both `state-keys.tar.age` and a litestream snapshot are
+    there. Until `verify` passes the backup is marked unverified
+    (`mesh-backup-unverified:<launch>`): the fleet card says so and offers
+    the action again, a headscale relaunch warns, and auto-recovery will not
+    relaunch headscale on it. Abandoned before `update`, the op puts the
+    spec's backup and the previous secret back; after it, headscale already
+    runs with the new settings, so they stay, still unverified.
 
     **Shared mesh** (`topology.headscale.reuseFleet`): a fleet can attach to
     an existing fleet's headscale instead of deploying its own — the use
@@ -834,6 +873,31 @@ machine enforces, before `sparkdreamd start` on the new container:
    then wait a safety window of N blocks past it (default 20) before the new
    node starts signing. tmkms mode is inherently safe here (key never in the
    container); the UI says so and skips the window.
+   - A sentry RPC that does not answer at close does not block the close
+     (the outage that prompted the relaunch may have hit it too): the window
+     is measured at the start step instead, which can only be later, and
+     with no sentry answering at all the op pauses rather than guess. A
+     fleet whose sentries exist but none is active (one mid-relaunch) counts
+     as not answering, never as having no sentry.
+   - A chain that cannot advance without this validator (a single-validator
+     fleet, or one holding a third of the power) never clears the window.
+     After 2 minutes without a block the step reads the sentry's
+     `/consensus_state`: no prevotes or precommits **by this validator**
+     held at the stuck height means nothing the old node signed can
+     conflict, and the node boots; one held there parks the op with the
+     reason (a sentry restart drops its vote set, after which a resume boots
+     it). Its votes are picked out by the address fingerprint in each vote
+     string (`Vote{index:<first 6 address bytes> ...}`), since the other
+     validators keep voting on a height stalled without it; an answer with
+     no vote strings falls back to counting every vote, which only pauses.
+
+**Relaunching sentry-0** tolerates an unreachable validator or fellow sentry
+the way a validator relaunch tolerates its sentries: those writes land on
+other machines and are re-aimed by their own relaunch or by repair. When the
+spec has `publicEndpoints`, a final `public-dns` step waits for the API and
+RPC domains to answer from the new provider and otherwise pauses with the
+`CNAME` records to set (node resize runs the same step after its cutover).
+The confirm dialog names those domains up front.
 
 **Pre-action guards** (computed from topology + chain state, shown in the
 confirm dialog):
@@ -850,6 +914,133 @@ confirm dialog):
 
 Both actions record into `launch_steps` like any other step, so they're
 resumable and their provider decisions are explainable in the UI.
+
+### Chain-data backups and restores (day-2)
+
+`data-backup.ts`. Chain data goes to the mesh backup's bucket under
+`sparkdream-launcher/<chain-id>/chain-data/` (so the mesh backup is a
+prerequisite), as `data-<UTC time>-h<height>.tar.zst.age` plus a
+`latest.json`; the last 3 are kept. The node image must carry `s5cmd`,
+`age`, `zstd` and the entrypoint's launcher hold (chain repo, 2026-10).
+
+- **Backup** (`data-backup` op, "chain backups…" → Back up now, or a daily /
+  weekly schedule that only runs when a sentry other than sentry-0
+  exists): the source is the highest-numbered sentry other than sentry-0,
+  else sentry-0 after a confirm (its public endpoints and the validator's
+  link stop for the copy), never a validator. `hold` writes a deadline to
+  `<home>/.launcher-hold` and restarts the container (`kill -TERM 1`, PID 1
+  being the node; a wait-mode container, whose PID 1 is a tail, is refused,
+  since restarting it would start nothing); the entrypoint then keeps the node
+  stopped until the file is removed or its deadline (30 min, refreshed
+  every 15 s during the copy) passes. `upload` streams
+  `tar | zstd | age -r <fleet recipient> | s5cmd pipe` (2 x 32 MB parts in
+  memory, nothing on disk), detached and polled; credentials reach the node
+  only in an uploaded env file the script deletes on start. `release`
+  removes the hold and waits for the node. A failed upload removes the hold
+  before it pauses, and a resumed one holds the node again before copying.
+- **Detached scripts** (backup and restore): started under `setsid` with
+  their pid and status in `/tmp`, so a script that died with its container
+  reads as dead rather than "still running". The poll gives up on a failed
+  or dead script, after 12 hours, after 20 failed polls in a row, and (for
+  a restore) after 20 minutes without the copy growing; giving up kills the
+  script's whole session before anything else happens.
+- **Records**: the launcher keeps the bucket's list in the settings table
+  (`data-backups:<launch>`) with height, time, source and the sha256 of the
+  genesis it was taken on.
+- **Automatic restore** (on by default, per-fleet switch in the dialog): the
+  end of `prepareNodeHome` (relaunch, add-sentry, resize staging) restores
+  the latest backup into the fresh volume before the first boot, keeping
+  the node's own `priv_validator_state.json` and dropping the source's
+  `cs.wal`. It does not fail the step: no backup, no tools or a broken
+  bucket means a sync from peers as before. The one exception is a restore
+  that had to be given up but could not be stopped (the node stopped
+  answering): the step fails rather than start the node on a data directory
+  that may still be being replaced.
+- **The swap** (restore script): the new data is moved in only once the
+  copy is complete and no `sparkdreamd` is running (a held node's hold is
+  renewed just before), the old directory goes to `data.old` first and
+  comes back if the move fails or a killed run left it there.
+- **Never restored** (`restoreBlocker`): a backup taken on another genesis
+  (a reset keeps the chain id, so only the genesis hash tells the chains
+  apart), or before a completed upgrade, halt-upgrade or reset (the
+  running binary cannot replay the blocks up to the upgrade height).
+- **In-place restore** ("restore from backup…" on a node, `data-restore`
+  op): hold, restore a chosen usable backup over the data directory (the
+  hold renewed while it runs, and taken again on resume if it ran out),
+  release. For corrupted data or a node wedged on bad state, without
+  moving it.
+
+### Unattended recovery (day-2)
+
+Three opt-in pieces turn an incident into a fix nobody has to start:
+
+- **Auto-recovery policy** per fleet (fleet card "auto-recovery", off by
+  default; component groups validators / sentries / headscale / services).
+  When an incident confirms and its suggested fix is relaunch, force
+  redeploy or restart, `FleetService.autoRecover` starts that fix as an op
+  with `auto: true` (a restart runs directly). Guards: no other op active
+  (an incident that opens during one is tried again once it is done); at
+  most 2 automatic attempts per component per 24 h, restarts included
+  (they are no op, so `auto-restarts:<launch>:<key>` records them), then
+  an alert hands it over; a softsign validator is moved only when the incident is
+  `lease-not-active` (tmkms keeps its own watermark, so it needs no proof);
+  headscale only with a verified mesh backup. Alerts go out when it starts, when
+  it needs a signature it may not make, and when it gives up.
+- **Unattended signing** (System panel, per wallet; see the signing model):
+  after a drive parks on a signature, `signUnattended` signs it when the
+  rules allow, and the monitor retries parked auto ops each pass (so a
+  grant made later picks them up). Anything else (a fee-bearing op, a
+  missing grant, the cap reached) waits for Keplr as before.
+- **DNS** (System panel, "Recovery and alerts" in the settings menu;
+  launcher-wide Cloudflare API token with DNS Edit and Zone Read on the
+  fleets' zones, `dns.ts`; saving checks it the way updates use it, by
+  listing the zones it sees and reading one zone's records, since
+  `/user/tokens/verify` rejects account-owned tokens): the
+  relaunch `verify` step of service components, sentry-0's `public-dns` and
+  headscale's `dns` step point the record at the new ingress through the
+  API first (zone found by suffix; an existing CNAME is updated in place,
+  keeping its proxy setting; A/AAAA records are replaced, and put back if
+  the new CNAME cannot be written; a name holding any other record type
+  (MX, TXT, CAA...) is left to the operator; a new name is DNS only, since
+  headscale's DERP and STUN do not pass the proxy), then re-check for 3
+  minutes before pausing with the records to set.
+
+A relaunch can still pause for what only a person can do: a tmkms signer the
+launcher does not manage (repoint it), or DNS outside the token's zones.
+
+### Adding a sentry to a running fleet (day-2)
+
+"add sentry…" on a chain fleet (`add-sentry` op, `add-sentry.ts`) bumps
+`topology.sentries.count` (an explicit `mapping` gains an entry fronting
+validator `S mod V`), optionally records `infra.nodeSizes`, and runs:
+
+1. `home`: `sparkdreamd init` for the new sentry, its node id merged into
+   the `generate-keys` output (every peer-line writer reads ids there),
+   genesis copied from val-0's home, `renderNodeConfigs` for it. The other
+   nodes' launcher-side `config.toml` gain it the way render-configs would
+   have written it (fellow sentries: `id@{{TAILNET_IP:sentry-S}}:26656` in
+   `persistent_peers`; everyone: `unconditional_peer_ids`), and every
+   touched bundle is re-packed, so a later relaunch of any node boots
+   knowing it.
+2. `render`: its SDL (no public accept hosts: those stay on sentry-0) and
+   its fleet row. Rows outside the launch plan are never rebuilt from step
+   outputs, so the row sticks.
+3. The relaunch steps minus `close` (deploy, lease, manifest, configure,
+   start, persist). Without a close output `configure` treats the node as
+   added: `wireMovedNode` appends it to the live peers instead of
+   rewriting an old address, and the validator's peer line is rebuilt
+   from the topology, which now lists it.
+
+Abandoning the op before the sentry is active undoes the request
+(`undoAddSentry`): the spec's `topology.sentries` and size go back, its row,
+node id and launcher-side files are dropped, and the other homes' peer lists
+lose it (bundles re-packed). Once `configure` has run, the live peers may
+list it, and the abort says to run repair.
+
+The new sentry block-syncs from block 1 off its peers and shows
+catching-up until it reaches the head. With two sentries a validator no
+longer loses the chain when one sentry's provider dies, and the relaunch
+confirm stops warning that sentry-0 is its only connection.
 
 ### Service component kinds and adding one to a running fleet (day-2)
 
@@ -2276,6 +2467,57 @@ management makes tmkms fleets operable rather than automatic:
   waiting validator as failed, and the dashboard tells the user exactly
   which signer needs reconnecting.
 
+**Managed local signer (opt-in exception to the non-goal).** When the tmkms
+signer runs on the launcher's own machine (a local launcher on Linux, WSL
+included), a validator whose signer runs there gets a **manage signer**
+action (fleet row and tmkms panel; shown only when a `tmkms start` process
+on this machine signs for that validator, or it is already managed, which
+shows **release signer** instead). Adopting
+finds the running `tmkms start` process (`/proc`: binary, working directory,
+`-c` config), installs a systemd user unit `sparkdream-tmkms-<chain-id>-<key>`
+running the same binary and config with `Restart=always`, stops the
+hand-started process and starts the unit (seconds without signing). The
+binding lives in the settings table (`local-signer:<launch>:<key>`), along
+with the Tailscale CLI that owns the machine's mesh address (on WSL with
+mirrored networking that is the Windows `tailscale.exe`). From then on the
+signer pauses act instead of asking:
+
+| Pause | Managed action |
+|---|---|
+| launch `await-signer` | repoint `addr` to the validator, restart |
+| relaunch `await-signer` | repoint to the new tailnet IP, restart |
+| node-resize `prepare-signer` / `start-node` | no warning; repoint + restart at the handover |
+| headscale relaunch `signer` (no backup) | `tailscale up --login-server … --authkey <home> --force-reauth`, then repoint + restart |
+| reset-chain `signer` | rename the state file to `.reset-<time>`, restart (pause skipped only when every fleet validator is managed) |
+| resume-signing `await-signer` | repoint if stale, restart |
+
+Each action is followed by the step's normal session probe; any failure
+(including a tmkms process outside the unit running the same config, which
+would put two signers on one validator) falls back to the guided pause with
+the reason appended. Config edits replace one `addr` line and keep a `.bak`;
+the state file is never edited. The monitor also runs a watchdog over
+managed signers of completed fleets with no active op: a config pointing at
+a stale address is repointed at once, and a signer without a privval
+session for three consecutive checks is restarted (10 min cooldown).
+Disabled with `LOCAL_SIGNER=off`, on Akash, and wherever no systemd user
+manager runs. "release signer" only forgets the binding; the unit keeps
+running.
+
+**Signer on another machine** (2026-10, the testnet's Raspberry Pi with a
+Pico-HSM): "manage signer…" on a tmkms validator whose signer is not on the
+launcher's machine asks for an ssh_config alias. The conductor resolves it
+from its own `~/.ssh/config` or, on WSL, the Windows user's (a `C:\` key
+path read through `/mnt/c`), and `SshSignerHost` does over SSH what
+`SystemdSignerHost` does locally (process discovery from `/proc`, config
+reads, upload-then-rename writes with a `.bak`, `systemctl`). A tmkms that
+already runs as a systemd service is adopted as it is: the binding records
+that unit and its scope (`system` units are driven with `sudo -n
+systemctl`, so the SSH user needs passwordless sudo), and nothing is
+stopped or installed. One tmkms may sign for several chains: repoints edit
+only the `[[validator]]` block of this fleet's chain id, and a chain reset
+moves aside only the `state_file` of this chain's `[[chain]]` block. A mesh
+re-key runs `sudo -n tailscale up …` on that machine.
+
 ### Fleet health monitor
 
 Health is produced by a conductor background loop per active fleet, not
@@ -2295,6 +2537,29 @@ while someone is watching. Cadence 30–60s per fleet:
   degraded/zombie) — a state on-chain reconciliation alone can never see —
   and what feeds the double-sign safety and last-peer-path guards above
   with fresh data.
+
+**Incidents and alerts** (`incidents.ts`). After each health pass the
+monitor turns readings into incidents in `component_incidents`. A bad
+reading opens an unconfirmed incident; three in a row (about two minutes)
+confirm it (two for a lease the chain reports closed), and a blip that
+recovers first is deleted unseen. `catching-up` is neither an outage nor a
+recovery, so a node syncing after a fix keeps its incident open until it
+is healthy. On confirmation an `unreachable` component gets one provider
+probe (its lease status), which separates the three fixes:
+
+| Reading | Cause | Suggested fix |
+|---|---|---|
+| lease not active | provider closed the lease | relaunch |
+| unreachable, provider lease API down | provider unreachable | relaunch |
+| unreachable, service has no ready replica | container not running | force redeploy |
+| unreachable, container running | service not answering | restart |
+| stalled / jailed / low escrow | as named | restart / unjail / top up |
+
+The fleet card lists open incidents with that fix as a button (it runs
+the ordinary fleet action, signatures included) and the latest resolved
+ones under "recent outages". Confirmed incidents and their resolution are
+sent to the System panel's alert channels: an ntfy topic (`POST
+<server>/<topic>`, high priority for an outage) and/or a webhook (JSON).
 
 ### Fleet bundle (management portability & DR)
 

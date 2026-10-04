@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -42,6 +41,63 @@ import {
   type WithdrawDeps,
 } from "./relayer-funds.js";
 
+/** Automatic recovery attempts per component per 24 hours before it gives up and alerts. */
+const AUTO_ATTEMPTS_PER_DAY = 2;
+
+/** Which components auto-recovery may act on, per fleet (all off by default). */
+export interface AutoRecoverPolicy {
+  enabled: boolean;
+  validators: boolean;
+  sentries: boolean;
+  headscale: boolean;
+  services: boolean;
+}
+const DEFAULT_AUTO_RECOVER: AutoRecoverPolicy = {
+  enabled: false,
+  validators: true,
+  sentries: true,
+  headscale: true,
+  services: true,
+};
+
+export interface UnattendedStatus {
+  /** the conductor can query and sign on Akash at all */
+  available: boolean;
+  /** the launcher's key the wallet grants to */
+  grantee: string;
+  settings: UnattendedSettings;
+  /** null: could not be read */
+  grants: GrantInfo[] | null;
+  allowance: AllowanceInfo | null;
+  spentToday: string;
+  /** msg types a full grant covers */
+  covers: string[];
+}
+
+/** Consecutive monitor checks (45s apart) without a signer session before a restart. */
+const SIGNER_WATCH_MISSES = 3;
+const SIGNER_WATCH_COOLDOWN_MS = 10 * 60_000;
+
+export interface LocalSignerView {
+  /** this launcher can manage a signer on its own machine at all */
+  available: boolean;
+  validators: {
+    key: string;
+    managed: boolean;
+    /** unmanaged, but a tmkms process on this machine signs for it */
+    adoptable: boolean;
+    unit: string | null;
+    active: boolean | null;
+    config: string | null;
+    /** the addr the managed config points at */
+    addr: string | null;
+    addrMatches: boolean | null;
+    lastAction: { at: string; what: string } | null;
+    /** where the managed signer runs: "this machine" or the SSH alias */
+    machine: string | null;
+  }[];
+}
+
 /** How often the monitor reads the relayer's balances. */
 const RELAYER_FUNDS_EVERY_MS = 15 * 60_000;
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
@@ -62,7 +118,7 @@ import {
   sessionSummary,
   type SessionRole,
 } from "./sessions.js";
-import type { ConductorDb, FleetComponentRow, FleetOpProgress, LaunchRow } from "./db.js";
+import type { ConductorDb, FleetComponentRow, FleetOpProgress, IncidentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
@@ -74,15 +130,72 @@ import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
 import { valoperAddress } from "./gentx.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
-import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile } from "./secrets.js";
+import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile, writeSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
-import { extractForwardedPort, templateHeadscaleSdl, type Assignments, type DeploymentPlan, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
+import { extractForwardedPort, headscaleBackupPath, providerUnreachable, resolveS3Secret, templateHeadscaleSdl, type Assignments, type DeploymentPlan, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
 import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import { AUTO_BID, imageRepo } from "./fleet-ops.js";
+import { AUTO_BID, consensusAddress, imageRepo, sentryPublicDomains } from "./fleet-ops.js";
+import {
+  keepPreviousS3Secret,
+  markMeshBackupUnverified,
+  meshBackupUnverified,
+  S3_SECRET_FILE,
+  undoMeshBackup,
+  type MeshBackupParams,
+} from "./mesh-backup.js";
+import { undoAddSentry, type AddSentryParams } from "./add-sentry.js";
+import {
+  autoRestoreEnabled,
+  backupSource,
+  dataBackups,
+  restoreBlocker,
+  dataBackupStorage,
+  lastDataBackup,
+  type DataBackupParams,
+  type DataRestoreParams,
+} from "./data-backup.js";
 import { HANDOVER_STEPS, UNRETIRE_CMD, type NodeResizeParams } from "./node-resize.js";
 import { sizeToBytes } from "./estimate.js";
+import {
+  depositsOf,
+  opsKey,
+  recordSpend,
+  spentToday,
+  unattendedBlocker,
+  unattendedSettings,
+  type AllowanceInfo,
+  type GrantInfo,
+  type UnattendedSettings,
+} from "./unattended.js";
+import { UNATTENDED_MSG_TYPES, unattendedGrantMsgs, unattendedRevokeMsgs, type Msg } from "@sparkdream/akash-tx";
+import {
+  alertFor,
+  alertSettings,
+  sendAlert,
+  trackIncident,
+  type IncidentEvent,
+  type ProviderProbe,
+} from "./incidents.js";
+import {
+  adoptSigner,
+  candidateFor,
+  clearBinding,
+  hostFor,
+  resolveSshAlias,
+  type RemoteHost,
+  type SignerDeps,
+  getBinding,
+  managedSigner,
+  parseTmkmsConfig,
+  repointSigner,
+  restartSigner,
+  signerAddr,
+  type LocalSignerBinding,
+} from "./local-signer.js";
+import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
+
 import type { AddComponentParams, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
@@ -189,6 +302,35 @@ export interface FleetView {
   chainId: string;
   /** softsign | tmkms — the UI gates signer-related actions on this. */
   keyMode: string;
+  /** tmkms fleets on a launcher that can run their signer on its own
+   *  machine (local-signer.ts): validators whose signer it manages, and
+   *  those whose signer runs here unmanaged (the card offers to manage). */
+  localSigner?: { managed: string[]; adoptable: string[]; remote: boolean };
+  /** Chain fleets with a headscale of their own: where its backup goes, or
+   *  null when it has none (the card offers to turn it on). */
+  /** verified: false while a mesh-backup op has not yet seen the backup land */
+  meshBackup?: { bucket: string; path: string; verified: boolean } | null;
+  /** Chain fleets: recorded chain-data backups (newest first) and their schedule. */
+  dataBackups?: {
+    schedule: "off" | "daily" | "weekly";
+    /** relaunched and added nodes start from the latest usable backup */
+    autoRestore: boolean;
+    backups: Array<{ name: string; height: number; takenAt: string; from: string; blocker: string | null }>;
+  };
+  /** Which components auto-recovery may act on (off unless turned on). */
+  autoRecover: AutoRecoverPolicy;
+  /** Confirmed outages (incidents.ts): open ones first, then the latest resolved. */
+  incidents: Array<{
+    id: number;
+    component: string;
+    status: string;
+    cause: string;
+    /** fleet action that fixes it (the card's restore button), if any */
+    action: string | null;
+    detail: string | null;
+    openedAt: string;
+    closedAt: string | null;
+  }>;
   /** Chain fleets: token.minGasPrice (per gas unit, base denom), and why it
    *  is implausible when it is (a fee pasted into the per-gas field). */
   minGasPrice?: string;
@@ -310,9 +452,7 @@ export function parseDf(stdout: string): Omit<NodeDisk, "checkedAt"> | undefined
 }
 
 /** CometBFT consensus address (uppercase hex) of a base64 ed25519 pubkey. */
-export function consensusAddress(pubkeyBase64: string): string {
-  return createHash("sha256").update(Buffer.from(pubkeyBase64, "base64")).digest("hex").slice(0, 40).toUpperCase();
-}
+export { consensusAddress };
 
 /** The Mastodon settings a running instance can change (settings action). */
 export interface MastodonSettings {
@@ -735,6 +875,7 @@ export class FleetService {
         const staged = this.db.stepOutput<{ dseq: string }>(launch.id, `op${op.id}:deploy`);
         if (staged?.dseq) known.add(staged.dseq);
       }
+      const localSigner = await this.localSignerSummary(launch, spec);
       fleets.push({
         launchId: launch.id,
         launchStatus: launch.status,
@@ -743,6 +884,44 @@ export class FleetService {
         // join-aware: a joined fleet runs the LIVE chain, not name-suffix
         chainId: chainId(spec),
         keyMode: spec.security.keyMode,
+        ...(localSigner ? { localSigner } : {}),
+        ...(isServicesFleet(spec)
+          ? {}
+          : {
+              dataBackups: {
+                schedule: this.dataBackupSchedule(launch.id),
+                autoRestore: autoRestoreEnabled(this.db, launch.id),
+                backups: dataBackups(this.db, launch.id).map((b) => ({
+                  name: b.name,
+                  height: b.height,
+                  takenAt: b.takenAt,
+                  from: b.from,
+                  blocker: restoreBlocker(this.db, launch.id, launchDirs(this.workRoot, launch.id).node, b),
+                })),
+              },
+            }),
+        autoRecover: this.autoRecoverPolicy(launch.id),
+        incidents: this.db.listIncidents(launch.id, 5).map((i) => ({
+          id: i.id,
+          component: i.component,
+          status: i.status,
+          cause: i.cause,
+          action: i.action,
+          detail: i.detail,
+          openedAt: i.opened_at,
+          closedAt: i.closed_at,
+        })),
+        ...(isServicesFleet(spec) || spec.topology.headscale.reuseFleet
+          ? {}
+          : {
+              meshBackup: spec.topology.headscale.backup
+                ? {
+                    bucket: spec.topology.headscale.backup.s3.bucket,
+                    path: headscaleBackupPath(spec),
+                    verified: !meshBackupUnverified(this.db, launch.id),
+                  }
+                : null,
+            }),
         // per gas unit, base denom; the card warns when it is really a fee
         ...(isServicesFleet(spec)
           ? {}
@@ -1039,7 +1218,10 @@ export class FleetService {
     const warnings = this.sentryIsolationWarnings(spec, component, "while it relaunches");
     if (component.key === "headscale") {
       warnings.push(
-        spec.topology.headscale.backup
+        spec.topology.headscale.backup && meshBackupUnverified(this.db, launch.id)
+          ? "headscale's backup was never verified (back up mesh… did not finish): a relaunch may " +
+              "find nothing in the bucket and come up with an empty mesh. Finish or redo back up mesh… first."
+          : spec.topology.headscale.backup
           ? "relaunching headscale redeploys it on a different provider and restores the mesh " +
               "from its S3 backup, so every client reconnects as-is. You will be asked to point " +
               "the domain's DNS record at the new provider."
@@ -1061,9 +1243,20 @@ export class FleetService {
           "different provider. The node is offline until the replacement syncs; its keys and " +
           "config are restored automatically" +
           (spec.security.keyMode === "tmkms"
-            ? ", and you will be prompted to repoint your tmkms signer to the new node."
+            ? managedSigner(this.signerDeps(launch.id), component.key)
+              ? ", and the launcher repoints and restarts its managed tmkms signer at the new node."
+              : ", and you will be prompted to repoint your tmkms signer to the new node."
             : ", and the launcher waits a safety window before it signs again, so there is no double-sign risk."),
       );
+    } else if (component.key === "sentry-0") {
+      const domains = sentryPublicDomains(spec).map((d) => d.domain);
+      if (domains.length > 0) {
+        warnings.push(
+          `sentry-0 serves the public ${domains.join(" and ")} domain${domains.length > 1 ? "s" : ""}: they go ` +
+            "dark until their DNS records point at the new provider, and the relaunch pauses at the end " +
+            "with the records to set.",
+        );
+      }
     }
     return warnings;
   }
@@ -1271,7 +1464,7 @@ export class FleetService {
             .find((l) => l.startsWith("AGE-SECRET-KEY-"))
         : undefined;
       return yaml.dump(
-        templateHeadscaleSdl(spec, { ageRecipient: keys?.ageRecipient, ageIdentity }),
+        templateHeadscaleSdl(spec, { ageRecipient: keys?.ageRecipient, ageIdentity, secretsDir: dirs.secrets }),
         { lineWidth: 120 },
       );
     }
@@ -1487,6 +1680,478 @@ export class FleetService {
     };
   }
 
+  /** How alerts reach ntfy or a webhook; tests swap in a fake. */
+  alertFetch: typeof fetch = (...args) => fetch(...args);
+
+  /**
+   * Turn this pass's health readings into incidents (incidents.ts) and
+   * alert on the ones that opened or resolved. Runs after tick().
+   */
+  async trackIncidents(launchId: string): Promise<IncidentEvent[]> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch) return [];
+    const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
+    const events: IncidentEvent[] = [];
+    for (const h of this.db.listComponentHealth(launchId)) {
+      const row = rows.find((r) => r.key === h.component);
+      if (!row) continue;
+      const ev = await trackIncident(this.db, launchId, h.component, h.status, h.detail, () =>
+        this.probeProvider(launch, row),
+      );
+      if (ev) events.push(ev);
+    }
+    const settings = alertSettings(this.db);
+    if (events.length > 0 && (settings.ntfy || settings.webhook)) {
+      const fleetName = this.spec(launch).network.name;
+      for (const ev of events) {
+        const failures = await sendAlert(settings, alertFor(fleetName, ev), this.alertFetch);
+        for (const f of failures) console.log(`[alerts] ${fleetName}/${ev.incident.component}: ${f}`);
+      }
+    }
+    for (const ev of events) {
+      if (ev.kind === "opened") await this.autoRecover(launch, ev.incident).catch((e) => console.log(`[auto-recover] ${e}`));
+    }
+    // incidents that opened while another op ran: their turn once it is done
+    const deferred = this.deferredRecoveries.get(launchId);
+    if (deferred && deferred.size > 0 && this.db.listFleetOps(launchId, "active").length === 0) {
+      for (const component of [...deferred]) {
+        deferred.delete(component);
+        const incident = this.db.openIncident(launchId, component);
+        if (incident?.confirmed_at) {
+          await this.autoRecover(launch, incident).catch((e) => console.log(`[auto-recover] ${e}`));
+        }
+      }
+    }
+    return events;
+  }
+
+  /** Components whose incident opened while an op was active, per launch. */
+  private readonly deferredRecoveries = new Map<string, Set<string>>();
+
+  /** Automatic restarts of `key` in the last 24 hours (restarts are no op, so ops do not count them). */
+  private recentAutoRestarts(launchId: string, key: string, record = false): number {
+    const setting = `auto-restarts:${launchId}:${key}`;
+    const raw = this.db.getSetting(setting);
+    const now = Date.now();
+    const kept = (raw ? (JSON.parse(raw) as string[]) : []).filter((t) => now - Date.parse(t) < 86_400_000);
+    if (record) kept.push(new Date(now).toISOString());
+    this.db.setSetting(setting, JSON.stringify(kept));
+    return kept.length;
+  }
+
+  /** Launches whose auto-recovery started an op this pass; the server drives them. */
+  readonly autoStarted = new Set<string>();
+
+  /** A one-off alert outside the incident lifecycle (auto-recovery news). */
+  private async notify(launch: LaunchRow, component: string, title: string, message: string): Promise<void> {
+    const settings = alertSettings(this.db);
+    if (!settings.ntfy && !settings.webhook) return;
+    const fleetName = this.spec(launch).network.name;
+    await sendAlert(
+      settings,
+      { fleet: fleetName, component, kind: "auto", severity: "warn", title: `${fleetName}: ${title}`, message, action: null },
+      this.alertFetch,
+    );
+  }
+
+  autoRecoverPolicy(launchId: string): AutoRecoverPolicy {
+    const raw = this.db.getSetting(`auto-recover:${launchId}`);
+    return { ...DEFAULT_AUTO_RECOVER, ...(raw ? (JSON.parse(raw) as Partial<AutoRecoverPolicy>) : {}) };
+  }
+
+  setAutoRecoverPolicy(launch: LaunchRow, policy: Partial<AutoRecoverPolicy>): AutoRecoverPolicy {
+    const next = { ...this.autoRecoverPolicy(launch.id), ...policy };
+    this.db.setSetting(`auto-recover:${launch.id}`, JSON.stringify(next));
+    return next;
+  }
+
+  /**
+   * An incident just confirmed: start its fix, when this fleet's policy
+   * covers the component and it is safe to. The op it starts carries
+   * auto: true, which is what lets signUnattended sign its txs.
+   */
+  private async autoRecover(launch: LaunchRow, incident: IncidentRow): Promise<void> {
+    const policy = this.autoRecoverPolicy(launch.id);
+    const key = incident.component;
+    const group: keyof AutoRecoverPolicy = key.startsWith("val-")
+      ? "validators"
+      : key.startsWith("sentry-")
+        ? "sentries"
+        : key === "headscale"
+          ? "headscale"
+          : "services";
+    if (!policy.enabled || !policy[group]) return;
+    const action = incident.action;
+    if (action !== "relaunch" && action !== "force-redeploy" && action !== "restart") return;
+    const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === key);
+    if (!row || row.state === "closed") return;
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      // not now, but not never: tried again once the running op is done
+      let deferred = this.deferredRecoveries.get(launch.id);
+      if (!deferred) this.deferredRecoveries.set(launch.id, (deferred = new Set()));
+      deferred.add(key);
+      return;
+    }
+    const spec = this.spec(launch);
+    const recent =
+      this.db.listFleetOps(launch.id).filter((o) => {
+        const p = JSON.parse(o.params_json) as { auto?: boolean; key?: string };
+        return p.auto && p.key === key && Date.now() - Date.parse(o.created_at) < 86_400_000;
+      }).length + this.recentAutoRestarts(launch.id, key);
+    if (recent >= AUTO_ATTEMPTS_PER_DAY) {
+      await this.notify(
+        launch,
+        key,
+        `${key} still down, giving up on automatic recovery`,
+        `${recent} automatic attempts in 24 hours did not bring ${key} back (${incident.cause}). Over to you.`,
+      );
+      return;
+    }
+    if (action === "relaunch") {
+      // a softsign validator moves only once the chain shows its old lease
+      // closed: an old container still signing beside the new one is a
+      // double-sign. tmkms keeps its own watermark, so it needs no proof.
+      if (key.startsWith("val-") && spec.security.keyMode === "softsign" && incident.status !== "lease-not-active") {
+        await this.notify(launch, key, `${key} needs you`, `${key} is unreachable but its lease is still open; a softsign validator is only moved automatically once the provider has closed the lease. Relaunch it by hand if the provider is gone.`);
+        return;
+      }
+      if (key === "headscale" && (!spec.topology.headscale.backup || meshBackupUnverified(this.db, launch.id))) {
+        await this.notify(
+          launch,
+          key,
+          "headscale needs you",
+          spec.topology.headscale.backup
+            ? "headscale is down and its backup was never verified (back up mesh… did not finish): a relaunch could restore an empty mesh, so it is left to you."
+            : "headscale is down and has no backup: a relaunch would re-key the whole mesh, so it is left to you (turn on the mesh backup to let it recover alone).",
+        );
+        return;
+      }
+      await this.requestRelaunch(launch, row, { auto: true });
+    } else if (action === "force-redeploy") {
+      this.requestForceRedeploy(launch, row, { auto: true });
+    } else {
+      this.recentAutoRestarts(launch.id, key, true);
+      await this.restart(launch, row);
+      await this.notify(launch, key, `restarted ${key}`, `${key} was restarted automatically (${incident.cause}).`);
+      return;
+    }
+    this.autoStarted.add(launch.id);
+    const signing = unattendedSettings(this.db, launch.owner).enabled;
+    await this.notify(
+      launch,
+      key,
+      `recovering ${key} automatically`,
+      `${incident.cause}: started ${action} of ${key}.` +
+        (signing ? " Its transactions are signed with the launcher's grant." : " Its transactions wait for your Keplr signature (unattended signing is off)."),
+    );
+  }
+
+  /** Grant info is a chain round trip; a minute's cache serves a whole relaunch. */
+  private readonly grantCache = new Map<string, { at: number; grants: GrantInfo[] }>();
+  /** Steps whose unattended refusal was already alerted. */
+  private readonly refusedSteps = new Set<string>();
+
+  /**
+   * Sign the launch's next pending tx with the launcher's grant, when it
+   * belongs to an op auto-recovery started and passes every rule
+   * (unattendedBlocker). True when it was signed: the caller drives on.
+   */
+  async signUnattended(launchId: string): Promise<boolean> {
+    const chain = this.services.unattended;
+    const launch = this.db.getLaunch(launchId);
+    if (!chain || !launch) return false;
+    const pending = this.db.nextPendingTx(launchId);
+    const m = pending ? /^op(\d+):/.exec(pending.step) : null;
+    if (!pending || !m) return false;
+    const op = this.db.listFleetOps(launchId).find((o) => o.id === Number(m[1]));
+    if (!op || op.status !== "active" || !(JSON.parse(op.params_json) as { auto?: boolean }).auto) return false;
+    const msgs = JSON.parse(pending.msgs_json) as Msg[];
+    const settings = unattendedSettings(this.db, launch.owner);
+    const { mnemonic, address } = await opsKey(this.workRoot, launch.owner);
+    let cached = this.grantCache.get(launch.owner);
+    if (!cached || Date.now() - cached.at > 60_000) {
+      cached = { at: Date.now(), grants: await chain.grants(launch.owner, address).catch(() => []) };
+      this.grantCache.set(launch.owner, cached);
+    }
+    const blocker = unattendedBlocker({
+      owner: launch.owner,
+      msgs,
+      settings,
+      grants: cached.grants,
+      spent: spentToday(this.db, launch.owner, settings.dailyCap.denom),
+    });
+    if (blocker) {
+      const tag = `${launchId}:${pending.step}`;
+      if (!this.refusedSteps.has(tag)) {
+        this.refusedSteps.add(tag);
+        await this.notify(launch, op.kind, "automatic recovery waits for your signature", `${pending.step}: ${blocker}. Sign it in the launcher (Keplr) to continue.`);
+      }
+      return false;
+    }
+    const hash = await chain.exec(mnemonic, launch.owner, msgs);
+    this.db.setPendingTxSigned(launchId, pending.step, hash);
+    const deposits = depositsOf(msgs).map((d) => ({
+      at: new Date().toISOString(),
+      denom: d.denom,
+      amount: d.amount.toString(),
+      step: pending.step,
+    }));
+    if (deposits.length > 0) recordSpend(this.db, launch.owner, deposits);
+    return true;
+  }
+
+  /** The wallet's unattended-recovery state: the launcher's key, the grant on chain, the settings. */
+  async unattendedStatus(owner: string): Promise<UnattendedStatus> {
+    const { address } = await opsKey(this.workRoot, owner);
+    const settings = unattendedSettings(this.db, owner);
+    const chain = this.services.unattended;
+    const grants = chain ? await chain.grants(owner, address).catch(() => null) : null;
+    const allowance = chain ? await chain.allowance(owner, address).catch(() => null) : null;
+    if (grants) this.grantCache.set(owner, { at: Date.now(), grants });
+    return {
+      available: Boolean(chain),
+      grantee: address,
+      settings,
+      grants,
+      allowance,
+      spentToday: spentToday(this.db, owner, settings.dailyCap.denom).toString(),
+      covers: UNATTENDED_MSG_TYPES as unknown as string[],
+    };
+  }
+
+  /** What the wallet signs (Keplr) to grant or revoke unattended recovery. */
+  async unattendedMsgs(owner: string, kind: "grant" | "revoke", days = 30, feeLimit = { denom: "uact", amount: "5000000" }): Promise<Msg[]> {
+    const { address } = await opsKey(this.workRoot, owner);
+    // what the chain holds now: a renewal must replace a live fee allowance
+    // (a second one is refused), and a revoke may only name what is there
+    // (one missing grant fails the whole tx). Unknown: assume a fresh grant
+    // and a full revoke, as before
+    const chain = this.services.unattended;
+    const grants = chain ? await chain.grants(owner, address).catch(() => null) : null;
+    const allowance = chain ? await chain.allowance(owner, address).catch(() => undefined) : undefined;
+    if (kind === "revoke") {
+      const types = grants ? UNATTENDED_MSG_TYPES.filter((t) => grants.some((g) => g.msgType === t)) : UNATTENDED_MSG_TYPES;
+      const withAllowance = allowance !== null;
+      if (types.length === 0 && !withAllowance) throw new Error("nothing to revoke: the chain holds no grant for the launcher's key");
+      return unattendedRevokeMsgs(owner, address, withAllowance, types);
+    }
+    if (!(days >= 1 && days <= 365)) throw new Error("a grant lasts 1 to 365 days");
+    if (!/^\d+$/.test(feeLimit.amount)) throw new Error("the fee limit is a whole number of base units");
+    const expiration = new Date(Date.now() + days * 86_400_000).toISOString().replace(/\.\d+Z$/, "Z");
+    return unattendedGrantMsgs(owner, address, expiration, feeLimit, { replaceAllowance: Boolean(allowance) });
+  }
+
+
+
+  /** Where an unreachable component's trouble is: its provider, its container, or its service. */
+  private async probeProvider(launch: LaunchRow, row: FleetComponentRow): Promise<ProviderProbe> {
+    let status: unknown;
+    try {
+      status = await this.services.provider.leaseStatus(this.mtlsCreds(launch), row.host_uri, row.dseq, 1, 1);
+    } catch (e) {
+      return providerUnreachable(e) ? "unreachable" : "unknown";
+    }
+    const services = Object.values(
+      ((status as { services?: Record<string, { available?: number; total?: number }> })?.services ?? {}),
+    );
+    if (services.some((s) => (s.total ?? 0) > 0 && (s.available ?? 0) === 0)) return "service-down";
+    return services.length > 0 ? "up" : "unknown";
+  }
+
+  /** Send a test alert to the configured channels; the failures, if any. */
+  async testAlert(): Promise<string[]> {
+    const settings = alertSettings(this.db);
+    if (!settings.ntfy && !settings.webhook) return ["no alert channel is configured"];
+    return sendAlert(
+      settings,
+      {
+        fleet: "launcher",
+        component: "alerts",
+        kind: "test",
+        severity: "warn",
+        title: "SparkDream launcher: test alert",
+        message: "Alerts from this launcher reach you here.",
+        action: null,
+      },
+      this.alertFetch,
+    );
+  }
+
+  /** Per managed signer: consecutive "no session" checks, last watchdog restart. */
+  private readonly signerWatch = new Map<string, { misses: number; lastRestart: number }>();
+
+  /**
+   * Monitor pass over launcher-managed tmkms signers (local-signer.ts). Two
+   * cures, both convergent: a signer whose config still points at a
+   * validator's old mesh address is repointed at once, and one with no
+   * privval session for SIGNER_WATCH_MISSES checks in a row is restarted
+   * (at most once per SIGNER_WATCH_COOLDOWN_MS). A validator the launcher
+   * cannot reach says nothing about the signer and leaves the count alone.
+   * Never during an op: ops drive the signer themselves.
+   */
+  async signerWatchdog(launchId: string): Promise<void> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return;
+    if (this.spec(launch).security.keyMode !== "tmkms") return;
+    if (this.db.listFleetOps(launch.id, "active").length > 0) return;
+    const deps = this.signerDeps(launchId, (m) => console.log(`[signer ${launchId.slice(0, 8)}] ${m}`));
+    for (const row of this.db.listFleetComponents(launchId) as FleetComponentRow[]) {
+      if (!row.key.startsWith("val-") || row.state !== "active" || !row.tailnet_ip) continue;
+      const b = managedSigner(deps, row.key);
+      const host = b && hostFor(deps, b);
+      if (!b || !host) continue;
+      const watchKey = `${launchId}:${row.key}`;
+      const w = this.signerWatch.get(watchKey) ?? { misses: 0, lastRestart: 0 };
+      this.signerWatch.set(watchKey, w);
+      try {
+        const view = parseTmkmsConfig(await host.readFile(b.config));
+        const addr = view.validators.find((v) => v.chainId === b.chainId)?.addr;
+        if (addr && addr !== signerAddr(row.tailnet_ip)) {
+          await repointSigner(deps, row.key, row.tailnet_ip, `watchdog: config pointed at ${addr}`);
+          w.misses = 0;
+          w.lastRestart = Date.now();
+          continue;
+        }
+        let connected: boolean;
+        try {
+          const probe = await this.services.ssh.exec(this.sshTargetFor(launch, row), SIGNER_CONNECTED_PROBE, {
+            quick: true,
+          });
+          connected = probeSaysConnected(probe.stdout);
+        } catch {
+          continue;
+        }
+        if (connected) {
+          w.misses = 0;
+          continue;
+        }
+        w.misses++;
+        if (w.misses >= SIGNER_WATCH_MISSES && Date.now() - w.lastRestart >= SIGNER_WATCH_COOLDOWN_MS) {
+          await restartSigner(deps, row.key, `watchdog: no signer session for ${w.misses} checks`);
+          w.misses = 0;
+          w.lastRestart = Date.now();
+        }
+      } catch (e) {
+        deps.log?.(`${row.key}: watchdog could not act: ${String(e instanceof Error ? e.message : e)}`);
+      }
+    }
+  }
+
+  /**
+   * Which validators' signers the fleet card can offer to manage: those
+   * already managed, and those a tmkms process on this machine signs for
+   * right now. Undefined (no action at all) on softsign fleets and on a
+   * launcher that cannot manage a signer.
+   */
+  private async localSignerSummary(
+    launch: LaunchRow,
+    spec: LaunchSpec,
+  ): Promise<{ managed: string[]; adoptable: string[]; remote: boolean } | undefined> {
+    const host = this.services.localSigner;
+    const remote = Boolean(this.services.remoteSigner);
+    if ((!host && !remote) || spec.security.keyMode !== "tmkms") return undefined;
+    const count = spec.topology.validators.count;
+    const rows = this.db.listFleetComponents(launch.id) as FleetComponentRow[];
+    const managed: string[] = [];
+    const adoptable: string[] = [];
+    for (let v = 0; v < count; v++) {
+      const key = `val-${v}`;
+      if (getBinding(this.db, launch.id, key)) {
+        managed.push(key);
+        continue;
+      }
+      const ip = rows.find((r) => r.key === key)?.tailnet_ip ?? null;
+      const found = host ? await candidateFor(host, chainId(spec), key, ip, count).catch(() => null) : null;
+      // a released signer still runs under the launcher's unit: adopting it
+      // again only re-records the binding
+      if (found) adoptable.push(key);
+    }
+    return { managed, adoptable, remote };
+  }
+
+  /** Signer deps for this launch: the local machine, and remote ones over SSH. */
+  private signerDeps(launchId: string, log?: (m: string) => void): SignerDeps {
+    return {
+      db: this.db,
+      host: this.services.localSigner,
+      remote: this.services.remoteSigner,
+      launchId,
+      ...(log ? { log } : {}),
+    };
+  }
+
+  /** Managed-signer state per validator, for the tmkms panel. */
+  async localSignerView(launch: LaunchRow): Promise<LocalSignerView> {
+    const local = this.services.localSigner;
+    const deps = this.signerDeps(launch.id);
+    const spec = this.spec(launch);
+    const rows = this.db.listFleetComponents(launch.id) as FleetComponentRow[];
+    const validators: LocalSignerView["validators"] = [];
+    for (let v = 0; v < spec.topology.validators.count; v++) {
+      const key = `val-${v}`;
+      const b = getBinding(this.db, launch.id, key);
+      const host = b ? hostFor(deps, b) : undefined;
+      const ip = rows.find((r) => r.key === key)?.tailnet_ip ?? null;
+      if (!b || !host) {
+        const adoptable = local
+          ? Boolean(await candidateFor(local, chainId(spec), key, ip, spec.topology.validators.count).catch(() => null))
+          : false;
+        validators.push({ key, managed: false, adoptable, unit: null, active: null, config: null, addr: null, addrMatches: null, lastAction: null, machine: null });
+        continue;
+      }
+      let addr: string | null = null;
+      try {
+        addr = parseTmkmsConfig(await host.readFile(b.config)).validators.find((x) => x.chainId === b.chainId)?.addr ?? null;
+      } catch {
+        addr = null;
+      }
+      validators.push({
+        key,
+        managed: true,
+        adoptable: false,
+        unit: b.unit,
+        active: await host.unitActive(b.unit, b.scope).catch(() => null),
+        machine: b.remote ? (b.remote.alias ?? b.remote.host) : "this machine",
+        config: b.config,
+        addr,
+        addrMatches: addr && ip ? addr === signerAddr(ip) : null,
+        lastAction: b.lastAction ?? null,
+      });
+    }
+    return { available: Boolean(local || this.services.remoteSigner), validators };
+  }
+
+  /** Move the running tmkms signer for `key` under a launcher-owned unit. */
+  async adoptLocalSigner(launch: LaunchRow, key: string, remoteAlias?: string): Promise<LocalSignerBinding> {
+    const spec = this.spec(launch);
+    if (spec.security.keyMode !== "tmkms") throw new Error("launch is not in tmkms mode");
+    if (!/^val-\d+$/.test(key) || Number(key.slice(4)) >= spec.topology.validators.count) {
+      throw new Error(`${key} is not a validator of this fleet`);
+    }
+    const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((r) => r.key === key);
+    const ip = row?.tailnet_ip ?? this.db.stepOutput<{ ips: Record<string, string> }>(launch.id, "await-mesh")?.ips[key] ?? null;
+    // a signer on another machine: an ssh_config alias the conductor can read
+    let remote: RemoteHost | undefined;
+    if (remoteAlias?.trim()) {
+      if (!this.services.remoteSigner) throw new Error("this launcher cannot reach a signer over SSH");
+      remote = resolveSshAlias(remoteAlias.trim()) ?? undefined;
+      if (!remote) throw new Error(`no ssh_config entry (with an IdentityFile) named ${remoteAlias.trim()}`);
+    }
+    return adoptSigner(this.signerDeps(launch.id), {
+      key,
+      chainId: chainId(spec),
+      tailnetIp: ip,
+      validatorCount: spec.topology.validators.count,
+      ...(remote ? { remote } : {}),
+    });
+  }
+
+  /** Forget the binding: the unit keeps running, the launcher stops touching it. */
+  releaseLocalSigner(launch: LaunchRow, key: string): void {
+    clearBinding(this.db, launch.id, key);
+    this.signerWatch.delete(`${launch.id}:${key}`);
+  }
+
   private sshTargetFor(launch: LaunchRow, component: FleetComponentRow) {
     if (!component.ssh_host || !component.ssh_port) {
       throw new Error(`no SSH endpoint recorded for ${component.key}`);
@@ -1631,7 +2296,7 @@ export class FleetService {
   async requestRelaunch(
     launch: LaunchRow,
     component: FleetComponentRow,
-    opts: { manualBid?: boolean } = {},
+    opts: { manualBid?: boolean; auto?: boolean } = {},
   ): Promise<number> {
     // headscale relaunches through a dedicated flow (headscaleRelaunchSteps):
     // a naive redeploy re-keys the whole mesh. A shared-mesh fleet has no
@@ -1672,6 +2337,8 @@ export class FleetService {
       avoidProviders,
       preferProviders: prefs.prefer,
       ...(opts.manualBid ? { manualBid: true } : {}),
+      // started by auto-recovery: its txs may be signed with the grant
+      ...(opts.auto ? { auto: true } : {}),
     });
   }
 
@@ -2122,6 +2789,212 @@ export class FleetService {
    * launcher's node copies and relaunch bundles, and each live node's
    * app.toml ("gas-price" op). Refuses a value that is a fee, not a price.
    */
+  /**
+   * Copy a node's chain data to the fleet's backup bucket ("data-backup"
+   * op). The source is a sentry other than sentry-0 when there is one; with
+   * only sentry-0 the public endpoints and the validator's path go quiet
+   * for the copy, which the UI warns about (and the schedule never does).
+   */
+  requestDataBackup(launch: LaunchRow, opts: { auto?: boolean } = {}): { opId: number; source: string } {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) throw new Error("a services fleet has no chain data");
+    if (!dataBackupStorage(spec, launchDirs(this.workRoot, launch.id).secrets)) {
+      throw new Error("turn on the mesh backup first: chain data goes to the same bucket");
+    }
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: back up once it is done");
+    }
+    const source = backupSource(this.db.listFleetComponents(launch.id) as FleetComponentRow[]);
+    if (!source) throw new Error("no running sentry to copy the chain data from");
+    if (opts.auto && source.key === "sentry-0") throw new Error("scheduled backups need a second sentry");
+    const opId = this.db.createFleetOp(launch.id, "data-backup", {
+      source: source.key,
+      ...(opts.auto ? { auto: true } : {}),
+    } satisfies DataBackupParams);
+    return { opId, source: source.key };
+  }
+
+  /** Replace a node's chain data with a recorded backup, in place ("data-restore" op). */
+  requestDataRestore(launch: LaunchRow, component: FleetComponentRow, name: string): number {
+    if (!/^(val|sentry)-\d+$/.test(component.key)) throw new Error("only chain nodes hold chain data");
+    if (component.state !== "active") throw new Error(`${component.key} is not running`);
+    const record = dataBackups(this.db, launch.id).find((r) => r.name === name);
+    if (!record) throw new Error(`no backup named ${name} is recorded for this fleet`);
+    const blocker = restoreBlocker(this.db, launch.id, launchDirs(this.workRoot, launch.id).node, record);
+    if (blocker) throw new Error(blocker);
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: restore once it is done");
+    }
+    return this.db.createFleetOp(launch.id, "data-restore", { key: component.key, name } satisfies DataRestoreParams);
+  }
+
+  setAutoRestore(launch: LaunchRow, on: boolean): void {
+    this.db.setSetting(`data-restore-auto:${launch.id}`, on ? "on" : "off");
+  }
+
+  /** How often scheduled chain-data backups run: "off" (default), "daily" or "weekly". */
+  dataBackupSchedule(launchId: string): "off" | "daily" | "weekly" {
+    const v = this.db.getSetting(`data-backup-schedule:${launchId}`);
+    return v === "daily" || v === "weekly" ? v : "off";
+  }
+
+  setDataBackupSchedule(launch: LaunchRow, schedule: string): void {
+    if (schedule !== "off" && schedule !== "daily" && schedule !== "weekly") {
+      throw new Error('schedule must be "off", "daily" or "weekly"');
+    }
+    if (schedule !== "off" && !dataBackupStorage(this.spec(launch), launchDirs(this.workRoot, launch.id).secrets)) {
+      throw new Error("turn on the mesh backup first: chain data goes to the same bucket");
+    }
+    this.db.setSetting(`data-backup-schedule:${launch.id}`, schedule);
+  }
+
+  /**
+   * A scheduled backup is due: on schedule, past its interval, nothing else
+   * running, and a sentry to copy other than sentry-0 (a schedule never
+   * takes the public endpoints down).
+   */
+  dataBackupDue(launchId: string, now = Date.now()): boolean {
+    const schedule = this.dataBackupSchedule(launchId);
+    if (schedule === "off") return false;
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return false;
+    if (this.db.listFleetOps(launchId, "active").length > 0) return false;
+    const source = backupSource(this.db.listFleetComponents(launchId) as FleetComponentRow[]);
+    if (!source || source.key === "sentry-0") return false;
+    const last = lastDataBackup(this.db, launchId);
+    const every = schedule === "daily" ? 86_400_000 : 7 * 86_400_000;
+    // a failed attempt waits a full interval too, rather than retrying every minute
+    const lastAttempt = this.db
+      .listFleetOps(launchId)
+      .filter((o) => o.kind === "data-backup")
+      .map((o) => Date.parse(o.created_at))
+      .sort((a, b) => b - a)[0];
+    const since = Math.max(last ? Date.parse(last.takenAt) : 0, lastAttempt ?? 0);
+    return now - since >= every;
+  }
+
+  /**
+   * Add a sentry to a running chain fleet ("add-sentry" op). The spec counts
+   * it from here on (an explicit sentry mapping gains an entry fronting the
+   * validator round-robin would give it); the op builds its home and places
+   * it. `size` records a per-node size for it, as resize does.
+   */
+  requestAddSentry(launch: LaunchRow, opts: { size?: "small" | "standard" | "large" } = {}): { opId: number; key: string } {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) throw new Error("a services fleet runs no chain");
+    if (this.db.getStep(launch.id, "finalize")?.status !== "done") {
+      throw new Error("the launch has not finished: add a sentry once it has");
+    }
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: add the sentry once it is done");
+    }
+    this.assertMeshAlive(launch, "a sentry cannot be added");
+    const s = spec.topology.sentries.count;
+    const key = `sentry-${s}`;
+    const stored = JSON.parse(launch.spec_json);
+    stored.topology.sentries = { ...stored.topology.sentries, count: s + 1 };
+    const mapping = spec.topology.sentries.mapping;
+    if (Array.isArray(mapping)) {
+      stored.topology.sentries.mapping = [...mapping, [s % spec.topology.validators.count]];
+    }
+    if (opts.size) {
+      stored.infra = { ...stored.infra, nodeSizes: { ...(stored.infra?.nodeSizes ?? {}), [key]: opts.size } };
+    }
+    const { errors } = validateSpec(withDefaults(stored));
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    const opId = this.db.createFleetOp(launch.id, "add-sentry", {
+      key,
+      sentriesBefore: JSON.parse(launch.spec_json).topology.sentries,
+    } satisfies AddSentryParams);
+    return { opId, key };
+  }
+
+  /**
+   * Turn on the headscale backup of a running fleet ("mesh-backup" op):
+   * S3 settings go into the spec (the secret into the launch's secrets as
+   * secret:s3-backup), then the op adds the backup env to the running
+   * headscale, uploads its static keys and checks the bucket holds both
+   * halves. A blank secret reuses the one another fleet of this launcher
+   * already holds for the same access key.
+   */
+  requestMeshBackup(
+    launch: LaunchRow,
+    s3: { endpoint: string; bucket: string; region?: string; accessKeyId: string; secret?: string; path?: string },
+  ): number {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) throw new Error("a services fleet runs no mesh");
+    if (spec.topology.headscale.reuseFleet) {
+      throw new Error("this fleet shares another fleet's mesh: back up that fleet's headscale instead");
+    }
+    const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === "headscale");
+    if (!row || row.state !== "active") throw new Error("this fleet has no running headscale");
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: turn on the backup once it is done");
+    }
+    const endpoint = s3.endpoint.trim();
+    const bucket = s3.bucket.trim();
+    const accessKeyId = s3.accessKeyId.trim();
+    if (!/^https:\/\/[^\s/]+/.test(endpoint)) throw new Error("the S3 endpoint must be an https:// URL");
+    if (!bucket || !accessKeyId) throw new Error("bucket and access key are required");
+    let secret = s3.secret?.trim();
+    if (!secret) secret = this.knownS3Secret(launch.owner, accessKeyId, launch.id);
+    if (!secret) throw new Error("the S3 secret key is required (no other fleet here holds one for this access key)");
+    const dirs = launchDirs(this.workRoot, launch.id);
+    keepPreviousS3Secret(dirs.secrets);
+    writeSecretFile(path.join(dirs.secrets, S3_SECRET_FILE), secret);
+    const stored = JSON.parse(launch.spec_json);
+    const backupBefore = stored.topology.headscale?.backup ?? null;
+    stored.topology.headscale = {
+      ...stored.topology.headscale,
+      backup: {
+        s3: {
+          endpoint,
+          bucket,
+          region: s3.region?.trim() || "us-west-2",
+          accessKeyId,
+          secretRef: "secret:s3-backup",
+          ...(s3.path?.trim() ? { path: s3.path.trim() } : {}),
+        },
+      },
+    };
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    const updated = withDefaults(stored);
+    const opId = this.db.createFleetOp(launch.id, "mesh-backup", {
+      endpoint,
+      bucket,
+      path: headscaleBackupPath(updated),
+      backupBefore,
+    } satisfies MeshBackupParams);
+    markMeshBackupUnverified(this.db, launch.id, opId);
+    return opId;
+  }
+
+  /** The S3 secret another fleet of this wallet holds for `accessKeyId`. */
+  private knownS3Secret(owner: string, accessKeyId: string, exceptLaunch: string): string | undefined {
+    for (const other of this.db.listLaunches()) {
+      if (other.id === exceptLaunch || other.owner !== owner) continue;
+      const backup = withDefaults(JSON.parse(other.spec_json)).topology.headscale.backup;
+      if (backup?.s3.accessKeyId !== accessKeyId) continue;
+      const secret = resolveS3Secret(backup, launchDirs(this.workRoot, other.id).secrets);
+      if (secret) return secret;
+    }
+    return undefined;
+  }
+
+  /** S3 settings (never the secret) of another fleet of this wallet, to prefill the backup form. */
+  knownBackupStorage(owner: string): { endpoint: string; bucket: string; region: string; accessKeyId: string } | null {
+    for (const other of this.db.listLaunches()) {
+      if (other.owner !== owner) continue;
+      const backup = withDefaults(JSON.parse(other.spec_json)).topology.headscale.backup;
+      if (backup) {
+        const { endpoint, bucket, region, accessKeyId } = backup.s3;
+        return { endpoint, bucket, region, accessKeyId };
+      }
+    }
+    return null;
+  }
+
   requestGasPrice(launch: LaunchRow, minGasPrice: string): number {
     const value = minGasPrice.trim();
     const spec = this.spec(launch);
@@ -2627,7 +3500,7 @@ export class FleetService {
    * manifest, so every convergent pass correctly does nothing, while the
    * running container still serves env from before the update landed.
    */
-  requestForceRedeploy(launch: LaunchRow, component: FleetComponentRow): number {
+  requestForceRedeploy(launch: LaunchRow, component: FleetComponentRow, opts: { auto?: boolean } = {}): number {
     const running = this.db
       .listFleetOps(launch.id)
       .find(
@@ -2639,7 +3512,7 @@ export class FleetService {
     if (running) {
       throw new Error(`a redeploy op (#${running.id}) is already in progress for ${component.key}`);
     }
-    return this.db.createFleetOp(launch.id, "force-redeploy", { key: component.key });
+    return this.db.createFleetOp(launch.id, "force-redeploy", { key: component.key, ...(opts.auto ? { auto: true } : {}) });
   }
 
   /**
@@ -2680,6 +3553,28 @@ export class FleetService {
       const key = (JSON.parse(op.params_json) as AddComponentParams).key;
       const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
       if (row && row.state !== "active") this.db.setComponentState(launch.id, key, "closed");
+    }
+    if (op.kind === "mesh-backup") {
+      const note = undoMeshBackup(
+        this.db,
+        launchDirs(this.workRoot, launch.id).secrets,
+        launch.id,
+        opId,
+        JSON.parse(op.params_json) as MeshBackupParams,
+      );
+      if (note) warning = warning ? `${warning}; ${note}` : note;
+    }
+    // an abandoned add-sentry must not leave the spec counting a sentry
+    // that never ran (reads the op's home step, so before the steps go)
+    if (op.kind === "add-sentry") {
+      const note = await undoAddSentry(
+        this.db,
+        launchDirs(this.workRoot, launch.id),
+        launch.id,
+        opId,
+        JSON.parse(op.params_json) as AddSentryParams,
+      );
+      if (note) warning = warning ? `${warning}; ${note}` : note;
     }
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error

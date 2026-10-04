@@ -10,6 +10,10 @@ import {
 import { MsgAccountDeposit } from "@sparkdreamnft/sparkdreamjs/akash/escrow/v1/msg.js";
 import { MsgCreateLease } from "@sparkdreamnft/sparkdreamjs/akash/market/v1beta5/leasemsg.js";
 import { MsgMintACT } from "@sparkdreamnft/sparkdreamjs/akash/bme/v1/msgs.js";
+import { GenericAuthorization } from "cosmjs-types/cosmos/authz/v1beta1/authz";
+import { MsgExec, MsgGrant, MsgRevoke } from "cosmjs-types/cosmos/authz/v1beta1/tx";
+import { AllowedMsgAllowance, BasicAllowance } from "cosmjs-types/cosmos/feegrant/v1beta1/feegrant";
+import { MsgGrantAllowance, MsgRevokeAllowance } from "cosmjs-types/cosmos/feegrant/v1beta1/tx";
 
 /**
  * Shared Akash tx layer: the conductor STORES msgs as plain proto-JSON
@@ -31,6 +35,13 @@ export const TypeUrl = {
   MintAct: "/akash.bme.v1.MsgMintACT",
   /** Bank transfer — the launch service fee rides the create-leases tx. */
   Send: "/cosmos.bank.v1beta1.MsgSend",
+  /** Unattended recovery: the owner grants the launcher's key one msg type
+   *  (GenericAuthorization) and a fee allowance limited to MsgExec. */
+  Grant: "/cosmos.authz.v1beta1.MsgGrant",
+  Revoke: "/cosmos.authz.v1beta1.MsgRevoke",
+  Exec: "/cosmos.authz.v1beta1.MsgExec",
+  GrantAllowance: "/cosmos.feegrant.v1beta1.MsgGrantAllowance",
+  RevokeAllowance: "/cosmos.feegrant.v1beta1.MsgRevokeAllowance",
 } as const;
 
 export interface Msg {
@@ -171,9 +182,133 @@ export function toEncodeObject(msg: Msg): EncodeObject {
           amount: v.amount,
         },
       };
+    case TypeUrl.Grant:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgGrant.fromPartial({
+          granter: v.granter,
+          grantee: v.grantee,
+          grant: {
+            authorization: {
+              typeUrl: "/cosmos.authz.v1beta1.GenericAuthorization",
+              value: GenericAuthorization.encode({ msg: v.msg_type_url }).finish(),
+            },
+            expiration: toTimestamp(v.expiration),
+          },
+        }),
+      };
+    case TypeUrl.Revoke:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgRevoke.fromPartial({ granter: v.granter, grantee: v.grantee, msgTypeUrl: v.msg_type_url }),
+      };
+    case TypeUrl.GrantAllowance:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgGrantAllowance.fromPartial({
+          granter: v.granter,
+          grantee: v.grantee,
+          allowance: {
+            typeUrl: "/cosmos.feegrant.v1beta1.AllowedMsgAllowance",
+            value: AllowedMsgAllowance.encode({
+              allowance: {
+                typeUrl: "/cosmos.feegrant.v1beta1.BasicAllowance",
+                value: BasicAllowance.encode(
+                  BasicAllowance.fromPartial({ spendLimit: v.spend_limit, expiration: toTimestamp(v.expiration) }),
+                ).finish(),
+              },
+              allowedMessages: v.allowed_messages,
+            }).finish(),
+          },
+        }),
+      };
+    case TypeUrl.RevokeAllowance:
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgRevokeAllowance.fromPartial({ granter: v.granter, grantee: v.grantee }),
+      };
+    case TypeUrl.Exec: {
+      // the inner msgs are launcher msgs themselves, encoded to Any
+      const registry = launcherRegistry();
+      return {
+        typeUrl: msg.typeUrl,
+        value: MsgExec.fromPartial({
+          grantee: v.grantee,
+          msgs: (v.msgs as Msg[]).map((inner) => {
+            const enc = toEncodeObject(inner);
+            return { typeUrl: enc.typeUrl, value: registry.encode(enc) };
+          }),
+        }),
+      };
+    }
     default:
       throw new Error(`no encoder for ${msg.typeUrl}`);
   }
+}
+
+/** RFC 3339 → protobuf Timestamp. */
+function toTimestamp(iso: string): { seconds: bigint; nanos: number } {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) throw new Error(`not a timestamp: ${iso}`);
+  return { seconds: BigInt(Math.floor(ms / 1000)), nanos: (ms % 1000) * 1_000_000 };
+}
+
+/** Message types the launcher's key may send on the owner's behalf (unattended recovery). */
+export const UNATTENDED_MSG_TYPES = [
+  TypeUrl.CreateDeployment,
+  TypeUrl.UpdateDeployment,
+  TypeUrl.CloseDeployment,
+  TypeUrl.CreateLease,
+] as const;
+
+/**
+ * What the owner signs to let the launcher's key recover fleets alone: one
+ * GenericAuthorization per msg type, and a fee allowance (capped, MsgExec
+ * only) so the key never needs funds of its own. Both expire.
+ */
+export function unattendedGrantMsgs(
+  owner: string,
+  grantee: string,
+  expiration: string,
+  feeLimit: { denom: string; amount: string },
+  /** a fee allowance is live: the feegrant module refuses a second one, so a
+   *  renewal revokes it first (both in one tx: nothing in between) */
+  opts: { replaceAllowance?: boolean } = {},
+): Msg[] {
+  return [
+    ...(opts.replaceAllowance ? [{ typeUrl: TypeUrl.RevokeAllowance, value: { granter: owner, grantee } }] : []),
+    ...UNATTENDED_MSG_TYPES.map((t) => ({
+      typeUrl: TypeUrl.Grant,
+      value: { granter: owner, grantee, msg_type_url: t, expiration },
+    })),
+    {
+      typeUrl: TypeUrl.GrantAllowance,
+      value: {
+        granter: owner,
+        grantee,
+        spend_limit: [feeLimit],
+        expiration,
+        allowed_messages: [TypeUrl.Exec],
+      },
+    },
+  ];
+}
+
+/**
+ * Withdraw what unattendedGrantMsgs gave. A revoke of a grant that is not
+ * there (expired, revoked already) fails the whole tx, so callers pass the
+ * types and allowance the chain still holds.
+ */
+export function unattendedRevokeMsgs(
+  owner: string,
+  grantee: string,
+  withAllowance = true,
+  types: readonly string[] = UNATTENDED_MSG_TYPES,
+): Msg[] {
+  return [
+    ...types.map((t) => ({ typeUrl: TypeUrl.Revoke, value: { granter: owner, grantee, msg_type_url: t } })),
+    ...(withAllowance ? [{ typeUrl: TypeUrl.RevokeAllowance, value: { granter: owner, grantee } }] : []),
+  ];
 }
 
 /** Plain bank transfer, stored proto-JSON like every other launcher msg. */

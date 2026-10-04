@@ -95,6 +95,22 @@ CREATE TABLE IF NOT EXISTS component_health (
   checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (launch_id, component)
 );
+-- A component that stayed unhealthy across several monitor checks
+-- (incidents.ts). confirmed_at is set once the streak is long enough to be
+-- an outage rather than a blip; closed_at when it is healthy again.
+CREATE TABLE IF NOT EXISTS component_incidents (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  launch_id     TEXT NOT NULL REFERENCES launches(id),
+  component     TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  detail        TEXT,
+  cause         TEXT NOT NULL,
+  action        TEXT,
+  checks        INTEGER NOT NULL DEFAULT 1,
+  opened_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  confirmed_at  TEXT,
+  closed_at     TEXT
+);
 CREATE TABLE IF NOT EXISTS pending_gentxs (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   launch_id     TEXT NOT NULL REFERENCES launches(id),
@@ -187,6 +203,10 @@ export class ConductorDb {
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       )
       .run(key, value);
+  }
+
+  deleteSetting(key: string): void {
+    this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
   }
 
   close(): void {
@@ -713,6 +733,55 @@ export class ConductorDb {
       .run(launchId, component, status, detail ?? null);
   }
 
+  /** The component's incident still in progress (unconfirmed or confirmed), if any. */
+  openIncident(launchId: string, component: string): IncidentRow | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM component_incidents WHERE launch_id = ? AND component = ? AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
+      )
+      .get(launchId, component) as IncidentRow | undefined;
+  }
+
+  insertIncident(row: { launchId: string; component: string; status: string; detail: string | null; cause: string; action: string | null }): number {
+    return Number(
+      this.db
+        .prepare(
+          "INSERT INTO component_incidents (launch_id, component, status, detail, cause, action) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(row.launchId, row.component, row.status, row.detail, row.cause, row.action).lastInsertRowid,
+    );
+  }
+
+  updateIncident(
+    id: number,
+    fields: Partial<Pick<IncidentRow, "status" | "detail" | "cause" | "action" | "checks" | "confirmed_at" | "closed_at">>,
+  ): void {
+    const keys = Object.keys(fields) as (keyof typeof fields)[];
+    if (keys.length === 0) return;
+    this.db
+      .prepare(`UPDATE component_incidents SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`)
+      .run(...keys.map((k) => fields[k] ?? null), id);
+  }
+
+  deleteIncident(id: number): void {
+    this.db.prepare("DELETE FROM component_incidents WHERE id = ?").run(id);
+  }
+
+  /** Confirmed incidents, newest first: open ones, plus the last `closedLimit` closed. */
+  listIncidents(launchId: string, closedLimit = 10): IncidentRow[] {
+    const open = this.db
+      .prepare(
+        "SELECT * FROM component_incidents WHERE launch_id = ? AND confirmed_at IS NOT NULL AND closed_at IS NULL ORDER BY id DESC",
+      )
+      .all(launchId) as IncidentRow[];
+    const closed = this.db
+      .prepare(
+        "SELECT * FROM component_incidents WHERE launch_id = ? AND confirmed_at IS NOT NULL AND closed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+      )
+      .all(launchId, closedLimit) as IncidentRow[];
+    return [...open, ...closed];
+  }
+
   listComponentHealth(launchId: string): ComponentHealthRow[] {
     return this.db
       .prepare("SELECT * FROM component_health WHERE launch_id = ?")
@@ -971,6 +1040,20 @@ export interface BidPickRow {
   offers_json: string | null;
   /** The operator's pick; null while waiting for one. */
   provider: string | null;
+}
+
+export interface IncidentRow {
+  id: number;
+  launch_id: string;
+  component: string;
+  status: string;
+  detail: string | null;
+  cause: string;
+  action: string | null;
+  checks: number;
+  opened_at: string;
+  confirmed_at: string | null;
+  closed_at: string | null;
 }
 
 export interface ComponentHealthRow {

@@ -79,6 +79,9 @@ import { joinSpecFromBundle } from "./join-prefill.js";
 import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
+import { alertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
+import { setUnattendedSettings } from "./unattended.js";
+import { CloudflareDns, cloudflareToken, setCloudflareToken } from "./dns.js";
 
 export interface ServerDeps {
   db: ConductorDb;
@@ -242,12 +245,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           .map(async (launch) => {
             if (await fleet.peerSetupReady(launch.id).catch(() => false)) {
               drive(launch.id, JSON.parse(launch.spec_json));
+            } else if (await fleet.signUnattended(launch.id).catch(() => false)) {
+              // an auto-recovery op parked on a signature the grant now covers
+              drive(launch.id, JSON.parse(launch.spec_json));
             }
           }),
       );
       await Promise.all(
         deps.db.listCompletedLaunches().map(async (launch) => {
           await fleet.tick(launch.id).catch(() => {});
+          // outages with a start, a cause and a fix; alerts when they open/close
+          await fleet.trackIncidents(launch.id).catch(() => {});
+          // auto-recovery started a fix for one of them
+          if (fleet.autoStarted.delete(launch.id)) drive(launch.id, JSON.parse(launch.spec_json));
+          // scheduled chain-data backup (off unless the fleet turned it on)
+          if (!running.has(launch.id) && fleet.dataBackupDue(launch.id)) {
+            try {
+              fleet.requestDataBackup(launch, { auto: true });
+              drive(launch.id, JSON.parse(launch.spec_json));
+            } catch {
+              // not possible right now (no second sentry, an op started): next pass
+            }
+          }
+          // a tmkms signer on this machine: repoint a stale addr, restart a
+          // signer that lost its session (never while the launch is driven)
+          if (!running.has(launch.id)) await fleet.signerWatchdog(launch.id).catch(() => {});
           const queued = await fleet.settleFleetTxs(launch.id).catch((): string[] => []);
           for (const other of queued) {
             const l = deps.db.getLaunch(other);
@@ -307,9 +329,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         deps.db.setLaunchStatus(id, "paused");
         app.log.error(e, `launch ${id} driver crashed`);
       })
-      .finally(() => {
+      .finally(async () => {
         running.delete(id);
-        if (rerun.delete(id)) drive(id, spec);
+        if (rerun.delete(id)) {
+          drive(id, spec);
+          return;
+        }
+        // parked on a signature an auto-recovery op may sign with the
+        // wallet's grant: sign it and carry on (unattended.ts)
+        if (await fleet.signUnattended(id).catch((e) => (app.log.warn(`launch ${id}: unattended signing: ${e}`), false))) {
+          drive(id, JSON.parse(deps.db.getLaunch(id)!.spec_json));
+        }
       });
     return "started";
   };
@@ -1536,6 +1566,187 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // a second (third, ...) sentry for a running chain fleet (add-sentry op)
+  app.post("/api/fleet/:launchId/add-sentry", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const { size } = (req.body ?? {}) as { size?: string };
+    if (size !== undefined && size !== "small" && size !== "standard" && size !== "large") {
+      return reply.status(400).send({ error: 'size must be "small", "standard" or "large"' });
+    }
+    try {
+      const started = fleet.requestAddSentry(launch, size ? { size } : {});
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "add-sentry-started", ...started };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // chain-data backups (data-backup.ts): back up now, schedule, restore in place
+  app.post("/api/fleet/:launchId/data-backup", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const { schedule, autoRestore } = (req.body ?? {}) as { schedule?: string; autoRestore?: boolean };
+    try {
+      if (schedule !== undefined || autoRestore !== undefined) {
+        if (schedule !== undefined) fleet.setDataBackupSchedule(launch, schedule);
+        if (autoRestore !== undefined) fleet.setAutoRestore(launch, Boolean(autoRestore));
+        return { schedule: fleet.dataBackupSchedule(launchId), autoRestore: autoRestore ?? null };
+      }
+      const started = fleet.requestDataBackup(launch);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "data-backup-started", ...started };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.post("/api/fleet/:launchId/data-restore", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const { key, name } = (req.body ?? {}) as { key?: string; name?: string };
+    const component = deps.db.listFleetComponents(launchId).find((c) => c.key === key);
+    if (!component || !name) return reply.status(400).send({ error: "key and name required" });
+    try {
+      const opId = fleet.requestDataRestore(launch, component, name);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "data-restore-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // Cloudflare token for DNS updates after a move (dns.ts). Launcher-wide;
+  // the token itself is never sent back.
+  const dnsZones = (): string[] => {
+    const raw = deps.db.getSetting("cloudflare-zones");
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  };
+  app.get("/api/dns", async () => {
+    const set = cloudflareToken(deps.workRoot) !== null;
+    return { cloudflare: set, zones: set ? dnsZones() : [] };
+  });
+  app.post("/api/dns", async (req, reply) => {
+    const { token } = (req.body ?? {}) as { token?: string | null };
+    if (!token) {
+      setCloudflareToken(deps.workRoot, null);
+      deps.db.deleteSetting("cloudflare-zones");
+      return { cloudflare: false, zones: [] };
+    }
+    const checked = await new CloudflareDns(() => token).check(token.trim());
+    if (!checked.ok) return reply.status(400).send({ error: checked.reason });
+    setCloudflareToken(deps.workRoot, token);
+    deps.db.setSetting("cloudflare-zones", JSON.stringify(checked.zones));
+    return { cloudflare: true, zones: checked.zones };
+  });
+
+  // unattended recovery (unattended.ts): the wallet's grant to the
+  // launcher's key, its settings, and each fleet's auto-recovery policy
+  app.get("/api/unattended", async (req, reply) => {
+    const owner = requestOwner(req, (req.query as { owner?: string }).owner);
+    if (!owner) return reply.status(400).send({ error: "owner required" });
+    return fleet.unattendedStatus(owner);
+  });
+  app.get("/api/unattended/msgs", async (req, reply) => {
+    const q = req.query as { owner?: string; kind?: string; days?: string; feeLimit?: string };
+    const owner = requestOwner(req, q.owner);
+    if (!owner) return reply.status(400).send({ error: "owner required" });
+    try {
+      return {
+        msgs: await fleet.unattendedMsgs(
+          owner,
+          q.kind === "revoke" ? "revoke" : "grant",
+          q.days ? Number(q.days) : undefined,
+          q.feeLimit ? { denom: "uact", amount: q.feeLimit } : undefined,
+        ),
+      };
+    } catch (e) {
+      return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.post("/api/unattended/settings", async (req, reply) => {
+    const body = (req.body ?? {}) as { owner?: string; enabled?: boolean; dailyCap?: string };
+    const owner = requestOwner(req, body.owner);
+    if (!owner) return reply.status(400).send({ error: "owner required" });
+    try {
+      return setUnattendedSettings(deps.db, owner, {
+        ...(body.enabled !== undefined ? { enabled: Boolean(body.enabled) } : {}),
+        ...(body.dailyCap !== undefined ? { dailyCap: { denom: "uact", amount: String(body.dailyCap) } } : {}),
+      });
+    } catch (e) {
+      return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.post("/api/fleet/:launchId/auto-recover", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as Partial<Record<"enabled" | "validators" | "sentries" | "headscale" | "services", boolean>>;
+    const clean = Object.fromEntries(
+      Object.entries(body).filter(([k, v]) => ["enabled", "validators", "sentries", "headscale", "services"].includes(k) && typeof v === "boolean"),
+    );
+    return fleet.setAutoRecoverPolicy(launch, clean);
+  });
+
+  // alert channels for incidents (incidents.ts): ntfy and/or a webhook.
+  // Launcher-wide, like the rest of the System panel.
+  app.get("/api/alerts", async () => alertSettings(deps.db));
+  app.post("/api/alerts", async (req, reply) => {
+    try {
+      setAlertSettings(deps.db, (req.body ?? {}) as AlertSettings);
+      return alertSettings(deps.db);
+    } catch (e) {
+      return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.post("/api/alerts/test", async () => ({ failures: await fleet.testAlert() }));
+
+  // headscale backup on a running fleet (mesh-backup op, §5 "Headscale
+  // backup"): the storage settings of another fleet of this wallet prefill
+  // the form (never its secret, which a blank field reuses server-side)
+  app.get("/api/fleet/:launchId/mesh-backup", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    return { known: fleet.knownBackupStorage(launch.owner) };
+  });
+  app.post("/api/fleet/:launchId/mesh-backup", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as {
+      endpoint?: string;
+      bucket?: string;
+      region?: string;
+      accessKeyId?: string;
+      secret?: string;
+      path?: string;
+    };
+    try {
+      const opId = fleet.requestMeshBackup(launch, {
+        endpoint: body.endpoint ?? "",
+        bucket: body.bucket ?? "",
+        accessKeyId: body.accessKeyId ?? "",
+        ...(body.region ? { region: body.region } : {}),
+        ...(body.secret ? { secret: body.secret } : {}),
+        ...(body.path ? { path: body.path } : {}),
+      });
+      drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+      return { status: "mesh-backup-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
   // correct a chain fleet's minimum gas price (gas-price op): the spec, the
   // relaunch bundles and every live node's app.toml
   app.post("/api/fleet/:launchId/gas-price", async (req, reply) => {
@@ -1693,6 +1904,36 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       homePreauthKey: preauth?.home,
       nodeDir: dirs.node,
     });
+  });
+
+  // launcher-managed tmkms signer (local-signer.ts): the signer runs on
+  // this machine, so the launcher repoints and restarts it instead of
+  // pausing for the operator. Adopt moves the running tmkms process under a
+  // systemd user unit; release forgets the binding (the unit keeps running).
+  app.get("/api/launches/:id/tmkms/local", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const launch = deps.db.getLaunch(id);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    return fleet.localSignerView(launch);
+  });
+  app.post("/api/launches/:id/tmkms/local/:action", async (req, reply) => {
+    const { id, action } = req.params as { id: string; action: string };
+    const { key, remote } = (req.body ?? {}) as { key?: string; remote?: string };
+    const launch = deps.db.getLaunch(id);
+    if (!launch) return reply.status(404).send({ error: "not found" });
+    if (denyForeign(req, reply, launch)) return;
+    if (!key) return reply.status(400).send({ error: "key required" });
+    try {
+      if (action === "adopt") return { binding: await fleet.adoptLocalSigner(launch, key, remote) };
+      if (action === "release") {
+        fleet.releaseLocalSigner(launch, key);
+        return { released: key };
+      }
+      return reply.status(404).send({ error: `unknown action ${action}` });
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
   });
 
   // live signer status for the guided tmkms setup (§5 step 19): whether an

@@ -6,6 +6,7 @@ import {
   chainId,
   COMPONENT_KINDS,
   headscaleDomain,
+  isServicesFleet,
   nodes,
   resolveTopology,
   serviceComponents,
@@ -27,7 +28,7 @@ import { pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { gateForFreshVolume } from "./akash/update.js";
-import { extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
+import { ageIdentityAt, extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
   createNamedAccounts,
@@ -57,6 +58,25 @@ import {
 import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, STALLED_BEHIND_BLOCKS, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import { nodeResizeSteps } from "./node-resize.js";
+import { meshBackupSteps } from "./mesh-backup.js";
+import { addSentrySteps, type AddSentryParams } from "./add-sentry.js";
+import {
+  dataBackupSteps,
+  dataRestoreSteps,
+  restoreChainData,
+  type DataBackupParams,
+  type DataRestoreParams,
+} from "./data-backup.js";
+import {
+  managedSigner,
+  rejoinSignerMesh,
+  signerMachine,
+  repointSigner,
+  resetSignerState,
+  restartSigner,
+  signerDepsOf,
+  tryManaged,
+} from "./local-signer.js";
 import { readSecretFile } from "./secrets.js";
 import type { SshTarget } from "./services.js";
 
@@ -367,7 +387,7 @@ function meshSocket(ctx: StepCtx, key: string): string {
  * key scoped to that exact set, and let a 422 pass only once the versions
  * already agree, where it can only be the provider's "no change to apply".
  */
-async function updateOnChainAndPush(
+export async function updateOnChainAndPush(
   ctx: StepCtx,
   owner: string,
   cert: ReturnType<typeof loadCert>,
@@ -519,6 +539,149 @@ export async function refreshSshEndpoints(
     corrected.push(row.key);
   }
   return { corrected, unreadable };
+}
+
+/** Polls of the double-sign window with no new block before it calls the chain halted. */
+const HALT_POLLS = 24;
+
+/**
+ * §5 double-sign safety window for a relaunched softsign validator: its
+ * fresh volume carries the launch-time priv_validator_state, so it must not
+ * sign until the chain is past every height the old node may have signed.
+ * That is DOUBLE_SIGN_WINDOW blocks past the height measured at close (or,
+ * when the sentry did not answer then, measured now: later is only safer).
+ *
+ * A chain that cannot advance without this validator (a single-validator
+ * fleet, or one holding a third of the power) never clears the window, and
+ * the node used to be left unbooted for good. A halted chain is let through
+ * only when the network holds no votes at the stuck height: a vote the old
+ * node cast there and someone kept is exactly what a fresh vote would
+ * conflict with. Votes are kept in memory, so none means none to conflict.
+ */
+async function doubleSignWindow(
+  ctx: StepCtx,
+  stepName: string,
+  key: string,
+  close: { baselineHeight?: number; baselineMissed?: boolean },
+): Promise<void> {
+  let baseline = close.baselineHeight;
+  // no height at close with sentries in the fleet means none answered
+  // (or none was active, e.g. one mid-relaunch), not that there are none:
+  // measure now, and never skip the window for it
+  const hasSentries = ctx.db.listFleetComponents(ctx.launchId).some((c) => c.key.startsWith("sentry-"));
+  if (baseline === undefined && (close.baselineMissed || hasSentries)) {
+    for (let i = 0; i < 12 && baseline === undefined; i++) {
+      if (i > 0) await ctx.services.sleep(5000);
+      baseline = await sentryRpcHeight(ctx, key).catch(() => undefined);
+    }
+    if (baseline === undefined) {
+      throw new AwaitUser(
+        stepName,
+        `no active sentry's RPC answers, so the launcher cannot tell how far the chain is past the last height ` +
+          `the old ${key} may have signed; booting it now could double-sign. Bring a sentry back ` +
+          "(relaunch it if its provider is gone), then resume.",
+      );
+    }
+  }
+  if (baseline === undefined) return; // no sentry in this fleet at all, so no height to read
+  let last = -1;
+  let still = 0;
+  for (let i = 0; i < 120; i++) {
+    const height = await sentryRpcHeight(ctx, key).catch(() => undefined);
+    if (height !== undefined && height >= baseline + DOUBLE_SIGN_WINDOW) return;
+    if (height !== undefined && height === last) still++;
+    else still = 0;
+    if (height !== undefined) last = height;
+    if (still >= HALT_POLLS) {
+      const votes = await stuckHeightVotes(ctx, key);
+      if (votes === 0) {
+        ctx.log(
+          `${key}: the chain is halted at ${last} without this validator and the network holds no ` +
+            "votes for the next height, so nothing the old node signed can conflict: booting it",
+        );
+        return;
+      }
+      throw new AwaitUser(
+        stepName,
+        `the chain is halted at ${last}, and it cannot advance until ${key} signs again, but ` +
+          (votes === null
+            ? "the launcher could not read the sentry's consensus state"
+            : `the network still holds ${votes} vote(s) for height ${last + 1}`) +
+          `. One of them may be the old ${key}'s, and a fresh vote beside it would be a double-sign. ` +
+          "If the old node can be reached, resize-style recovery is safer (its signing state moves " +
+          "with it). Otherwise resume once the sentry shows no votes at the stuck height.",
+      );
+    }
+    await ctx.services.sleep(5000);
+  }
+  throw new Error("double-sign window never cleared: the chain advanced too slowly");
+}
+
+/**
+ * Prevotes plus precommits by validator `key` the sentry holds for the
+ * height in progress, summed over rounds; null when its consensus state
+ * cannot be read.
+ */
+async function stuckHeightVotes(ctx: StepCtx, key: string): Promise<number | null> {
+  const sentry = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find(
+    (c) => c.key.startsWith("sentry-") && c.state === "active" && c.key !== key,
+  );
+  if (!sentry) return null;
+  const pubkey = ctx.output<{ consensusPubkeys?: Record<string, string> }>("generate-keys")?.consensusPubkeys?.[key];
+  try {
+    const url = await nodeRpcUrl(ctx, sentry.host_uri, sentry.dseq);
+    return countConsensusVotes(await ctx.services.rpc.getText(`${url}/consensus_state`), pubkey ? consensusAddress(pubkey) : undefined);
+  } catch {
+    return null;
+  }
+}
+
+/** Hex consensus address (upper case) of a base64 ed25519 consensus pubkey. */
+export function consensusAddress(pubkeyBase64: string): string {
+  return crypto.createHash("sha256").update(Buffer.from(pubkeyBase64, "base64")).digest("hex").slice(0, 40).toUpperCase();
+}
+
+/**
+ * Votes in a CometBFT /consensus_state answer. With `address` (hex
+ * consensus address), only that validator's: each vote string reads
+ * "Vote{<index>:<first 6 address bytes> <height>/<round>/...}", and only a
+ * vote by the same validator can conflict with a fresh one, so the other
+ * validators' votes on a stalled height must not hold the node back. When
+ * the answer carries no vote strings, every vote in the bit arrays counts
+ * ("BA{1:x} 100/100 = 1.00"): over-counting only pauses, never double-signs.
+ */
+export function countConsensusVotes(body: string, address?: string): number | null {
+  const json = JSON.parse(body) as {
+    result?: {
+      round_state?: {
+        height_vote_set?: {
+          prevotes?: string[];
+          precommits?: string[];
+          prevotes_bit_array?: string;
+          precommits_bit_array?: string;
+        }[];
+      };
+    };
+  };
+  const rounds = json.result?.round_state?.height_vote_set;
+  if (!Array.isArray(rounds)) return null;
+  const fingerprint = address?.slice(0, 12).toUpperCase();
+  let votes = 0;
+  for (const r of rounds) {
+    for (const [strings, bits] of [
+      [r.prevotes, r.prevotes_bit_array],
+      [r.precommits, r.precommits_bit_array],
+    ] as const) {
+      if (fingerprint && Array.isArray(strings)) {
+        votes += strings.filter((v) => /^Vote\{\d+:([0-9A-Fa-f]+) /.exec(v)?.[1]?.toUpperCase() === fingerprint).length;
+        continue;
+      }
+      // the bit array itself: one x per validator that voted
+      const m = /\{\d+:([x_]*)\}/.exec(bits ?? "");
+      if (m) votes += [...m[1]!].filter((c) => c === "x").length;
+    }
+  }
+  return votes;
 }
 
 export async function sentryRpcHeight(ctx: StepCtx, excludeKey?: string): Promise<number | undefined> {
@@ -1195,6 +1358,9 @@ export async function prepareNodeHome(
     );
     ctx.log(`${key}: state-sync trust anchor refreshed at height ${trust.trustHeight}`);
   }
+  // the fleet's latest chain-data backup, when it has one: the node starts
+  // from there instead of replaying the chain from block 1 (or state-syncing)
+  await restoreChainData(ctx, spec, key, target);
 }
 
 /**
@@ -1212,6 +1378,9 @@ export async function wireMovedNode(
     deploy: { dseq: string };
     lease: { hostUri: string; gseq: number; oseq: number };
     oldTailnetIp: string | null;
+    /** a node new to the fleet (add-sentry): its peers gain an entry for
+     *  it, where a moved node's old address is rewritten */
+    added?: boolean;
   },
 ): Promise<{ tailnetIp: string }> {
   const isValidator = key.startsWith("val-");
@@ -1300,9 +1469,14 @@ export async function wireMovedNode(
   } else {
     // relaunched sentry: create its own tunnels to current validator IPs
     const sIndex = Number(key.split("-")[1]);
+    // A validator with no recorded address (mid-relaunch itself) is skipped:
+    // its own relaunch re-aims this sentry's tunnel at it when it comes back.
     for (const v of topo.sentryValidators[sIndex] ?? []) {
       const valIp = componentRow(ctx, `val-${v}`).tailnet_ip;
-      if (!valIp) throw new Error(`val-${v} has no recorded tailnet IP`);
+      if (!valIp) {
+        ctx.log(`${key}: val-${v} has no recorded tailnet IP yet; leaving its tunnel for its own relaunch to create`);
+        continue;
+      }
       const port = tunnelPort(v);
       await ctx.services.ssh.exec(target, socatTunnelCmd(port, valIp));
     }
@@ -1331,34 +1505,82 @@ export async function wireMovedNode(
       ...Array.from({ length: spec.topology.sentries.count }, (_, s2) => `sentry-${s2}`)
         .filter((k) => k !== key),
     ];
+    // These writes land on OTHER machines. One that cannot be reached (its
+    // provider is gone, it is mid-relaunch) is logged and skipped, as the
+    // validator branch above does: failing here stranded the moved sentry
+    // unbooted, cutting the validator off for good, over links that have
+    // their own reconcilers (the dependent's own relaunch, repair's peers
+    // pass).
     for (const depKey of dependents) {
       const row = componentRow(ctx, depKey);
       if (!row.tailnet_ip) continue; // not reachable/placed right now
-      if (depKey.startsWith("val-")) {
-        // A validator's line is rebuilt whole: it may name this sentry's
-        // old PUBLIC endpoint (public-first peering), which a tailnet-IP
-        // sed never matches, leaving the validator dialing a closed
-        // deployment (seen live 2026-10-02). Its dial-out tunnel's env is
-        // re-aimed by the persist step below, whose manifest push
-        // restarts it onto that.
-        await wireValidatorPeers(
-          ctx,
-          depKey,
-          rowTarget(ctx, row),
-          (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
-          (s) => sentryPublicP2p(ctx, s),
-        );
-      } else if (moved.oldTailnetIp) {
-        await ctx.services.ssh.exec(
-          rowTarget(ctx, row),
-          `sed -i 's|${moved.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
+      try {
+        await repatchDependent(row);
+      } catch (e) {
+        ctx.log(
+          `${key}: ${depKey} unreachable (${e instanceof Error ? e.message : String(e)}); ` +
+            `leaving its peers for its own relaunch or repair to fix`,
         );
       }
-      // peer change requires a process restart (documented in the dialog)
-      await restartNode(ctx.services.ssh, rowTarget(ctx, row));
     }
   }
   return { tailnetIp: ip };
+
+  async function repatchDependent(row: FleetComponentRow): Promise<void> {
+    if (row.key.startsWith("val-")) {
+      // A validator's line is rebuilt whole: it may name this sentry's
+      // old PUBLIC endpoint (public-first peering), which a tailnet-IP
+      // sed never matches, leaving the validator dialing a closed
+      // deployment (seen live 2026-10-02). Its dial-out tunnel's env is
+      // re-aimed by the persist step below, whose manifest push
+      // restarts it onto that.
+      await wireValidatorPeers(
+        ctx,
+        row.key,
+        rowTarget(ctx, row),
+        (s) => componentRow(ctx, `sentry-${s}`).tailnet_ip,
+        (s) => sentryPublicP2p(ctx, s),
+      );
+    } else if (moved.oldTailnetIp) {
+      await ctx.services.ssh.exec(
+        rowTarget(ctx, row),
+        `sed -i 's|${moved.oldTailnetIp}|${ip}|g' ${NODE_HOME}/config/config.toml`,
+      );
+    }
+    if (moved.added) {
+      // a new sentry: fellow sentries peer with it directly over the mesh,
+      // and every node it talks to keeps it as an unconditional peer
+      const id = ctx.output<GenerateKeysOutput>("generate-keys")?.nodeIds[key];
+      if (!id) throw new Error(`no node id recorded for ${key}`);
+      const config = `${NODE_HOME}/config/config.toml`;
+      const cmds = [appendTomlListCmd(config, "unconditional_peer_ids", id, id)];
+      if (row.key.startsWith("sentry-")) cmds.unshift(appendTomlListCmd(config, "persistent_peers", `${id}@${ip}:26656`, id));
+      await ctx.services.ssh.exec(rowTarget(ctx, row), cmds.join(" && "));
+    }
+    // peer change requires a process restart (documented in the dialog)
+    await restartNode(ctx.services.ssh, rowTarget(ctx, row));
+  }
+}
+
+/**
+ * Shell that appends `entry` to a quoted comma list in a TOML file (CometBFT's
+ * persistent_peers, unconditional_peer_ids), unless `id` is already in it.
+ * Busybox sed: -E, and the empty list ("") is mended after the append.
+ */
+export function appendTomlListCmd(file: string, field: string, entry: string, id: string): string {
+  return (
+    `{ grep -Eq '^${field} = ".*${id}' ${file} || ` +
+    `sed -i -E 's|^${field} = "(.*)"|${field} = "\\1,${entry}"|; s|^${field} = ",|${field} = "|' ${file}; }`
+  );
+}
+
+/** The same append on a config.toml held by the launcher (node homes for bundles). */
+export function withTomlListEntry(text: string, field: string, entry: string, id: string): string {
+  const re = new RegExp(`^${field} = "(.*)"$`, "m");
+  const m = re.exec(text);
+  if (!m || m[1]!.includes(id)) return text;
+  const list = m[1] ? `${m[1]},${entry}` : entry;
+  return text.replace(re, `${field} = "${list}"`);
 }
 
 /**
@@ -1403,12 +1625,17 @@ export function relaunchSteps(
   // sentry-0 always gets the mesh-client pass: another fleet's relayer may
   // dial it, which only the db (at run time) can tell
   const meshClients = key === "sentry-0" || meshDependents(spec, key).length > 0;
+  // sentry-0 serves the fleet's public API/RPC domains: a move lands them on
+  // another provider's ingress, so their DNS has to follow
+  const publicDomains = key === "sentry-0" ? sentryPublicDomains(spec) : [];
   const lastStep = p(
-    meshClients
-      ? "mesh-clients"
-      : signerGate
-        ? "await-signer"
-        : "persist",
+    publicDomains.length > 0
+      ? "public-dns"
+      : meshClients
+        ? "mesh-clients"
+        : signerGate
+          ? "await-signer"
+          : "persist",
   );
 
   const steps: StepDef[] = [];
@@ -1419,9 +1646,18 @@ export function relaunchSteps(
       const row = componentRow(ctx, key);
       const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
       let baseline: number | undefined;
+      let baselineMissed = false;
       if (isValidator && spec.security.keyMode === "softsign") {
-        // §5 double-sign safety: record height before the old node dies
-        baseline = await sentryRpcHeight(ctx);
+        // §5 double-sign safety: record height before the old node dies. A
+        // sentry that does not answer right now (the outage that prompted
+        // this relaunch may have hit it too) must not block the close: the
+        // start step measures it then instead, which can only be higher,
+        // so the window it waits out is at least as long
+        try {
+          baseline = await sentryRpcHeight(ctx);
+        } catch {
+          baselineMissed = true;
+        }
       }
       const lease = await ctx.services.api.leaseState(owner, row.dseq, row.provider);
       if (lease === "active") {
@@ -1449,7 +1685,12 @@ export function relaunchSteps(
         }
       }
       ctx.db.setComponentState(ctx.launchId, key, "relaunching");
-      return { closedDseq: row.dseq, oldTailnetIp: row.tailnet_ip, baselineHeight: baseline };
+      return {
+        closedDseq: row.dseq,
+        oldTailnetIp: row.tailnet_ip,
+        baselineHeight: baseline,
+        ...(baselineMissed ? { baselineMissed: true } : {}),
+      };
     },
   });
 
@@ -1746,11 +1987,23 @@ export function relaunchSteps(
         const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
         const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
         // each domain to its own service's ingress hostname
-        const records: string[] = [];
+        const targets: { domain: string; target: string }[] = [];
         for (const d of dark) {
-          const ingress = await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, d.domain);
-          records.push(`${d.domain} → CNAME ${ingress}`);
+          targets.push({ domain: d.domain, target: await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, d.domain) });
         }
+        if ((await pointDns(ctx, targets)).length > 0) {
+          for (let i = 0; i < 36 && dark.length > 0; i++) {
+            await ctx.services.sleep(5000);
+            const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.healthUrl)));
+            dark = dark.filter((_, j) => !answers[j]);
+          }
+          if (dark.length === 0) {
+            ctx.db.setComponentState(ctx.launchId, key, "active");
+            if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
+            return { healthy: true, url, dnsUpdated: true };
+          }
+        }
+        const records = targets.filter((t) => dark.some((d) => d.domain === t.domain)).map((t) => `${t.domain} → CNAME ${t.target}`);
         throw new AwaitUser(
           p("verify"),
           `${key} not answering at ${dark.map((d) => d.healthUrl).join(", ")} — create or update the DNS ` +
@@ -1777,11 +2030,14 @@ export function relaunchSteps(
       const row = componentRow(ctx, key);
       const target = rowTarget(ctx, row);
       await prepareNodeHome(ctx, spec, key, target);
-      const close = ctx.output<{ oldTailnetIp: string | null }>(p("close"))!;
+      // no close step: a node added to the fleet (add-sentry), which has
+      // no old address to replace and is appended to its peers instead
+      const close = ctx.output<{ oldTailnetIp: string | null }>(p("close"));
       return wireMovedNode(ctx, spec, key, target, {
         deploy: ctx.output<{ dseq: string }>(p("deploy"))!,
         lease: ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!,
-        oldTailnetIp: close.oldTailnetIp,
+        oldTailnetIp: close?.oldTailnetIp ?? null,
+        ...(close ? {} : { added: true }),
       });
     },
   });
@@ -1789,7 +2045,7 @@ export function relaunchSteps(
   steps.push({
     name: p("start"),
     async run(ctx) {
-      const close = ctx.output<{ baselineHeight?: number }>(p("close"))!;
+      const close = ctx.output<{ baselineHeight?: number; baselineMissed?: boolean }>(p("close")) ?? {};
       const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
 
       if (isValidator && spec.security.keyMode === "tmkms") {
@@ -1802,18 +2058,15 @@ export function relaunchSteps(
         // resume with a perfectly repointed signer failed forever (observed
         // live). The real check runs after the boot, in await-signer.
         ctx.log(
-          `${key}: repoint your tmkms signer while this finishes — ` +
-            `addr = "tcp://${cfg.tailnetIp}:26659"`,
+          managedSigner(signerDepsOf(ctx), key)
+            ? `${key}: the launcher repoints its managed tmkms signer at ` +
+                `tcp://${cfg.tailnetIp}:26659 once the node boots`
+            : `${key}: repoint your tmkms signer while this finishes — ` +
+                `addr = "tcp://${cfg.tailnetIp}:26659"`,
         );
       }
-      if (isValidator && spec.security.keyMode === "softsign" && close.baselineHeight !== undefined) {
-        // §5 double-sign safety window: wait N blocks past the pre-close height
-        for (let i = 0; i < 120; i++) {
-          const height = await sentryRpcHeight(ctx, key);
-          if (height !== undefined && height >= close.baselineHeight + DOUBLE_SIGN_WINDOW) break;
-          if (i === 119) throw new Error("double-sign window never cleared (chain halted?)");
-          await ctx.services.sleep(5000);
-        }
+      if (isValidator && spec.security.keyMode === "softsign") {
+        await doubleSignWindow(ctx, p("start"), key, close);
       }
       // Deliberately NOT starting sparkdreamd here. This step used to
       // SSH-start it, and the persist step's manifest push then restarted
@@ -2049,6 +2302,11 @@ export function relaunchSteps(
         // signer anywhere, and the chain signs nothing until tmkms dials in.
         const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
         const row = componentRow(ctx, key);
+        // a signer on the launcher's own machine is repointed here instead
+        // of asking the operator to (local-signer.ts)
+        const local = await tryManaged(signerDepsOf(ctx), (d) =>
+          repointSigner(d, key, cfg.tailnetIp, "relaunch"),
+        );
         let connected = false;
         for (let attempt = 0; attempt < 12 && !connected; attempt++) {
           if (attempt > 0) await ctx.services.sleep(5000);
@@ -2067,7 +2325,8 @@ export function relaunchSteps(
             `repoint your tmkms signer at the relaunched ${key} — the relaunch moved it to a ` +
               `new mesh address:\n  addr = "tcp://${cfg.tailnetIp}:26659"\n` +
               "in the [[validator]] block of tmkms.toml, then restart the signer and resume. " +
-              "Keep the existing state file: its watermark is what stops a double-sign.",
+              "Keep the existing state file: its watermark is what stops a double-sign." +
+              local.note,
           );
         }
         ctx.log(`${key}: signer connected`);
@@ -2132,13 +2391,90 @@ export function relaunchSteps(
             );
           }
         }
-        ctx.db.setFleetOpStatus(opId, "done");
+        if (lastStep === p("mesh-clients")) ctx.db.setFleetOpStatus(opId, "done");
         return { repointed: pushes.map((p2) => p2.row.key) };
       },
     });
   }
 
+  if (publicDomains.length > 0) {
+    steps.push({
+      name: p("public-dns"),
+      async run(ctx) {
+        // the node is serving again (persist booted it); a domain still
+        // dark after a few minutes points at the old provider's ingress
+        let dark = publicDomains;
+        for (let i = 0; i < 36 && dark.length > 0; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.url)));
+          dark = dark.filter((_, j) => !answers[j]);
+        }
+        if (dark.length > 0) {
+          const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+          const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+          const targets: { domain: string; target: string }[] = [];
+          for (const d of dark) {
+            targets.push({ domain: d.domain, target: await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, d.domain) });
+          }
+          // the launcher's DNS token, when it has one, then a few more minutes
+          if ((await pointDns(ctx, targets)).length > 0) {
+            for (let i = 0; i < 36 && dark.length > 0; i++) {
+              await ctx.services.sleep(5000);
+              const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.url)));
+              dark = dark.filter((_, j) => !answers[j]);
+            }
+            if (dark.length === 0) {
+              ctx.db.setFleetOpStatus(opId, "done");
+              return { answering: publicDomains.map((d) => d.domain), dnsUpdated: true };
+            }
+          }
+          const records = targets.filter((t) => dark.some((d) => d.domain === t.domain)).map((t) => `${t.domain} → CNAME ${t.target}`);
+          throw new AwaitUser(
+            p("public-dns"),
+            `${key} moved to another provider, and the fleet's public ` +
+              `${dark.map((d) => d.name).join(" and ")} no longer answer${dark.length > 1 ? "" : "s"} at ` +
+              `${dark.map((d) => d.url).join(", ")}. Update the DNS record${records.length > 1 ? "s" : ""} ` +
+              `${records.join(", ")} (Cloudflare: proxy on, SSL=Flexible), then resume.`,
+          );
+        }
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { answering: publicDomains.map((d) => d.domain) };
+      },
+    });
+  }
+
   return steps;
+}
+
+/**
+ * Point domains at their new ingress through the launcher's DNS token
+ * (dns.ts). Returns the domains it updated; none when no token is set or no
+ * zone holds them, and a failure is only logged (the step's own pause with
+ * the records to set still follows).
+ */
+export async function pointDns(ctx: StepCtx, records: { domain: string; target: string }[]): Promise<string[]> {
+  const dns = ctx.services.dns;
+  if (!dns) return [];
+  const done: string[] = [];
+  for (const r of records) {
+    try {
+      if (await dns.pointCname(r.domain, r.target)) done.push(r.domain);
+    } catch (e) {
+      ctx.log(`DNS update for ${r.domain} failed: ${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
+    }
+  }
+  if (done.length > 0) ctx.log(`DNS pointed through Cloudflare: ${records.filter((r) => done.includes(r.domain)).map((r) => `${r.domain} → ${r.target}`).join(", ")}`);
+  return done;
+}
+
+/** The fleet's public API/RPC domains, all served by sentry-0, with the URL
+ *  that proves each one reaches the node (the same probes verify-chain uses). */
+export function sentryPublicDomains(spec: LaunchSpec): { name: string; domain: string; url: string }[] {
+  const pub = isServicesFleet(spec) ? undefined : spec.topology.publicEndpoints;
+  const out: { name: string; domain: string; url: string }[] = [];
+  if (pub?.api) out.push({ name: "API", domain: pub.api, url: `https://${pub.api}/cosmos/base/tendermint/v1beta1/node_info` });
+  if (pub?.rpc) out.push({ name: "RPC", domain: pub.rpc, url: `https://${pub.rpc}/status` });
+  return out;
 }
 
 /**
@@ -2241,11 +2577,8 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         ageRecipient: backup
           ? ctx.output<{ ageRecipient: string }>("generate-keys")!.ageRecipient
           : undefined,
-        ageIdentity: backup
-          ? readSecretFile(path.join(ctx.dirs.secrets, "age.txt"))
-              .split("\n")
-              .find((l) => l.startsWith("AGE-SECRET-KEY-"))
-          : undefined,
+        ageIdentity: backup ? ageIdentityAt(ctx.dirs.secrets) : undefined,
+        secretsDir: ctx.dirs.secrets,
       });
       const sdlPath = sdlPathFor(ctx, key);
       fs.writeFileSync(sdlPath, yaml.dump(sdl, { lineWidth: 120 }));
@@ -2483,12 +2816,14 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
       const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
       const ingress = await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain);
+      // the launcher's DNS token flips it here when it can
+      const flipped = (await pointDns(ctx, [{ domain, target: ingress }])).length > 0;
       // poll briefly first (the record may already be right, e.g. a wildcard
       // or a fast flip), then gate unconditionally: the relaunch moved
       // providers, so the domain points at the OLD headscale until the user
       // flips it, and a health pass against the old server would split the
       // mesh (keys minted on the new one, clients registering on the old)
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < (flipped ? 36 : 6); i++) {
         if (await ctx.services.rpc.httpOk(`https://${domain}/health`)) return { dns: true };
         await ctx.services.sleep(5000);
       }
@@ -2636,6 +2971,27 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       const rekeyOut = ctx.output<{ newIps?: Record<string, string> }>(p("rekey"))!;
       const home = configure.keys!.home;
       const newIps = rekeyOut.newIps ?? {};
+      // signers on the launcher's own machine: log that machine back into
+      // the re-keyed mesh (once per Tailscale CLI), then repoint each one
+      const deps = signerDepsOf(ctx);
+      const notes: string[] = [];
+      const rejoined = new Set<string>();
+      for (const vk of valKeys) {
+        const b = managedSigner(deps, vk);
+        if (!b) continue;
+        const ip = newIps[vk] ?? componentRow(ctx, vk).tailnet_ip;
+        const res = await tryManaged(deps, async (d) => {
+          // one login per machine: a local and a remote signer can both use "tailscale"
+          const machine = `${signerMachine(b)}|${b.meshCli}`;
+          if (b.meshCli && !rejoined.has(machine)) {
+            await rejoinSignerMesh(d, b, `https://${domain}`, home);
+            rejoined.add(machine);
+          }
+          if (!ip) throw new Error(`${vk} has no recorded mesh address yet`);
+          return repointSigner(d, vk, ip, "headscale re-key");
+        });
+        if (res.note) notes.push(res.note);
+      }
       // a ready signer's reconnect lands within seconds: poll a minute before
       // parking (same cushion as resume-signing's await-signer)
       const poll = async (): Promise<string[]> => {
@@ -2665,7 +3021,8 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
           "at the validator(s), then restart tmkms:\n" +
           `  sudo tailscale up --login-server=https://${domain} --authkey=${home} --hostname tmkms-${spec.network.name}\n` +
           `${addrs}\n` +
-          "Resume once the tmkms panel reports the signer connected.",
+          "Resume once the tmkms panel reports the signer connected." +
+          [...new Set(notes)].join(""),
       );
     },
   });
@@ -3800,10 +4157,32 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
       // signer means no blocks, and its failure says so.
       const notice = `op${opId}-signer-notice`;
       const alreadyAsked = fs.existsSync(path.join(ctx.dirs.root, `${notice}.pin`));
+      // signers on the launcher's own machine are cleared here (state file
+      // renamed aside, signer restarted): only the rest need the operator
+      const tmkms = spec.security.keyMode === "tmkms";
+      const allVals = nodeRows(ctx).filter((r) => r.key.startsWith("val-")).map((r) => r.key);
+      const cleared: string[] = [];
+      const notes: string[] = [];
+      if (tmkms && !alreadyAsked) {
+        const deps = signerDepsOf(ctx);
+        // a re-run after a crash mid-loop resets a signer twice, which is
+        // harmless: nothing has signed on the new chain before op:start
+        for (const vk of allVals) {
+          const res = await tryManaged(deps, (d) => resetSignerState(d, vk));
+          if (res.ok) cleared.push(vk);
+          else if (res.note) notes.push(res.note);
+        }
+        if (cleared.length === allVals.length && allVals.length > 0) {
+          ctx.log(
+            `managed tmkms signer(s) cleared for ${cleared.join(", ")}. Any validator signing on ` +
+              `${cid} from outside this fleet must clear its own signer state before it signs again.`,
+          );
+          return { signersReady: true, managedReset: cleared };
+        }
+      }
       await pinnedValue(ctx, notice, async () => "asked");
       if (!alreadyAsked) {
-        const vals = nodeRows(ctx).filter((r) => r.key.startsWith("val-")).map((r) => r.key);
-        const tmkms = spec.security.keyMode === "tmkms";
+        const vals = allVals.filter((v) => !cleared.includes(v));
         throw new AwaitUser(
           p("signer"),
           `${cid} restarts at height 1 on a fresh genesis, and every signer for it must be ` +
@@ -3818,7 +4197,9 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
             `Any validator signing on ${cid} from outside this fleet must have its own signer ` +
             "state cleared too, and must not sign again until it does: the old chain's votes " +
             "and this one's now share a chain-id, so the same key voting twice at one height " +
-            "is a double-sign. Resume once every signer is clear.",
+            "is a double-sign. Resume once every signer is clear." +
+            (cleared.length > 0 ? ` (The launcher already cleared its managed signer for ${cleared.join(", ")}.)` : "") +
+            notes.join(""),
         );
       }
       return { signersReady: true };
@@ -4351,6 +4732,14 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
       async run(ctx) {
         const row = componentRow(ctx, params.key);
         const target = rowTarget(ctx, row);
+        // a managed signer is restarted (and repointed, if its addr went
+        // stale) up front: a stalled session is as likely on the signer's
+        // side as on the node's, and the node restarts in the next step
+        const local = await tryManaged(signerDepsOf(ctx), (d) =>
+          row.tailnet_ip
+            ? repointSigner(d, params.key, row.tailnet_ip, "resume signing")
+            : restartSigner(d, params.key, "resume signing"),
+        );
         // a ready signer's reconnect lands within seconds — poll a minute
         // before parking (same cushion as the launch's await-signer)
         for (let attempt = 0; attempt < 12; attempt++) {
@@ -4363,7 +4752,8 @@ export function resumeSigningSteps(opId: number, params: ResumeSigningParams, sp
           `${params.key} has no connected tmkms signer: start (or restart) the signer and let ` +
             "it rejoin the mesh (the tmkms panel shows the live session state). Resume once " +
             "it reports connected; the op then restarts the validator process in place and " +
-            "watches it sign blocks again.",
+            "watches it sign blocks again." +
+            local.note,
         );
       },
     },
@@ -5450,6 +5840,10 @@ function buildSteps(
     if (op.kind === "relink") steps.push(...relinkSteps(op.id, spec));
     if (op.kind === "public-grpc") steps.push(...publicGrpcSteps(op.id));
     if (op.kind === "gas-price") steps.push(...gasPriceSteps(op.id, spec));
+    if (op.kind === "mesh-backup") steps.push(...meshBackupSteps(op.id, spec));
+    if (op.kind === "add-sentry") steps.push(...addSentrySteps(op.id, params as AddSentryParams, spec));
+    if (op.kind === "data-backup") steps.push(...dataBackupSteps(op.id, params as DataBackupParams, spec));
+    if (op.kind === "data-restore") steps.push(...dataRestoreSteps(op.id, params as DataRestoreParams, spec));
     if (op.kind === "relayer-paths") steps.push(...relayerPathsSteps(op.id, params, spec));
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));

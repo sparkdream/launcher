@@ -21,6 +21,7 @@ import { extractForwardedPort, loadCert, nodeShellFallback, pinnedValue, sshTarg
 import type { GenerateKeysOutput } from "./steps/phase-a.js";
 import type { SshTarget } from "./services.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
+import { managedSigner, repointSigner, signerDepsOf, tryManaged } from "./local-signer.js";
 
 /** Params of a "node-resize" op: the relaunch's, plus the size to move to. */
 export interface NodeResizeParams extends RelaunchParams {
@@ -486,6 +487,12 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
               const stage = ctx.output<StageOutput>(p("stage"))!;
               const addr = `tcp://${stage.stagedIp}:26659`;
               if (fs.existsSync(told)) return { addr };
+              // a signer on the launcher's own machine needs no warning: the
+              // launcher repoints and restarts it at the handover itself
+              if (managedSigner(signerDepsOf(ctx), key)) {
+                ctx.log(`${key}: the launcher repoints its managed tmkms signer at ${addr} during the handover`);
+                return { addr, managed: true };
+              }
               fs.writeFileSync(told, new Date().toISOString());
               throw new AwaitUser(
                 p("prepare-signer"),
@@ -640,7 +647,13 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
           // (seen live 2026-10-03: one start, one exit, a halted devnet).
           const cfg = ctx.output<{ tailnetIp: string }>(p("configure"))!;
           const addr = `tcp://${cfg.tailnetIp}:26659`;
-          ctx.log(`${key}: handed over; restart your tmkms signer now (addr = "${addr}")`);
+          // managed signer: repointed and restarted right here, the moment
+          // the old node stopped signing (tmkms keeps redialing until the
+          // node below is up)
+          const local = await tryManaged(signerDepsOf(ctx), (d) =>
+            repointSigner(d, key, cfg.tailnetIp, "resize handover"),
+          );
+          if (!local.managed) ctx.log(`${key}: handed over; restart your tmkms signer now (addr = "${addr}")`);
           for (let i = 0; i < 36; i++) {
             if (!(await up().catch(() => true))) {
               await ctx.services.ssh.exec(target, START_NODE_CMD).catch(() => undefined);
@@ -661,7 +674,8 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
               `tmkms.toml has\n  addr = "${addr}"\nin the [[validator]] block, restart the signer, then resume. ` +
               "The node is started again on resume and kept starting until the signer connects (it exits " +
               "after a few seconds without one). Keep the signer's state file: its watermark is what stops " +
-              "a double-sign.",
+              "a double-sign." +
+              local.note,
           );
         }
         if (!(await up())) await ctx.services.ssh.exec(target, START_NODE_CMD);
@@ -693,6 +707,7 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
     ...pick("persist"),
     ...pick("await-signer"),
     ...pick("mesh-clients"),
+    ...pick("public-dns"),
   ];
 }
 
