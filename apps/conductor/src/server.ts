@@ -79,7 +79,8 @@ import { joinSpecFromBundle } from "./join-prefill.js";
 import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
-import { alertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
+import { autoRestoreEnabled } from "./data-backup.js";
+import { publicAlertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
 import { setUnattendedSettings } from "./unattended.js";
 import { CloudflareDns, cloudflareToken, setCloudflareToken } from "./dns.js";
 
@@ -248,6 +249,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             } else if (await fleet.signUnattended(launch.id).catch(() => false)) {
               // an auto-recovery op parked on a signature the grant now covers
               drive(launch.id, JSON.parse(launch.spec_json));
+            } else {
+              // a fleet paused inside an op (failed, or waiting on the user)
+              // is still running: keep its health current and its outages
+              // alerted beyond what the op is working on. Watching only
+              // completed launches left a fleet unwatched for as long as a
+              // failed relink sat there.
+              await fleet.tick(launch.id).catch(() => {});
+              await fleet.trackIncidents(launch.id).catch(() => {});
+              broadcast({ type: "health", launchId: launch.id, health: deps.db.listComponentHealth(launch.id) });
             }
           }),
       );
@@ -267,6 +277,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
               // not possible right now (no second sentry, an op started): next pass
             }
           }
+          // no usable chain-data backup (or only an old one): a moved node
+          // would replay the chain for hours; alerted at most once a day
+          await fleet.backupStaleCheck(launch.id).catch(() => {});
           // a tmkms signer on this machine: repoint a stale addr, restart a
           // signer that lost its session (never while the launch is driven)
           if (!running.has(launch.id)) await fleet.signerWatchdog(launch.id).catch(() => {});
@@ -858,13 +871,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
           }
         }
-        const warnings = fleet.relaunchWarnings(launch, component);
+        const scratch = await fleet.scratchSyncWarnings(launch, component.key);
+        const warnings = [...fleet.relaunchWarnings(launch, component), ...scratch];
         if (warnings.length > 0 && !body.confirm) {
           // a validator relaunch note is informational (the op is safe by
           // design), so it confirms with "Proceed?"; sentry isolation and
           // the other guards warn against the action ("Proceed anyway?")
           return reply.status(409).send({
             warnings,
+            // a backup would turn hours of replay into minutes: the UI offers it first
+            ...(scratch.length > 0 ? { backupFirst: true } : {}),
             ...(component.key.startsWith("val-") ? { confirmPrompt: "Proceed?" } : {}),
           });
         }
@@ -879,6 +895,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
       case "remove": {
         try {
+          if (/^sentry-\d+$/.test(component.key)) {
+            const { unreachable } = await fleet.removeSentry(launch, component.key);
+            return {
+              status: "removed",
+              key: component.key,
+              note:
+                `${component.key} removed; the running nodes drop it from their peers at their next restart` +
+                (unreachable.length > 0 ? ` (not reached: ${unreachable.join(", ")}; a repair finishes them)` : ""),
+            };
+          }
           fleet.removeComponent(launch, component.key);
           return { status: "removed", key: component.key };
         } catch (e) {
@@ -913,7 +939,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           try {
             const warnings = await fleet.nodeResizeWarnings(launch, component, body.size);
             if (!body.confirm) {
-              return reply.status(409).send({ warnings, confirmPrompt: `Resize ${component.key} to "${body.size}"?` });
+              const backupFirst = (await fleet.scratchSyncWarnings(launch, component.key)).length > 0;
+              return reply.status(409).send({
+                warnings,
+                confirmPrompt: `Resize ${component.key} to "${body.size}"?`,
+                ...(backupFirst ? { backupFirst: true } : {}),
+              });
             }
             const opId = await fleet.requestNodeResize(launch, component, body.size);
             drive(launchId, spec);
@@ -1188,6 +1219,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return disk;
   });
 
+  // the resize dialog's sizes, estimates and disk use (FleetService.resizeOptions)
+  app.get("/api/fleet/:launchId/:dseq/resize-options", async (req, reply) => {
+    const { launchId, dseq } = req.params as { launchId: string; dseq: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const component = deps.db.getFleetComponentByDseq(launchId, dseq);
+    if (!component || !/^(val|sentry)-\d+$/.test(component.key)) return reply.status(404).send({ error: "no chain node at that dseq" });
+    return fleet.resizeOptions(launch, component);
+  });
+
   // the chain's genesis.json (identical for every node)
   app.get("/api/launches/:id/genesis", async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -1442,6 +1484,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       image?: string;
       paths?: RelayerPath[];
       settings?: Record<string, unknown>;
+      manualBid?: boolean;
     };
     if (!body.key) return reply.status(400).send({ error: "key is required" });
     try {
@@ -1450,6 +1493,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         ...(body.image ? { image: body.image } : {}),
         ...(body.paths ? { paths: body.paths } : {}),
         ...(body.settings ? { settings: body.settings } : {}),
+        ...(body.manualBid === true ? { manualBid: true } : {}),
       });
       // drive with the UPDATED spec — requestAddComponent just rewrote it
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
@@ -1566,18 +1610,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }
   });
 
+  // what the fleet card's add dialog offers, with estimates and steps
+  app.get("/api/fleet/:launchId/add-options", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    return fleet.addOptions(launch);
+  });
+
   // a second (third, ...) sentry for a running chain fleet (add-sentry op)
   app.post("/api/fleet/:launchId/add-sentry", async (req, reply) => {
     const { launchId } = req.params as { launchId: string };
     const launch = deps.db.getLaunch(launchId);
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
-    const { size } = (req.body ?? {}) as { size?: string };
+    const { size, manualBid } = (req.body ?? {}) as { size?: string; manualBid?: boolean };
     if (size !== undefined && size !== "small" && size !== "standard" && size !== "large") {
       return reply.status(400).send({ error: 'size must be "small", "standard" or "large"' });
     }
     try {
-      const started = fleet.requestAddSentry(launch, size ? { size } : {});
+      const started = fleet.requestAddSentry(launch, { ...(size ? { size } : {}), ...(manualBid === true ? { manualBid: true } : {}) });
       drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
       return { status: "add-sentry-started", ...started };
     } catch (e) {
@@ -1591,16 +1644,43 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const launch = deps.db.getLaunch(launchId);
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
-    const { schedule, autoRestore } = (req.body ?? {}) as { schedule?: string; autoRestore?: boolean };
+    const { schedule, autoRestore, source } = (req.body ?? {}) as { schedule?: string; autoRestore?: boolean; source?: string | null };
+    // a malformed request is the caller's (400); a refusal of a valid one is a conflict (409)
+    if (schedule !== undefined && schedule !== "off" && schedule !== "daily" && schedule !== "weekly") {
+      return reply.status(400).send({ error: 'schedule must be "off", "daily" or "weekly"' });
+    }
+    if (autoRestore !== undefined && typeof autoRestore !== "boolean") {
+      return reply.status(400).send({ error: "autoRestore must be true or false" });
+    }
+    if (source !== undefined && source !== null && typeof source !== "string") {
+      return reply.status(400).send({ error: "source must be a sentry key, or null for the automatic pick" });
+    }
     try {
-      if (schedule !== undefined || autoRestore !== undefined) {
+      if (schedule !== undefined || autoRestore !== undefined || source !== undefined) {
         if (schedule !== undefined) fleet.setDataBackupSchedule(launch, schedule);
-        if (autoRestore !== undefined) fleet.setAutoRestore(launch, Boolean(autoRestore));
-        return { schedule: fleet.dataBackupSchedule(launchId), autoRestore: autoRestore ?? null };
+        if (autoRestore !== undefined) fleet.setAutoRestore(launch, autoRestore);
+        if (source !== undefined) fleet.setDataBackupSource(launch, source);
+        return {
+          schedule: fleet.dataBackupSchedule(launchId),
+          autoRestore: autoRestoreEnabled(deps.db, launchId),
+          source: deps.db.getSetting(`data-backup-source:${launchId}`),
+        };
       }
       const started = fleet.requestDataBackup(launch);
       drive(launchId, JSON.parse(launch.spec_json));
       return { status: "data-backup-started", ...started };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.delete("/api/fleet/:launchId/data-backups/:name", async (req, reply) => {
+    const { launchId, name } = req.params as { launchId: string; name: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      await fleet.deleteDataBackup(launch, name);
+      return { status: "deleted", name };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }
@@ -1624,26 +1704,30 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   // Cloudflare token for DNS updates after a move (dns.ts). Launcher-wide;
   // the token itself is never sent back.
-  const dnsZones = (): string[] => {
+  // what the token reached when it was saved: zones, and whether it may
+  // edit origin rules (the sentry's public API/RPC ports)
+  const dnsReach = (): { zones: string[]; originRules: boolean } => {
     const raw = deps.db.getSetting("cloudflare-zones");
-    return raw ? (JSON.parse(raw) as string[]) : [];
+    const parsed = raw ? (JSON.parse(raw) as string[] | { zones: string[]; originRules: boolean }) : [];
+    return Array.isArray(parsed) ? { zones: parsed, originRules: false } : parsed;
   };
   app.get("/api/dns", async () => {
     const set = cloudflareToken(deps.workRoot) !== null;
-    return { cloudflare: set, zones: set ? dnsZones() : [] };
+    return { cloudflare: set, ...(set ? dnsReach() : { zones: [], originRules: false }) };
   });
   app.post("/api/dns", async (req, reply) => {
     const { token } = (req.body ?? {}) as { token?: string | null };
     if (!token) {
       setCloudflareToken(deps.workRoot, null);
       deps.db.deleteSetting("cloudflare-zones");
-      return { cloudflare: false, zones: [] };
+      return { cloudflare: false, zones: [], originRules: false };
     }
     const checked = await new CloudflareDns(() => token).check(token.trim());
     if (!checked.ok) return reply.status(400).send({ error: checked.reason });
     setCloudflareToken(deps.workRoot, token);
-    deps.db.setSetting("cloudflare-zones", JSON.stringify(checked.zones));
-    return { cloudflare: true, zones: checked.zones };
+    const reach = { zones: checked.zones, originRules: checked.originRules };
+    deps.db.setSetting("cloudflare-zones", JSON.stringify(reach));
+    return { cloudflare: true, ...reach };
   });
 
   // unattended recovery (unattended.ts): the wallet's grant to the
@@ -1697,11 +1781,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   // alert channels for incidents (incidents.ts): ntfy and/or a webhook.
   // Launcher-wide, like the rest of the System panel.
-  app.get("/api/alerts", async () => alertSettings(deps.db));
+  app.get("/api/alerts", async () => publicAlertSettings(deps.db));
   app.post("/api/alerts", async (req, reply) => {
     try {
       setAlertSettings(deps.db, (req.body ?? {}) as AlertSettings);
-      return alertSettings(deps.db);
+      return publicAlertSettings(deps.db);
     } catch (e) {
       return reply.status(400).send({ error: String(e instanceof Error ? e.message : e) });
     }

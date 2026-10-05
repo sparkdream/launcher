@@ -536,6 +536,36 @@ button.launch-row.summary .lbl { color: var(--dim2); font-style: italic; }
 
 /* ---------- fleet ---------- */
 .fleet-acts { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 22px 14px; align-items: center; }
+/* grouped fleet actions (design 2a): labeled groups, the danger zone apart on the right */
+.act-grid {
+  flex-basis: 100%; display: flex; gap: 28px; align-items: flex-start;
+  padding: 16px 0 6px; border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.act-groups { display: flex; flex-wrap: wrap; gap: 22px 28px; flex: 1; min-width: 0; }
+.act-group { display: flex; flex-direction: column; gap: 8px; }
+.act-label { font-size: 10.5px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--dim); }
+.act-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+/* a group none of whose actions applies here is not drawn */
+.act-group:has(> .act-btns:empty) { display: none; }
+.act-group.danger { flex: none; padding-left: 24px; border-left: 1px solid rgba(248, 113, 113, 0.18); }
+.act-group.danger .act-label { color: #f0a3a3; }
+.act-group.danger .act-btns { flex-direction: column; align-items: stretch; }
+@media (max-width: 720px) {
+  .act-grid { flex-direction: column; }
+  .act-group.danger { padding-left: 0; border-left: none; }
+}
+/* the fleet's collapsed widgets as pills: "Auto-recovery Off ›" */
+details.pill { border: none; background: none; padding: 0; margin: 0; }
+details.pill > summary {
+  list-style: none; display: inline-flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 99px;
+  border: 1px solid rgba(255, 255, 255, 0.08); color: var(--dim); font-size: 12px; cursor: pointer;
+}
+details.pill > summary::-webkit-details-marker { display: none; }
+details.pill > summary::after { content: "›"; }
+details.pill[open] > summary::after { content: "⌄"; }
+details.pill > summary:hover { color: var(--text); }
+details.pill > summary b { color: var(--text); font-weight: 600; }
+details.pill[open] > summary { border-color: rgba(109, 106, 248, 0.45); }
 .op-active { color: var(--amber-text); font-size: 12px; animation: dvpulse 1.4s infinite; display: inline-flex; gap: 8px; align-items: center; }
 /* an op that reports a real position says so with the bar; pulsing the text
    as well (the way an unmeasured op does) just makes the number hard to read */
@@ -596,9 +626,47 @@ button.launch-row.summary .lbl { color: var(--dim2); font-style: italic; }
    chevrons, which sit flush against the card's 22px padding */
 .fleet-row .chev { color: var(--dim2); font-size: 13px; justify-self: end; }
 .fleet-detail { padding: 2px 22px 16px 52px; }
-.fleet-detail .facts { display: flex; gap: 28px; font-size: 11.5px; color: var(--dim); flex-wrap: wrap; }
-.fleet-detail .facts .v { font-family: var(--font-mono); color: var(--mid); }
+/* the row's facts as a grid of labeled cells (design 2a): label above value,
+   Health, Escrow left, Lease dseq and Mesh IP first, long values two cells wide */
+/* cells are transparent over a light tint of the card's own surface, and
+   draw their dividers as a 1px outer shadow: a row the facts do not fill
+   ends in the same tint, never in a block of the divider color */
+.fleet-detail .facts {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0;
+  background: #101016; border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 10px; overflow: hidden;
+  font-size: 11px; color: var(--dim);
+}
+.fleet-detail .facts > span {
+  display: flex; flex-direction: column; gap: 4px; padding: 10px 13px; min-width: 0; order: 5;
+  /* each cell draws only its left and top divider (the container clips them at
+     the outer edge), so a row with an unfilled slot gets no line beside it */
+  box-shadow: -1px 0 0 rgba(255, 255, 255, 0.07), 0 -1px 0 rgba(255, 255, 255, 0.07);
+}
+.fleet-detail .facts > span.f-health { order: 1; }
+.fleet-detail .facts > span.f-escrow { order: 2; }
+.fleet-detail .facts > span.f-dseq { order: 3; }
+.fleet-detail .facts > span.f-mesh { order: 4; }
+.fleet-detail .facts > span.f-wide { grid-column: span 2; }
+.fleet-detail .facts > span.f-image { order: 8; }
+.fleet-detail .facts > span.f-provider { order: 9; }
+.fleet-detail .facts .v {
+  font-family: var(--font-mono); color: var(--text); font-size: 12.5px; overflow-wrap: anywhere;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.fleet-detail .facts .dim-note { font-size: 11px; }
+.fleet-detail .facts button.copy, .fleet-detail .facts .pref-tag {
+  padding: 2px 7px; border-radius: 5px; border: 1px solid rgba(255, 255, 255, 0.1); background: transparent;
+  color: var(--dim); font-size: 11px; cursor: pointer; font-family: inherit; align-self: flex-start;
+}
+.fleet-detail .facts button.copy:hover { color: var(--text); }
+@media (max-width: 900px) { .fleet-detail .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .fleet-detail .acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+/* grouped row actions: Operate, Lease, Deploy, Move provider; destructive ones apart */
+.fleet-detail .acts.grouped { gap: 24px; align-items: flex-end; margin-top: 16px; }
+.fleet-detail .acts.grouped .act-groups { gap: 16px 24px; }
+.fleet-detail .acts.grouped .act-label { font-size: 10.5px; }
+.act-group.move .act-label { color: #d9b56a; }
+.act-danger { flex: none; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; margin-left: auto; }
 .fleet-detail pre.logs {
   background: var(--field); border: 1px solid var(--line); border-radius: 10px;
   padding: 12px; margin: 12px 0 0; font-size: 11px; font-family: var(--font-mono);
@@ -767,3 +835,34 @@ button.launch-row.summary .lbl { color: var(--dim2); font-style: italic; }
 @media (max-width: 600px) {
   .rs-row { flex-direction: column; }
 }
+
+/* the chain backups dialog's running copy: no measured position, so a moving sliver */
+.bk-progress { display: block; height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.08); overflow: hidden; position: relative; }
+.bk-progress > span { position: absolute; top: 0; bottom: 0; width: 30%; background: #6d6af8; border-radius: 99px; animation: bkslide 1.6s ease-in-out infinite; }
+@keyframes bkslide { 0% { left: -30%; } 100% { left: 100%; } }
+
+/* chain backups dialog: per-backup delete */
+.bk-delete {
+  font-size: 11px; padding: 2px 8px; border-radius: 6px; cursor: pointer;
+  background: transparent; border: 1px solid rgba(248, 113, 113, 0.25); color: #f87171;
+}
+.bk-delete:hover:not(:disabled) { background: rgba(248, 113, 113, 0.1); }
+.bk-delete:disabled { opacity: 0.4; cursor: default; }
+
+/* dialogs (designs 1a-4a): close button and inline warnings */
+.dlg-x {
+  width: 30px; height: 30px; border-radius: 8px; border: none; background: transparent;
+  color: #9a9bab; font-size: 16px; cursor: pointer; flex: none;
+}
+.dlg-x:hover { background: rgba(255, 255, 255, 0.06); color: #ecedf2; }
+.dlg-warn {
+  display: flex; gap: 10px; padding: 10px 12px; border-radius: 9px; font-size: 12.5px; line-height: 1.45;
+  background: rgba(245, 199, 106, 0.06); border: 1px solid rgba(245, 199, 106, 0.25); color: #f5d08a;
+}
+.dlg-warn > b { flex: none; font-weight: 700; }
+.dlg-warn.red { background: rgba(248, 113, 113, 0.06); border-color: rgba(248, 113, 113, 0.3); color: #fca5a5; }
+.dlg-link {
+  background: none; border: none; padding: 0; font: inherit; color: #8f8dfa; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.dlg-link:hover { color: #b3b1fb; }

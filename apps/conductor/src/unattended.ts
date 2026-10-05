@@ -190,9 +190,13 @@ export function unattendedBlocker(args: {
     if (!g) return `no grant for ${m.typeUrl}`;
     if (g.expiration && Date.parse(g.expiration) <= now) return `the grant for ${m.typeUrl} expired`;
   }
+  // every deposit in the tx counts, summed: two creates each under the cap
+  // may still exceed it together
+  let total = args.spent;
   for (const d of depositsOf(args.msgs)) {
     if (d.denom !== args.settings.dailyCap.denom) return `a deposit in ${d.denom}, not the cap's ${args.settings.dailyCap.denom}`;
-    if (args.spent + d.amount > BigInt(args.settings.dailyCap.amount)) {
+    total += d.amount;
+    if (total > BigInt(args.settings.dailyCap.amount)) {
       return `the daily cap (${args.settings.dailyCap.amount}${d.denom}) would be exceeded`;
     }
   }

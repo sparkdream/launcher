@@ -472,7 +472,16 @@ export interface FleetSummary {
     dataBackups?: {
       schedule: "off" | "daily" | "weekly";
       autoRestore: boolean;
-      backups: Array<{ name: string; height: number; takenAt: string; from: string; blocker: string | null }>;
+      /** the chosen "copy from" sentry, null for the automatic pick */
+      source: string | null;
+      /** the sentry a backup started now would copy */
+      sourceNow: string | null;
+      /** verified: read back and unpacked after the upload (backups before 2026-10-05 never were) */
+      backups: Array<{ name: string; height: number; takenAt: string; from: string; verified: boolean; blocker: string | null }>;
+      /** no usable backup: what a moved or added node replays from block 1 */
+      scratchSync?: { blocks: number; blocksPerSecond: number; hours: number; reason: string };
+      /** age in days of the latest usable backup */
+      latestAgeDays?: number;
     };
     /** Which components recover on their own (off unless turned on). */
     autoRecover: AutoRecoverPolicy;
@@ -610,7 +619,7 @@ export async function postFleetAction(
     registrations?: "open" | "approved" | "none";
     walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
   } = {},
-): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; error?: string }> {
+): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; backupFirst?: boolean; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -618,7 +627,7 @@ export async function postFleetAction(
   });
   // 409 carries either pre-action warnings (confirmable) or a refusal error
   if (res.status === 409) {
-    return res.json() as Promise<{ warnings?: string[]; confirmPrompt?: string; error?: string }>;
+    return res.json() as Promise<{ warnings?: string[]; confirmPrompt?: string; backupFirst?: boolean; error?: string }>;
   }
   return json(res);
 }
@@ -728,7 +737,7 @@ export async function postDomainUpdate(
 /** Add a service component to a running fleet (add-component op). */
 export async function postAddComponent(
   launchId: string,
-  body: { key: string; domain?: string; image?: string; paths?: unknown[]; settings?: Record<string, unknown> },
+  body: { key: string; domain?: string; image?: string; paths?: unknown[]; settings?: Record<string, unknown>; manualBid?: boolean },
 ): Promise<{ status: string; opId: number }> {
   return json(
     await afetch(`/api/fleet/${launchId}/components`, {
@@ -827,8 +836,13 @@ export async function postGasPrice(launchId: string, minGasPrice: string): Promi
 
 /** Where incident alerts go (launcher-wide). */
 export interface AlertSettings {
-  ntfy?: { server: string; topic: string };
+  /** token: write-only (never returned); omit to keep the stored one, "" to remove it */
+  ntfy?: { server: string; topic: string; token?: string };
+  /** a second ntfy topic, used when `ntfy` does not take an alert */
+  ntfyFallback?: { server: string; topic: string };
   webhook?: string;
+  /** read side only: whether an ntfy access token is stored */
+  ntfyTokenSet?: boolean;
 }
 export async function getAlertSettings(): Promise<AlertSettings> {
   return json(await afetch("/api/alerts"));
@@ -847,10 +861,10 @@ export async function sendTestAlert(): Promise<{ failures: string[] }> {
 }
 
 /** Cloudflare token for DNS updates after a move (launcher-wide). */
-export async function getDnsSettings(): Promise<{ cloudflare: boolean; zones: string[] }> {
+export async function getDnsSettings(): Promise<{ cloudflare: boolean; zones: string[]; originRules: boolean }> {
   return json(await afetch("/api/dns"));
 }
-export async function saveCloudflareToken(token: string | null): Promise<{ cloudflare: boolean; zones: string[] }> {
+export async function saveCloudflareToken(token: string | null): Promise<{ cloudflare: boolean; zones: string[]; originRules: boolean }> {
   return json(
     await afetch("/api/dns", {
       method: "POST",
@@ -931,7 +945,7 @@ export async function postMeshBackup(
 /** Back up chain data now (no body), or change the schedule / automatic restore. */
 export async function postDataBackup(
   launchId: string,
-  settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+  settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean; source?: string | null } = {},
 ): Promise<{ status?: string; opId?: number; source?: string }> {
   return json(
     await afetch(`/api/fleet/${launchId}/data-backup`, {
@@ -940,6 +954,10 @@ export async function postDataBackup(
       body: JSON.stringify(settings),
     }),
   );
+}
+/** Delete a recorded chain-data backup from the bucket and the fleet's list. */
+export async function deleteDataBackup(launchId: string, name: string): Promise<{ status: string }> {
+  return json(await afetch(`/api/fleet/${launchId}/data-backups/${encodeURIComponent(name)}`, { method: "DELETE" }));
 }
 /** Replace a node's chain data with a recorded backup, in place. */
 export async function postDataRestore(launchId: string, key: string, name: string): Promise<{ opId: number }> {
@@ -953,15 +971,42 @@ export async function postDataRestore(launchId: string, key: string, name: strin
 }
 
 /** Add a sentry to a running chain fleet (add-sentry op). */
+/** What the fleet card's add dialog offers (conductor FleetService.addOptions). */
+export interface AddOptions {
+  kinds: Array<{
+    key: string;
+    label: string;
+    summary: string;
+    version?: string;
+    needsDomain: boolean;
+    lowUsd?: number;
+    highUsd?: number;
+    signatures: number;
+    steps: string[];
+  }>;
+  sentry?: {
+    name: string;
+    have: number;
+    signatures: number;
+    sizes: Array<{ id: "small" | "standard" | "large"; cpu: number; memory: string; data: string; lowUsd: number; highUsd: number }>;
+    steps: string[];
+    scratchSync?: { blocks: number; blocksPerSecond: number; hours: number; reason: string };
+  };
+}
+export async function getAddOptions(launchId: string): Promise<AddOptions> {
+  return json(await afetch(`/api/fleet/${launchId}/add-options`));
+}
+
 export async function postAddSentry(
   launchId: string,
   size?: "small" | "standard" | "large",
+  manualBid?: boolean,
 ): Promise<{ status: string; opId: number; key: string }> {
   return json(
     await afetch(`/api/fleet/${launchId}/add-sentry`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(size ? { size } : {}),
+      body: JSON.stringify({ ...(size ? { size } : {}), ...(manualBid ? { manualBid: true } : {}) }),
     }),
   );
 }
@@ -1125,6 +1170,28 @@ export interface NodeDisk {
   freeBytes: number;
   percentUsed: number;
   checkedAt: string;
+}
+
+/** A node's resources as the conductor deploys them (launch-spec RoleResources). */
+export interface NodeResources {
+  cpu: number;
+  memory: string;
+  storage: { root: string; data: string; persistent: boolean; class: string };
+}
+/** What the resize dialog shows (conductor FleetService.resizeOptions). */
+export interface ResizeOptions {
+  current: { size: "small" | "standard" | "large" | "custom"; resources: NodeResources };
+  sizes: Array<{ id: "small" | "standard" | "large"; resources: NodeResources; lowUsd: number; highUsd: number; tooSmall?: string }>;
+  disk: NodeDisk | null;
+  /** why no resize can start now (another op moving it, not active…) */
+  blocked?: string;
+  /** what the cutover risks, one short line each */
+  risks: string[];
+  /** a tmkms validator: the op pauses for the signer before and after the cutover */
+  tmkms: boolean;
+}
+export async function getResizeOptions(launchId: string, dseq: string): Promise<ResizeOptions> {
+  return json(await afetch(`/api/fleet/${launchId}/${dseq}/resize-options`));
 }
 
 export async function getComponentDisk(launchId: string, dseq: string): Promise<NodeDisk> {

@@ -174,6 +174,12 @@ export function renderNodeConfigs(input: RenderConfigsInput): void {
     config = setTomlLine(
       config, "unconditional_peer_ids", `unconditional_peer_ids = "${unconditional}"`,
     );
+    // Every mesh peer reaches a node from 127.0.0.1 (userspace tailscale
+    // delivers to localhost, and the validator's link is a local tunnel), so
+    // CometBFT's duplicate-IP filter would refuse all but the first: the
+    // template's false left a sentry with its validator link and nothing
+    // else, refusing a second sentry and a resize's staged copy.
+    config = setTomlLine(config, "allow_duplicate_ip", "allow_duplicate_ip = true", "p2p");
   } else {
     const sentries = topology.validatorSentries[node.index] ?? [];
     const sentryIds = sentries.map((s) => nodeIds[`sentry-${s}`]).join(",");

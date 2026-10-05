@@ -9,6 +9,7 @@ import { FleetService } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { dataBackups } from "../src/data-backup.js";
+import { setAlertSettings } from "../src/incidents.js";
 import { fakeServices, FakeSigner, type FakeWorld } from "./fakes.js";
 
 const tmpDirs: string[] = [];
@@ -104,6 +105,10 @@ describe("taking a chain-data backup", () => {
     const [record] = dataBackups(w.db, "fl");
     expect(record!.from).toBe("sentry-1");
     expect(record!.genesisSha).toMatch(/^[0-9a-f]{64}$/);
+    // read back and unpacked before it was recorded, with the upload's hash
+    expect(record!.verified).toBe(true);
+    expect(record!.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(w.services.ssh.files.get(`${id}|/tmp/sd-verify.age`)).toMatch(/^AGE-SECRET-KEY-/);
     expect([...w.services.ssh.s3Objects]).toEqual([`bk/sparkdream-launcher/sparkdream-1/chain-data/${record!.name}`]);
     // the secret reached the node only through the uploaded env file
     expect(w.services.ssh.execLog.some((e) => e.command.includes("s3cr3t"))).toBe(false);
@@ -184,6 +189,172 @@ describe("taking a chain-data backup", () => {
     expect(two.fleet.dataBackupDue("fl")).toBe(false);
     expect(two.fleet.dataBackupDue("fl", Date.now() + 25 * 3_600_000)).toBe(true);
   }, 240_000);
+
+  it("backs up again right after a node upgrade, not after a bridge one", async () => {
+    const w = await backedUp();
+    w.fleet.setDataBackupSchedule(w.db.getLaunch("fl")!, "daily");
+    expect(w.fleet.dataBackupDue("fl")).toBe(false);
+    const bridge = w.db.createFleetOp("fl", "upgrade", { components: ["bridge"] });
+    w.db.setFleetOpStatus(bridge, "done");
+    expect(w.fleet.dataBackupDue("fl")).toBe(false);
+    const nodes = w.db.createFleetOp("fl", "upgrade", { components: ["sentry-0", "sentry-1", "val-0"] });
+    w.db.setFleetOpStatus(nodes, "done");
+    expect(w.fleet.dataBackupDue("fl")).toBe(true);
+    w.fleet.requestDataBackup(w.db.getLaunch("fl")!, { auto: true });
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.fleet.dataBackupDue("fl")).toBe(false);
+  }, 300_000);
+
+  it("copies the chosen sentry, except a scheduled backup never takes sentry-0", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    expect(w.fleet.backupSourceFor("fl")!.key).toBe("sentry-1");
+    expect(() => w.fleet.setDataBackupSource(launch, "val-0")).toThrow(/not a sentry/);
+    w.fleet.setDataBackupSource(launch, "sentry-0");
+    expect(w.fleet.backupSourceFor("fl")!.key).toBe("sentry-0");
+    expect(w.fleet.backupSourceFor("fl", { auto: true })!.key).toBe("sentry-1");
+    w.fleet.setDataBackupSchedule(launch, "daily");
+    expect(w.fleet.dataBackupDue("fl")).toBe(true);
+    const { source } = w.fleet.requestDataBackup(launch);
+    expect(source).toBe("sentry-0");
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(dataBackups(w.db, "fl")[0]!.from).toBe("sentry-0");
+    w.fleet.setDataBackupSource(launch, null);
+    expect(w.fleet.backupSourceFor("fl")!.key).toBe("sentry-1");
+  }, 240_000);
+
+  it("keeps a rolling pair", async () => {
+    const w = await backedUp();
+    for (let i = 0; i < 2; i++) {
+      w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+      expect((await driveOps(w)).status).toBe("completed");
+      await new Promise((r) => setTimeout(r, 1100)); // names carry the second
+    }
+    expect(dataBackups(w.db, "fl")).toHaveLength(2);
+  }, 300_000);
+});
+
+describe("checking a backup after its upload", () => {
+  it("deletes a backup that does not read back and takes it again", async () => {
+    const w = await launched();
+    w.services.ssh.corruptUploads = 1;
+    const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    const records = dataBackups(w.db, "fl");
+    expect(records).toHaveLength(1);
+    expect(records[0]!.verified).toBe(true);
+    // only the good copy is left in the bucket, and the node was held twice
+    expect([...w.services.ssh.s3Objects]).toEqual([`bk/sparkdream-launcher/sparkdream-1/chain-data/${records[0]!.name}`]);
+    const id = sshId(w, "sentry-1");
+    expect(w.services.ssh.containerRestarts.get(id)).toBe(2);
+    expect(w.services.ssh.started.has(id)).toBe(true);
+  }, 240_000);
+
+  it("pauses after a second failure with what the hashes say, and records nothing", async () => {
+    const w = await launched();
+    w.services.ssh.corruptUploads = 2;
+    const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:verify`);
+    expect(parked.reason).toContain("different bytes than the node uploaded");
+    expect(dataBackups(w.db, "fl")).toEqual([]);
+    expect(w.services.ssh.s3Objects.size).toBe(0);
+    expect(w.services.ssh.started.has(sshId(w, "sentry-1"))).toBe(true);
+
+    // resume takes it again, and this copy is good
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(dataBackups(w.db, "fl")[0]!.verified).toBe(true);
+  }, 300_000);
+
+  it("blames the node when the bucket returns exactly what it uploaded", async () => {
+    const w = await launched();
+    w.services.ssh.corruptUploads = 2;
+    w.services.ssh.corruptInTransit = false;
+    w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    const parked = await driveOps(w);
+    expect(parked.reason).toContain("sentry-1 produced a broken stream");
+  }, 300_000);
+});
+
+describe("backups taken before verification", () => {
+  it("are not restored, and can be deleted from the bucket and the list", async () => {
+    const w = await backedUp();
+    // a record as the launcher kept them before 2026-10-05: no verified flag
+    const [good] = dataBackups(w.db, "fl");
+    const legacy = { ...good!, name: "data-20261004T231932Z-h216415.tar.zst.age" };
+    delete (legacy as { verified?: boolean }).verified;
+    const bucket = `bk/sparkdream-launcher/sparkdream-1/chain-data`;
+    w.services.ssh.s3Objects.add(`${bucket}/${legacy.name}`);
+    w.services.ssh.s3Objects.delete(`${bucket}/${good!.name}`);
+    w.db.setSetting("data-backups:fl", JSON.stringify([legacy]));
+
+    const view = (await w.fleet.fleetForOwner("akash1owner")).fleets.find((f) => f.launchId === "fl")!;
+    expect(view.dataBackups!.backups[0]).toMatchObject({ verified: false, blocker: expect.stringMatching(/never read back/) });
+    const v = row(w, "val-0");
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, v);
+    w.services.api.leaseStates.set(v.dseq, "closed");
+    w.services.ssh.failHosts.add(`${v.ssh_host}:${v.ssh_port}`);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.services.ssh.restoredFrom.size).toBe(0);
+
+    await w.fleet.deleteDataBackup(w.db.getLaunch("fl")!, legacy.name);
+    expect(dataBackups(w.db, "fl")).toEqual([]);
+    expect(w.services.ssh.s3Objects.size).toBe(0);
+    await expect(w.fleet.deleteDataBackup(w.db.getLaunch("fl")!, legacy.name)).rejects.toThrow(/no backup named/);
+  }, 300_000);
+
+  it("a bridge-only upgrade does not make a backup stale", async () => {
+    const w = await backedUp();
+    const opId = w.db.createFleetOp("fl", "upgrade", { components: ["bridge"] });
+    w.db.setFleetOpStatus(opId, "done");
+    const view = (await w.fleet.fleetForOwner("akash1owner")).fleets.find((f) => f.launchId === "fl")!;
+    expect(view.dataBackups!.backups[0]!.blocker).toBeNull();
+  }, 240_000);
+});
+
+describe("suggesting a backup before a long replay", () => {
+  it("warns a node move with nothing to restore, with an estimate, and stops once a backup exists", async () => {
+    const w = await launched();
+    const s1 = row(w, "sentry-1");
+    const warned = await w.fleet.scratchSyncWarnings(w.db.getLaunch("fl")!, "sentry-1");
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/No chain-data backup to start from \(this fleet has no chain-data backup\)/);
+    expect(warned[0]).toMatch(/blocks\/s/);
+    expect(warned[0]).toMatch(/chain backups… → Back up now/);
+    // service components never replay a chain
+    expect(await w.fleet.scratchSyncWarnings(w.db.getLaunch("fl")!, "explorer")).toEqual([]);
+    const view = (await w.fleet.fleetForOwner("akash1owner")).fleets.find((f) => f.launchId === "fl")!;
+    expect(view.dataBackups!.scratchSync!.blocks).toBeGreaterThan(0);
+
+    // the measured rate replaces the default in the estimate
+    w.db.setSetting("sync-rate:fl", "2.5");
+    (w.fleet as any).headCache.clear();
+    expect((await w.fleet.scratchSyncWarnings(w.db.getLaunch("fl")!, "sentry-1"))[0]).toMatch(/~2\.5 blocks\/s/);
+
+    w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(await w.fleet.scratchSyncWarnings(w.db.getLaunch("fl")!, "sentry-1")).toEqual([]);
+    const resize = (await w.fleet.nodeResizeWarnings(w.db.getLaunch("fl")!, s1, "large")).join(" ");
+    expect(resize).toMatch(/starts from the chain-data backup taken at height/);
+    const after = (await w.fleet.fleetForOwner("akash1owner")).fleets.find((f) => f.launchId === "fl")!;
+    expect(after.dataBackups!.scratchSync).toBeUndefined();
+    expect(after.dataBackups!.latestAgeDays).toBe(0);
+  }, 240_000);
+
+  it("alerts a fleet without a backup at most once a day", async () => {
+    const w = await launched();
+    const sent: string[] = [];
+    w.fleet.alertFetch = (async (_url: string, init: RequestInit) => {
+      sent.push(String((init.headers as Record<string, string>).Title));
+      return new Response("ok");
+    }) as typeof fetch;
+    setAlertSettings(w.db, { ntfy: { server: "https://ntfy.sh", topic: "t" } });
+    await w.fleet.backupStaleCheck("fl");
+    await w.fleet.backupStaleCheck("fl");
+    expect(sent.filter((t) => /no chain-data backup/.test(t))).toHaveLength(1);
+  }, 180_000);
 });
 
 describe("with secrets encrypted at rest (LAUNCHER_SECRET)", () => {

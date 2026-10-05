@@ -15,6 +15,7 @@ import type { Signer } from "../src/engine.js";
 import { templatePath } from "../src/vendor.js";
 import type { LocalSignerHost, MeshCli, TmkmsProcess } from "../src/local-signer.js";
 import type { AllowanceInfo, GrantInfo, UnattendedChain } from "../src/unattended.js";
+import { RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -285,6 +286,8 @@ export class FakeProviderGateway {
           // P2P is global on sentries (§5 "Public peering") — the source of
           // external_address and the join bundle's peer strings
           { host: ep.host, port: 26656, externalPort: ep.port + 20000 },
+          // sentry-0's public API (publicEndpoints.api): a forwarded port as well
+          { host: ep.host, port: 1317, externalPort: ep.port + 5000 },
           // gRPC only once a pushed manifest exposes it (a relayer's public
           // route to a sister fleet on another mesh)
           ...(this.lastManifest.get(dseq)?.includes('"port":9090')
@@ -634,6 +637,8 @@ export class FakeSsh {
   /** The bucket chain-data backups land in: bucket/prefix/name. */
   s3Objects = new Set<string>();
   backupFails = false;
+  /** Nodes whose config.toml still says allow_duplicate_ip = false (host:port). */
+  refusesDuplicateIp = new Set<string>();
   /** Backup/restore scripts die with their container on these nodes (/tmp emptied, no status). */
   scriptsDie = new Set<string>();
   /** Nodes whose container runs in wait mode (PID 1 is a tail). */
@@ -642,6 +647,14 @@ export class FakeSsh {
   stoppedScripts: string[] = [];
   backupStatus = new Map<string, string>();
   restoreStatus = new Map<string, string>();
+  verifyStatus = new Map<string, string>();
+  /** The next this-many backup uploads land corrupt in the bucket. */
+  corruptUploads = 0;
+  /** Corrupt objects: true = the bucket changed them (readback hash differs), false = the node uploaded them broken. */
+  corruptObjects = new Map<string, boolean>();
+  /** A corrupt upload happens in transit (readback hash differs) rather than on the node. */
+  corruptInTransit = true;
+  private readonly uploadSha = "a".repeat(64);
   /** node → the backup restored into it. */
   restoredFrom = new Map<string, string>();
   private envFile(id: string, file: string): Record<string, string> {
@@ -730,6 +743,10 @@ export class FakeSsh {
     this.execLog.push({ target: id, command });
     const ok = (stdout = ""): SshResult => ({ stdout, code: 0 });
 
+    // --- a sentry refusing several peers from one IP (acceptMeshPeers) ---
+    if (command.includes("^allow_duplicate_ip = true")) {
+      return ok(this.refusesDuplicateIp.delete(id) ? "changed" : "ok");
+    }
     // --- chain-data backups (data-backup.ts) and the entrypoint's hold ---
     if (command.includes("command -v $t")) return ok(this.backupToolsMissing);
     if (command.includes(".launcher-hold")) {
@@ -750,6 +767,7 @@ export class FakeSsh {
       // a new container: /tmp starts empty
       this.backupStatus.delete(id);
       this.restoreStatus.delete(id);
+      this.verifyStatus.delete(id);
       if (this.holds.has(id)) this.heldContainers.add(id);
       else this.started.add(id);
       return ok();
@@ -760,15 +778,41 @@ export class FakeSsh {
     // the PID 1 probe (restartNode, the hold) answers only for wait mode; other
     // nodes keep the default, which restartNode reads as "node is a child"
     if (command === "cat /proc/1/comm 2>/dev/null || true" && this.waitMode.has(id)) return ok("tail");
-    const script = /\/tmp\/(sd-backup|sd-restore)\.pid/.exec(command)?.[1];
+    const script = /\/tmp\/(sd-backup|sd-restore|sd-verify)\.pid/.exec(command)?.[1];
+    const statusOf = (name: string) =>
+      name === "sd-backup" ? this.backupStatus : name === "sd-verify" ? this.verifyStatus : this.restoreStatus;
     if (script && command.includes("kill -TERM --")) {
       this.stoppedScripts.push(`${id}|${script}`);
-      (script === "sd-backup" ? this.backupStatus : this.restoreStatus).set(id, "failed");
+      statusOf(script).set(id, "failed");
       return ok("stopped");
     }
     if (script && command.includes("kill -0")) {
-      const status = (script === "sd-backup" ? this.backupStatus : this.restoreStatus).get(id);
+      const status = statusOf(script).get(id);
       return ok(`${status || "none"} ${status === "running" ? "alive" : "dead"}`);
+    }
+    if (command.startsWith("rm -f /tmp/sd-backup.status")) {
+      this.backupStatus.delete(id);
+      this.verifyStatus.delete(id);
+      return ok();
+    }
+    if (command === "cat /tmp/sd-backup.sha 2>/dev/null || true") {
+      return ok(this.backupStatus.get(id) === "done" ? this.uploadSha : "");
+    }
+    if (command === "cat /tmp/sd-verify.readback 2>/dev/null || true") {
+      const env = this.envFile(id, "/tmp/sd-verify.env");
+      const changed = this.corruptObjects.get(`${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`);
+      return ok(changed ? "b".repeat(64) : this.uploadSha);
+    }
+    if (command.includes(". /tmp/sd-rm.env") && command.includes(" rm ")) {
+      const env = this.envFile(id, "/tmp/sd-rm.env");
+      this.s3Objects.delete(`${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`);
+      return ok("removed");
+    }
+    if (command.includes("bash /tmp/sd-verify.sh")) {
+      const env = this.envFile(id, "/tmp/sd-verify.env");
+      const object = `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`;
+      this.verifyStatus.set(id, this.s3Objects.has(object) && !this.corruptObjects.has(object) ? "done" : "failed");
+      return ok();
     }
     if (command.includes("bash /tmp/sd-backup.sh")) {
       const env = this.envFile(id, "/tmp/sd-backup.env");
@@ -776,7 +820,12 @@ export class FakeSsh {
       if (this.scriptsDie.has(id)) this.backupStatus.delete(id);
       else if (this.backupFails) this.backupStatus.set(id, "failed");
       else {
-        this.s3Objects.add(`${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`);
+        const object = `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`;
+        this.s3Objects.add(object);
+        if (this.corruptUploads > 0) {
+          this.corruptUploads--;
+          this.corruptObjects.set(object, this.corruptInTransit);
+        } else this.corruptObjects.delete(object);
         this.backupStatus.set(id, "done");
       }
       return ok();
@@ -817,7 +866,7 @@ export class FakeSsh {
         paths: Array<{ id: string; a: string; b: string; port: string; version: string }>;
       };
     if (command === "relayer-bringup --keys-only") return ok();
-    if (command === "relayer-fundcheck || true") {
+    if (command === RELAYER_FUNDCHECK) {
       return ok(
         JSON.stringify(
           manifest().chains.map((c) => {

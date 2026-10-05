@@ -403,7 +403,7 @@ infra:
     validator: { cpu: 1, memory: 8Gi,
                  storage: { root: 5Gi, data: 50Gi, persistent: true, class: beta3 } }
     sentry:    { cpu: 2, memory: 8Gi,
-                 storage: { root: 5Gi, data: 8Gi, persistent: true, class: beta3 } }
+                 storage: { root: 5Gi, data: 20Gi, persistent: true, class: beta3 } }
     # the data volume mounts at /root/.sparkdream (matches the source SDLs;
     # TS_STATE_DIR lives on it, so tailnet identity survives restarts).
     # persistent is required for validators and sentries
@@ -920,12 +920,17 @@ resumable and their provider decisions are explainable in the UI.
 `data-backup.ts`. Chain data goes to the mesh backup's bucket under
 `sparkdream-launcher/<chain-id>/chain-data/` (so the mesh backup is a
 prerequisite), as `data-<UTC time>-h<height>.tar.zst.age` plus a
-`latest.json`; the last 3 are kept. The node image must carry `s5cmd`,
+`latest.json`; a rolling pair is kept (the last 2, which with a daily
+schedule means today's and yesterday's, about 190 MB a day of growth each
+on devnet in 2026-10). The node image must carry `s5cmd`,
 `age`, `zstd` and the entrypoint's launcher hold (chain repo, 2026-10).
 
 - **Backup** (`data-backup` op, "chain backups…" → Back up now, or a daily /
   weekly schedule that only runs when a sentry other than sentry-0
-  exists): the source is the highest-numbered sentry other than sentry-0,
+  exists, and that also runs at once after a node upgrade, halt-upgrade or
+  reset, which leave no usable backup until the next one): the source is the sentry chosen under "copy from" in the dialog
+  (`data-backup-source:<launch>`; a schedule never takes a chosen sentry-0),
+  else the highest-numbered sentry other than sentry-0,
   else sentry-0 after a confirm (its public endpoints and the validator's
   link stop for the copy), never a validator. `hold` writes a deadline to
   `<home>/.launcher-hold` and restarts the container (`kill -TERM 1`, PID 1
@@ -935,9 +940,34 @@ prerequisite), as `data-<UTC time>-h<height>.tar.zst.age` plus a
   every 15 s during the copy) passes. `upload` streams
   `tar | zstd | age -r <fleet recipient> | s5cmd pipe` (2 x 32 MB parts in
   memory, nothing on disk), detached and polled; credentials reach the node
-  only in an uploaded env file the script deletes on start. `release`
-  removes the hold and waits for the node. A failed upload removes the hold
-  before it pauses, and a resumed one holds the node again before copying.
+  only in an uploaded env file the script deletes on start, and a `tee`
+  hashes exactly what was uploaded. `release` removes the hold and waits for
+  the node. A failed upload removes the hold before it pauses, and a resumed
+  one holds the node again before copying.
+- **Verify** (after `release`, the node serving again): the node reads the
+  object back and unpacks it to nowhere (`s5cmd cat | age -d | zstd -d |
+  tar -t`, every age chunk authenticated), with the age identity sent for the
+  check and deleted after. Only a backup that passes is recorded
+  (`verified: true` plus the upload's sha256) and becomes `latest.json`, and
+  only then are older ones pruned. One that fails is deleted from the bucket
+  and taken again once (`RerunFrom` hold/upload/release); a second failure
+  pauses the op with what the hashes say: the bucket returning different
+  bytes than the node uploaded (upload or storage at fault) or exactly the
+  same ones (the node produced a broken stream). Seen 2026-10-05: the first
+  live restore (add-sentry) found both devnet backups failing age
+  authentication mid-file, and the node silently replayed from block 1.
+  The objects were intact: `s5cmd cat` (v2.2.2) against 4everland ends a
+  download at a random point without an error (two reads of one intact
+  1.4 GB object stopped at 419 MB and 206 MB; `aws s3 cp` read it whole).
+  Verify and restore therefore read through `s3get` (`S3GET_FN`), curl with
+  `--aws-sigv4` fetching 64 MiB ranges, each length-checked and retried up to
+  6 times, the key passed on a pipe (`-K -`) rather than the command line, and
+  a missing or empty object refused (4everland can answer a missing key's
+  HEAD with length 0). Uploads still use `s5cmd pipe`, which round-trips
+  intact.
+- **Delete** (a backup's delete in the dialog, `DELETE
+  /api/fleet/:id/data-backups/:name`): removes the object through a running
+  sentry (`s5cmd rm`; the conductor has no S3 client) and drops the record.
 - **Detached scripts** (backup and restore): started under `setsid` with
   their pid and status in `/tmp`, so a script that died with its container
   reads as dead rather than "still running". The poll gives up on a failed
@@ -960,10 +990,26 @@ prerequisite), as `data-<UTC time>-h<height>.tar.zst.age` plus a
   copy is complete and no `sparkdreamd` is running (a held node's hold is
   renewed just before), the old directory goes to `data.old` first and
   comes back if the move fails or a killed run left it there.
-- **Never restored** (`restoreBlocker`): a backup taken on another genesis
+- **Suggested before a long replay** (`backupStanding`, `scratchSyncWarnings`):
+  with no usable backup (none, automatic restore off, or one blocked), a
+  node relaunch, resize or add says so in its confirm with an estimate (the
+  chain height over the fleet's last measured replay rate, which a resize's
+  sync records, else 5 blocks/s), and the relaunch and resize confirms first
+  offer to open chain backups… (`backupFirst`; the op is asked for again
+  after). The fleet card shows the same estimate with a chain backups…
+  button, and the monitor alerts at most once a day when a fleet with a
+  backup bucket has no usable backup or only one older than 7 days. Seen
+  2026-10-04: a devnet sentry resize replayed ~175k blocks for 8 hours that
+  a backup would have reduced to minutes; neither fleet had ever taken one
+  (a schedule needs a sentry other than sentry-0, and both had one).
+- **Never restored** (`restoreBlocker`): a backup that was never verified
+  (every backup before 2026-10-05; shown as "unverified"), one taken on another genesis
   (a reset keeps the chain id, so only the genesis hash tells the chains
-  apart), or before a completed upgrade, halt-upgrade or reset (the
-  running binary cannot replay the blocks up to the upgrade height).
+  apart), or before a completed node upgrade, halt-upgrade or reset (the
+  running binary cannot replay the blocks up to the upgrade height; an
+  upgrade of service components only, such as the bridge, does not count).
+  A new node starts from the newest backup none of these block
+  (`latestRestorable`).
 - **In-place restore** ("restore from backup…" on a node, `data-restore`
   op): hold, restore a chosen usable backup over the data directory (the
   hold renewed while it runs, and taken again on resume if it ran out),
@@ -992,25 +1038,38 @@ Three opt-in pieces turn an incident into a fix nobody has to start:
   grant made later picks them up). Anything else (a fee-bearing op, a
   missing grant, the cap reached) waits for Keplr as before.
 - **DNS** (System panel, "Recovery and alerts" in the settings menu;
-  launcher-wide Cloudflare API token with DNS Edit and Zone Read on the
-  fleets' zones, `dns.ts`; saving checks it the way updates use it, by
-  listing the zones it sees and reading one zone's records, since
-  `/user/tokens/verify` rejects account-owned tokens): the
-  relaunch `verify` step of service components, sentry-0's `public-dns` and
-  headscale's `dns` step point the record at the new ingress through the
-  API first (zone found by suffix; an existing CNAME is updated in place,
-  keeping its proxy setting; A/AAAA records are replaced, and put back if
-  the new CNAME cannot be written; a name holding any other record type
-  (MX, TXT, CAA...) is left to the operator; a new name is DNS only, since
-  headscale's DERP and STUN do not pass the proxy), then re-check for 3
-  minutes before pausing with the records to set.
+  launcher-wide Cloudflare API token with DNS Edit, Zone Read and Origin
+  ("Origin Rules") Edit on the fleets' zones, all zone-level permissions,
+  `dns.ts`; saving checks it the way updates use it, by listing the zones it
+  sees and reading one zone's records and its origin rules, since
+  `/user/tokens/verify` rejects account-owned tokens). Every step that
+  pauses for DNS tries the token first, then re-checks for 3 minutes before
+  pausing with the records to set (`dns-steps.ts`): launch-time
+  `deploy-headscale` and `verify-chain`, the relaunch and add-component
+  `verify` of service components, sentry-0's `public-dns` (relaunch and
+  resize), headscale's `dns` and the domain change's `verify`. Records: the
+  zone is found by suffix; an existing CNAME is updated in place, keeping
+  its proxy setting; A/AAAA records are replaced, and put back if the new
+  CNAME cannot be written; a name holding any other record type (MX, TXT,
+  CAA...) is left to the operator; a new name is proxied, like every fleet
+  domain (SSL Flexible: Cloudflare ends TLS, the ingress speaks HTTP).
+  The sentry's public API and RPC are forwarded ports (1317 and 26657
+  exposed globally), not the port-80 ingress: `pointOrigin` sets a CNAME to
+  the provider's host and an Origin Rule on that hostname rewriting the
+  destination port to the lease's forwarded port. An existing rule matching
+  exactly that one host (`http.host eq "h"`, `==`, or a one-element `in`
+  set; the operator's own included) gets the new port in place, otherwise
+  the launcher adds a rule of its own (creating the zone's origin ruleset if
+  needed); a wider rule that mentions the host is the operator's, and the
+  step pauses with the port to set.
 
 A relaunch can still pause for what only a person can do: a tmkms signer the
 launcher does not manage (repoint it), or DNS outside the token's zones.
 
 ### Adding a sentry to a running fleet (day-2)
 
-"add sentry…" on a chain fleet (`add-sentry` op, `add-sentry.ts`) bumps
+"add…" → sentry on a chain fleet (the fleet card's one add action, which also
+offers the service kinds; `add-sentry` op, `add-sentry.ts`) bumps
 `topology.sentries.count` (an explicit `mapping` gains an entry fronting
 validator `S mod V`), optionally records `infra.nodeSizes`, and runs:
 
@@ -1030,6 +1089,14 @@ validator `S mod V`), optionally records `infra.nodeSizes`, and runs:
    added: `wireMovedNode` appends it to the live peers instead of
    rewriting an old address, and the validator's peer line is rebuilt
    from the topology, which now lists it.
+
+A closed sentry is removed with the fleet card's **remove** (the same
+button closed service components have), for the highest-numbered sentry
+only and never sentry-0 (`removeSentry`): the spec counts one fewer, its
+size, row, node id, home, bundle and SDL go, the other homes' peer lists
+lose it (bundles re-packed), and the running nodes' persistent_peers and
+unconditional_peer_ids are edited over SSH (busybox awk), which they act on
+at their next restart. Nothing is signed: its deployment is already closed.
 
 Abandoning the op before the sentry is active undoes the request
 (`undoAddSentry`): the spec's `topology.sentries` and size go back, its row,
@@ -1072,7 +1139,46 @@ places a kind on a fleet that launched without it, or brings back a closed
 one: enable it in the stored spec and re-validate (a refusal changes
 nothing) → render its SDL and create the row → open what it needs on the
 sentries → the relaunch placement steps minus the close (fresh deployment,
-bids, lease, manifest, health gate: 2 signatures). Abandoning it closes its
+bids, lease, manifest, health gate: 2 signatures). The wallet's avoided
+providers are kept off as for a relaunch (add-sentry too); until 2026-10-04
+they were not, and an ntfy landed on a provider the wallet had avoided for
+its broken ingress. Every placement's lease step reads the wallet's avoid
+list as it stands when it runs (not only as it stood at the request), except
+the component's own current provider, which a resize may keep.
+
+**Broken provider ingress.** A provider can accept the lease and run the
+container while its ingress routes nothing: the domain answers 404 whatever
+DNS says. Every gate that probes a domain (launch-time `verify-chain` /
+`verify-services` for service components, the relaunch and add-component
+`verify`) now checks past DNS before pausing (`ingressVerdict`): when the
+lease reports the container ready and the provider's own generated hostname
+for it (plain HTTP on the ingress, no DNS or Cloudflare involved) does not
+serve the health path either, the provider is at fault. The placement then
+moves by itself: the provider goes on the wallet's avoid list, the
+deployment is closed (a signature, or the unattended grant for an
+auto-recovery op), and the placement steps run again from fresh bids
+through the engine's `RerunFrom` (a step names earlier steps to forget and
+the drive starts the plan over, done steps skipping), at most twice before
+it pauses with what it found. At launch this is the fleet card's re-place
+(send-manifests and everything after it, `replaceRerunSteps`). A container
+not yet ready, or no generated hostname, is never blamed on the provider.
+The monitor's provider probe reads the same: a public component whose
+provider does not serve its own hostname is `ingress-broken`, an incident
+whose fix is a relaunch, not a restart.
+
+The same move covers the other public placements (`replacePlacement` in
+fleet-ops, one helper for every op):
+- **sentry-0's API and RPC** are forwarded ports, so `forwardedVerdict`
+  tries `host:externalPort` directly and blames the provider only when the
+  node answers on its own localhost over SSH; sentry-0's relaunch then
+  re-runs from deploy to `public-dns`. A resize's `public-dns` only reports:
+  past its handover, the deployment is the node.
+- **headscale**: the relaunch's `dns` step (deploy to `dns` again) and the
+  launch's `deploy-headscale` gate (its own `replace-close` tx, since that
+  step drops any pending `deploy-headscale:close:<dseq>` on every pass while
+  the lease lives, which would discard the signature the close waits for).
+Every lease step reads the avoid list live (the op's params, then the
+wallet's), so a provider left mid-op is never picked again by the rerun. Abandoning it closes its
 row so it can be added again.
 
 The new deployment runs the current release. The images it runs, its own and
@@ -1878,8 +1984,23 @@ and one confirm dialog:
    not to one pass. A repair too expensive to state that plainly should
    report the problem and let the operator pick the op that fixes it.
 
-Today's passes all serve one failure, described below: a component's mesh
-address moved and the fleet kept dialling the old one.
+Most passes serve one failure, described below: a component's mesh
+address moved and the fleet kept dialling the old one. Two more:
+- **mesh-peers**: a sentry with `allow_duplicate_ip = false` gets `true`
+  and a restart (only the ones that change). Under userspace tailscale every
+  mesh peer reaches a node from 127.0.0.1, and the validator link is a local
+  tunnel too, so CometBFT's duplicate-IP filter refuses all but the first
+  peer, closing the rest before the handshake ("secret conn failed: EOF" on
+  the dialer). The sentry template said `false` until 2026-10-04, when
+  devnet's sentry-0 kept only its val-0 link and refused a second sentry and
+  a resize's staged copy. New sentries render with `true`, a relaunched or
+  added one is corrected after its bundle unpacks, and a resize's `sync`
+  step opens the sentries it syncs from (then restarts the staged node, so
+  it dials at once instead of waiting out CometBFT's redial backoff).
+- **dns**: with the launcher's Cloudflare token, every public domain that
+  does not answer is pointed at where its component runs now (CNAME, or
+  CNAME and Origin Rule for sentry-0's API and RPC); domains that answer are
+  left alone, so a record pointed elsewhere on purpose stays.
 
 #### Mesh addresses
 
@@ -2089,11 +2210,13 @@ per role:
 | tier | validator | sentry |
 |---|---|---|
 | small | 1 CPU, 4Gi, 20Gi data | 1 CPU, 4Gi, 10Gi data |
-| standard | 1 CPU, 8Gi, 50Gi data | 2 CPU, 8Gi, 8Gi data |
+| standard | 1 CPU, 8Gi, 50Gi data | 2 CPU, 8Gi, 20Gi data |
 | large | 2 CPU, 16Gi, 100Gi data | 4 CPU, 16Gi, 50Gi data |
 
 `standard` is exactly the profile default, so fleets launched before tiers
-existed read as standard. The resolved size of each node is
+existed read as standard, except sentries launched before the standard
+sentry's data volume went from 8Gi to 20Gi (2026-10-04): those read as
+`custom` until resized. The resolved size of each node is
 `infra.nodeSizes[key]`, else `infra.roleSizes[role]`, else the tier its
 role's `infra.resources` matches, else `custom` (hand-edited resources);
 `render-sdl` and the cost estimate read the per-node value
@@ -2476,7 +2599,16 @@ shows **release signer** instead). Adopting
 finds the running `tmkms start` process (`/proc`: binary, working directory,
 `-c` config), installs a systemd user unit `sparkdream-tmkms-<chain-id>-<key>`
 running the same binary and config with `Restart=always`, stops the
-hand-started process and starts the unit (seconds without signing). The
+hand-started process and starts the unit (seconds without signing). Before
+anything is stopped it refuses a binary or working directory that is not a
+usable path (a replaced binary reads `… (deleted)`, a process the SSH user
+cannot inspect shows none) and a user whose systemd would not outlive its
+sessions (no logind linger, enabled first where the user may; without it a
+user unit stops between the launcher's SSH commands). After the start, a
+second tmkms on the same config (a wrapper respawning the hand-started one)
+stops the launcher's unit again, so two never sign. `ExecStart` quotes and
+escapes its paths; the headscale auth key is redacted from a failed
+rejoin's error. The
 binding lives in the settings table (`local-signer:<launch>:<key>`), along
 with the Tailscale CLI that owns the machine's mesh address (on WSL with
 mirrored networking that is the Windows `tailscale.exe`). From then on the
@@ -2560,6 +2692,28 @@ the ordinary fleet action, signatures included) and the latest resolved
 ones under "recent outages". Confirmed incidents and their resolution are
 sent to the System panel's alert channels: an ntfy topic (`POST
 <server>/<topic>`, high priority for an outage) and/or a webhook (JSON).
+An ntfy access token (`tk_...`, sent as `Authorization: Bearer`) lets the
+launcher post to a self-hosted server that refuses anonymous writes; it is
+write-only in the API (the browser sees only `ntfyTokenSet`). A fallback
+ntfy topic (`ntfyFallback`, typically a long random one on ntfy.sh, never
+sent the token) takes an alert the main server refuses or cannot be
+reached for, which is exactly when the alerts server is the outage. The
+topic and webhook URL themselves are returned to every session on purpose:
+the launcher has no admin tier, and any session (an `OPERATOR_ADDRESSES`
+wallet) can already export the launcher's full backup.
+The **ntfy component** (`ntfy`, `components/ntfy.ts`, upstream
+`binwiederhier/ntfy`) is such a server, for a chain or services fleet. It is
+stateless: its users, topic access and the launcher's token are declared in
+env (`NTFY_AUTH_USERS/ACCESS/TOKENS`, deny-all by default), generated once
+into `secrets/ntfy.json` (the phone password, bcrypt hashes, a `tk_` token)
+so every render is the same and a relaunch on another provider keeps every
+login; only the 24 h message cache is lost. Its databases live in `/tmp`
+(the image has no `/var/cache/ntfy`, and ntfy will not create it). The phone
+app logs in as `topology.components.ntfy.user` (default `phone`, read-only
+on `topic`, default `sparkdream-alerts`); that login and its password show
+in the fleet's accounts panel. Its configure step (after launch, add and
+every relaunch) points the launcher's alerts at it, unless they already go
+to another server.
 
 ### Fleet bundle (management portability & DR)
 

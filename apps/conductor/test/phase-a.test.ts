@@ -212,6 +212,9 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
       `unconditional_peer_ids = "${keys.nodeIds["val-0"]},${keys.nodeIds["val-1"]},` +
         `${keys.nodeIds["sentry-0"]}"`,
     );
+    // every mesh peer arrives from 127.0.0.1: a sentry must take several
+    expect(sentry1).toContain("allow_duplicate_ip = true");
+    expect(sentry1).not.toContain("allow_duplicate_ip = false");
 
     const app = fs.readFileSync(path.join(dirs.node("sentry-0"), "config", "app.toml"), "utf8");
     expect(app).toContain('minimum-gas-prices = "0.025uspark.sparkdreamtest"');

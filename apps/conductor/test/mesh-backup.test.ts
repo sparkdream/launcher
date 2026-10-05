@@ -199,6 +199,41 @@ describe("turning on the mesh backup of a running fleet", () => {
   }, 120_000);
 });
 
+describe("a headscale relaunch onto a provider whose ingress serves nothing", () => {
+  it("moves again by itself and avoids that provider", async () => {
+    const relaunched = async (brokenHost?: string) => {
+      const w = world();
+      await launch(w, "fl", spec());
+      w.fleet.requestMeshBackup(w.db.getLaunch("fl")!, { ...STORAGE, secret: "s3cr3t" });
+      expect((await driveOps(w, "fl")).status).toBe("completed");
+      // DNS that works when pointed at an ingress that serves
+      w.services.dns = {
+        async pointCname(name, target) {
+          if (![...w.services.rpc.darkUrls].some((d) => target.includes(d))) w.services.rpc.darkUrls.delete(`${name}/health`);
+          return true;
+        },
+      };
+      const before = hsRow(w, "fl");
+      await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+      w.services.api.leaseStates.set(before.dseq, "closed");
+      if (brokenHost) {
+        w.services.rpc.darkUrls.add("headscale.sparkdream.io/health");
+        w.services.rpc.darkUrls.add(`fake.ingress.${brokenHost}`);
+      }
+      const res = await driveOps(w, "fl");
+      return { w, res, row: hsRow(w, "fl") };
+    };
+    const usual = await relaunched();
+    expect(usual.res.status).toBe("completed");
+    const brokenHost = new URL(usual.row.host_uri).hostname;
+    const moved = await relaunched(brokenHost);
+    expect(moved.res.reason ?? "").toBe("");
+    expect(moved.res.status).toBe("completed");
+    expect(moved.row.provider).not.toBe(usual.row.provider);
+    expect(moved.w.fleet.providerPrefs("akash1owner").avoid).toContain(usual.row.provider);
+  }, 300_000);
+});
+
 describe("a launch with backup configured", () => {
   it("uploads the static keys at launch time instead of stopping at a local archive", async () => {
     const w = world();

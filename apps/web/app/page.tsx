@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Children, Fragment, isValidElement, useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
 import {
@@ -395,6 +395,95 @@ function usePersistedState<T>(key: string, initial: T) {
   return [value, setValue] as const;
 }
 
+/** "40 minutes", "8.5 hours", "2 days". */
+function hoursText(hours: number): string {
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} minutes`;
+  if (hours < 48) return `${Math.round(hours * 10) / 10} hours`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+/** "sparkdreamnft/hermes:v1.0.48@sha256:8588a6…f00d": a long digest shortened, the rest as it is. */
+function shortImage(image: string): string {
+  const m = /^(.*@sha256:)([0-9a-f]{64})$/.exec(image);
+  return m ? `${m[1]}${m[2]!.slice(0, 6)}…${m[2]!.slice(-4)}` : image;
+}
+
+/** "akash1k8j8…9476uc8": a bech32 address shortened in the middle (copy takes the whole). */
+function shortAddress(address: string): string {
+  return address.length > 24 ? `${address.slice(0, 10)}…${address.slice(-7)}` : address;
+}
+
+/** A component row's actions, by intent (design 2a): the group of each by its label. */
+const ACTION_GROUPS: Array<{ id: string; title: string; match: RegExp }> = [
+  { id: "operate", title: "Operate", match: /^(restart|logs|upload|uploading|channels|shell|unjail|resume signing|manage signer|release signer|taking over|bridge peers|back up mesh)/ },
+  { id: "lease", title: "Lease", match: /^(top-up|top up|funds|relink)/ },
+  { id: "deploy", title: "Deploy", match: /^(upgrade|settings|sdl|force redeploy|resize|restore)/ },
+  { id: "move", title: "Move provider", match: /^relaunch/ },
+];
+/** Destructive ones, set apart on the right. */
+const ACTION_DANGER = /^(close|remove|reset data)/;
+
+/** The visible text of a rendered element (its label). */
+function nodeText(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (isValidElement(node)) return nodeText((node.props as { children?: ReactNode }).children);
+  return "";
+}
+
+/** Rendered children with fragments unwrapped and nothing-rendering ones dropped. */
+function flattenActions(children: ReactNode): ReactElement[] {
+  const out: ReactElement[] = [];
+  Children.toArray(children).forEach((child) => {
+    if (!isValidElement(child)) return;
+    if (child.type === Fragment) out.push(...flattenActions((child.props as { children?: ReactNode }).children));
+    else out.push(child);
+  });
+  return out;
+}
+
+/**
+ * Files a row's action buttons into labeled groups (Operate, Lease, Deploy,
+ * Move provider) with the destructive ones in a column of their own, from
+ * the buttons that actually render: each keeps its own condition, and a
+ * group with none is not drawn.
+ */
+function ActionGroups({ children }: { children: ReactNode }) {
+  const items = flattenActions(children).map((el, i) => ({ el, i, label: nodeText(el).trim().toLowerCase() }));
+  const danger = items.filter((x) => ACTION_DANGER.test(x.label));
+  const rest = items.filter((x) => !ACTION_DANGER.test(x.label));
+  const groups = ACTION_GROUPS.map((g) => ({ ...g, items: rest.filter((x) => g.match.test(x.label)) }));
+  // anything no group names joins Operate, so no action is ever lost
+  const named = new Set(groups.flatMap((g) => g.items.map((x) => x.i)));
+  groups[0]!.items.push(...rest.filter((x) => !named.has(x.i)));
+  return (
+    <div className="acts grouped">
+      <div className="act-groups">
+        {groups
+          .filter((g) => g.items.length > 0)
+          .map((g) => (
+            <div key={g.id} className={`act-group${g.id === "move" ? " move" : ""}`}>
+              <div className="act-label">{g.title}</div>
+              <div className="act-btns">
+                {g.items.map((x) => (
+                  <Fragment key={x.i}>{x.el}</Fragment>
+                ))}
+              </div>
+            </div>
+          ))}
+      </div>
+      {danger.length > 0 && (
+        <div className="act-danger">
+          {danger.map((x) => (
+            <Fragment key={x.i}>{x.el}</Fragment>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Page() {
   const [chain, setChain] = useState<ChainConfig>(DEFAULT_CHAIN);
   const [wallet, setWallet] = useState<ConnectedWallet | null>(null);
@@ -774,9 +863,32 @@ export default function Page() {
   // encrypted export and the merge-import
   // chain-data backups dialog (data-backup / data-restore ops), by launch id
   const [chainBackupsFor, setChainBackupsFor] = useState<string | null>(null);
+  // design 4a: the resize dialog (sizes from GET resize-options)
+  const [resizeFor, setResizeFor] = useState<{
+    launchId: string;
+    dseq: string;
+    key: string;
+    pick: "small" | "standard" | "large" | null;
+    opts?: import("../lib/api").ResizeOptions;
+    error?: string;
+  } | null>(null);
+  const openResize = async (launchId: string, dseq: string, key: string) => {
+    setResizeFor({ launchId, dseq, key, pick: null });
+    try {
+      const { getResizeOptions } = await import("../lib/api");
+      const opts = await getResizeOptions(launchId, dseq);
+      // the next size up that fits, else any other that fits
+      const order = ["small", "standard", "large"] as const;
+      const fits = opts.sizes.filter((z) => z.id !== opts.current.size && !z.tooSmall).map((z) => z.id);
+      const up = order.slice(order.indexOf(opts.current.size as (typeof order)[number]) + 1).find((z) => fits.includes(z));
+      setResizeFor((r) => (r && r.dseq === dseq ? { ...r, opts, pick: up ?? fits[fits.length - 1] ?? null } : r));
+    } catch (e) {
+      setResizeFor((r) => (r && r.dseq === dseq ? { ...r, error: String(e) } : r));
+    }
+  };
   const chainBackupAction = async (
     launchId: string,
-    settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+    settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean; source?: string | null } = {},
   ) => {
     setError(null);
     try {
@@ -789,6 +901,22 @@ export default function Page() {
       } else if (wallet) {
         setFleet(await getFleet(wallet.address));
       }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const removeChainBackup = async (launchId: string, b: { name: string; height: number; verified: boolean }) => {
+    const what = `the backup at height ${b.height.toLocaleString("en-US")}`;
+    const ask = b.verified
+      ? `Delete ${what} from the bucket? It passed its check and could still be restored.`
+      : `Delete ${what} from the bucket? It was never checked after its upload, so it may not restore anyway.`;
+    if (!window.confirm(ask)) return;
+    setError(null);
+    try {
+      const { deleteDataBackup, getFleet } = await import("../lib/api");
+      await deleteDataBackup(launchId, b.name);
+      showToast(`deleted ${what}`);
+      if (wallet) setFleet(await getFleet(wallet.address));
     } catch (e) {
       setError(String(e));
     }
@@ -827,6 +955,108 @@ export default function Page() {
     }
   };
   // headscale mesh backup form (mesh-backup op)
+  // the fleet card's add… dialog (design 1a): what to add, and how it is placed
+  const [addForm, setAddForm] = useState<{
+    launchId: string;
+    name: string;
+    /** the fleet's current USD/month, for the footer's "fleet after" */
+    fleetMonthly: number | null;
+    /** loaded from the conductor when the dialog opens */
+    options: import("../lib/api").AddOptions | null;
+    key: string;
+    pickerOpen: boolean;
+    /** lease a bid of the operator's choosing (the lease step parks with every bid) */
+    manualBid: boolean;
+    size: "small" | "standard" | "large";
+    domain: string;
+    bridgeTarget: string;
+    verifierWallet: string;
+  } | null>(null);
+  const [addBusy, setAddBusy] = useState(false);
+  /** Open the add dialog for a fleet, reading what it can add; `prefer` preselects a choice (the backups dialog's "add a second sentry"). */
+  const openAddDialog = (launchId: string, name: string, fleetMonthly: number | null, prefer?: string) => {
+    setAddForm({
+      launchId,
+      name,
+      fleetMonthly,
+      options: null,
+      key: "",
+      pickerOpen: false,
+      manualBid: false,
+      size: "standard",
+      domain: "",
+      bridgeTarget: "",
+      verifierWallet: "",
+    });
+    void import("../lib/api")
+      .then(({ getAddOptions }) => getAddOptions(launchId))
+      .then((options) =>
+        setAddForm((cur) => {
+          if (!cur || cur.launchId !== launchId) return cur;
+          const choices = [...(options.sentry ? ["sentry"] : []), ...options.kinds.map((k) => k.key)];
+          const key = prefer && choices.includes(prefer) ? prefer : (choices[0] ?? "");
+          return { ...cur, options, key };
+        }),
+      )
+      .catch((e) => {
+        setAddForm(null);
+        setError(String(e));
+      });
+  };
+  const submitAdd = async () => {
+    if (!addForm) return;
+    const { launchId, key, manualBid } = addForm;
+    setError(null);
+    setAddBusy(true);
+    try {
+      if (key === "sentry") {
+        const { postAddSentry } = await import("../lib/api");
+        const started = await postAddSentry(launchId, addForm.size, manualBid);
+        showToast(`adding ${started.key}: follow it in the Launch panel`);
+      } else {
+        if (!isComponentKey(key)) throw new Error(`"${key}" is not a component kind`);
+        // kinds with structured settings (the relayer's paths, mastodon's
+        // owner and bridge) take them from the spec editor, as the domains
+        // button takes domains; the bridge and verifier need one value each
+        let settings: Record<string, unknown> | undefined;
+        if (key === "relayer" || key === "mastodon" || key === "verifier" || key === "bridge") {
+          const edited = yaml.load(specText) as any;
+          settings = edited?.topology?.components?.[key];
+          if ((!settings || typeof settings !== "object") && key === "bridge" && addForm.bridgeTarget.trim()) {
+            settings = { enabled: true, target: { fleet: addForm.bridgeTarget.trim() } };
+          }
+          if ((!settings || typeof settings !== "object") && key === "verifier" && addForm.verifierWallet.trim()) {
+            settings = { enabled: true, wallet: addForm.verifierWallet.trim() };
+          }
+          if (!settings || typeof settings !== "object") {
+            throw new Error(
+              key === "bridge"
+                ? "name the Mastodon fleet to bridge to"
+                : key === "verifier"
+                  ? "give the verifier's member address"
+                  : `add topology.components.${key} in the spec editor first (see the example spec), then add the ${COMPONENT_KINDS[key].label}`,
+            );
+          }
+        }
+        const domain =
+          addForm.domain.trim() || (typeof settings?.domain === "string" ? (settings.domain as string) : undefined);
+        if (COMPONENT_KINDS[key].domain && !domain) throw new Error(`the ${COMPONENT_KINDS[key].label} needs a public domain`);
+        const { postAddComponent } = await import("../lib/api");
+        await postAddComponent(launchId, {
+          key,
+          ...(domain ? { domain } : {}),
+          ...(settings ? { settings } : {}),
+          ...(manualBid ? { manualBid: true } : {}),
+        });
+      }
+      setAddForm(null);
+      openLaunch(launchId); // surfaces the signing banner (and the bid list, when picking)
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setAddBusy(false);
+    }
+  };
   const [meshBackupForm, setMeshBackupForm] = useState<
     | (import("../lib/api").MeshBackupStorage & { launchId: string; network: string; secret: string; known: boolean })
     | null
@@ -884,9 +1114,11 @@ export default function Page() {
   // Cloudflare DNS token and the wallet's unattended recovery, loaded with the System panel
   const [dnsSet, setDnsSet] = useState<boolean | null>(null);
   const [dnsZones, setDnsZones] = useState<string[]>([]);
+  const [dnsOrigin, setDnsOrigin] = useState(false);
   const [dnsToken, setDnsToken] = useState("");
   const [unattended, setUnattended] = useState<import("../lib/api").UnattendedStatus | null>(null);
   const [unattendedCap, setUnattendedCap] = useState("");
+  const [unattendedSaving, setUnattendedSaving] = useState(false);
   const loadUnattended = useCallback(async (owner: string) => {
     try {
       const { getUnattended } = await import("../lib/api");
@@ -898,7 +1130,16 @@ export default function Page() {
     }
   }, []);
   // incident alert channels, loaded when the System panel opens
-  const [alertForm, setAlertForm] = useState<{ topic: string; server: string; webhook: string } | null>(null);
+  const [alertForm, setAlertForm] = useState<{
+    topic: string;
+    server: string;
+    webhook: string;
+    /** typed here only to replace the stored token; the stored one is never shown */
+    token: string;
+    tokenSet: boolean;
+    /** fallback ntfy topic (server: ntfy.sh unless given as https://server/topic) */
+    fallback: string;
+  } | null>(null);
   const [alertNote, setAlertNote] = useState<string | null>(null);
   useEffect(() => {
     if (!systemOpen) return;
@@ -910,14 +1151,22 @@ export default function Page() {
           topic: a.ntfy?.topic ?? "",
           server: a.ntfy?.server && a.ntfy.server !== "https://ntfy.sh" ? a.ntfy.server : "",
           webhook: a.webhook ?? "",
+          token: "",
+          tokenSet: Boolean(a.ntfyTokenSet),
+          fallback: a.ntfyFallback
+            ? a.ntfyFallback.server === "https://ntfy.sh"
+              ? a.ntfyFallback.topic
+              : `${a.ntfyFallback.server}/${a.ntfyFallback.topic}`
+            : "",
         }),
       )
-      .catch(() => setAlertForm({ topic: "", server: "", webhook: "" }));
+      .catch(() => setAlertForm({ topic: "", server: "", webhook: "", token: "", tokenSet: false, fallback: "" }));
     import("../lib/api")
       .then(({ getDnsSettings }) => getDnsSettings())
       .then((d) => {
         setDnsSet(d.cloudflare);
         setDnsZones(d.zones ?? []);
+        setDnsOrigin(Boolean(d.originRules));
       })
       .catch(() => setDnsSet(null));
     if (wallet) void loadUnattended(wallet.address);
@@ -1617,6 +1866,8 @@ export default function Page() {
       haltHeight?: number;
       manualBid?: boolean;
       size?: "small" | "standard" | "large";
+      /** already confirmed in a dialog (resize): skip the warnings round trip */
+      confirm?: boolean;
       peers?: string[];
       registrations?: "open" | "approved" | "none";
       walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
@@ -1630,6 +1881,20 @@ export default function Page() {
         return;
       }
       let result = first;
+      // no chain-data backup to start from: offer to take one first, since
+      // it turns hours of replay into minutes (the op is asked for again after)
+      if (first.backupFirst) {
+        const backUp = window.confirm(
+          `${action === "resize" ? "This resize" : "This move"} has no chain-data backup to start from, so the new node ` +
+            "replays the whole chain from its peers (see the estimate on the next screen).\n\n" +
+            "OK: take a backup first (opens chain backups…; run this again once it is done, it then starts from the backup).\n" +
+            "Cancel: go on without one.",
+        );
+        if (backUp) {
+          setChainBackupsFor(launchId);
+          return;
+        }
+      }
       if (first.warnings?.length) {
         const ok = window.confirm(
           `${first.warnings.join("\n\n")}\n\n${first.confirmPrompt ?? "Proceed anyway?"}`,
@@ -3067,94 +3332,730 @@ export default function Page() {
         </div>
       )}
 
-      {chainBackupsFor &&
+      {resizeFor &&
         (() => {
-          const f = fleet?.fleets.find((x) => x.launchId === chainBackupsFor);
-          const db = f?.dataBackups;
-          if (!f || !db) return null;
-          const sentries = f.components.filter((c) => c.key.startsWith("sentry-") && c.state === "active");
-          const spare = sentries.some((c) => c.key !== "sentry-0");
+          // design 4a: size cards, now vs. after, what the move does, cost change
+          const f = fleet?.fleets.find((x) => x.launchId === resizeFor.launchId);
+          const c = f?.components.find((x) => x.dseq === resizeFor.dseq);
+          if (!f || !c) return null;
+          const { opts, pick } = resizeFor;
+          const close = () => setResizeFor(null);
+          const gib = (v: string) => {
+            const m = /^(\d+(?:\.\d+)?)(Mi|Gi|Ti)$/.exec(v);
+            return m ? Number(m[1]) * (m[2] === "Mi" ? 1 / 1024 : m[2] === "Ti" ? 1024 : 1) : NaN;
+          };
+          const fmtGib = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(1)} GiB`;
+          const role = c.key.startsWith("val-") ? "Validator" : "Sentry node";
+          const now = opts?.current.resources;
+          const next = opts?.sizes.find((z) => z.id === pick);
+          const col = (a: number, b: number) => (a > b ? "#4ade80" : a < b ? "#f5d08a" : "#c9cad6");
+          const nowUsd = c.priceDenom === "uact" ? monthlyNum(c.price) : null;
+          const delta = next && nowUsd !== null ? next.lowUsd - nowUsd : null;
+          const usedGib = opts?.disk ? opts.disk.usedBytes / 2 ** 30 : null;
+          const shrinks = now && next && (gib(next.resources.storage.data) < gib(now.storage.data) || gib(next.resources.memory) < gib(now.memory));
+          const db = f.dataBackups;
+          const usable = db?.autoRestore ? db.backups.find((b) => !b.blocker) : undefined;
+          // what the old confirm said, folded into the design's own parts:
+          // the steps, one amber note, and a backup link in the replay step
+          const backupLink = (
+            <button
+              className="dlg-link"
+              onClick={() => {
+                close();
+                setChainBackupsFor(f.launchId);
+              }}
+            >
+              take a backup first
+            </button>
+          );
+          const steps: ReactNode[] = [
+            `A new ${pick ?? ""} deployment is created beside ${c.key}, on ${c.providerName} when it bids, else on another provider`,
+            usable ? (
+              `It starts from the chain-data backup at height ${usable.height.toLocaleString("en-US")} and syncs the rest while ${c.key} keeps running (both are billed until the handover)`
+            ) : db?.scratchSync ? (
+              <>
+                It replays all ~{db.scratchSync.blocks.toLocaleString("en-US")} blocks from the fleet&apos;s nodes, about {hoursText(db.scratchSync.hours)}, while {c.key} keeps
+                running and both are billed: {backupLink} to cut that to minutes
+              </>
+            ) : (
+              `It syncs the chain from the fleet's nodes while ${c.key} keeps running (both are billed until the handover)`
+            ),
+            c.key.startsWith("val-")
+              ? opts?.tmkms
+                ? `The op pauses with the new signer address for tmkms.toml, then again after the one-minute handover for you to restart tmkms: be at the signer for both`
+                : `It takes over ${c.key}'s node ID and signing state, so it cannot double-sign; about a minute offline`
+              : `It takes over ${c.key}'s node ID and public endpoints; about a minute offline`,
+            "The old deployment is closed and its deposit refunded; other fleet operations wait until then",
+          ];
+          const mono = "'JetBrains Mono', monospace";
+          const cell = { padding: "8px 12px", borderTop: "1px solid rgba(255,255,255,.06)" } as const;
+          const head = { padding: "8px 12px", background: "rgba(255,255,255,.025)", color: "#9a9bab" } as const;
           return (
-            <div className="modal-scrim" onClick={() => setChainBackupsFor(null)}>
-              <div className="modal" style={{ maxWidth: 620 }} onClick={(e) => e.stopPropagation()}>
-                <div className="k">Chain-data backups of {f.name}</div>
-                <p className="note">
-                  A sentry&apos;s whole data directory, encrypted with this fleet&apos;s key and streamed to the mesh
-                  backup&apos;s bucket (nothing is written to the node&apos;s disk). The sentry stops for the copy:{" "}
-                  {spare
-                    ? "a sentry other than sentry-0 is used, so the public endpoints stay up."
-                    : "this fleet has only sentry-0, so the public API/RPC and the validator's link go quiet for the copy (add a sentry to avoid that; schedules need one)."}{" "}
-                  The last {3} are kept.
-                </p>
-                {db.backups.length === 0 ? (
-                  <p className="note">No backups yet.</p>
-                ) : (
-                  <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
-                    {db.backups.map((b) => (
-                      <div key={b.name}>
-                        height {b.height} · {new Date(b.takenAt).toLocaleString()} · from {b.from}
-                        {b.blocker && <span style={{ color: "var(--amber-text)" }}> · not restorable: {b.blocker}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div style={{ display: "grid", gap: 8, marginTop: 12, fontSize: 13 }}>
-                  <label>
-                    schedule{" "}
-                    <select
-                      className="field"
-                      style={{ width: "auto", display: "inline-block" }}
-                      value={db.schedule}
-                      disabled={!spare && db.schedule === "off"}
-                      onChange={(e) =>
-                        void chainBackupAction(f.launchId, { schedule: e.target.value as "off" | "daily" | "weekly" })
-                      }
-                    >
-                      <option value="off">off</option>
-                      <option value="daily">daily</option>
-                      <option value="weekly">weekly</option>
-                    </select>
-                    {!spare && <span className="dim-note"> (needs a second sentry)</span>}
-                  </label>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={db.autoRestore}
-                      onChange={(e) => void chainBackupAction(f.launchId, { autoRestore: e.target.checked })}
-                    />{" "}
-                    relaunched and added nodes start from the latest usable backup
-                    <span className="dim-note">
-                      {" "}
-                      (off: they sync the whole chain from their peers; a backup from another genesis or from
-                      before an upgrade is never used either way)
+            <div className="modal-scrim" onClick={close}>
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{ width: 500, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)", overflowY: "auto", background: "#101016", border: "1px solid rgba(255,255,255,.1)", borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,.6)", color: "#ecedf2" }}
+              >
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, padding: "20px 22px 0" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                    <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 17 }}>Resize {c.key}</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#9a9bab" }}>
+                      {role} <span style={{ color: "#4a4b56" }}>·</span>{" "}
+                      <span style={{ fontFamily: mono, fontSize: 11.5, color: "#c9cad6" }}>{c.providerName}</span>
                     </span>
-                  </label>
+                  </div>
+                  <button onClick={close} aria-label="Close" className="dlg-x">✕</button>
                 </div>
-                <div className="actions" style={{ marginTop: 12 }}>
-                  <button
-                    className="btn primary small"
-                    onClick={() => {
-                      if (
-                        !spare &&
-                        !window.confirm(
-                          "Only sentry-0 can be copied: the public API/RPC and the validator's link to the chain stop " +
-                            "for the copy (minutes for a small chain, longer for a big one). Go ahead?",
-                        )
-                      )
-                        return;
-                      void chainBackupAction(f.launchId);
-                    }}
-                  >
-                    Back up now
-                  </button>
-                  <button className="btn" onClick={() => setChainBackupsFor(null)}>
-                    Close
-                  </button>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: "20px 22px" }}>
+                  {!opts && !resizeFor.error && <div style={{ fontSize: 12.5, color: "#9a9bab" }}>Reading {c.key}'s sizes and disk…</div>}
+                  {resizeFor.error && <div style={{ fontSize: 12.5, color: "#fca5a5" }}>{resizeFor.error}</div>}
+                  {opts && (
+                    <>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                          <span style={{ fontWeight: 600, color: "#c9cad6" }}>New size</span>
+                          <span style={{ display: "flex", alignItems: "center", gap: 6, color: "#9a9bab" }}>
+                            Current{" "}
+                            <span style={{ fontFamily: mono, fontSize: 11, color: "#f5d08a", background: "rgba(245,199,106,.08)", border: "1px solid rgba(245,199,106,.25)", padding: "1px 6px", borderRadius: 5 }}>
+                              {opts.current.size}
+                            </span>
+                          </span>
+                        </div>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                          {opts.sizes.map((z) => {
+                            const sel = z.id === pick;
+                            const current = z.id === opts.current.size;
+                            const off = current || !!z.tooSmall;
+                            return (
+                              <button
+                                key={z.id}
+                                disabled={off}
+                                title={current ? `${c.key} is ${z.id} now` : z.tooSmall}
+                                onClick={() => setResizeFor((r) => r && { ...r, pick: z.id })}
+                                style={{ display: "flex", flexDirection: "column", gap: 4, padding: "10px 11px", borderRadius: 9, border: `1px solid ${sel ? "rgba(109,106,248,.6)" : "rgba(255,255,255,.1)"}`, background: sel ? "rgba(109,106,248,.12)" : "#16161e", color: "#ecedf2", cursor: off ? "default" : "pointer", textAlign: "left", opacity: off ? 0.45 : 1 }}
+                              >
+                                <span style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                                  <span style={{ fontSize: 13, fontWeight: 600, textTransform: "capitalize" }}>{z.id}</span>
+                                  <span style={{ fontFamily: mono, fontSize: 11.5, color: "#c9cad6" }}>{current ? "now" : `$${z.lowUsd.toFixed(2)}`}</span>
+                                </span>
+                                <span style={{ display: "flex", flexDirection: "column", fontFamily: mono, fontSize: 10.5, color: "#9a9bab", lineHeight: 1.5 }}>
+                                  <span style={{ whiteSpace: "nowrap" }}>{z.resources.cpu} vCPU · {fmtGib(gib(z.resources.memory))}</span>
+                                  <span style={{ whiteSpace: "nowrap" }}>{fmtGib(gib(z.resources.storage.data))} disk</span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {now && next && (
+                        <div style={{ display: "grid", gridTemplateColumns: "72px repeat(3, minmax(0, 1fr))", border: "1px solid rgba(255,255,255,.08)", borderRadius: 10, overflow: "hidden", fontSize: 12 }}>
+                          <span style={{ ...head, color: "#7d7e8c" }} />
+                          <span style={head}>CPU</span>
+                          <span style={head}>Memory</span>
+                          <span style={head}>Data disk</span>
+                          <span style={{ ...cell, color: "#9a9bab" }}>Now</span>
+                          <span style={{ ...cell, fontFamily: mono, color: "#c9cad6" }}>{now.cpu} CPU</span>
+                          <span style={{ ...cell, fontFamily: mono, color: "#c9cad6" }}>{fmtGib(gib(now.memory))}</span>
+                          <span style={{ ...cell, fontFamily: mono, color: "#c9cad6" }}>
+                            {fmtGib(gib(now.storage.data))}
+                            <span
+                              style={{ display: "block", fontSize: 10.5, color: "#7d7e8c" }}
+                              title={usedGib === null ? `${c.key}'s disk could not be read, so whether a size fits its chain data was not checked` : undefined}
+                            >
+                              {usedGib !== null ? `${fmtGib(Math.round(usedGib * 10) / 10)} used` : "use unknown"}
+                            </span>
+                          </span>
+                          <span style={{ ...cell, color: "#9a9bab" }}>After</span>
+                          <span style={{ ...cell, fontFamily: mono, color: col(next.resources.cpu, now.cpu) }}>{next.resources.cpu} CPU</span>
+                          <span style={{ ...cell, fontFamily: mono, color: col(gib(next.resources.memory), gib(now.memory)) }}>{fmtGib(gib(next.resources.memory))}</span>
+                          <span style={{ ...cell, fontFamily: mono, color: col(gib(next.resources.storage.data), gib(now.storage.data)) }}>{fmtGib(gib(next.resources.storage.data))}</span>
+                        </div>
+                      )}
+
+                      {opts.blocked && (
+                        <div className="dlg-warn red">
+                          <b>!</b>
+                          <span>{opts.blocked}</span>
+                        </div>
+                      )}
+                      {!opts.blocked && !next && (
+                        <div className="dlg-warn">
+                          <b>!</b>
+                          <span>No other size fits: {c.key}'s chain data needs more room than the sizes it could move to.</span>
+                        </div>
+                      )}
+                      {!opts.blocked && next && (shrinks || opts.risks.length > 0) && (
+                        <div className="dlg-warn">
+                          <b>!</b>
+                          <span style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                            {shrinks && (
+                              <span>
+                                {gib(next.resources.storage.data) < gib(now!.storage.data)
+                                  ? `The data disk shrinks to ${fmtGib(gib(next.resources.storage.data))}` +
+                                    (usedGib !== null && opts.disk
+                                      ? `. ${c.key} uses ~${fmtGib(Math.round(usedGib * 10) / 10)} today (${fmtGib(Math.round((opts.disk.freeBytes / 2 ** 30) * 10) / 10)} free), so it has less room to grow.`
+                                      : ".")
+                                  : `Memory drops to ${fmtGib(gib(next.resources.memory))}: a busy node may run short.`}
+                              </span>
+                            )}
+                            {opts.risks.map((r) => (
+                              <span key={r}>{r}</span>
+                            ))}
+                          </span>
+                        </div>
+                      )}
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "12px 14px", background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.07)", borderRadius: 10 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: ".06em", textTransform: "uppercase", color: "#9a9bab" }}>What happens</div>
+                        {steps.map((t, i) => (
+                          <div key={i} style={{ display: "flex", gap: 10, fontSize: 12.5, lineHeight: 1.45, color: "#c9cad6" }}>
+                            <span style={{ flex: "none", width: 18, height: 18, borderRadius: 99, background: "rgba(109,106,248,.16)", color: "#b3b1fb", font: `600 10.5px ${mono}`, display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1 }}>{i + 1}</span>
+                            <span style={{ textWrap: "pretty" } as React.CSSProperties}>{t}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.02)", borderRadius: "0 0 14px 14px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 0 }}>
+                    {next && (
+                      <span style={{ fontFamily: mono, fontSize: 13, color: "#ecedf2" }}>
+                        {nowUsd !== null ? `$${nowUsd.toFixed(2)} → ` : ""}~${next.lowUsd.toFixed(2)}
+                        {delta !== null && (
+                          <span style={{ color: delta > 0 ? "#f5d08a" : "#4ade80" }}>
+                            {" "}({delta >= 0 ? "+" : "−"}${Math.abs(delta).toFixed(2)})
+                          </span>
+                        )}
+                      </span>
+                    )}
+                    <span style={{ fontSize: 11.5, color: "#9a9bab" }}>per month, est. · 4 signatures</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={close}
+                      style={{ padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.12)", background: "transparent", color: "#c9cad6", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      disabled={!next || !!opts?.blocked}
+                      onClick={() => {
+                        if (!pick) return;
+                        close();
+                        // the dialog is the confirmation: the conductor still refuses
+                        // what cannot go ahead (too small, another resize running)
+                        void fleetAction(f.launchId, c.dseq, "resize", { size: pick, confirm: true });
+                      }}
+                      style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: !next || opts?.blocked ? "#3d3c7a" : "#6d6af8", color: "#fff", fontSize: 13, fontWeight: 600, cursor: !next || opts?.blocked ? "default" : "pointer" }}
+                    >
+                      Resize{pick ? ` to ${pick}` : ""}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           );
         })()}
+
+      {chainBackupsFor &&
+        (() => {
+          // design 3a: the downtime risk up front, kept backups as a list,
+          // schedule and restore as real controls
+          const f = fleet?.fleets.find((x) => x.launchId === chainBackupsFor);
+          const db = f?.dataBackups;
+          if (!f || !db) return null;
+          const sentries = f.components.filter((c) => c.key.startsWith("sentry-") && c.state === "active");
+          const spare = sentries.some((c) => c.key !== "sentry-0");
+          const running = f.ops.find((o) => o.kind === "data-backup" && o.status === "active");
+          // the copy's source: the running op's, else the chosen sentry or the automatic pick
+          const source = (running?.params as { source?: string } | undefined)?.source ?? db.sourceNow ?? "sentry-0";
+          const latestUsable = db.backups.find((b) => !b.blocker)?.name;
+          const label = { fontSize: 12, fontWeight: 600, color: "#c9cad6" };
+          const footNote = running
+            ? source !== "sentry-0"
+              ? "sentry-0 keeps serving meanwhile"
+              : "API/RPC paused until the copy finishes"
+            : source !== "sentry-0"
+              ? `Copies from ${source}, no downtime`
+              : "sentry-0 will pause during the copy";
+          const schedulable = spare || db.schedule !== "off";
+          return (
+            <div className="modal-scrim" onClick={() => setChainBackupsFor(null)}>
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{ width: 560, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)", overflowY: "auto", background: "#101016", border: "1px solid rgba(255,255,255,.1)", borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,.6)", color: "#ecedf2" }}
+              >
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, padding: "20px 22px 0" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 17 }}>Chain-data backups</span>
+                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#c9cad6", background: "rgba(255,255,255,.06)", padding: "2px 7px", borderRadius: 5 }}>{f.name}</span>
+                    </div>
+                    <div style={{ fontSize: 12.5, lineHeight: 1.5, color: "#9a9bab" }}>
+                      A sentry&apos;s full data directory, encrypted with the fleet key and streamed to the mesh backup bucket.
+                      Nothing is written to the node&apos;s disk.
+                    </div>
+                  </div>
+                  <button
+                    aria-label="Close"
+                    onClick={() => setChainBackupsFor(null)}
+                    style={{ flex: "none", width: 30, height: 30, borderRadius: 8, border: "none", background: "transparent", color: "#9a9bab", fontSize: 16, cursor: "pointer" }}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: "18px 22px 20px" }}>
+                  {!spare && (
+                    <div style={{ display: "flex", gap: 12, padding: "12px 14px", background: "rgba(245,199,106,.06)", border: "1px solid rgba(245,199,106,.28)", borderRadius: 10 }}>
+                      <span style={{ flex: "none", width: 18, height: 18, borderRadius: 99, background: "rgba(245,199,106,.18)", color: "#f5d08a", font: "700 11px 'JetBrains Mono', monospace", display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1 }}>!</span>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "#f5d08a" }}>Backing up causes downtime</div>
+                        <div style={{ fontSize: 12.5, lineHeight: 1.5, color: "#e6dcc4" }}>
+                          sentry-0 stops while it copies. It&apos;s your only sentry, so the public API/RPC and the validator&apos;s link go quiet until it&apos;s done.
+                        </div>
+                        <button
+                          onClick={() => {
+                            setChainBackupsFor(null);
+                            openAddDialog(f.launchId, f.name, null, "sentry");
+                          }}
+                          style={{ alignSelf: "flex-start", padding: 0, border: "none", background: "none", color: "#8f8dfa", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
+                        >
+                          Add a second sentry to avoid this and enable schedules ›
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={label}>Kept backups</span>
+                      <span style={{ fontSize: 11.5, color: "#9a9bab" }}>last 2 are kept</span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", border: "1px solid rgba(255,255,255,.09)", borderRadius: 10, overflow: "hidden" }}>
+                      {running && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 7, padding: "10px 13px", background: "rgba(109,106,248,.07)", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: 99, background: "#8f8dfa" }} />
+                            <span style={{ fontSize: 12.5 }}>{running.progress?.label ?? `backing up from ${(running.params as { source?: string }).source ?? source}`}</span>
+                            <span style={{ flex: 1 }} />
+                            {running.progress?.elapsedSeconds !== undefined && (
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#b3b1fb" }}>
+                                {Math.round(running.progress.elapsedSeconds / 60)} min
+                              </span>
+                            )}
+                          </div>
+                          <span className="bk-progress"><span /></span>
+                        </div>
+                      )}
+                      {db.backups.length === 0 && !running && (
+                        <div style={{ padding: "10px 13px", fontSize: 12.5, color: "#9a9bab" }}>No backups yet.</div>
+                      )}
+                      {db.backups.map((b) => {
+                        const latest = b.name === latestUsable;
+                        const tag = !b.verified ? "unverified" : b.blocker ? "not restorable" : latest ? "latest" : "usable";
+                        return (
+                          <div
+                            key={b.name}
+                            title={b.blocker ?? b.name}
+                            style={{ display: "grid", gridTemplateColumns: "120px minmax(0,1fr) auto auto", alignItems: "center", gap: 12, padding: "10px 13px", borderBottom: "1px solid rgba(255,255,255,.06)" }}
+                          >
+                            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: b.blocker ? "#7d7e8c" : latest ? "#ecedf2" : "#c9cad6" }}>
+                              {b.height.toLocaleString("en-US")}
+                            </span>
+                            <span style={{ fontSize: 12, color: "#9a9bab" }}>
+                              {new Date(b.takenAt).toLocaleString()} · from {b.from}
+                            </span>
+                            <span
+                              style={{
+                                fontSize: 11,
+                                fontWeight: 600,
+                                padding: "2px 8px",
+                                borderRadius: 99,
+                                color: !b.verified ? "#fbbf24" : b.blocker ? "#9a9bab" : latest ? "#4ade80" : "#c9cad6",
+                                background: !b.verified ? "rgba(251,191,36,.1)" : b.blocker ? "rgba(255,255,255,.04)" : latest ? "rgba(74,222,128,.1)" : "rgba(255,255,255,.07)",
+                              }}
+                            >
+                              {tag}
+                            </span>
+                            <button
+                              className="bk-delete"
+                              title={`Delete ${b.name} from the bucket`}
+                              disabled={!!running}
+                              onClick={() => void removeChainBackup(f.launchId, b)}
+                            >
+                              delete
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {sentries.length > 1 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                        <span style={label}>Copy from</span>
+                        <span style={{ fontSize: 11.5, color: "#9a9bab" }}>
+                          {db.source === "sentry-0" ? "scheduled backups still skip sentry-0" : "the sentry pauses during the copy"}
+                        </span>
+                      </div>
+                      <div
+                        style={{ display: "grid", gridTemplateColumns: `repeat(${sentries.length + 1}, minmax(0, 1fr))`, gap: 2, padding: 3, background: "#16161e", border: "1px solid rgba(255,255,255,.1)", borderRadius: 9, opacity: running ? 0.45 : 1 }}
+                      >
+                        {[null, ...sentries.map((c) => c.key).sort((a, b) => Number(a.split("-")[1]) - Number(b.split("-")[1]))].map((k) => {
+                          const on = db.source === k;
+                          return (
+                            <button
+                              key={k ?? "auto"}
+                              disabled={!!running || on}
+                              title={
+                                k === null
+                                  ? `The highest-numbered sentry other than sentry-0 (now ${db.sourceNow ?? "none"})`
+                                  : k === "sentry-0"
+                                    ? "sentry-0 serves the public API/RPC: they pause while it is copied"
+                                    : `Copy ${k}; sentry-0 keeps serving`
+                              }
+                              onClick={() => void chainBackupAction(f.launchId, { source: k })}
+                              style={{ padding: "7px 0", borderRadius: 6, border: "none", background: on ? "rgba(109,106,248,.22)" : "transparent", color: on ? "#ecedf2" : "#9a9bab", fontSize: 12.5, fontWeight: 500, cursor: !running && !on ? "pointer" : "default", fontFamily: k ? "'JetBrains Mono', monospace" : undefined }}
+                            >
+                              {k ?? "Automatic"}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={label}>Schedule</span>
+                      {!spare && <span style={{ fontSize: 11.5, color: "#9a9bab" }}>needs a second sentry</span>}
+                    </div>
+                    <div
+                      style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 2, padding: 3, background: "#16161e", border: "1px solid rgba(255,255,255,.1)", borderRadius: 9, opacity: schedulable ? 1 : 0.45 }}
+                    >
+                      {(["off", "daily", "weekly"] as const).map((v) => {
+                        const on = db.schedule === v;
+                        return (
+                          <button
+                            key={v}
+                            disabled={!schedulable || on}
+                            onClick={() => void chainBackupAction(f.launchId, { schedule: v })}
+                            style={{ padding: "7px 0", borderRadius: 6, border: "none", background: on ? "rgba(109,106,248,.22)" : "transparent", color: on ? "#ecedf2" : "#9a9bab", fontSize: 12.5, fontWeight: 500, cursor: schedulable && !on ? "pointer" : "default", textTransform: "capitalize" }}
+                          >
+                            {v}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <button
+                    role="switch"
+                    aria-checked={db.autoRestore}
+                    onClick={() => void chainBackupAction(f.launchId, { autoRestore: !db.autoRestore })}
+                    style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "12px 14px", background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 10, color: "#ecedf2", cursor: "pointer", textAlign: "left" }}
+                  >
+                    <span style={{ flex: "none", width: 32, height: 18, borderRadius: 99, background: db.autoRestore ? "#6d6af8" : "rgba(255,255,255,.18)", display: "flex", alignItems: "center", padding: 2, boxSizing: "border-box", justifyContent: db.autoRestore ? "flex-end" : "flex-start", marginTop: 1 }}>
+                      <span style={{ width: 14, height: 14, borderRadius: 99, background: "#fff" }} />
+                    </span>
+                    <span style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>New nodes start from the latest usable backup</span>
+                      <span style={{ fontSize: 12, lineHeight: 1.5, color: "#9a9bab" }}>
+                        Applies to relaunched and added nodes. Off: they sync the whole chain from peers. An unverified backup, or one from another genesis or from before a node upgrade, is never used.
+                      </span>
+                    </span>
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.02)", borderRadius: "0 0 14px 14px" }}>
+                  <span style={{ fontSize: 12, color: source !== "sentry-0" ? "#9a9bab" : "#f5d08a", flex: 1, minWidth: 0 }}>{footNote}</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => setChainBackupsFor(null)}
+                      style={{ padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.12)", background: "transparent", color: "#c9cad6", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+                    >
+                      Close
+                    </button>
+                    <button
+                      disabled={Boolean(running)}
+                      onClick={() => void chainBackupAction(f.launchId)}
+                      style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: running ? "#3d3c7a" : "#6d6af8", color: "#fff", fontSize: 13, fontWeight: 600, cursor: running ? "default" : "pointer" }}
+                    >
+                      {running ? "Backing up…" : source !== "sentry-0" ? "Back up now" : "Back up now, pause sentry-0"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+      {addForm && (() => {
+        const o = addForm.options;
+        const isSentry = addForm.key === "sentry";
+        const kind = o?.kinds.find((k) => k.key === addForm.key);
+        const size = o?.sentry?.sizes.find((z) => z.id === addForm.size);
+        const low = isSentry ? size?.lowUsd : kind?.lowUsd;
+        const high = isSentry ? size?.highUsd : kind?.highUsd;
+        const name = isSentry ? (o?.sentry?.name ?? "sentry") : addForm.key;
+        const usd = (n: number) => `$${n.toFixed(2)}`;
+        const range = (lo?: number, hi?: number) => (lo !== undefined && hi !== undefined ? `${usd(lo)}–${usd(hi)}` : "—");
+        const steps = isSentry ? (o?.sentry?.steps ?? []) : (kind?.steps ?? []);
+        const signatures = isSentry ? (o?.sentry?.signatures ?? 3) : (kind?.signatures ?? 2);
+        const choice = (k: string) =>
+          k === "sentry"
+            ? { label: "Sentry node", summary: "Public peer in front of the validator", count: `${o?.sentry?.have ?? 0} in fleet` }
+            : (() => {
+                const kk = o?.kinds.find((x) => x.key === k);
+                return { label: kk?.label ?? k, summary: kk?.summary ?? "", count: "not in fleet" };
+              })();
+        const cur = addForm.key ? choice(addForm.key) : null;
+        const sel = (on: boolean) => ({
+          background: on ? "rgba(109,106,248,.12)" : "#16161e",
+          border: `1px solid ${on ? "rgba(109,106,248,.6)" : "rgba(255,255,255,.1)"}`,
+        });
+        const field = {
+          padding: "9px 12px",
+          background: "#16161e",
+          border: "1px solid rgba(255,255,255,.12)",
+          borderRadius: 9,
+          color: "#ecedf2",
+          fontSize: 13,
+          outline: "none",
+          width: "100%",
+          boxSizing: "border-box" as const,
+        };
+        const label = { fontSize: 12, fontWeight: 600, color: "#c9cad6" };
+        return (
+          <div className="modal-scrim" onClick={() => !addBusy && setAddForm(null)}>
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                width: 500,
+                maxWidth: "calc(100vw - 32px)",
+                maxHeight: "calc(100vh - 32px)",
+                overflowY: "auto",
+                background: "#101016",
+                border: "1px solid rgba(255,255,255,.1)",
+                borderRadius: 14,
+                boxShadow: "0 24px 64px rgba(0,0,0,.6)",
+                position: "relative",
+                color: "#ecedf2",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, padding: "20px 22px 0" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 17 }}>Add component</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#9a9bab" }}>
+                    to fleet{" "}
+                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#c9cad6", background: "rgba(255,255,255,.06)", padding: "2px 7px", borderRadius: 5 }}>
+                      {addForm.name}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  aria-label="Close"
+                  disabled={addBusy}
+                  onClick={() => setAddForm(null)}
+                  style={{ width: 30, height: 30, borderRadius: 8, border: "1px solid transparent", background: "transparent", color: "#9a9bab", fontSize: 16, cursor: "pointer" }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              {!o ? (
+                <div style={{ padding: "26px 22px", fontSize: 12.5, color: "#9a9bab" }}>Reading what this fleet can add…</div>
+              ) : !cur ? (
+                <div style={{ padding: "26px 22px", fontSize: 12.5, color: "#9a9bab" }}>Nothing left to add to this fleet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: "20px 22px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7, position: "relative" }}>
+                    <div style={label}>Component</div>
+                    <button
+                      onClick={() => setAddForm({ ...addForm, pickerOpen: !addForm.pickerOpen })}
+                      style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, width: "100%", padding: "10px 12px", background: "#16161e", border: "1px solid rgba(255,255,255,.12)", borderRadius: 9, color: "#ecedf2", cursor: "pointer", textAlign: "left" }}
+                    >
+                      <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        <span style={{ fontSize: 13.5, fontWeight: 600 }}>{cur.label}</span>
+                        <span style={{ fontSize: 12, color: "#9a9bab" }}>{cur.summary}</span>
+                      </span>
+                      <span style={{ color: "#9a9bab", fontSize: 11 }}>▾</span>
+                    </button>
+                    {addForm.pickerOpen && (
+                      <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 6, zIndex: 5, background: "#16161e", border: "1px solid rgba(255,255,255,.14)", borderRadius: 10, boxShadow: "0 16px 40px rgba(0,0,0,.6)", padding: 5, display: "flex", flexDirection: "column", gap: 2 }}>
+                        {[...(o.sentry ? ["sentry"] : []), ...o.kinds.map((k) => k.key)].map((k) => {
+                          const c = choice(k);
+                          return (
+                            <button
+                              key={k}
+                              onClick={() => setAddForm({ ...addForm, key: k, pickerOpen: false })}
+                              style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 10px", borderRadius: 7, border: "none", background: k === addForm.key ? "rgba(109,106,248,.12)" : "transparent", color: "#ecedf2", cursor: "pointer", textAlign: "left" }}
+                            >
+                              <span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                <span style={{ fontSize: 13, fontWeight: 600 }}>{c.label}</span>
+                                <span style={{ fontSize: 11.5, color: "#9a9bab" }}>{c.summary}</span>
+                              </span>
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#9a9bab", whiteSpace: "nowrap" }}>{c.count}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                      <span style={label}>Name</span>
+                      <span style={{ color: "#7d7e8c" }}>{isSentry ? "auto-numbered" : "one per fleet"}</span>
+                    </div>
+                    <input readOnly value={name} style={{ ...field, fontFamily: "'JetBrains Mono', monospace", color: "#c9cad6" }} />
+                  </div>
+
+                  {!isSentry && kind?.needsDomain && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      <div style={label}>Public domain</div>
+                      <input
+                        placeholder="e.g. ntfy.example.com (blank: the spec editor's)"
+                        value={addForm.domain}
+                        onChange={(e) => setAddForm({ ...addForm, domain: e.target.value })}
+                        style={field}
+                      />
+                    </div>
+                  )}
+                  {addForm.key === "bridge" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      <div style={label}>Mastodon fleet</div>
+                      <input
+                        placeholder="network name or launch id (blank: the spec editor's)"
+                        value={addForm.bridgeTarget}
+                        onChange={(e) => setAddForm({ ...addForm, bridgeTarget: e.target.value })}
+                        style={field}
+                      />
+                    </div>
+                  )}
+                  {addForm.key === "verifier" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      <div style={label}>Verifier member</div>
+                      <input
+                        placeholder="address, ESTABLISHED or above (blank: the spec editor's)"
+                        value={addForm.verifierWallet}
+                        onChange={(e) => setAddForm({ ...addForm, verifierWallet: e.target.value })}
+                        style={field}
+                      />
+                    </div>
+                  )}
+                  {(addForm.key === "relayer" || addForm.key === "mastodon") && (
+                    <div style={{ fontSize: 12, color: "#9a9bab" }}>
+                      Its settings come from topology.components.{addForm.key} in the spec editor.
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "12px 14px", background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.07)", borderRadius: 10 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: ".06em", textTransform: "uppercase", color: "#9a9bab" }}>What happens</div>
+                    {steps.map((text, i) => (
+                      <div key={i} style={{ display: "flex", gap: 10, fontSize: 12.5, lineHeight: 1.45, color: "#c9cad6" }}>
+                        <span style={{ flex: "none", width: 18, height: 18, borderRadius: 99, background: "rgba(109,106,248,.16)", color: "#b3b1fb", font: "600 10.5px 'JetBrains Mono', monospace", display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1 }}>
+                          {i + 1}
+                        </span>
+                        <span style={{ textWrap: "pretty" } as React.CSSProperties}>{text}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {isSentry && o.sentry && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                      <div style={label}>Size</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                        {o.sentry.sizes.map((z) => (
+                          <button
+                            key={z.id}
+                            onClick={() => setAddForm({ ...addForm, size: z.id })}
+                            style={{ display: "flex", flexDirection: "column", gap: 4, padding: "10px 11px", borderRadius: 9, color: "#ecedf2", cursor: "pointer", textAlign: "left", ...sel(z.id === addForm.size) }}
+                          >
+                            <span style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 6 }}>
+                              <span style={{ fontSize: 13, fontWeight: 600, textTransform: "capitalize" }}>{z.id}</span>
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#c9cad6" }}>{usd(z.lowUsd)}</span>
+                            </span>
+                            <span style={{ display: "flex", flexDirection: "column", fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: "#9a9bab", lineHeight: 1.5 }}>
+                              <span style={{ whiteSpace: "nowrap" }}>
+                                {z.cpu} vCPU · {z.memory.replace("Gi", " GiB")}
+                              </span>
+                              <span style={{ whiteSpace: "nowrap" }}>{z.data.replace("Gi", " GiB")} disk</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    <div style={label}>Provider</div>
+                    {(
+                      [
+                        [false, "Let the launcher pick", "Leases the best bid your selection policy accepts (audit, uptime, price cap, avoid list) right away."],
+                        [true, "Choose the bid myself", "Pauses in the Launch panel with every bid received until you pick one."],
+                      ] as const
+                    ).map(([manual, title, desc]) => {
+                      const on = addForm.manualBid === manual;
+                      return (
+                        <button
+                          key={title}
+                          onClick={() => setAddForm({ ...addForm, manualBid: manual })}
+                          style={{ display: "flex", gap: 11, alignItems: "flex-start", padding: "10px 12px", borderRadius: 9, color: "#ecedf2", cursor: "pointer", textAlign: "left", ...sel(on) }}
+                        >
+                          <span style={{ flex: "none", width: 16, height: 16, borderRadius: 99, border: `1.5px solid ${on ? "#6d6af8" : "rgba(255,255,255,.3)"}`, display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1 }}>
+                            {on && <span style={{ width: 8, height: 8, borderRadius: 99, background: "#6d6af8" }} />}
+                          </span>
+                          <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                            <span style={{ fontSize: 13, fontWeight: 600 }}>{title}</span>
+                            <span style={{ fontSize: 12, color: "#9a9bab", lineHeight: 1.45 }}>{desc}</span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.02)", borderRadius: "0 0 14px 14px" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 0 }}>
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>
+                    +{range(low, high)}/mo<span style={{ color: "#9a9bab" }}> est.</span>
+                  </span>
+                  <span style={{ fontSize: 11.5, color: "#9a9bab" }}>
+                    {addForm.fleetMonthly !== null && low !== undefined
+                      ? `fleet $${addForm.fleetMonthly.toFixed(2)} → ~$${(addForm.fleetMonthly + low).toFixed(2)}/mo · `
+                      : ""}
+                    1 lease + deposit · {signatures} signatures
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    disabled={addBusy}
+                    onClick={() => setAddForm(null)}
+                    style={{ padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.12)", background: "transparent", color: "#c9cad6", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    disabled={addBusy || !cur}
+                    onClick={() => void submitAdd()}
+                    style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: "#6d6af8", color: "#fff", fontSize: 13, fontWeight: 600, cursor: addBusy || !cur ? "default" : "pointer", opacity: addBusy || !cur ? 0.6 : 1 }}
+                  >
+                    {addBusy ? "Starting…" : `Add ${name}`}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {meshBackupForm && (
         <div className="modal-scrim" onClick={() => !meshBackupBusy && setMeshBackupForm(null)}>
@@ -3336,7 +4237,8 @@ export default function Page() {
                 <div className="sys-desc">
                   Where the launcher tells you a component went down (after about two minutes of
                   failed checks) and when it is back, with the fix it suggests. ntfy.sh is free:
-                  install its app, subscribe to a topic name only you know, and enter it here. A
+                  install its app, subscribe to a topic name only you know, and enter it here. On
+                  your own ntfy server with logins, add the launcher user&apos;s access token. A
                   webhook gets the same alerts as JSON.
                 </div>
                 {alertForm && (
@@ -3355,6 +4257,23 @@ export default function Page() {
                     />
                     <input
                       className="field"
+                      type="password"
+                      placeholder={
+                        alertForm.tokenSet
+                          ? "ntfy access token is set (type to replace)"
+                          : "ntfy access token tk_... (self-hosted server with logins)"
+                      }
+                      value={alertForm.token}
+                      onChange={(e) => setAlertForm({ ...alertForm, token: e.target.value })}
+                    />
+                    <input
+                      className="field"
+                      placeholder="fallback ntfy topic on ntfy.sh, used when your server is down (or https://server/topic)"
+                      value={alertForm.fallback}
+                      onChange={(e) => setAlertForm({ ...alertForm, fallback: e.target.value })}
+                    />
+                    <input
+                      className="field"
                       placeholder="webhook URL (optional)"
                       value={alertForm.webhook}
                       onChange={(e) => setAlertForm({ ...alertForm, webhook: e.target.value })}
@@ -3369,12 +4288,29 @@ export default function Page() {
                       setError(null);
                       try {
                         const { saveAlertSettings } = await import("../lib/api");
-                        await saveAlertSettings({
+                        const saved = await saveAlertSettings({
                           ...(alertForm.topic.trim()
-                            ? { ntfy: { topic: alertForm.topic.trim(), server: alertForm.server.trim() } }
+                            ? {
+                                ntfy: {
+                                  topic: alertForm.topic.trim(),
+                                  server: alertForm.server.trim(),
+                                  // blank keeps the stored token
+                                  ...(alertForm.token.trim() ? { token: alertForm.token.trim() } : {}),
+                                },
+                              }
+                            : {}),
+                          ...(alertForm.fallback.trim()
+                            ? {
+                                ntfyFallback: (() => {
+                                  const f = alertForm.fallback.trim().replace(/\/+$/, "");
+                                  const m = /^(https?:\/\/.+)\/([^/]+)$/.exec(f);
+                                  return m ? { server: m[1]!, topic: m[2]! } : { server: "https://ntfy.sh", topic: f };
+                                })(),
+                              }
                             : {}),
                           ...(alertForm.webhook.trim() ? { webhook: alertForm.webhook.trim() } : {}),
                         });
+                        setAlertForm({ ...alertForm, token: "", tokenSet: Boolean(saved.ntfyTokenSet) });
                         setAlertNote("saved");
                       } catch (e) {
                         setError(String(e));
@@ -3405,10 +4341,13 @@ export default function Page() {
                 <div className="f-label">Cloudflare DNS</div>
                 <div className="sys-desc">
                   When a move puts a component on another provider, its domains have to point at the new
-                  ingress. With a Cloudflare API token (DNS Edit and Zone Read on the zones your fleets use;
-                  free plans include them) the launcher updates the records itself instead of pausing for you.{" "}
+                  ingress. With a Cloudflare API token (DNS Edit, Zone Read and Origin Rules Edit on the zones
+                  your fleets use; free plans include them) the launcher sets the records, and the origin rules
+                  that send the sentry&apos;s public API and RPC to their ports, instead of pausing for you.{" "}
                   {dnsSet === true
-                    ? `A token is set${dnsZones.length > 0 ? `; it reaches ${dnsZones.join(", ")}` : ""}.`
+                    ? `A token is set${dnsZones.length > 0 ? `; it reaches ${dnsZones.join(", ")}` : ""}${
+                        dnsOrigin ? " and can edit origin rules." : ", but not origin rules: the public API and RPC still pause for you."
+                      }`
                     : dnsSet === false
                       ? "No token is set."
                       : ""}
@@ -3432,6 +4371,7 @@ export default function Page() {
                         const saved = await saveCloudflareToken(dnsToken.trim());
                         setDnsSet(saved.cloudflare);
                         setDnsZones(saved.zones ?? []);
+                        setDnsOrigin(Boolean(saved.originRules));
                         setDnsToken("");
                       } catch (e) {
                         setError(String(e));
@@ -3498,13 +4438,23 @@ export default function Page() {
                       <input
                         type="checkbox"
                         checked={unattended.settings.enabled}
+                        disabled={unattendedSaving}
                         onChange={async (e) => {
+                          // shown at once: a controlled box otherwise snaps back
+                          // until the reload answers, and reads as "did nothing"
+                          const enabled = e.target.checked;
+                          const before = unattended;
+                          setUnattended({ ...unattended, settings: { ...unattended.settings, enabled } });
+                          setUnattendedSaving(true);
                           try {
                             const { saveUnattended } = await import("../lib/api");
-                            await saveUnattended(wallet.address, { enabled: e.target.checked });
+                            await saveUnattended(wallet.address, { enabled });
                             await loadUnattended(wallet.address);
                           } catch (err) {
-                            setError(String(err));
+                            setUnattended(before);
+                            setError(`could not ${enabled ? "turn on" : "turn off"} unattended signing: ${String(err)}`);
+                          } finally {
+                            setUnattendedSaving(false);
                           }
                         }}
                       />{" "}
@@ -4346,496 +5296,419 @@ export default function Page() {
 
                 {actsOpen && (
                   <div className="fleet-acts">
-                    {!shutDown && (
-                      <>
-                        {chainFleet && (
-                          <button
-                            className="btn"
-                            onClick={() => {
-                              const feeNote =
-                                fee && fee.upgradeFlat > 0
-                                  ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
-                                  : "";
-                              // node fleet only — prefill with a current node image so
-                              // the expected ns/repo:tag format is obvious
-                              const nodes = f.components.filter(
-                                (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
-                              );
-                              const node = nodes[0];
-                              const image = window.prompt(
-                                `New sparkdreamd image for validators + sentries:${feeNote}`,
-                                node?.image ?? undefined,
-                              );
-                              // skip only when the whole node fleet already runs the
-                              // image — after an aborted mid-upgrade the fleet is mixed
-                              // and re-running with the same tag is the retry path
-                              if (image && node && nodes.some((c) => c.image !== image))
-                                fleetAction(f.launchId, node.dseq, "upgrade", { image });
-                            }}
-                          >
-                            rolling upgrade…
-                          </button>
-                        )}
-                        {chainFleet && (
-                          <button
-                            className="btn"
-                            onClick={async () => {
-                              const feeNote =
-                                fee && fee.upgradeFlat > 0
-                                  ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
-                                  : "";
-                              // prefill with a current node image, as the rolling
-                              // prompt does: the expected ns/repo:tag shape is
-                              // then obvious, and a tag typed from memory cannot
-                              // quietly disagree with what the fleet runs
-                              const nodes = f.components.filter(
-                                (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
-                              );
-                              const image = window.prompt(
-                                `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
-                                nodes[0]?.image ?? undefined,
-                              );
-                              // an unedited prefill on a fleet already running it
-                              // would halt consensus to install what is installed;
-                              // a mixed fleet is the aborted-upgrade retry path
-                              if (!image || !nodes.some((c) => c.image !== image)) return;
-                              const h = window.prompt("Halt height:");
-                              const first = f.components.find(
-                                (c) => c.state === "active" && c.key !== "headscale",
-                              );
-                              if (h && first) {
-                                const { postFleetAction: post } = await import("../lib/api");
-                                await post(f.launchId, first.dseq, "halt-upgrade", {
-                                  image,
-                                  haltHeight: Number(h),
-                                }).catch((e) => setError(String(e)));
-                                openLaunch(f.launchId);
-                              }
-                            }}
-                          >
-                            halt-height upgrade…
-                          </button>
-                        )}
-                        {(() => {
-                          const addable = COMPONENT_KEYS.filter(
-                            (k) =>
-                              // a services fleet runs chain-independent kinds only
-                              (chainFleet || SERVICES_FLEET_COMPONENTS.includes(k)) &&
-                              !f.components.some((c) => c.key === k && c.state !== "closed"),
-                          );
-                          if (addable.length === 0) return null;
-                          return (
-                            <button
-                              className="btn"
-                              title={`Deploy a service component beside this chain (${addable
-                                .map((k) => COMPONENT_KINDS[k].label)
-                                .join(", ")}): one deployment and one lease signature`}
-                              onClick={async () => {
-                                const key =
-                                  addable.length === 1
-                                    ? addable[0]!
-                                    : window.prompt(`Component to add (${addable.join(", ")}):`, addable[0])?.trim();
-                                if (!key) return;
-                                if (!isComponentKey(key) || !addable.includes(key)) {
-                                  setError(`"${key}" is not one of: ${addable.join(", ")}`);
-                                  return;
-                                }
-                                // kinds with structured settings (the relayer's paths,
-                                // mastodon's owner and bridge) take them from the spec
-                                // editor, as the domains button takes domains
-                                const structured =
-                                  key === "relayer" || key === "mastodon" || key === "verifier" || key === "bridge";
-                                let settings: Record<string, unknown> | undefined;
-                                if (structured) {
-                                  const edited = yaml.load(specText) as any;
-                                  settings = edited?.topology?.components?.[key];
-                                  if ((!settings || typeof settings !== "object") && key === "bridge") {
-                                    // the one thing it needs: the fleet whose Mastodon it links
-                                    const target = window
-                                      .prompt(
-                                        "Mastodon fleet to bridge to this chain (its network name or launch id, typically your services fleet). " +
-                                          "The bridge's account there is named after this network (bridgedev, bridgetest, or bridge on mainnet):",
-                                      )
-                                      ?.trim();
-                                    if (!target) return;
-                                    settings = { enabled: true, target: { fleet: target } };
-                                  }
-                                  if ((!settings || typeof settings !== "object") && key === "verifier") {
-                                    // the common case needs one value: the member it acts as,
-                                    // whose wallet signs the bond and the session grant
-                                    const wallet = window
-                                      .prompt(
-                                        "Verifier member address (ESTABLISHED or above on this chain, not the bridge operator). " +
-                                          "Your wallet signs its 500 DREAM bond and the daemon's session key; its key never leaves the wallet:",
-                                      )
-                                      ?.trim();
-                                    if (!wallet) return;
-                                    settings = { enabled: true, wallet };
-                                  }
-                                  if (!settings || typeof settings !== "object") {
-                                    setError(
-                                      `add topology.components.${key} in the spec editor first (see the example spec), then add the ${COMPONENT_KINDS[key].label}`,
-                                    );
-                                    return;
-                                  }
-                                }
-                                let domain = typeof settings?.domain === "string" ? (settings.domain as string) : undefined;
-                                if (COMPONENT_KINDS[key].domain && !domain) {
-                                  domain = window.prompt(`Public domain for the ${COMPONENT_KINDS[key].label}:`)?.trim();
-                                  if (!domain) return;
-                                }
-                                try {
-                                  const { postAddComponent } = await import("../lib/api");
-                                  await postAddComponent(f.launchId, {
-                                    key,
-                                    ...(domain ? { domain } : {}),
-                                    ...(settings ? { settings } : {}),
-                                  });
-                                  openLaunch(f.launchId); // surfaces the signing banner
-                                } catch (e) {
-                                  setError(String(e));
-                                }
-                              }}
-                            >
-                              add component…
-                            </button>
-                          );
-                        })()}
-                        <button
-                          className="btn"
-                          title="Apply the domains from the spec editor to this fleet: one deployment-update signature, then repoint DNS"
-                          onClick={async () => {
-                            try {
-                              // the spec editor is the source of truth: diff its
-                              // domains against the fleet's stored spec and apply
-                              const edited = yaml.load(specText) as any;
-                              const ec = edited?.topology?.components ?? {};
-                              const ep = edited?.topology?.publicEndpoints ?? {};
-                              const cur = (await getLaunch(f.launchId)).spec as any;
-                              const cc = cur?.topology?.components ?? {};
-                              const cp = cur?.topology?.publicEndpoints ?? {};
-                              const changes: Record<string, string> = {};
-                              if (ec.explorer?.domain && ec.explorer.domain !== cc.explorer?.domain)
-                                changes.explorer = ec.explorer.domain;
-                              if (ec.explorer?.route && ec.explorer.route !== cc.explorer?.route)
-                                changes.explorerRoute = ec.explorer.route;
-                              if (ec.frontend?.domain && ec.frontend.domain !== cc.frontend?.domain)
-                                changes.frontend = ec.frontend.domain;
-                              if (ep?.api && ep.api !== cp?.api) changes.api = ep.api;
-                              if (ep?.rpc && ep.rpc !== cp?.rpc) changes.rpc = ep.rpc;
-                              if (Object.keys(changes).length === 0) {
-                                setError(
-                                  "no domain changes: the spec editor's domains match this fleet, edit the spec first",
-                                );
-                                return;
-                              }
-                              const { postDomainUpdate } = await import("../lib/api");
-                              await postDomainUpdate(f.launchId, changes);
-                              openLaunch(f.launchId); // surfaces the signing banner
-                            } catch (e) {
-                              setError(String(e));
-                            }
-                          }}
-                        >
-                          update domains…
-                        </button>
-                      </>
-                    )}
-                    <button
-                      className="btn"
-                      onClick={async () => {
-                        const { downloadFleetBundle } = await import("../lib/api");
-                        await downloadFleetBundle(f.launchId).catch((e) => setError(String(e)));
-                      }}
-                    >
-                      export fleet bundle
-                    </button>
-                    {chainFleet && (
-                      <button
-                        className="btn"
-                        onClick={async () => {
-                          const { downloadGenesis } = await import("../lib/api");
-                          await downloadGenesis(f.launchId, f.chainId).catch((e) =>
-                            setError(String(e)),
-                          );
-                        }}
-                      >
-                        download genesis
-                      </button>
-                    )}
-                    {chainFleet && (
-                      <button
-                        className="btn"
-                        title="Public join document for third-party operators (genesis sha256, sentry peer strings, state-sync RPCs); they paste it into their own launcher's spec join block"
-                        onClick={async () => {
-                          const { downloadJoinBundle } = await import("../lib/api");
-                          await downloadJoinBundle(f.launchId, f.chainId).catch((e) =>
-                            setError(String(e)),
-                          );
-                        }}
-                      >
-                        join bundle
-                      </button>
-                    )}
-                    {!shutDown && (
-                      <button
-                        className="btn"
-                        title={
-                          chainFleet
-                            ? "Other Akash wallets on this launcher whose relayers may relay to this chain (your devnet and testnet wallets, say): content federation and transfers between sister chains. This fleet's own wallet always may. Removing a wallet stops new links; relayers already linked keep running."
-                            : "Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
-                        }
-                        onClick={async () => {
-                          try {
-                            const current: string[] = ((await getLaunch(f.launchId)).spec as any)?.sharing?.wallets ?? [];
-                            const input = window.prompt(
-                              `Wallets this ${chainFleet ? "chain" : "services"} fleet is shared with (comma separated; empty for none):`,
-                              current.join(", "),
-                            );
-                            if (input === null) return;
-                            const { postFleetSharing } = await import("../lib/api");
-                            const r = await postFleetSharing(
-                              f.launchId,
-                              input.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean),
-                            );
-                            showToast(r.wallets.length ? `shared with ${r.wallets.length} wallet(s)` : "no longer shared");
-                          } catch (e) {
-                            setError(String(e));
-                          }
-                        }}
-                      >
-                        share…
-                      </button>
-                    )}
-                    {chainFleet && (
-                      <button
-                        className="btn"
-                        title="For a Mastodon first set up in this chain fleet: draft a services fleet (no chain: shared components several chains use) in the editor, carrying this fleet's Mastodon settings (owner, SMTP, size, providers) under the domain you choose. The SMTP password is copied from this fleet's secret store when you launch it. Starting fresh? Use New services fleet… on the launch card. Each chain then links the instance with a standalone bridge."
-                        onClick={() => void servicesSpecFromFleet(f)}
-                      >
-                        services spec…
-                      </button>
-                    )}
-                    {chainFleet && (
-                      <button
-                        className="btn"
-                        title="Add another sovereign validator/sentry pair to this chain: writes a join spec into the editor, built from this fleet's own spec (its resources, providers and key mode) plus the live join bundle. What it cannot carry over, it says in the notes."
-                        onClick={() => void joinSpecFromFleet(f)}
-                      >
-                        join spec
-                      </button>
-                    )}
-                    {chainFleet && !shutDown && active.length > 0 && (
-                      <button
-                        className="btn"
-                        title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node, and every node's minimum gas price is brought back to the spec's. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
-                        onClick={() => fleetAction(f.launchId, active[0]!.dseq, "repair")}
-                      >
-                        repair fleet
-                      </button>
-                    )}
-                    {chainFleet && !shutDown && active.length > 0 && (
-                      <button
-                        className="btn"
-                        title="Deploy another sentry for this chain on its own provider. With two, losing one sentry no longer cuts its validator off from the chain. The new sentry gets its own keys, joins the mesh, peers with the validator and the other sentries, and syncs the whole chain from its peers (it shows catching-up until it reaches the head). Costs one more lease."
-                        onClick={async () => {
-                          const sentries = f.components.filter((c) => c.key.startsWith("sentry-") && c.state !== "closed").length;
-                          const size = window.prompt(
-                            `Add sentry-${sentries} to ${f.name}? It is deployed on another provider (one more lease and ` +
-                              "deposit, three signatures), then syncs the chain from block 1 off its peers, which can take " +
-                              "hours on a long chain. Size: small, standard or large.",
-                            "standard",
-                          )?.trim();
-                          if (!size) return;
-                          if (size !== "small" && size !== "standard" && size !== "large") {
-                            setError('size must be "small", "standard" or "large"');
-                            return;
-                          }
-                          try {
-                            const { postAddSentry } = await import("../lib/api");
-                            const { key } = await postAddSentry(f.launchId, size);
-                            showToast(`adding ${key}: follow it in the Launch panel`);
-                            openLaunch(f.launchId);
-                          } catch (e) {
-                            setError(String(e));
-                          }
-                        }}
-                      >
-                        add sentry…
-                      </button>
-                    )}
-                    {chainFleet && !shutDown && (
-                      <details className="dim-note" style={{ display: "inline-block" }}>
-                        <summary
-                          style={{ cursor: "pointer", color: f.autoRecover.enabled ? "var(--ok)" : undefined }}
-                          title="Recover a component on its own once an outage is confirmed: relaunch it off a dead provider, re-create a dead container, or restart a stuck node. Its transactions are signed with your wallet's unattended-recovery grant (System panel), else they wait for Keplr."
-                        >
-                          auto-recovery: {f.autoRecover.enabled ? "on" : "off"}
-                        </summary>
-                        <div style={{ display: "grid", gap: 2, padding: "4px 0" }}>
-                          {(
-                            [
-                              ["enabled", "recover automatically"],
-                              ["validators", "validators"],
-                              ["sentries", "sentries"],
-                              ["headscale", "headscale (only with its mesh backup)"],
-                              ["services", "explorer, frontend and other services"],
-                            ] as const
-                          ).map(([k, label]) => (
-                            <label key={k} style={{ marginLeft: k === "enabled" ? 0 : 16 }}>
-                              <input
-                                type="checkbox"
-                                checked={f.autoRecover[k]}
-                                disabled={k !== "enabled" && !f.autoRecover.enabled}
-                                onChange={async (e) => {
+                    {/* actions grouped by intent; the danger zone is set apart on the right */}
+                    <div className="act-grid">
+                      <div className="act-groups">
+                        <div className="act-group">
+                          <div className="act-label">Upgrade</div>
+                          <div className="act-btns">
+                            {!shutDown && (
+                              <>
+                                {chainFleet && (
+                                  <button
+                                    className="btn"
+                                    onClick={() => {
+                                      const feeNote =
+                                        fee && fee.upgradeFlat > 0
+                                          ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
+                                          : "";
+                                      // node fleet only — prefill with a current node image so
+                                      // the expected ns/repo:tag format is obvious
+                                      const nodes = f.components.filter(
+                                        (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                                      );
+                                      const node = nodes[0];
+                                      const image = window.prompt(
+                                        `New sparkdreamd image for validators + sentries:${feeNote}`,
+                                        node?.image ?? undefined,
+                                      );
+                                      // skip only when the whole node fleet already runs the
+                                      // image — after an aborted mid-upgrade the fleet is mixed
+                                      // and re-running with the same tag is the retry path
+                                      if (image && node && nodes.some((c) => c.image !== image))
+                                        fleetAction(f.launchId, node.dseq, "upgrade", { image });
+                                    }}
+                                  >
+                                    rolling upgrade…
+                                  </button>
+                                )}
+                              </>
+                            )}
+                            {!shutDown && (
+                              <>
+                                {chainFleet && (
+                                  <button
+                                    className="btn"
+                                    onClick={async () => {
+                                      const feeNote =
+                                        fee && fee.upgradeFlat > 0
+                                          ? ` A ${microToDisplay(String(fee.upgradeFlat))} ${denomLabel} service fee is added per upgrade (signed together).`
+                                          : "";
+                                      // prefill with a current node image, as the rolling
+                                      // prompt does: the expected ns/repo:tag shape is
+                                      // then obvious, and a tag typed from memory cannot
+                                      // quietly disagree with what the fleet runs
+                                      const nodes = f.components.filter(
+                                        (c) => c.state === "active" && /^(val|sentry)-/.test(c.key),
+                                      );
+                                      const image = window.prompt(
+                                        `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
+                                        nodes[0]?.image ?? undefined,
+                                      );
+                                      // an unedited prefill on a fleet already running it
+                                      // would halt consensus to install what is installed;
+                                      // a mixed fleet is the aborted-upgrade retry path
+                                      if (!image || !nodes.some((c) => c.image !== image)) return;
+                                      const h = window.prompt("Halt height:");
+                                      const first = f.components.find(
+                                        (c) => c.state === "active" && c.key !== "headscale",
+                                      );
+                                      if (h && first) {
+                                        const { postFleetAction: post } = await import("../lib/api");
+                                        await post(f.launchId, first.dseq, "halt-upgrade", {
+                                          image,
+                                          haltHeight: Number(h),
+                                        }).catch((e) => setError(String(e)));
+                                        openLaunch(f.launchId);
+                                      }
+                                    }}
+                                  >
+                                    halt-height upgrade…
+                                  </button>
+                                )}
+                              </>
+                            )}
+                            {chainFleet && !shutDown && active.length > 0 && (
+                              <button
+                                className="btn"
+                                title="Set halt-height back to 0 on every chain node. Recovery for a halt-height upgrade abandoned before it cleared the setting itself: until it is cleared, a node that stopped at the halt height halts again on every restart, and nothing else in the launcher edits it. Nothing is started — restart a halted node to resume on its current image, or run an upgrade to bring it back on a new one."
+                                onClick={() => fleetAction(f.launchId, active[0]!.dseq, "clear-halt-height")}
+                              >
+                                clear halt height
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="act-group">
+                          <div className="act-label">Configure</div>
+                          <div className="act-btns">
+                            {!shutDown && (
+                              <>
+                                {(() => {
+                                  const addable = COMPONENT_KEYS.filter(
+                                    (k) =>
+                                      // a services fleet runs chain-independent kinds only
+                                      (chainFleet || SERVICES_FLEET_COMPONENTS.includes(k)) &&
+                                      !f.components.some((c) => c.key === k && c.state !== "closed"),
+                                  );
+                                  // a chain fleet can also grow a sentry: a node, not a service
+                                  // kind (its own add-sentry op), offered in the same picker
+                                  const sentryAddable = chainFleet && !shutDown && active.length > 0;
+                                  const choices: string[] = [...addable, ...(sentryAddable ? ["sentry"] : [])];
+                                  if (choices.length === 0) return null;
+                                  return (
+                                    <button
+                                      className="btn accent-ghost"
+                                      title={`Add to this fleet: ${[
+                                        ...addable.map((k) => COMPONENT_KINDS[k].label),
+                                        ...(sentryAddable
+                                          ? ["a sentry (another node on its own provider, so losing one no longer cuts the validator off)"]
+                                          : []),
+                                      ].join(", ")}`}
+                                      onClick={() => openAddDialog(f.launchId, f.name, monthly)}
+                                    >
+                                      + add component…
+                                    </button>
+                                  );
+                                })()}
+                              </>
+                            )}
+                            {!shutDown && (
+                              <>
+                                <button
+                                  className="btn"
+                                  title="Apply the domains from the spec editor to this fleet: one deployment-update signature, then repoint DNS"
+                                  onClick={async () => {
+                                    try {
+                                      // the spec editor is the source of truth: diff its
+                                      // domains against the fleet's stored spec and apply
+                                      const edited = yaml.load(specText) as any;
+                                      const ec = edited?.topology?.components ?? {};
+                                      const ep = edited?.topology?.publicEndpoints ?? {};
+                                      const cur = (await getLaunch(f.launchId)).spec as any;
+                                      const cc = cur?.topology?.components ?? {};
+                                      const cp = cur?.topology?.publicEndpoints ?? {};
+                                      const changes: Record<string, string> = {};
+                                      if (ec.explorer?.domain && ec.explorer.domain !== cc.explorer?.domain)
+                                        changes.explorer = ec.explorer.domain;
+                                      if (ec.explorer?.route && ec.explorer.route !== cc.explorer?.route)
+                                        changes.explorerRoute = ec.explorer.route;
+                                      if (ec.frontend?.domain && ec.frontend.domain !== cc.frontend?.domain)
+                                        changes.frontend = ec.frontend.domain;
+                                      if (ep?.api && ep.api !== cp?.api) changes.api = ep.api;
+                                      if (ep?.rpc && ep.rpc !== cp?.rpc) changes.rpc = ep.rpc;
+                                      if (Object.keys(changes).length === 0) {
+                                        setError(
+                                          "no domain changes: the spec editor's domains match this fleet, edit the spec first",
+                                        );
+                                        return;
+                                      }
+                                      const { postDomainUpdate } = await import("../lib/api");
+                                      await postDomainUpdate(f.launchId, changes);
+                                      openLaunch(f.launchId); // surfaces the signing banner
+                                    } catch (e) {
+                                      setError(String(e));
+                                    }
+                                  }}
+                                >
+                                  update domains…
+                                </button>
+                              </>
+                            )}
+                            {chainFleet && !shutDown && active.length > 0 && f.minGasPrice !== undefined && (
+                              <button
+                                className={`btn${f.gasPriceProblem ? " amber" : ""}`}
+                                title={`The minimum gas price every node accepts, per gas unit in ${f.gasDenom ?? "the base denom"} (now ${f.minGasPrice}). Sets it in the fleet's spec, the bundles a relaunch boots from, and each live node's app.toml; only nodes whose value changes restart, sentries first. Node config, not consensus: no reset or upgrade.`}
+                                onClick={async () => {
+                                  const input = window.prompt(
+                                    `Minimum gas price for ${f.chainId}, per gas unit in ${f.gasDenom ?? "the base denom"} ` +
+                                      `(now ${f.minGasPrice}; typically 0.025, or 0 on a devnet). A fee for a 200,000-gas ` +
+                                      "transaction is this times 200,000.",
+                                    f.gasPriceProblem ? "0.025" : f.minGasPrice,
+                                  );
+                                  if (input === null || input.trim() === f.minGasPrice) return;
                                   try {
-                                    const { saveAutoRecover, getFleet } = await import("../lib/api");
-                                    await saveAutoRecover(f.launchId, { [k]: e.target.checked });
-                                    if (wallet) setFleet(await getFleet(wallet.address));
-                                  } catch (err) {
-                                    setError(String(err));
+                                    const { postGasPrice } = await import("../lib/api");
+                                    await postGasPrice(f.launchId, input.trim());
+                                    showToast(`setting the minimum gas price to ${input.trim()}: follow it in the Launch panel`);
+                                    openLaunch(f.launchId);
+                                  } catch (e) {
+                                    setError(String(e));
                                   }
                                 }}
-                              />{" "}
-                              {label}
-                            </label>
-                          ))}
+                              >
+                                gas price…
+                              </button>
+                            )}
+                            {chainFleet && (
+                              <button
+                                className="btn"
+                                title="For a Mastodon first set up in this chain fleet: draft a services fleet (no chain: shared components several chains use) in the editor, carrying this fleet's Mastodon settings (owner, SMTP, size, providers) under the domain you choose. The SMTP password is copied from this fleet's secret store when you launch it. Starting fresh? Use New services fleet… on the launch card. Each chain then links the instance with a standalone bridge."
+                                onClick={() => void servicesSpecFromFleet(f)}
+                              >
+                                services spec…
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      </details>
-                    )}
-                    {chainFleet && !shutDown && f.dataBackups && f.meshBackup && (
-                      <button
-                        className="btn"
-                        title="Back up the chain data to the mesh backup's bucket, schedule it, and choose whether relaunched nodes restore from it."
-                        onClick={() => setChainBackupsFor(f.launchId)}
-                      >
-                        chain backups…
-                      </button>
-                    )}
-                    {chainFleet && !shutDown && active.length > 0 && f.minGasPrice !== undefined && (
-                      <button
-                        className={`btn${f.gasPriceProblem ? " amber" : ""}`}
-                        title={`The minimum gas price every node accepts, per gas unit in ${f.gasDenom ?? "the base denom"} (now ${f.minGasPrice}). Sets it in the fleet's spec, the bundles a relaunch boots from, and each live node's app.toml; only nodes whose value changes restart, sentries first. Node config, not consensus: no reset or upgrade.`}
-                        onClick={async () => {
-                          const input = window.prompt(
-                            `Minimum gas price for ${f.chainId}, per gas unit in ${f.gasDenom ?? "the base denom"} ` +
-                              `(now ${f.minGasPrice}; typically 0.025, or 0 on a devnet). A fee for a 200,000-gas ` +
-                              "transaction is this times 200,000.",
-                            f.gasPriceProblem ? "0.025" : f.minGasPrice,
-                          );
-                          if (input === null || input.trim() === f.minGasPrice) return;
-                          try {
-                            const { postGasPrice } = await import("../lib/api");
-                            await postGasPrice(f.launchId, input.trim());
-                            showToast(`setting the minimum gas price to ${input.trim()}: follow it in the Launch panel`);
-                            openLaunch(f.launchId);
-                          } catch (e) {
-                            setError(String(e));
-                          }
-                        }}
-                      >
-                        gas price…
-                      </button>
-                    )}
-                    {chainFleet && !shutDown && active.length > 0 && (
-                      <button
-                        className="btn"
-                        title="Set halt-height back to 0 on every chain node. Recovery for a halt-height upgrade abandoned before it cleared the setting itself: until it is cleared, a node that stopped at the halt height halts again on every restart, and nothing else in the launcher edits it. Nothing is started — restart a halted node to resume on its current image, or run an upgrade to bring it back on a new one."
-                        onClick={() => fleetAction(f.launchId, active[0]!.dseq, "clear-halt-height")}
-                      >
-                        clear halt height
-                      </button>
-                    )}
-                    {!shutDown && (
-                      <>
-                        <button
-                          className="btn"
-                          title="Copy this fleet's live spec into the spec editor, replacing the draft there. The starting point for a chain reset that changes accounts, chainParams or token: edited from the fleet's own spec, those edits are carried into the reset instead of being ignored."
-                          onClick={async () => {
-                            try {
-                              const live = (await getLaunch(f.launchId)).spec;
-                              if (
-                                specText.trim() &&
-                                !window.confirm(
-                                  `Replace the spec editor with ${f.chainId}'s live spec? Your current draft there is lost.`,
-                                )
-                              )
-                                return;
-                              updateSpec(yaml.dump(live, { lineWidth: 100, noRefs: true }));
-                              setAdvOpen(true);
-                            } catch (e) {
-                              setError(String(e));
-                            }
-                          }}
-                        >
-                          load spec into editor
-                        </button>
-                        {chainFleet && (
-                          <button
-                            className="btn amber"
-                            title="Wipe all chain state and restart from a genesis rebuilt from this fleet's own spec: accounts and members are re-seeded (fresh mnemonics!), deployments and the chain-id stay. The op pauses after the wipe for you to clear every signer's watermark before the chain restarts. Prompts for the node image; edit accounts, chainParams or token in the spec editor first to change those too."
-                            onClick={async () => {
-                              try {
-                                // the fleet's own spec is the baseline, so the
-                                // reset never has to be reconciled by hand with
-                                // whatever draft the spec editor happens to hold
-                                const live = (await getLaunch(f.launchId)).spec as LaunchSpec;
-                                const { spec, fromEditor } = resetSource(specText, live);
-                                const image = window.prompt(
-                                  "sparkdreamd image for the reset chain (the fleet restarts on it):",
-                                  spec.images.sparkdreamd,
-                                );
-                                if (image === null) return;
-                                if (image.trim()) spec.images.sparkdreamd = image.trim();
-                                const ok = window.confirm(
-                                  `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis, still as ${f.chainId}, built from ` +
-                                    (fromEditor
-                                      ? "your edited spec in the spec editor"
-                                      : "this fleet's own current spec") +
-                                    `. The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones. The op then waits for you to clear every signer's watermark (tmkms state, and any validator outside this fleet) before the chain restarts at height 1. Node image: ${spec.images.sparkdreamd}.`,
-                                );
-                                if (!ok) return;
-                                const { postChainReset } = await import("../lib/api");
-                                await postChainReset(f.launchId, spec);
-                                openLaunch(f.launchId); // surfaces the signing banner
-                              } catch (e) {
-                                setError(String(e));
-                              }
-                            }}
-                          >
-                            reset chain…
-                          </button>
-                        )}
-                        <button
-                          className="btn red"
-                          onClick={async () => {
-                            const activeKeys = active.map((c) => c.key);
-                            const ok = window.confirm(
-                              `Shut down the whole fleet? This closes ${activeKeys.length} deployment${activeKeys.length === 1 ? "" : "s"} (${activeKeys.join(", ")}). The chain STOPS and escrow is refunded. One signature.`,
-                            );
-                            if (!ok) return;
-                            const { postFleetShutdown } = await import("../lib/api");
-                            try {
-                              await postFleetShutdown(f.launchId);
-                              openLaunch(f.launchId); // surfaces the signing banner
-                            } catch (e) {
-                              setError(String(e));
-                            }
-                          }}
-                        >
-                          shut down fleet…
-                        </button>
-                      </>
-                    )}
-                    {deletable && (
-                      <button
-                        className="btn red"
-                        title="Permanently delete this launch's records and secrets (account mnemonics, validator keys) from the launcher"
-                        onClick={() => deleteFleet()}
-                      >
-                        delete…
-                      </button>
-                    )}
+                        <div className="act-group">
+                          <div className="act-label">Maintain</div>
+                          <div className="act-btns">
+                            {chainFleet && !shutDown && active.length > 0 && (
+                              <button
+                                className="btn"
+                                title="Reconcile this fleet against reality and fix what has drifted, in place. Today: corrects the launcher's own records — where each component answers SSH (re-read from its provider) and its live mesh address (asked of the component) — so containers recycled outside the launcher don't leave it out of step, then fixes anything dialling an old address — stale tunnel env is rewritten and re-pushed to its deployment, stale persistent_peers are edited on the node, and every node's minimum gas price is brought back to the spec's. Only what is actually broken is touched, and only those components restart. No redeploy, no data moves. Free to run on a healthy fleet."
+                                onClick={() => fleetAction(f.launchId, active[0]!.dseq, "repair")}
+                              >
+                                repair fleet
+                              </button>
+                            )}
+                            {chainFleet && !shutDown && f.dataBackups && f.meshBackup && (
+                              <button
+                                className="btn"
+                                title="Back up the chain data to the mesh backup's bucket, schedule it, and choose whether relaunched nodes restore from it."
+                                onClick={() => setChainBackupsFor(f.launchId)}
+                              >
+                                chain backups…
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="act-group">
+                          <div className="act-label">Share &amp; export</div>
+                          <div className="act-btns">
+                            {!shutDown && (
+                              <button
+                                className="btn"
+                                title={
+                                  chainFleet
+                                    ? "Other Akash wallets on this launcher whose relayers may relay to this chain (your devnet and testnet wallets, say): content federation and transfers between sister chains. This fleet's own wallet always may. Removing a wallet stops new links; relayers already linked keep running."
+                                    : "Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
+                                }
+                                onClick={async () => {
+                                  try {
+                                    const current: string[] = ((await getLaunch(f.launchId)).spec as any)?.sharing?.wallets ?? [];
+                                    const input = window.prompt(
+                                      `Wallets this ${chainFleet ? "chain" : "services"} fleet is shared with (comma separated; empty for none):`,
+                                      current.join(", "),
+                                    );
+                                    if (input === null) return;
+                                    const { postFleetSharing } = await import("../lib/api");
+                                    const r = await postFleetSharing(
+                                      f.launchId,
+                                      input.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean),
+                                    );
+                                    showToast(r.wallets.length ? `shared with ${r.wallets.length} wallet(s)` : "no longer shared");
+                                  } catch (e) {
+                                    setError(String(e));
+                                  }
+                                }}
+                              >
+                                share…
+                              </button>
+                            )}
+                            <button
+                              className="btn"
+                              onClick={async () => {
+                                const { downloadFleetBundle } = await import("../lib/api");
+                                await downloadFleetBundle(f.launchId).catch((e) => setError(String(e)));
+                              }}
+                            >
+                              export fleet bundle
+                            </button>
+                            {chainFleet && (
+                              <button
+                                className="btn"
+                                onClick={async () => {
+                                  const { downloadGenesis } = await import("../lib/api");
+                                  await downloadGenesis(f.launchId, f.chainId).catch((e) =>
+                                    setError(String(e)),
+                                  );
+                                }}
+                              >
+                                download genesis
+                              </button>
+                            )}
+                            {chainFleet && (
+                              <button
+                                className="btn"
+                                title="Public join document for third-party operators (genesis sha256, sentry peer strings, state-sync RPCs); they paste it into their own launcher's spec join block"
+                                onClick={async () => {
+                                  const { downloadJoinBundle } = await import("../lib/api");
+                                  await downloadJoinBundle(f.launchId, f.chainId).catch((e) =>
+                                    setError(String(e)),
+                                  );
+                                }}
+                              >
+                                join bundle
+                              </button>
+                            )}
+                            {chainFleet && (
+                              <button
+                                className="btn"
+                                title="Add another sovereign validator/sentry pair to this chain: writes a join spec into the editor, built from this fleet's own spec (its resources, providers and key mode) plus the live join bundle. What it cannot carry over, it says in the notes."
+                                onClick={() => void joinSpecFromFleet(f)}
+                              >
+                                join spec
+                              </button>
+                            )}
+                            {!shutDown && (
+                              <>
+                                <button
+                                  className="btn"
+                                  title="Copy this fleet's live spec into the spec editor, replacing the draft there. The starting point for a chain reset that changes accounts, chainParams or token: edited from the fleet's own spec, those edits are carried into the reset instead of being ignored."
+                                  onClick={async () => {
+                                    try {
+                                      const live = (await getLaunch(f.launchId)).spec;
+                                      if (
+                                        specText.trim() &&
+                                        !window.confirm(
+                                          `Replace the spec editor with ${f.chainId}'s live spec? Your current draft there is lost.`,
+                                        )
+                                      )
+                                        return;
+                                      updateSpec(yaml.dump(live, { lineWidth: 100, noRefs: true }));
+                                      setAdvOpen(true);
+                                    } catch (e) {
+                                      setError(String(e));
+                                    }
+                                  }}
+                                >
+                                  load spec into editor
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="act-group danger">
+                        <div className="act-label">Danger zone</div>
+                        <div className="act-btns">
+                          {!shutDown && (
+                            <>
+                              {chainFleet && (
+                                <button
+                                  className="btn amber"
+                                  title="Wipe all chain state and restart from a genesis rebuilt from this fleet's own spec: accounts and members are re-seeded (fresh mnemonics!), deployments and the chain-id stay. The op pauses after the wipe for you to clear every signer's watermark before the chain restarts. Prompts for the node image; edit accounts, chainParams or token in the spec editor first to change those too."
+                                  onClick={async () => {
+                                    try {
+                                      // the fleet's own spec is the baseline, so the
+                                      // reset never has to be reconciled by hand with
+                                      // whatever draft the spec editor happens to hold
+                                      const live = (await getLaunch(f.launchId)).spec as LaunchSpec;
+                                      const { spec, fromEditor } = resetSource(specText, live);
+                                      const image = window.prompt(
+                                        "sparkdreamd image for the reset chain (the fleet restarts on it):",
+                                        spec.images.sparkdreamd,
+                                      );
+                                      if (image === null) return;
+                                      if (image.trim()) spec.images.sparkdreamd = image.trim();
+                                      const ok = window.confirm(
+                                        `Reset the chain? ALL on-chain state is wiped and the fleet restarts from a new genesis, still as ${f.chainId}, built from ` +
+                                          (fromEditor
+                                            ? "your edited spec in the spec editor"
+                                            : "this fleet's own current spec") +
+                                          `. The account keyring is rebuilt: generated accounts get FRESH mnemonics. Export the fleet bundle first if you need the old ones. The op then waits for you to clear every signer's watermark (tmkms state, and any validator outside this fleet) before the chain restarts at height 1. Node image: ${spec.images.sparkdreamd}.`,
+                                      );
+                                      if (!ok) return;
+                                      const { postChainReset } = await import("../lib/api");
+                                      await postChainReset(f.launchId, spec);
+                                      openLaunch(f.launchId); // surfaces the signing banner
+                                    } catch (e) {
+                                      setError(String(e));
+                                    }
+                                  }}
+                                >
+                                  reset chain…
+                                </button>
+                              )}
+                            </>
+                          )}
+                          {!shutDown && (
+                            <>
+                              <button
+                                className="btn red"
+                                onClick={async () => {
+                                  const activeKeys = active.map((c) => c.key);
+                                  const ok = window.confirm(
+                                    `Shut down the whole fleet? This closes ${activeKeys.length} deployment${activeKeys.length === 1 ? "" : "s"} (${activeKeys.join(", ")}). The chain STOPS and escrow is refunded. One signature.`,
+                                  );
+                                  if (!ok) return;
+                                  const { postFleetShutdown } = await import("../lib/api");
+                                  try {
+                                    await postFleetShutdown(f.launchId);
+                                    openLaunch(f.launchId); // surfaces the signing banner
+                                  } catch (e) {
+                                    setError(String(e));
+                                  }
+                                }}
+                              >
+                                shut down fleet…
+                              </button>
+                            </>
+                          )}
+                          {deletable && (
+                            <button
+                              className="btn red"
+                              title="Permanently delete this launch's records and secrets (account mnemonics, validator keys) from the launcher"
+                              onClick={() => deleteFleet()}
+                            >
+                              delete…
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
                     {f.ops
                       .filter((o) => o.status === "active")
                       .map((o) => (
@@ -4895,6 +5768,7 @@ export default function Page() {
                             restart: "restart",
                             unjail: "unjail",
                             topup: "top up",
+                            repair: "repair fleet",
                           };
                           return (
                             <span
@@ -4922,9 +5796,64 @@ export default function Page() {
                             </span>
                           );
                         })}
+                    {/* collapsed settings and history, side by side */}
+                    {((chainFleet && !shutDown) ||
+                      (!shutDown && f.incidents.some((i) => i.closedAt !== null)) ||
+                      (prefs && (prefs.avoid.length > 0 || prefs.prefer.length > 0))) && (
+                    <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-start" }}>
+                    {chainFleet && !shutDown && (
+                      <details className="dim-note pill">
+                        <summary
+                          title="Recover a component on its own once an outage is confirmed: relaunch it off a dead provider, re-create a dead container, or restart a stuck node. Its transactions are signed with your wallet's unattended-recovery grant (System panel), else they wait for Keplr."
+                        >
+                          Auto-recovery <b style={{ color: f.autoRecover.enabled ? "var(--ok)" : undefined }}>{f.autoRecover.enabled ? "On" : "Off"}</b>
+                        </summary>
+                        <div style={{ display: "grid", gap: 2, padding: "4px 0" }}>
+                          {(
+                            [
+                              ["enabled", "recover automatically"],
+                              ["validators", "validators"],
+                              ["sentries", "sentries"],
+                              ["headscale", "headscale (only with its mesh backup)"],
+                              ["services", "explorer, frontend and other services"],
+                            ] as const
+                          ).map(([k, label]) => (
+                            <label key={k} style={{ marginLeft: k === "enabled" ? 0 : 16 }}>
+                              <input
+                                type="checkbox"
+                                checked={f.autoRecover[k]}
+                                disabled={k !== "enabled" && !f.autoRecover.enabled}
+                                onChange={async (e) => {
+                                  // read before any await: React puts a controlled
+                                  // checkbox back to its old state once the handler yields
+                                  const on = e.target.checked;
+                                  setFleet((prev) =>
+                                    prev && {
+                                      ...prev,
+                                      fleets: prev.fleets.map((x) =>
+                                        x.launchId === f.launchId ? { ...x, autoRecover: { ...x.autoRecover, [k]: on } } : x,
+                                      ),
+                                    },
+                                  );
+                                  try {
+                                    const { saveAutoRecover, getFleet } = await import("../lib/api");
+                                    await saveAutoRecover(f.launchId, { [k]: on });
+                                    if (wallet) setFleet(await getFleet(wallet.address));
+                                  } catch (err) {
+                                    setError(String(err));
+                                    if (wallet) void getFleet(wallet.address).then(setFleet, () => undefined);
+                                  }
+                                }}
+                              />{" "}
+                              {label}
+                            </label>
+                          ))}
+                        </div>
+                      </details>
+                    )}
                     {!shutDown && f.incidents.some((i) => i.closedAt !== null) && (
-                      <details className="dim-note" style={{ flexBasis: "100%" }}>
-                        <summary>recent outages</summary>
+                      <details className="dim-note pill">
+                        <summary>Recent outages</summary>
                         {f.incidents
                           .filter((i) => i.closedAt !== null)
                           .map((i) => (
@@ -4935,17 +5864,15 @@ export default function Page() {
                           ))}
                       </details>
                     )}
-                    {f.gasPriceProblem && !shutDown && (
-                      <span className="dim-note" style={{ flexBasis: "100%", color: "var(--amber-text)" }}>
-                        Minimum gas price {f.minGasPrice} {f.gasDenom}: {f.gasPriceProblem}. Fix it with gas price….
-                      </span>
-                    )}
                     {prefs && (prefs.avoid.length > 0 || prefs.prefer.length > 0) && (
-                      <span
-                        className="pref-summary"
-                        title="These lists apply to every launch on this wallet"
-                      >
-                        relaunch policy:
+                      <details className="dim-note pill">
+                        <summary title="Providers to prefer or avoid when placing and moving components. These lists apply to every launch on this wallet.">
+                          Relaunch policy{" "}
+                          <b>
+                            {prefs.prefer.length + prefs.avoid.length} rule{prefs.prefer.length + prefs.avoid.length === 1 ? "" : "s"}
+                          </b>
+                        </summary>
+                        <span className="pref-summary" style={{ padding: "4px 0" }}>
                         {prefs.prefer.map((p) => (
                           <button
                             key={p}
@@ -4975,6 +5902,30 @@ export default function Page() {
                             ⛔ {prefs.names[p] ?? `${p.slice(0, 14)}…`} ✕
                           </button>
                         ))}
+                      </span>
+                      </details>
+                    )}
+                    </div>
+                    )}
+                    {f.gasPriceProblem && !shutDown && (
+                      <span className="dim-note" style={{ flexBasis: "100%", color: "var(--amber-text)" }}>
+                        Minimum gas price {f.minGasPrice} {f.gasDenom}: {f.gasPriceProblem}. Fix it with gas price….
+                      </span>
+                    )}
+                    {chainFleet && !shutDown && (f.dataBackups?.scratchSync || (f.dataBackups?.latestAgeDays ?? 0) > 7) && (
+                      <span className="dim-note" style={{ flexBasis: "100%", color: "var(--amber-text)" }}>
+                        {f.dataBackups!.scratchSync
+                          ? `No chain-data backup (${f.dataBackups!.scratchSync.reason}): a node this fleet moves, resizes or adds ` +
+                            `replays all ~${f.dataBackups!.scratchSync.blocks.toLocaleString("en-US")} blocks, about ` +
+                            `${hoursText(f.dataBackups!.scratchSync.hours)}. `
+                          : `The latest chain-data backup is ${f.dataBackups!.latestAgeDays} days old: a node moved now replays everything since. `}
+                        {f.meshBackup ? (
+                          <button className="btn" style={{ padding: "0 8px" }} onClick={() => setChainBackupsFor(f.launchId)}>
+                            chain backups…
+                          </button>
+                        ) : (
+                          "Turn on the mesh backup first (chain data goes to the same bucket)."
+                        )}
                       </span>
                     )}
                   </div>
@@ -5102,7 +6053,9 @@ export default function Page() {
                     const open = openComponent === rowKey;
                     const kind = healthKind(c);
                     const days = runwayDays(c);
-                    const version = c.image?.split(":").pop();
+                    // a tag as it is; an image pinned by digest shows the digest shortened
+                    const digest = c.image ? /@sha256:([0-9a-f]{64})$/.exec(c.image)?.[1] : undefined;
+                    const version = digest ? `${digest.slice(0, 6)}…${digest.slice(-4)}` : c.image?.split(":").pop();
                     const pref = providerPrefOf(f.launchId, c.provider);
                     const height = liveHeights[c.dseq];
                     const disk = nodeDisks[c.dseq];
@@ -5169,8 +6122,8 @@ export default function Page() {
                             <div className="facts">
                               {/* dseq first: it is what every provider/chain
                                   lookup keys on when something goes wrong */}
-                              <span>
-                                dseq{" "}
+                              <span className="f-dseq">
+                                Lease dseq{" "}
                                 <span
                                   className="v"
                                   title="click to copy"
@@ -5181,18 +6134,24 @@ export default function Page() {
                                 </span>
                               </span>
                               {c.image && (
-                                <span>
-                                  image <span className="v">{c.image}</span>
+                                <span className="f-wide f-image">
+                                  Image{" "}
+                                  <span className="v" title={c.image}>
+                                    {shortImage(c.image)}{" "}
+                                    <button className="copy" onClick={() => void navigator.clipboard.writeText(c.image!)}>
+                                      copy
+                                    </button>
+                                  </span>
                                 </span>
                               )}
                               {c.size && (
                                 <span>
-                                  size <span className="v">{c.size}</span>
+                                  Size <span className="v">{c.size}</span>
                                 </span>
                               )}
                               {disk && (
                                 <span title={`read ${new Date(disk.checkedAt).toLocaleTimeString()}`}>
-                                  chain data{" "}
+                                  Chain data{" "}
                                   <span className="v" style={diskColor ? { color: diskColor } : undefined}>
                                     {gib(disk.freeBytes)} free of {gib(disk.totalBytes)} ({disk.percentUsed}% used)
                                   </span>
@@ -5200,8 +6159,8 @@ export default function Page() {
                                 </span>
                               )}
                               {c.tailnetIp && (
-                                <span>
-                                  mesh ip{" "}
+                                <span className="f-mesh">
+                                  Mesh IP{" "}
                                   <span
                                     className="v"
                                     title="Address on the headscale mesh (click to copy). Peers reach this component here."
@@ -5215,14 +6174,14 @@ export default function Page() {
                                 </span>
                               )}
                               {c.escrow != null && (
-                                <span>
-                                  escrow left{" "}
+                                <span className="f-escrow">
+                                  Escrow left{" "}
                                   <span className="v">{balanceDisplay(c.escrow, c.priceDenom)}</span>
                                 </span>
                               )}
                               {height && (
                                 <span>
-                                  block height{" "}
+                                  Block height{" "}
                                   <span className="v">
                                     {height.height.toLocaleString()}
                                     {height.catchingUp ? " (syncing)" : ""}
@@ -5245,7 +6204,7 @@ export default function Page() {
                               )}
                               {height?.source === "chain" && (
                                 <span title={height.providerError}>
-                                  provider API{" "}
+                                  Provider API{" "}
                                   <span className="v" style={{ color: "var(--amber-text)" }}>
                                     unreachable
                                   </span>
@@ -5253,8 +6212,8 @@ export default function Page() {
                                 </span>
                               )}
                               {c.key === "headscale" && f.meshBackup !== undefined && (
-                                <span>
-                                  backup{" "}
+                                <span className="f-wide">
+                                  Mesh backup{" "}
                                   {f.meshBackup ? (
                                     <span className="v">
                                       {f.meshBackup.bucket}/{f.meshBackup.path}
@@ -5274,16 +6233,22 @@ export default function Page() {
                                 </span>
                               )}
                               {c.health && (
-                                <span>
-                                  health{" "}
+                                <span className="f-health">
+                                  Health{" "}
                                   <span className="v">
                                     {c.health.status}
                                     {c.health.detail ? ` (${c.health.detail})` : ""}
                                   </span>
                                 </span>
                               )}
-                              <span>
-                                provider <span className="v">{c.provider}</span>{" "}
+                              <span className="f-wide f-provider">
+                                Provider{" "}
+                                <span className="v" title={c.provider}>
+                                  {shortAddress(c.provider)}{" "}
+                                  <button className="copy" onClick={() => void navigator.clipboard.writeText(c.provider)}>
+                                    copy
+                                  </button>
+                                </span>
                                 <button
                                   className={`pref-tag ${pref}`}
                                   title="Cycle this provider (wallet-wide): none → avoid → prefer. Relaunch avoids ⛔ and prefers ⭐ across all your launches."
@@ -5296,7 +6261,7 @@ export default function Page() {
                                 </button>
                               </span>
                             </div>
-                            <div className="acts">
+                            <ActionGroups>
                               {c.state === "active" && (
                                 <>
                                   {c.key.startsWith("val-") && c.health?.status === "jailed" && (
@@ -5385,28 +6350,7 @@ export default function Page() {
                                       <button
                                         className="btn amber"
                                         title="Move this node to a deployment of another size. Akash cannot resize a running deployment, so a new one is created beside this node (on the same provider when it bids) and syncs the whole chain while this node keeps running; then it takes over this node's identity, with about a minute of downtime. A validator's signing state moves with it, so it cannot double-sign."
-                                        onClick={() => {
-                                          const role = c.key.startsWith("val-") ? "validator" : "sentry";
-                                          const sizes = (["small", "standard", "large"] as const).filter((s) => s !== c.size);
-                                          const size = window.prompt(
-                                            `Resize ${c.key} (now ${c.size ?? "unknown"}) to which size?\n` +
-                                              (["small", "standard", "large"] as const)
-                                                .map((s) => {
-                                                  const r = NODE_SIZES[s][role];
-                                                  return `  ${s.padEnd(9)}${r.cpu} CPU, ${r.memory} RAM, ${r.storage.data} data${s === c.size ? "  (current)" : ""}`;
-                                                })
-                                                .join("\n"),
-                                            sizes.includes("large") ? "large" : sizes[0],
-                                          )?.trim();
-                                          if (!size) return;
-                                          if (size !== "small" && size !== "standard" && size !== "large") {
-                                            setError('size must be "small", "standard" or "large"');
-                                            return;
-                                          }
-                                          // the conductor answers with what the move will do and
-                                          // risk, which fleetAction asks to confirm
-                                          fleetAction(f.launchId, c.dseq, "resize", { size });
-                                        }}
+                                        onClick={() => void openResize(f.launchId, c.dseq, c.key)}
                                       >
                                         resize…
                                       </button>
@@ -5829,6 +6773,27 @@ export default function Page() {
                                   (redeploy fresh) — the only action that applies */}
                               {c.state !== "active" && !shutDown && (
                                 <>
+                                  {c.state === "closed" &&
+                                    /^sentry-[1-9]\d*$/.test(c.key) &&
+                                    Number(c.key.split("-")[1]) ===
+                                      Math.max(...f.components.filter((x) => x.key.startsWith("sentry-")).map((x) => Number(x.key.split("-")[1]))) && (
+                                      <button
+                                        className="btn red"
+                                        title="Remove this closed sentry from the fleet: the spec counts one sentry fewer, its row goes, and the other nodes stop listing it as a peer (running ones at their next restart). Nothing is signed: its deployment is already closed."
+                                        onClick={() => {
+                                          if (
+                                            window.confirm(
+                                              `Remove ${c.key} from this fleet? The spec counts one sentry fewer, its row and node identity go, ` +
+                                                "and the other nodes stop listing it as a peer. Adding a sentry later creates a fresh one.",
+                                            )
+                                          ) {
+                                            fleetAction(f.launchId, c.dseq, "remove");
+                                          }
+                                        }}
+                                      >
+                                        remove
+                                      </button>
+                                    )}
                                   {c.state === "closed" && isComponentKey(c.key) && (
                                     <button
                                       className="btn red"
@@ -5866,7 +6831,7 @@ export default function Page() {
                                   </button>
                                 </>
                               )}
-                            </div>
+                            </ActionGroups>
                             {logsView?.key === c.key && (
                               <>
                                 <pre className="logs">{logsView.text}</pre>

@@ -3,10 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { chainId, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
-import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
+import { AwaitUser, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { componentRow, rowTarget, refreshSshEndpoints } from "./fleet-ops.js";
 import { NODE_HOME, NODE_RUNNING_PROBE } from "./node-ops.js";
-import type { SshTarget } from "./services.js";
+import type { Services, SshTarget } from "./services.js";
 import { ageIdentityAt, resolveS3Secret } from "./steps/phase-bcd.js";
 import type { GenerateKeysOutput } from "./steps/phase-a.js";
 
@@ -28,8 +28,8 @@ import type { GenerateKeysOutput } from "./steps/phase-a.js";
  * stay up. Needs a node image with s5cmd, age, zstd and the hold.
  */
 
-/** Backups kept in the bucket; older ones are deleted after each upload. */
-export const DATA_BACKUP_KEEP = 3;
+/** Backups kept in the bucket: a rolling pair, older ones deleted once a new one passes its check. */
+export const DATA_BACKUP_KEEP = 2;
 const HOLD_FILE = `${NODE_HOME}/.launcher-hold`;
 /** A held node comes back by itself this long after the last refresh. */
 const HOLD_SECS = 30 * 60;
@@ -50,6 +50,11 @@ export interface DataBackupRecord {
   from: string;
   /** sha256 of the genesis the chain ran when it was taken (a reset keeps the chain id) */
   genesisSha?: string;
+  /** sha256 of the encrypted stream the node uploaded */
+  sha256?: string;
+  /** read back from the bucket and unpacked end to end after the upload;
+   *  backups taken before 2026-10-05 never were, and two of those were corrupt */
+  verified?: boolean;
 }
 
 /** sha256 of the fleet's genesis as the launcher holds it (val-0's home, the authority after a reset). */
@@ -57,6 +62,27 @@ export function fleetGenesisSha(nodeDir: (key: string) => string): string | unde
   const file = path.join(nodeDir("val-0"), "config", "genesis.json");
   if (!fs.existsSync(file)) return undefined;
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+/**
+ * When the fleet last did something that makes older chain data unusable
+ * (a node upgrade, halt-upgrade or reset), in ms, or undefined.
+ */
+export function lastDataBreak(db: ConductorDb, launchId: string): number | undefined {
+  const times = db
+    .listFleetOps(launchId)
+    .filter((o) => o.status === "done" && DATA_BREAKING_OPS.has(o.kind) && (o.kind !== "upgrade" || upgradesNodes(o.params_json)))
+    .map((o) => Date.parse(o.created_at));
+  return times.length > 0 ? Math.max(...times) : undefined;
+}
+
+function upgradesNodes(paramsJson: string): boolean {
+  try {
+    const components = (JSON.parse(paramsJson) as { components?: string[] }).components;
+    return !Array.isArray(components) || components.some((k) => /^(val|sentry)-/.test(k));
+  } catch {
+    return true;
+  }
 }
 
 /** Op kinds after which older chain data must not be restored. */
@@ -75,13 +101,16 @@ export function restoreBlocker(
   nodeDir: (key: string) => string,
   record: DataBackupRecord,
 ): string | null {
+  if (!record.verified) return `${record.name} was never read back after its upload, so it may not restore: delete it and take a new one`;
   const sha = fleetGenesisSha(nodeDir);
   if (record.genesisSha && sha && record.genesisSha !== sha) {
     return `${record.name} was taken on a different genesis (the chain was reset since)`;
   }
   const breaking = db
     .listFleetOps(launchId)
-    .filter((o) => o.status === "done" && DATA_BREAKING_OPS.has(o.kind) && Date.parse(o.created_at) > Date.parse(record.takenAt));
+    .filter((o) => o.status === "done" && DATA_BREAKING_OPS.has(o.kind) && Date.parse(o.created_at) > Date.parse(record.takenAt))
+    // an upgrade of service components only (bridge, frontend) leaves the chain binary alone
+    .filter((o) => o.kind !== "upgrade" || upgradesNodes(o.params_json));
   if (breaking.length > 0) {
     return `${record.name} predates the fleet's ${breaking[breaking.length - 1]!.kind} (op ${breaking[breaking.length - 1]!.id}): take a new backup`;
   }
@@ -121,9 +150,62 @@ export function lastDataBackup(db: ConductorDb, launchId: string): DataBackupRec
   return dataBackups(db, launchId)[0] ?? null;
 }
 
+/** The newest backup a node may start from (verified, same genesis, after any upgrade), or null. */
+export function latestRestorable(
+  db: ConductorDb,
+  launchId: string,
+  nodeDir: (key: string) => string,
+): { record: DataBackupRecord | null; blocker: string | null } {
+  const all = dataBackups(db, launchId);
+  const record = all.find((r) => restoreBlocker(db, launchId, nodeDir, r) === null) ?? null;
+  return { record, blocker: record || !all[0] ? null : restoreBlocker(db, launchId, nodeDir, all[0]) };
+}
+
 function recordBackup(db: ConductorDb, launchId: string, record: DataBackupRecord): void {
   const next = [record, ...dataBackups(db, launchId).filter((r) => r.name !== record.name)].slice(0, DATA_BACKUP_KEEP);
   db.setSetting(historyKey(launchId), JSON.stringify(next));
+}
+
+function forgetBackup(db: ConductorDb, launchId: string, name: string): void {
+  db.setSetting(historyKey(launchId), JSON.stringify(dataBackups(db, launchId).filter((r) => r.name !== name)));
+}
+
+/**
+ * Delete a backup from the bucket and from the fleet's record, through a
+ * node that has the backup tools (the conductor holds no S3 client). An
+ * object already gone counts as deleted.
+ */
+export async function deleteDataBackup(
+  db: ConductorDb,
+  services: Pick<Services, "ssh">,
+  launchId: string,
+  spec: LaunchSpec,
+  secretsDir: string,
+  target: SshTarget,
+  name: string,
+): Promise<void> {
+  if (!/^data-[0-9TZ]+-h\d+\.tar\.zst\.age$/.test(name)) throw new Error(`not a chain-data backup name: ${name}`);
+  const storage = dataBackupStorage(spec, secretsDir);
+  if (!storage) throw new Error("this fleet has no backup bucket");
+  await removeObject(services, secretsDir, storage, target, name);
+  forgetBackup(db, launchId, name);
+}
+
+async function removeObject(
+  services: Pick<Services, "ssh">,
+  secretsDir: string,
+  storage: DataBackupStorage,
+  target: SshTarget,
+  name: string,
+): Promise<void> {
+  await uploadTextVia(services, secretsDir, target, "/tmp/sd-rm.env", envFile({ ...s3Env(storage), NAME: name }));
+  const res = await services.ssh.exec(
+    target,
+    `. /tmp/sd-rm.env && rm -f /tmp/sd-rm.env && ` +
+      `{ out=$(s5cmd --endpoint-url "$S3_ENDPOINT" rm "s3://$S3_BUCKET/$S3_PREFIX/$NAME" 2>&1); rc=$?; ` +
+      `if [ $rc -eq 0 ] || echo "$out" | grep -qi "no object found"; then echo removed; else echo "$out"; fi; }`,
+  );
+  if (!res.stdout.includes("removed")) throw new Error(`could not delete ${name} from the bucket: ${res.stdout.trim().slice(0, 300)}`);
 }
 
 /** Which node to copy: never a validator; a sentry other than sentry-0 when there is one. */
@@ -158,16 +240,79 @@ export const BACKUP_SCRIPT = `#!/bin/bash
 set -o pipefail
 . /tmp/sd-backup.env && rm -f /tmp/sd-backup.env
 ST=/tmp/sd-backup.status; LOG=/tmp/sd-backup.log
-echo $$ > /tmp/sd-backup.pid; echo running > $ST; : > $LOG
+echo $$ > /tmp/sd-backup.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-backup.sha
 S5="s5cmd --endpoint-url $S3_ENDPOINT"
+# the hash of exactly what was uploaded: the verify step compares the
+# bucket's copy against it to tell a corrupted upload from a broken stream
 if tar -C ${NODE_HOME} -cf - data 2>>$LOG | zstd -q -T0 -3 | age -r "$AGE_RECIPIENT" \\
-     | $S5 pipe --concurrency 2 --part-size 32 "s3://$S3_BUCKET/$S3_PREFIX/$NAME" >>$LOG 2>&1 \\
-   && printf '%s' "$MANIFEST" | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json" >>$LOG 2>&1; then
+     | tee >(sha256sum | cut -d' ' -f1 > /tmp/sd-backup.sha) \\
+     | $S5 pipe --concurrency 2 --part-size 32 "s3://$S3_BUCKET/$S3_PREFIX/$NAME" >>$LOG 2>&1; then
+  echo done > $ST
+else
+  echo failed > $ST
+fi
+`;
+
+/**
+ * Download an object in 64 MiB ranges, each checked for its length and
+ * retried, refusing to go on rather than ending early: \`s5cmd cat\` against
+ * 4everland stops at a random point without an error (2026-10-05: reads of
+ * one intact 1.4 GB object ended after 419 MB and 206 MB, \`aws s3 cp\` read
+ * all of it), which is what failed every backup check and the first live
+ * restore. curl signs the requests itself (--aws-sigv4, curl 7.75+). Path
+ * style, as s5cmd uses with a custom endpoint.
+ */
+const S3GET_FN = `# s3get KEY: stream s3://$S3_BUCKET/KEY to stdout in checked ranges (s5cmd
+# cat ends early without an error on 4everland). Needs AWS_* and S3_ENDPOINT.
+s3get() {
+  local url="\${S3_ENDPOINT%/}/$S3_BUCKET/$1" size off=0 end n tries chunk=67108864 part=/tmp/.s3get.$$
+  # the key reaches curl on a pipe, never on its command line (ps)
+  local sig=(--aws-sigv4 "aws:amz:\${AWS_REGION:-us-east-1}:s3")
+  s3cred() { printf 'user = "%s:%s"\\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; }
+  size=$(s3cred | curl -K - -sfI "\${sig[@]}" "$url" | tr -d '\\r' | awk 'tolower($1)=="content-length:"{print $2}')
+  # a missing key can answer with a length of 0: no backup is empty
+  [ "\${size:-0}" -gt 0 ] 2>/dev/null || { echo "s3get: $1 is missing or empty" >&2; return 1; }
+  while [ "$off" -lt "$size" ]; do
+    end=$(( off + chunk - 1 )); [ "$end" -ge "$size" ] && end=$(( size - 1 ))
+    for tries in 1 2 3 4 5 6; do
+      if s3cred | curl -K - -sf --max-time 600 "\${sig[@]}" -H "Range: bytes=$off-$end" -o "$part" "$url" \\
+         && n=$(wc -c < "$part") && [ "$n" -eq $(( end - off + 1 )) ]; then break; fi
+      [ "$tries" -eq 6 ] && { rm -f "$part"; echo "s3get: bytes $off-$end of $1 would not download" >&2; return 1; }
+      sleep $(( tries * 5 ))
+    done
+    cat "$part" || { rm -f "$part"; return 1; }
+    off=$(( end + 1 ))
+  done
+  rm -f "$part"
+}
+`;
+
+/**
+ * Read a just-uploaded backup back and unpack it to nowhere (every age chunk
+ * is authenticated, zstd checks its frames, tar walks every entry); only
+ * then does it become latest.json and older ones get pruned. On a failure,
+ * the hash of what the bucket returns goes to /tmp/sd-verify.readback.
+ * Runs on the released node: the node keeps serving meanwhile. Detached.
+ */
+export const VERIFY_SCRIPT = `#!/bin/bash
+# sd-data-verify (launcher data-backup op)
+set -o pipefail
+. /tmp/sd-verify.env && rm -f /tmp/sd-verify.env
+ST=/tmp/sd-verify.status; LOG=/tmp/sd-verify.log; KEY=/tmp/sd-verify.age
+echo $$ > /tmp/sd-verify.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-verify.readback
+S5="s5cmd --endpoint-url $S3_ENDPOINT"
+OBJ="s3://$S3_BUCKET/$S3_PREFIX/$NAME"
+${S3GET_FN}
+if s3get "$S3_PREFIX/$NAME" 2>>$LOG | age -d -i $KEY 2>>$LOG | zstd -dq 2>>$LOG | tar -tf - >/dev/null 2>>$LOG; then
+  rm -f $KEY
+  printf '%s' "$MANIFEST" | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json" >>$LOG 2>&1
   $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/data-*" 2>>$LOG | awk '{print $NF}' | sed 's|.*/||' | sort \\
     | awk -v k=$KEEP '{a[NR]=$0} END {for (i = 1; i <= NR - k; i++) print a[i]}' \\
     | while read -r old; do $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/$old" >>$LOG 2>&1; done
   echo done > $ST
 else
+  rm -f $KEY
+  s3get "$S3_PREFIX/$NAME" 2>>$LOG | sha256sum | cut -d' ' -f1 > /tmp/sd-verify.readback
   echo failed > $ST
 fi
 `;
@@ -184,7 +329,8 @@ rm -rf $H/data.restore && mkdir -p $H/data.restore
 # a swap a killed run left half done: put the old data back
 [ -d $H/data ] || { [ -d $H/data.old ] && mv $H/data.old $H/data; }
 rm -rf $H/data.old
-if $S5 cat "s3://$S3_BUCKET/$S3_PREFIX/$NAME" 2>>$LOG | age -d -i $KEY | zstd -dq \\
+${S3GET_FN}
+if s3get "$S3_PREFIX/$NAME" 2>>$LOG | age -d -i $KEY | zstd -dq \\
      | tar -C $H/data.restore -xf - 2>>$LOG; then
   rm -f $KEY
   # never swap under a running node: a held node keeps its hold past the
@@ -220,11 +366,21 @@ fi
  * file lives only for the upload, in the secrets directory (mode 0700).
  */
 async function uploadText(ctx: StepCtx, target: SshTarget, remote: string, text: string): Promise<void> {
-  const local = path.join(ctx.dirs.secrets, `.upload-${path.basename(remote)}-${process.pid}`);
-  fs.mkdirSync(ctx.dirs.secrets, { recursive: true, mode: 0o700 });
+  await uploadTextVia(ctx.services, ctx.dirs.secrets, target, remote, text);
+}
+
+async function uploadTextVia(
+  services: Pick<Services, "ssh">,
+  secretsDir: string,
+  target: SshTarget,
+  remote: string,
+  text: string,
+): Promise<void> {
+  const local = path.join(secretsDir, `.upload-${path.basename(remote)}-${process.pid}`);
+  fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(local, text, { mode: 0o600 });
   try {
-    await ctx.services.ssh.upload(target, local, remote);
+    await services.ssh.upload(target, local, remote);
   } finally {
     fs.rmSync(local, { force: true });
   }
@@ -403,8 +559,6 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
               ...s3Env(storage),
               AGE_RECIPIENT: keys.ageRecipient,
               NAME: name,
-              MANIFEST: JSON.stringify(record),
-              KEEP: String(DATA_BACKUP_KEEP),
             }),
           );
           await uploadText(ctx, target(ctx), "/tmp/sd-backup.sh", BACKUP_SCRIPT);
@@ -442,15 +596,120 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
         }
         const pending = ctx.db.getSetting(`data-backup-pending:${ctx.launchId}`);
         if (pending) {
-          recordBackup(ctx.db, ctx.launchId, JSON.parse(pending) as DataBackupRecord);
-          ctx.db.deleteSetting(`data-backup-pending:${ctx.launchId}`);
+          // the hash lands a moment after the upload ends (tee's reader)
+          let sha = "";
+          for (let i = 0; i < 5 && !/^[0-9a-f]{64}$/.test(sha); i++) {
+            if (i > 0) await ctx.services.sleep(2000);
+            sha = (await ctx.services.ssh.exec(target(ctx), "cat /tmp/sd-backup.sha 2>/dev/null || true")).stdout.trim();
+          }
+          const record = JSON.parse(pending) as DataBackupRecord;
+          if (/^[0-9a-f]{64}$/.test(sha)) record.sha256 = sha;
+          ctx.db.setSetting(`data-backup-pending:${ctx.launchId}`, JSON.stringify(record));
         }
         ctx.db.setFleetOpProgress(opId, null);
         return { name };
       },
     },
-    releaseStep(p, key, opId),
+    releaseStep(p, key, opId, { finish: false }),
+    verifyStep(p, key, opId, spec),
   ];
+}
+
+/** Times a backup op takes the copy again after it failed its check, before it pauses. */
+const VERIFY_ATTEMPTS = 2;
+
+/**
+ * Read the uploaded backup back and unpack it end to end before recording
+ * it: the first live restore (2026-10-05) found both devnet backups corrupt
+ * mid-file, and nothing had noticed. A backup that fails is deleted from the
+ * bucket and taken again once; a second failure pauses the op with what the
+ * hashes say went wrong.
+ */
+function verifyStep(p: (s: string) => string, key: string, opId: number, spec: LaunchSpec): StepDef {
+  const pendingKey = (ctx: StepCtx) => `data-backup-pending:${ctx.launchId}`;
+  const attemptsKey = `data-backup-verify-failures:${opId}`;
+  const retake = [p("hold"), p("upload"), p("release")];
+  return {
+    name: p("verify"),
+    async run(ctx) {
+      const target = () => nodeTarget(ctx, key);
+      const storage = dataBackupStorage(spec, ctx.dirs.secrets);
+      const identity = ageIdentityAt(ctx.dirs.secrets);
+      if (!storage || !identity) throw new Error("this fleet has no backup bucket or age key");
+      const pending = ctx.db.getSetting(pendingKey(ctx));
+      // resumed after the second failure: the failed copy is gone, take it again
+      if (!pending) throw new RerunFrom(retake, "no uploaded backup is waiting to be checked");
+      const record = JSON.parse(pending) as DataBackupRecord;
+      const state = await scriptState(ctx, target(), "sd-verify");
+      if (!(state.status === "done" || (state.status === "running" && state.alive))) {
+        await uploadText(ctx, target(), "/tmp/sd-verify.age", `${identity}\n`);
+        await uploadText(
+          ctx,
+          target(),
+          "/tmp/sd-verify.env",
+          envFile({
+            ...s3Env(storage),
+            NAME: record.name,
+            MANIFEST: JSON.stringify({ ...record, verified: true }),
+            KEEP: String(DATA_BACKUP_KEEP),
+          }),
+        );
+        await uploadText(ctx, target(), "/tmp/sd-verify.sh", VERIFY_SCRIPT);
+        await ctx.services.ssh.exec(target(), startScriptCmd("sd-verify"));
+      }
+      const failure =
+        state.status === "done"
+          ? null
+          : await watchScript(ctx, target, "sd-verify", {
+              maxSecs: MAX_COPY_SECS,
+              tick: (secs) => {
+                ctx.db.setFleetOpProgress(opId, {
+                  label: `reading the backup back from the bucket to check it (${key} keeps running)`,
+                  elapsedSeconds: secs,
+                  updatedAt: new Date().toISOString(),
+                });
+              },
+            });
+      ctx.db.setFleetOpProgress(opId, null);
+      if (!failure) {
+        recordBackup(ctx.db, ctx.launchId, { ...record, verified: true });
+        ctx.db.deleteSetting(pendingKey(ctx));
+        ctx.db.deleteSetting(attemptsKey);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { verified: true, name: record.name };
+      }
+
+      await stopScript(ctx, target(), "sd-verify", "rm -f /tmp/sd-verify.age");
+      const readback = (await ctx.services.ssh.exec(target(), "cat /tmp/sd-verify.readback 2>/dev/null || true").catch(() => ({ stdout: "" }))).stdout.trim();
+      const why =
+        !record.sha256 || !/^[0-9a-f]{64}$/.test(readback)
+          ? "it did not read back intact"
+          : readback === record.sha256
+            ? "the bucket returned exactly the bytes the node uploaded, and they do not decrypt: " +
+              `${key} produced a broken stream (its host's memory or disk may be at fault)`
+            : "the bucket returned different bytes than the node uploaded: the upload or the storage corrupted it";
+      await removeObject(ctx.services, ctx.dirs.secrets, storage, target(), record.name).catch((e) =>
+        ctx.log(`${record.name}: could not delete the failed backup: ${e instanceof Error ? e.message : e}`),
+      );
+      ctx.db.deleteSetting(pendingKey(ctx));
+      // the next copy must start over, not read this one's status as done
+      await ctx.services.ssh
+        .exec(target(), "rm -f /tmp/sd-backup.status /tmp/sd-backup.pid /tmp/sd-backup.sha /tmp/sd-verify.status")
+        .catch(() => undefined);
+      const failures = Number(ctx.db.getSetting(attemptsKey) ?? 0) + 1;
+      ctx.db.setSetting(attemptsKey, String(failures));
+      ctx.log(`${record.name} failed its check (${why}); deleted from the bucket`);
+      if (failures < VERIFY_ATTEMPTS) {
+        throw new RerunFrom(retake, `the backup failed its check (${why}); taking it again`);
+      }
+      throw new AwaitUser(
+        p("verify"),
+        `The chain-data backup from ${key} failed its check ${failures} times and was deleted from the bucket ` +
+          `each time. The last time, ${why}.\n${failure}\n` +
+          "Resume to take it again (another sentry may do better: add one, then resume), or abandon.",
+      );
+    },
+  };
 }
 
 const nodeTarget = (ctx: StepCtx, key: string) => rowTarget(ctx, componentRow(ctx, key));
@@ -511,7 +770,7 @@ function holdStep(p: (s: string) => string, key: string): StepDef {
 }
 
 /** Remove the hold; the entrypoint starts the node within ~15s. Closes the op. */
-function releaseStep(p: (s: string) => string, key: string, opId: number): StepDef {
+function releaseStep(p: (s: string) => string, key: string, opId: number, opts: { finish?: boolean } = {}): StepDef {
   return {
     name: p("release"),
     async run(ctx) {
@@ -520,7 +779,7 @@ function releaseStep(p: (s: string) => string, key: string, opId: number): StepD
       for (let i = 0; i < 36; i++) {
         if (await nodeRunning(ctx, target())) {
           ctx.log(`${key}: running again`);
-          ctx.db.setFleetOpStatus(opId, "done");
+          if (opts.finish !== false) ctx.db.setFleetOpStatus(opId, "done");
           return { running: true };
         }
         await ctx.services.sleep(5000);
@@ -608,15 +867,14 @@ export async function restoreChainData(
   key: string,
   target: SshTarget,
 ): Promise<{ restored: boolean; height?: number }> {
-  const latest = lastDataBackup(ctx.db, ctx.launchId);
-  if (!latest || !dataBackupStorage(spec, ctx.dirs.secrets)) return { restored: false };
+  if (!lastDataBackup(ctx.db, ctx.launchId) || !dataBackupStorage(spec, ctx.dirs.secrets)) return { restored: false };
   if (!autoRestoreEnabled(ctx.db, ctx.launchId)) {
     ctx.log(`${key}: automatic restore from backups is off for this fleet; syncing from peers`);
     return { restored: false };
   }
-  const blocker = restoreBlocker(ctx.db, ctx.launchId, ctx.dirs.node, latest);
-  if (blocker) {
-    ctx.log(`${key}: not restoring the chain-data backup (${blocker}); syncing from peers`);
+  const { record: latest, blocker } = latestRestorable(ctx.db, ctx.launchId, ctx.dirs.node);
+  if (!latest) {
+    ctx.log(`${key}: not restoring a chain-data backup (${blocker}); syncing from peers`);
     return { restored: false };
   }
   try {

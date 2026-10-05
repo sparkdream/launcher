@@ -55,12 +55,33 @@ export const relayer: ComponentDescriptor = {
   // its chain identities live in the Hermes config the link step uploads
   envRefresh: "none",
   // hermes is PID-supervised by relayer-run only once linked: before that the
-  // container idles on purpose, after it a missing hermes is a real fault
+  // container idles on purpose, after it a missing hermes is a real fault.
+  // A running hermes also needs its mesh tunnels: each chain it reaches on
+  // 127.0.0.1 must answer there, or hermes relays nothing for it while the
+  // process looks fine (seen live: a day tunnelling to a resized sentry-0's
+  // old address, reported "relaying" throughout)
   probe: {
-    command: "pgrep -x hermes >/dev/null && echo relaying || (test -f /data/relayer/ready && echo down || echo unlinked)",
+    command:
+      "pgrep -x hermes >/dev/null && { " +
+      "awk -F\"'\" '/^id = /{id=$2} /^rpc_addr = .http:[/][/]127[.]0[.]0[.]1:/{print id, $2}' " +
+      "/data/relayer/config.toml 2>/dev/null | while read id url; do " +
+      'curl -s -m 4 -o /dev/null "$url/status" || echo "dead $id $url"; done; echo relaying; } ' +
+      "|| (test -f /data/relayer/ready && echo down || echo unlinked)",
     verdict(stdout) {
-      const state = stdout.trim().split("\n").pop() ?? "";
-      if (state === "relaying") return { healthy: true, detail: "hermes relaying" };
+      const lines = stdout.trim().split("\n");
+      const state = lines.pop() ?? "";
+      if (state === "relaying") {
+        const dead = lines.filter((l) => l.startsWith("dead ")).map((l) => l.split(" "));
+        if (dead.length === 0) return { healthy: true, detail: "hermes relaying" };
+        return {
+          healthy: false,
+          status: "stale-tunnel",
+          detail:
+            `hermes runs but cannot reach ${dead.map(([, id, url]) => `${id} (${url})`).join(", ")} ` +
+            "through its mesh tunnel: the sentry is down, or the tunnel names an address it no longer " +
+            "holds (repair fleet re-aims it)",
+        };
+      }
       if (state === "unlinked") return { healthy: true, detail: "not linked yet (relink)" };
       return { healthy: false, detail: "linked but hermes is not running" };
     },

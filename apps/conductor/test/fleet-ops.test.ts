@@ -403,6 +403,24 @@ describe("node resize op", () => {
     ).toBe(true);
   }, 120_000);
 
+  it("opens the sentries it syncs from to several mesh peers, then restarts the new node to dial them now", async () => {
+    const w = await launched();
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const oldId = `${before.ssh_host}:${before.ssh_port}`;
+    // the source refuses all but its first peer (every mesh peer is 127.0.0.1)
+    w.services.ssh.refusesDuplicateIp.add(oldId);
+    await w.fleet.requestNodeResize(w.db.getLaunch("fl")!, before, "large");
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.services.ssh.refusesDuplicateIp.has(oldId)).toBe(false);
+    const after = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    const newId = `${after.ssh_host}:${after.ssh_port}`;
+    const log = w.services.ssh.execLog;
+    const opened = log.findIndex((e) => e.target === oldId && e.command.includes("^allow_duplicate_ip = true"));
+    const redial = log.findIndex((e, i) => i > opened && e.target === newId && /pkill -x sparkdreamd/.test(e.command));
+    expect(opened).toBeGreaterThan(-1);
+    expect(redial).toBeGreaterThan(opened);
+  }, 120_000);
+
   it("hands a softsign validator's key and last signed height over only after the old node stopped signing", async () => {
     const w = await launched();
     const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
@@ -896,6 +914,14 @@ describe("stateless component relaunch", () => {
     expect(explorerSdl()).toContain(`TS_TUNNEL_1=11317:${sentryAfter.tailnet_ip}:1317`);
     expect(explorerSdl()).toContain(`TS_TUNNEL_2=26657:${sentryAfter.tailnet_ip}:26657`);
     expect(explorerSdl()).not.toContain(sentryBefore.tailnet_ip!);
+    // the provider was told, not just the on-disk SDL: mesh-clients re-runs
+    // after its update tx is signed, finds the SDL already re-aimed, and
+    // must push the manifest anyway (a skipped push left a relayer dialing
+    // a resized sentry's old IP for a day)
+    const explorerRow = w.db.listFleetComponents("fl").find((c) => c.key === "explorer")!;
+    expect(w.services.provider.lastManifest.get(explorerRow.dseq)).toContain(
+      `11317:${sentryAfter.tailnet_ip}:1317`,
+    );
 
     // and a relaunch never redeploys a stale address: even with the env
     // wound back to a dead IP, the fresh deployment names the current one

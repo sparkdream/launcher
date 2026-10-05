@@ -10,13 +10,15 @@ import type { LaunchSpec } from "./schema.js";
  * kind is an entry here plus a descriptor there — not a sweep for
  * `key === "explorer"`.
  */
-export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub"] as const;
+export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub", "ntfy"] as const;
 export type ComponentKey = (typeof COMPONENT_KEYS)[number];
 
 export interface ComponentKind {
   key: ComponentKey;
   /** Label in the fleet UI and cost table. */
   label: string;
+  /** One line on what it is for (the add dialog's picker). */
+  summary: string;
   /** Joins the headscale mesh: needs a preauth key, tunnel re-aiming on peer
    *  moves, and a live headscale to relaunch. */
   mesh: boolean;
@@ -41,6 +43,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   explorer: {
     key: "explorer",
     label: "Block explorer",
+    summary: "Public block explorer for the chain",
     mesh: true,
     ssh: true,
     uploadDir: "/data",
@@ -52,6 +55,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   frontend: {
     key: "frontend",
     label: "Web app",
+    summary: "The chain's user-facing web app",
     mesh: false,
     ssh: false,
     domain: true,
@@ -62,6 +66,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   relayer: {
     key: "relayer",
     label: "IBC relayer",
+    summary: "Relays IBC packets between chains",
     mesh: true,
     ssh: true,
     // Hermes' key store and config live here; bringup re-reads them
@@ -74,6 +79,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   mastodon: {
     key: "mastodon",
     label: "Mastodon",
+    summary: "Social instance the chain's posts federate through",
     // talks to the world over its domain; its bridge reaches the chain over
     // the public api endpoint, like any client
     mesh: false,
@@ -87,6 +93,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   bridge: {
     key: "bridge",
     label: "ActivityPub bridge",
+    summary: "Federates the chain's posts to a Mastodon instance",
     // a client of another fleet's Mastodon (its API) and of this chain's
     // public api, like the verifier: no mesh, no sshd (the sdap image)
     mesh: false,
@@ -99,6 +106,7 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   verifier: {
     key: "verifier",
     label: "Content verifier",
+    summary: "Checks content posted through the bridge",
     // a client of the target chain's public api and of the Mastodon it
     // checks, like any outsider: no mesh, no sshd (the sdap image)
     mesh: false,
@@ -111,8 +119,22 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   hub: {
     key: "hub",
     label: "Landing page",
+    summary: "Landing page that links the apps",
     // a static site (nginx serving the hub's Vite build): reads nothing from
     // any chain, so it runs the same beside a chain or in a services fleet
+    mesh: false,
+    ssh: false,
+    domain: true,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
+  ntfy: {
+    key: "ntfy",
+    label: "Alerts (ntfy)",
+    summary: "Push server for the launcher's alerts to your phone",
+    // a push server the launcher posts incident alerts to and a phone app
+    // reads: chain-independent, so it runs in a services fleet as well
     mesh: false,
     ssh: false,
     domain: true,

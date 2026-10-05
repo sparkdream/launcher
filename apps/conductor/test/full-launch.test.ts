@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { testnetSpec, type LaunchSpec } from "@sparkdream/launch-spec";
+import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { launchDirs, runLaunch, runWithSigner } from "../src/engine.js";
 import { BLOCKS_PER_MONTH } from "../src/fee.js";
@@ -1422,14 +1422,18 @@ describe("full launch, simulated (2×2 softsign testnet)", () => {
     const s = spec();
     db.createLaunch("dns", JSON.stringify(s), "akash1owner");
     const services = fakeServices();
-    services.rpc.httpOkResult = false;
+    // no record for the domain yet: it does not answer, while the provider's
+    // own hostname for headscale does (so the provider is not blamed)
+    const domain = withDefaults(s).topology.headscale.domain!;
+    services.rpc.darkUrls.add(domain);
     const signer = new FakeSigner();
 
     const first = await runWithSigner(db, "dns", s, work, allSteps(), services, signer);
     expect(first.status).toBe("awaiting-user");
     expect(first.reason).toContain("DNS");
+    expect(first.reason).toContain("the DNS record is what is missing");
 
-    services.rpc.httpOkResult = true;
+    services.rpc.darkUrls.delete(domain);
     const second = await runWithSigner(db, "dns", s, work, allSteps(), services, signer);
     expect(second.status).toBe("completed");
     db.close();

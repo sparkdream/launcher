@@ -1147,6 +1147,10 @@ function validateServicesFleet(
     if (!spec.topology.components.hub.domain) err("topology.components.hub.domain", "domain is required when enabled");
     if (!spec.images.hub) err("images.hub", "image is required when enabled");
   }
+  if (spec.topology.components.ntfy?.enabled) {
+    if (!spec.topology.components.ntfy.domain) err("topology.components.ntfy.domain", "domain is required when enabled");
+    if (!spec.images.ntfy) err("images.ntfy", "image is required when enabled");
+  }
 }
 
 

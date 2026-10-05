@@ -6,11 +6,14 @@ import {
   chainId,
   COMPONENT_KEYS,
   COMPONENT_KINDS,
+  SERVICES_FLEET_COMPONENTS,
   frozenResetViolations,
   isComponentKey,
+  componentDomain,
   isServicesFleet,
   minGasPriceProblem,
   NODE_SIZES,
+  nodeResources,
   nodeRole,
   nodeSize,
   fleetBridge,
@@ -26,6 +29,7 @@ import {
   type LaunchSpec,
   type LaunchSpecInput,
   type NodeSize,
+  type RoleResources,
   type RelayerPath,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
@@ -103,11 +107,49 @@ const RELAYER_FUNDS_EVERY_MS = 15 * 60_000;
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
-import { servicesSteps } from "./services-steps.js";
+import { replaceRerunSteps } from "./services-steps.js";
 import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
+import { readNtfySecrets } from "./components/ntfy.js";
 
 /** The accounts-panel entry for the Mastodon instance's Owner. */
 const MASTODON_OWNER = "mastodon-owner";
+/** Blocks per second a node replays at, before the fleet has measured its own (devnet, 2026-10). */
+const SYNC_RATE_DEFAULT = 5;
+/** A latest chain-data backup older than this is alerted (a moved node replays everything since). */
+const BACKUP_STALE_DAYS = 7;
+
+/** "40 minutes", "8.5 hours", "2 days". */
+function formatHours(hours: number): string {
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} minutes`;
+  if (hours < 48) return `${Math.round(hours * 10) / 10} hours`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+/** The fleet card's add dialog: what can be added, at what estimated cost (FleetService.addOptions). */
+export interface AddOptions {
+  kinds: Array<{
+    key: string;
+    label: string;
+    summary: string;
+    version?: string;
+    needsDomain: boolean;
+    lowUsd?: number;
+    highUsd?: number;
+    signatures: number;
+    steps: string[];
+  }>;
+  sentry?: {
+    name: string;
+    have: number;
+    signatures: number;
+    sizes: Array<{ id: "small" | "standard" | "large"; cpu: number; memory: string; data: string; lowUsd: number; highUsd: number }>;
+    steps: string[];
+    scratchSync?: { blocks: number; blocksPerSecond: number; hours: number; reason: string };
+  };
+}
+
+/** The accounts-panel entry for the ntfy app's login (its "mnemonic" is the password). */
+const NTFY_LOGIN = "ntfy-login";
 import { relayerStatePath, type RelayerLinkOutput } from "./steps/relayer-link.js";
 import {
   grantHolds,
@@ -118,7 +160,7 @@ import {
   sessionSummary,
   type SessionRole,
 } from "./sessions.js";
-import type { ConductorDb, FleetComponentRow, FleetOpProgress, IncidentRow, LaunchRow } from "./db.js";
+import type { ConductorDb, FleetComponentRow, FleetOpProgress, FleetOpRow, IncidentRow, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
@@ -133,8 +175,8 @@ import type { Services } from "./services.js";
 import { copySecretsDecrypted, copySecretsEncrypted, readSecretFile, writeSecretFile } from "./secrets.js";
 import { toSsh2CompatiblePrivateKey } from "./keys.js";
 import { extractForwardedPort, headscaleBackupPath, providerUnreachable, resolveS3Secret, templateHeadscaleSdl, type Assignments, type DeploymentPlan, type HeadscaleOutput, type SshEndpoints } from "./steps/phase-bcd.js";
-import { phaseEFSteps } from "./steps/phase-ef.js";
 import { canonicalGenesisSha256 } from "./steps/join.js";
+import { serviceIngressHost } from "./steps/phase-ef.js";
 import { dependentFleets } from "./headscale-reuse.js";
 import { AUTO_BID, consensusAddress, imageRepo, sentryPublicDomains } from "./fleet-ops.js";
 import {
@@ -145,7 +187,7 @@ import {
   undoMeshBackup,
   type MeshBackupParams,
 } from "./mesh-backup.js";
-import { undoAddSentry, type AddSentryParams } from "./add-sentry.js";
+import { removeSentry, undoAddSentry, type AddSentryParams } from "./add-sentry.js";
 import {
   autoRestoreEnabled,
   backupSource,
@@ -153,11 +195,16 @@ import {
   restoreBlocker,
   dataBackupStorage,
   lastDataBackup,
+  latestRestorable,
+  lastDataBreak,
+  deleteDataBackup,
   type DataBackupParams,
   type DataRestoreParams,
+  type DataBackupRecord,
 } from "./data-backup.js";
 import { HANDOVER_STEPS, UNRETIRE_CMD, type NodeResizeParams } from "./node-resize.js";
-import { sizeToBytes } from "./estimate.js";
+import { estimateComponent, estimateNode, sizeToBytes } from "./estimate.js";
+import { cloudflareToken } from "./dns.js";
 import {
   depositsOf,
   opsKey,
@@ -315,7 +362,17 @@ export interface FleetView {
     schedule: "off" | "daily" | "weekly";
     /** relaunched and added nodes start from the latest usable backup */
     autoRestore: boolean;
-    backups: Array<{ name: string; height: number; takenAt: string; from: string; blocker: string | null }>;
+    /** the chosen "copy from" sentry, null for the automatic pick */
+    source: string | null;
+    /** the sentry a backup started now would copy */
+    sourceNow: string | null;
+    /** verified: read back and unpacked after its upload */
+    backups: Array<{ name: string; height: number; takenAt: string; from: string; verified: boolean; blocker: string | null }>;
+    /** No usable backup: what a moved or added node would replay from block 1
+     *  (blocks, the rate it is estimated at, hours). Absent with a usable backup. */
+    scratchSync?: { blocks: number; blocksPerSecond: number; hours: number; reason: string };
+    /** Age in days of the latest usable backup (absent without one). */
+    latestAgeDays?: number;
   };
   /** Which components auto-recovery may act on (off unless turned on). */
   autoRecover: AutoRecoverPolicy;
@@ -458,6 +515,31 @@ export { consensusAddress };
 export interface MastodonSettings {
   registrations?: "open" | "approved" | "none";
   walletLogin?: Record<string, unknown>;
+}
+
+/**
+ * The components one fleet op works on, from its params; undefined when it
+ * may touch any (a chain reset, a fleet-wide upgrade, a repair).
+ */
+function opComponents(op: FleetOpRow): string[] | undefined {
+  let p: { key?: unknown; keys?: unknown; components?: unknown; source?: unknown };
+  try {
+    p = JSON.parse(op.params_json);
+  } catch {
+    return undefined;
+  }
+  switch (op.kind) {
+    case "relink":
+    case "relayer-paths":
+      return ["relayer"];
+    case "public-grpc":
+      return ["sentry-0"];
+    case "mesh-backup":
+      return ["headscale"];
+  }
+  const keys = [p.key, ...(Array.isArray(p.keys) ? p.keys : []), ...(Array.isArray(p.components) ? p.components : []), p.source]
+    .filter((k): k is string => typeof k === "string");
+  return keys.length > 0 ? keys : undefined;
 }
 
 export class FleetService {
@@ -890,14 +972,19 @@ export class FleetService {
           : {
               dataBackups: {
                 schedule: this.dataBackupSchedule(launch.id),
+                // the chosen "copy from" sentry (null: automatic), and who a backup now would copy
+                source: this.db.getSetting(`data-backup-source:${launch.id}`),
+                sourceNow: this.backupSourceFor(launch.id)?.key ?? null,
                 autoRestore: autoRestoreEnabled(this.db, launch.id),
                 backups: dataBackups(this.db, launch.id).map((b) => ({
                   name: b.name,
                   height: b.height,
                   takenAt: b.takenAt,
                   from: b.from,
+                  verified: b.verified === true,
                   blocker: restoreBlocker(this.db, launch.id, launchDirs(this.workRoot, launch.id).node, b),
                 })),
+                ...(await this.backupStanding(launch).catch(() => ({}))),
               },
             }),
         autoRecover: this.autoRecoverPolicy(launch.id),
@@ -991,8 +1078,14 @@ export class FleetService {
    */
   async tick(launchId: string): Promise<void> {
     const launch = this.db.getLaunch(launchId);
-    if (!launch || launch.status !== "completed") return;
-    this.materialize(launchId);
+    if (!launch) return;
+    // a fleet paused inside an op is still a running fleet: everything the
+    // op is not working on keeps its readings current (its rows are not
+    // rebuilt mid-op, which would hand the op's half-made deployments over)
+    const scope = launch.status === "paused" ? this.pausedOpScope(launchId) : new Set<string>();
+    if (launch.status !== "completed" && launch.status !== "paused") return;
+    if (scope === "all") return;
+    if (launch.status === "completed") this.materialize(launchId);
     const owner = launch.owner;
     const spec = this.spec(launch);
     const perDay = blocksPerDay(spec);
@@ -1027,6 +1120,7 @@ export class FleetService {
     // provider doesn't stretch the whole pass
     await Promise.all(
       this.db.listFleetComponents(launchId).map(async (c) => {
+        if (scope.has(c.key)) return;
         if (c.state === "closed") {
           this.db.setComponentHealth(launchId, c.key, "closed");
           return;
@@ -1120,7 +1214,7 @@ export class FleetService {
             const verdict = probe.verdict(stdout);
             details.push(verdict.detail);
             if (!verdict.healthy) {
-              this.db.setComponentHealth(launchId, c.key, "unreachable", details.join("; "));
+              this.db.setComponentHealth(launchId, c.key, verdict.status ?? "unreachable", details.join("; "));
               return;
             }
             // a running hermes with an empty key relays nothing on that chain,
@@ -1433,10 +1527,21 @@ export class FleetService {
     if (masto?.enabled && masto.owner && password) {
       out.push({ name: MASTODON_OWNER, address: `@${masto.owner.username}@${masto.domain}`, hasMnemonic: true });
     }
+    // the alerts server's phone login: user@domain, its secret the password
+    // the ntfy app asks for
+    const ntfy = this.spec(launch).topology.components.ntfy;
+    if (ntfy?.enabled && ntfy.domain && readNtfySecrets(launchDirs(this.workRoot, launch.id).secrets)) {
+      out.push({ name: NTFY_LOGIN, address: `${ntfy.user ?? "phone"} @ https://${ntfy.domain}`, hasMnemonic: true });
+    }
     return out;
   }
 
   mnemonic(launch: LaunchRow, name: string): string {
+    if (name === NTFY_LOGIN) {
+      const password = readNtfySecrets(launchDirs(this.workRoot, launch.id).secrets)?.phonePassword;
+      if (!password) throw new Error("no ntfy login generated yet");
+      return password;
+    }
     if (name === MASTODON_OWNER) {
       const password = readMastodonSecrets(launchDirs(this.workRoot, launch.id).secrets)?.ownerPassword;
       if (!password) throw new Error("no Mastodon owner password recorded");
@@ -1690,11 +1795,15 @@ export class FleetService {
   async trackIncidents(launchId: string): Promise<IncidentEvent[]> {
     const launch = this.db.getLaunch(launchId);
     if (!launch) return [];
+    // paused inside an op: what the op is moving reads down because of it;
+    // the rest is watched as usual (auto-recovery defers to the op)
+    const scope = launch.status === "paused" ? this.pausedOpScope(launchId) : new Set<string>();
+    if (scope === "all") return [];
     const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
     const events: IncidentEvent[] = [];
     for (const h of this.db.listComponentHealth(launchId)) {
       const row = rows.find((r) => r.key === h.component);
-      if (!row) continue;
+      if (!row || scope.has(h.component)) continue;
       const ev = await trackIncident(this.db, launchId, h.component, h.status, h.detail, () =>
         this.probeProvider(launch, row),
       );
@@ -1723,6 +1832,25 @@ export class FleetService {
       }
     }
     return events;
+  }
+
+  /**
+   * The components a paused launch's active ops are working on, whose
+   * readings mid-op are the op's own doing (a node it stopped, a lease it
+   * closed) rather than an outage. "all" when an op may touch any of them,
+   * or when the launch is paused outside any op (a launch still launching
+   * has no running fleet to watch).
+   */
+  pausedOpScope(launchId: string): Set<string> | "all" {
+    const ops = this.db.listFleetOps(launchId, "active");
+    if (ops.length === 0) return "all";
+    const scope = new Set<string>();
+    for (const op of ops) {
+      const keys = opComponents(op);
+      if (!keys) return "all";
+      for (const k of keys) scope.add(k);
+    }
+    return scope;
   }
 
   /** Components whose incident opened while an op was active, per launch. */
@@ -1857,6 +1985,22 @@ export class FleetService {
    * (unattendedBlocker). True when it was signed: the caller drives on.
    */
   async signUnattended(launchId: string): Promise<boolean> {
+    // one signing at a time per launch: the monitor pass and a drive's
+    // completion can both reach here for the same pending tx, and two
+    // broadcasts of it collide on the account sequence (or a dseq)
+    if (this.unattendedSigning.has(launchId)) return false;
+    this.unattendedSigning.add(launchId);
+    try {
+      return await this.signUnattendedOnce(launchId);
+    } finally {
+      this.unattendedSigning.delete(launchId);
+    }
+  }
+
+  /** Launches whose pending tx signUnattended is signing right now. */
+  private readonly unattendedSigning = new Set<string>();
+
+  private async signUnattendedOnce(launchId: string): Promise<boolean> {
     const chain = this.services.unattended;
     const launch = this.db.getLaunch(launchId);
     if (!chain || !launch) return false;
@@ -1955,7 +2099,17 @@ export class FleetService {
       ((status as { services?: Record<string, { available?: number; total?: number }> })?.services ?? {}),
     );
     if (services.some((s) => (s.total ?? 0) > 0 && (s.available ?? 0) === 0)) return "service-down";
-    return services.length > 0 ? "up" : "unknown";
+    if (services.length === 0) return "unknown";
+    // a public component: does the provider serve it on its own hostname?
+    // Not doing so while the container runs is the ingress, not the service
+    const ingress = isComponentKey(row.key) && COMPONENT_KINDS[row.key].domain ? descriptorFor(row.key)?.ingress?.(this.spec(launch)) : undefined;
+    const domain = ingress?.[0]?.domain ?? (isComponentKey(row.key) ? componentDomain(this.spec(launch), row.key) : undefined);
+    const generated = domain ? serviceIngressHost(status, domain) : undefined;
+    if (domain && generated) {
+      const path = ingress?.[0] ? new URL(ingress[0].healthUrl).pathname : "/";
+      if (!(await this.services.rpc.httpOk(`http://${generated}${path}`))) return "ingress-broken";
+    }
+    return "up";
   }
 
   /** Send a test alert to the configured channels; the failures, if any. */
@@ -2282,11 +2436,7 @@ export class FleetService {
     // node boots, times out fetching its pubkey, and crash-loops.
     // a services fleet has its own, shorter pipeline: everything after the
     // manifests (its domain check and the components' configuration)
-    const services = servicesSteps().map((s) => s.name);
-    const from = isServicesFleet(this.spec(launch))
-      ? services.slice(services.indexOf("send-manifests") + 1)
-      : ["upload-node-data", ...phaseEFSteps().map((s) => s.name)];
-    for (const name of ["send-manifests", ...from]) {
+    for (const name of replaceRerunSteps(this.spec(launch))) {
       this.db.resetStep(launch.id, name);
     }
     return { ...(step ? { step } : {}), closing: info?.state === "active" };
@@ -2362,6 +2512,92 @@ export class FleetService {
    * refuses (throws) what it cannot do: the node already at that size, or a
    * new size whose data volume cannot hold the chain the node keeps now.
    */
+  /**
+   * Where a moved or added node would start: the latest usable chain-data
+   * backup (its age), or block 1 (how long that replay would take, at the
+   * fleet's last measured sync rate, else SYNC_RATE_DEFAULT). A join fleet
+   * state-syncs and is never asked.
+   */
+  async backupStanding(launch: LaunchRow): Promise<{
+    scratchSync?: { blocks: number; blocksPerSecond: number; hours: number; reason: string };
+    latestAgeDays?: number;
+  }> {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec) || spec.join) return {};
+    const usable = this.usableBackup(launch);
+    if (usable.record) return { latestAgeDays: Math.floor((Date.now() - Date.parse(usable.record.takenAt)) / 86_400_000) };
+    // the fleet view asks on every refresh: the head is read once a minute
+    let height = this.headCache.get(launch.id);
+    if (!height || Date.now() - height.at > 60_000) {
+      const url = await this.sentryRpcUrl(launch).catch(() => null);
+      const h = url ? await this.services.rpc.status(url).then((st) => st.latestBlockHeight).catch(() => 0) : 0;
+      height = { at: Date.now(), value: h };
+      this.headCache.set(launch.id, height);
+    }
+    if (!height.value) return {};
+    const rate = Number(this.db.getSetting(`sync-rate:${launch.id}`)) || SYNC_RATE_DEFAULT;
+    return {
+      scratchSync: {
+        blocks: height.value,
+        blocksPerSecond: rate,
+        hours: Math.round((height.value / rate / 3600) * 10) / 10,
+        reason: usable.reason,
+      },
+    };
+  }
+
+  /** Chain head per launch for backupStanding, read at most once a minute. */
+  private readonly headCache = new Map<string, { at: number; value: number }>();
+
+  /** The latest backup a new node would restore, or why there is none. */
+  private usableBackup(launch: LaunchRow): { record?: DataBackupRecord; reason: string } {
+    if (!lastDataBackup(this.db, launch.id)) return { reason: "this fleet has no chain-data backup" };
+    if (!autoRestoreEnabled(this.db, launch.id)) return { reason: "automatic restore from backups is off" };
+    const { record, blocker } = latestRestorable(this.db, launch.id, launchDirs(this.workRoot, launch.id).node);
+    if (!record) return { reason: blocker ?? "no backup can be restored" };
+    return { record, reason: "" };
+  }
+
+  /** The confirm-dialog warning for an op that places a node with nothing to restore. */
+  async scratchSyncWarnings(launch: LaunchRow, key: string): Promise<string[]> {
+    if (!/^(val|sentry)-\d+$/.test(key)) return [];
+    const { scratchSync } = await this.backupStanding(launch).catch(() => ({}) as { scratchSync?: undefined });
+    if (!scratchSync) return [];
+    return [
+      `No chain-data backup to start from (${scratchSync.reason}): the new ${key} replays all ` +
+        `~${scratchSync.blocks.toLocaleString("en-US")} blocks from its peers, about ${formatHours(scratchSync.hours)} ` +
+        `at ~${scratchSync.blocksPerSecond} blocks/s. Taking one first (chain backups… → Back up now) makes this minutes.`,
+    ];
+  }
+
+  /**
+   * Monitor pass: a chain fleet with a backup bucket but no usable chain-data
+   * backup, or only one older than BACKUP_STALE_DAYS, is alerted at most
+   * once a day (a node it has to move would replay the chain for hours).
+   */
+  async backupStaleCheck(launchId: string): Promise<void> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status === "aborted") return;
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec) || spec.join || !dataBackupStorage(spec, launchDirs(this.workRoot, launch.id).secrets)) return;
+    if (this.db.getStep(launch.id, "finalize")?.status !== "done") return;
+    const standing = await this.backupStanding(launch).catch(() => ({}) as Awaited<ReturnType<FleetService["backupStanding"]>>);
+    const stale = standing.latestAgeDays !== undefined && standing.latestAgeDays > BACKUP_STALE_DAYS;
+    if (!standing.scratchSync && !stale) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `backup-stale-alerted:${launch.id}`;
+    if (this.db.getSetting(key) === today) return;
+    this.db.setSetting(key, today);
+    await this.notify(
+      launch,
+      "chain-data",
+      stale ? `chain-data backup ${standing.latestAgeDays} days old` : "no chain-data backup",
+      stale
+        ? `The latest chain-data backup is ${standing.latestAgeDays} days old: a node moved now replays everything since. Take one (chain backups… → Back up now) or set a schedule.`
+        : `A node this fleet has to move or add replays all ~${standing.scratchSync!.blocks.toLocaleString("en-US")} blocks (about ${formatHours(standing.scratchSync!.hours)}). Take a backup (chain backups… → Back up now), then set a schedule.`,
+    );
+  }
+
   async nodeResizeWarnings(launch: LaunchRow, component: FleetComponentRow, size: NodeSize): Promise<string[]> {
     const spec = this.spec(launch);
     this.assertNodeResizable(launch, component, size);
@@ -2398,10 +2634,13 @@ export class FleetService {
         "of your own), and " +
         (spec.join
           ? "state-syncs from the chain"
-          : "syncs the whole chain from block 1 off the fleet's own nodes") +
+          : this.usableBackup(launch).record
+            ? `starts from the chain-data backup taken at height ${this.usableBackup(launch).record!.height.toLocaleString("en-US")}, then syncs the rest off the fleet's own nodes`
+            : "syncs the whole chain from block 1 off the fleet's own nodes") +
         " while the current node keeps running. On a long chain this takes hours, both deployments are " +
         "paid for meanwhile, and the fleet's other operations wait until it is done.",
     );
+    warnings.push(...(await this.scratchSyncWarnings(launch, component.key)));
     if (role === "validator") {
       warnings.push(
         spec.security.keyMode === "tmkms"
@@ -2449,6 +2688,66 @@ export class FleetService {
       ...(prefs.avoid.includes(component.provider) ? {} : { stayOn: component.provider }),
       size,
     } satisfies NodeResizeParams);
+  }
+
+  /**
+   * What the resize dialog shows: the node's current size and resources, each
+   * size with its estimate, the data disk's use, and whether a size is too
+   * small to sync into (the same 80 % rule nodeResizeWarnings refuses by) or
+   * the resize is blocked outright.
+   */
+  async resizeOptions(launch: LaunchRow, component: FleetComponentRow): Promise<{
+    current: { size: NodeSize | "custom"; resources: RoleResources };
+    sizes: Array<{ id: NodeSize; resources: RoleResources; lowUsd: number; highUsd: number; tooSmall?: string }>;
+    disk: NodeDisk | null;
+    blocked?: string;
+    /** what the cutover risks, one short line each (the confirm the dialog replaced said these) */
+    risks: string[];
+    /** a tmkms validator: the op pauses for the signer before and after the cutover */
+    tmkms: boolean;
+  }> {
+    const spec = this.spec(launch);
+    const role = nodeRole(component.key);
+    const risks: string[] = [];
+    if (role === "validator" && !spec.join && spec.topology.validators.count === 1) {
+      risks.push("This chain has a single validator: it produces no blocks during the cutover.");
+    }
+    for (const w of this.sentryIsolationWarnings(spec, component, "for the minute of the cutover")) risks.push(`${w}.`);
+    if (
+      component.key === "sentry-0" &&
+      (spec.topology.publicEndpoints?.api || spec.topology.publicEndpoints?.rpc) &&
+      !cloudflareToken(this.workRoot)
+    ) {
+      risks.push("sentry-0 serves the public API/RPC: if it moves provider, point their DNS records at it.");
+    }
+    const disk = await this.componentDisk(launch, component).catch(() => null);
+    let blocked: string | undefined;
+    try {
+      // any size other than the current one passes the size check
+      const other = (["small", "standard", "large"] as const).find((s) => s !== nodeSize(spec, component.key))!;
+      this.assertNodeResizable(launch, component, other);
+    } catch (e) {
+      blocked = e instanceof Error ? e.message : String(e);
+    }
+    return {
+      current: { size: nodeSize(spec, component.key), resources: nodeResources(spec, component.key) },
+      sizes: (["small", "standard", "large"] as const).map((id) => {
+        const resources = NODE_SIZES[id][role];
+        const capacity = sizeToBytes(resources.storage.data);
+        return {
+          id,
+          resources,
+          ...estimateNode(resources),
+          ...(disk && disk.usedBytes > capacity * 0.8
+            ? { tooSmall: `${component.key} holds ${Math.round(disk.usedBytes / 2 ** 30)} GiB of chain data, more than ${resources.storage.data} can take with room to grow` }
+            : {}),
+        };
+      }),
+      disk,
+      ...(blocked ? { blocked } : {}),
+      risks,
+      tmkms: role === "validator" && spec.security.keyMode === "tmkms",
+    };
   }
 
   private assertNodeResizable(launch: LaunchRow, component: FleetComponentRow, size: NodeSize): void {
@@ -2630,6 +2929,115 @@ export class FleetService {
    * grant is retired by the next "sessions" op, which finds no component
    * running it.
    */
+  /**
+   * What the fleet card's add dialog offers: every kind this fleet can
+   * still add, and a sentry for a running chain fleet, each with what it is
+   * for, the image it would run, an estimate (the launch cost table's
+   * rates, USD/month) and the steps it goes through, so the choice and its
+   * cost are visible before anything is signed.
+   */
+  async addOptions(launch: LaunchRow): Promise<AddOptions> {
+    const spec = this.spec(launch);
+    const rows = this.db.listFleetComponents(launch.id) as FleetComponentRow[];
+    const chain = !isServicesFleet(spec);
+    const images = spec.images as Record<string, string | undefined>;
+    const defaults = profiles[spec.network.type]?.images as Record<string, string | undefined> | undefined;
+    const tagOf = (image?: string) => image?.split(":").pop();
+    const kinds: AddOptions["kinds"] = [];
+    for (const key of COMPONENT_KEYS) {
+      if (!chain && !SERVICES_FLEET_COMPONENTS.includes(key)) continue;
+      if (rows.some((r) => r.key === key && r.state !== "closed")) continue;
+      // a component added now runs the current release (requestAddComponent)
+      const current = images[key];
+      const latest = defaults?.[key];
+      const latestTag = latest ? versionTag(latest) : undefined;
+      const image =
+        current && latest && latestTag && imageRepo(current) === imageRepo(latest) && imageBefore(current, `v${latestTag.join(".")}`)
+          ? latest
+          : (current ?? latest);
+      const kind = COMPONENT_KINDS[key];
+      // priced as it would deploy: enabled in the spec. A kind whose
+      // settings are still missing (a relayer's paths) has no estimate yet
+      let estimate: { lowUsd: number; highUsd: number } | undefined;
+      try {
+        const preview = withDefaults({
+          ...JSON.parse(launch.spec_json),
+          topology: {
+            ...spec.topology,
+            components: { ...spec.topology.components, [key]: { ...(spec.topology.components as any)[key], enabled: true } },
+          },
+        } as any);
+        estimate = estimateComponent(preview, key);
+      } catch {
+        // most kinds' resources do not depend on their settings
+        estimate = estimateComponent(spec, key);
+      }
+      kinds.push({
+        key,
+        label: kind.label,
+        summary: kind.summary,
+        ...(tagOf(image) ? { version: tagOf(image)! } : {}),
+        needsDomain: kind.domain,
+        ...(estimate ? { lowUsd: estimate.lowUsd, highUsd: estimate.highUsd } : {}),
+        signatures: 2,
+        steps: [
+          "New lease on an Akash provider, off the ones your wallet avoids",
+          "Deposit and 2 signatures (deployment, lease)",
+          `Pulls ${key}${tagOf(image) ? ` ${tagOf(image)}` : ""} and starts it`,
+          kind.domain
+            ? "Its domain is pointed at it (with the Cloudflare token) and checked until it answers"
+            : "Checked until its lease is up",
+        ],
+      });
+    }
+    let sentry: AddOptions["sentry"];
+    const active = rows.filter((r) => r.state === "active");
+    if (chain && launch.status !== "aborted" && active.length > 0) {
+      const next = `sentry-${spec.topology.sentries.count}`;
+      const standing = await this.backupStanding(launch).catch(() => ({}) as Awaited<ReturnType<FleetService["backupStanding"]>>);
+      const backup = this.usableBackup(launch).record;
+      sentry = {
+        name: next,
+        have: rows.filter((r) => r.key.startsWith("sentry-") && r.state !== "closed").length,
+        signatures: 3,
+        sizes: (["small", "standard", "large"] as const).map((id) => {
+          const r = NODE_SIZES[id].sentry;
+          const e = estimateNode(r);
+          return { id, cpu: r.cpu, memory: r.memory, data: r.storage.data, lowUsd: e.lowUsd, highUsd: e.highUsd };
+        }),
+        steps: [
+          "New lease on a provider other than the fleet's nodes', off the ones your wallet avoids",
+          "Deposit and 3 signatures",
+          backup
+            ? `Restores the latest chain-data backup (height ${backup.height.toLocaleString("en-US")})`
+            : standing.scratchSync
+              ? `No chain-data backup: replays all ~${standing.scratchSync.blocks.toLocaleString("en-US")} blocks from block 1, about ${formatHours(standing.scratchSync.hours)} (take a backup first to make this minutes)`
+              : "Syncs the chain from its peers",
+          "Syncs the remaining blocks from its peers and joins the mesh",
+        ],
+        ...(standing.scratchSync ? { scratchSync: standing.scratchSync } : {}),
+      };
+    }
+    return { kinds, ...(sentry ? { sentry } : {}) };
+  }
+
+  /**
+   * Take the fleet's closed, highest-numbered sentry out (add-sentry.ts
+   * removeSentry): the spec counts one fewer, its row and node id go, and
+   * the other nodes, here and running, stop listing it as a peer. Returns
+   * the running nodes that could not be edited (they drop it at a later
+   * repair or relaunch).
+   */
+  async removeSentry(launch: LaunchRow, key: string): Promise<{ unreachable: string[] }> {
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: remove the sentry once it is done");
+    }
+    return removeSentry(this.db, launchDirs(this.workRoot, launch.id), launch.id, key, async (row, command) => {
+      const full = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === row.key)!;
+      await this.services.ssh.exec(this.sshTargetFor(launch, full), command);
+    });
+  }
+
   removeComponent(launch: LaunchRow, key: string): void {
     if (!isComponentKey(key)) throw new Error(`${key} is not a service component; nodes and the mesh are not removed this way`);
     const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
@@ -2804,7 +3212,7 @@ export class FleetService {
     if (this.db.listFleetOps(launch.id, "active").length > 0) {
       throw new Error("another operation is in progress: back up once it is done");
     }
-    const source = backupSource(this.db.listFleetComponents(launch.id) as FleetComponentRow[]);
+    const source = this.backupSourceFor(launch.id, opts);
     if (!source) throw new Error("no running sentry to copy the chain data from");
     if (opts.auto && source.key === "sentry-0") throw new Error("scheduled backups need a second sentry");
     const opId = this.db.createFleetOp(launch.id, "data-backup", {
@@ -2812,6 +3220,32 @@ export class FleetService {
       ...(opts.auto ? { auto: true } : {}),
     } satisfies DataBackupParams);
     return { opId, source: source.key };
+  }
+
+  /**
+   * The sentry a backup copies: the fleet's chosen one ("copy from" in the
+   * chain backups dialog) while it runs, else the automatic pick
+   * (backupSource). A scheduled backup never takes a chosen sentry-0, whose
+   * public endpoints would stop for the copy.
+   */
+  backupSourceFor(launchId: string, opts: { auto?: boolean } = {}): FleetComponentRow | undefined {
+    const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
+    const chosen = this.db.getSetting(`data-backup-source:${launchId}`);
+    const row = chosen ? rows.find((r) => r.key === chosen && r.state === "active" && r.ssh_host) : undefined;
+    if (row && !(opts.auto && row.key === "sentry-0")) return row;
+    return backupSource(rows);
+  }
+
+  /** Choose the sentry backups copy, or null for the automatic pick. */
+  setDataBackupSource(launch: LaunchRow, key: string | null): void {
+    if (key === null) {
+      this.db.deleteSetting(`data-backup-source:${launch.id}`);
+      return;
+    }
+    const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+    if (!/^sentry-\d+$/.test(key) || !row) throw new Error(`${key} is not a sentry of this fleet (a validator is never copied)`);
+    if (row.state !== "active") throw new Error(`${key} is not running`);
+    this.db.setSetting(`data-backup-source:${launch.id}`, key);
   }
 
   /** Replace a node's chain data with a recorded backup, in place ("data-restore" op). */
@@ -2826,6 +3260,32 @@ export class FleetService {
       throw new Error("another operation is in progress: restore once it is done");
     }
     return this.db.createFleetOp(launch.id, "data-restore", { key: component.key, name } satisfies DataRestoreParams);
+  }
+
+  /**
+   * Delete a recorded backup from the bucket and the fleet's list (the
+   * chain backups dialog's delete). The bucket is reached through a running
+   * sentry, which has the backup tools.
+   */
+  async deleteDataBackup(launch: LaunchRow, name: string): Promise<void> {
+    if (!dataBackups(this.db, launch.id).some((r) => r.name === name)) {
+      throw new Error(`no backup named ${name} is recorded for this fleet`);
+    }
+    const running = this.db
+      .listFleetOps(launch.id, "active")
+      .find((o) => (o.kind === "data-backup" || o.kind === "data-restore") && o.params_json.includes(name));
+    if (running) throw new Error(`op ${running.id} is using ${name}: delete it once that is done`);
+    const via = backupSource(this.db.listFleetComponents(launch.id) as FleetComponentRow[]);
+    if (!via) throw new Error("no running sentry to reach the bucket through");
+    await deleteDataBackup(
+      this.db,
+      this.services,
+      launch.id,
+      this.spec(launch),
+      launchDirs(this.workRoot, launch.id).secrets,
+      this.sshTargetFor(launch, via),
+      name,
+    );
   }
 
   setAutoRestore(launch: LaunchRow, on: boolean): void {
@@ -2859,9 +3319,10 @@ export class FleetService {
     const launch = this.db.getLaunch(launchId);
     if (!launch || launch.status !== "completed") return false;
     if (this.db.listFleetOps(launchId, "active").length > 0) return false;
-    const source = backupSource(this.db.listFleetComponents(launchId) as FleetComponentRow[]);
+    const source = this.backupSourceFor(launchId, { auto: true });
     if (!source || source.key === "sentry-0") return false;
-    const last = lastDataBackup(this.db, launchId);
+    // a backup that never passed its check does not count as taken
+    const last = dataBackups(this.db, launchId).find((r) => r.verified);
     const every = schedule === "daily" ? 86_400_000 : 7 * 86_400_000;
     // a failed attempt waits a full interval too, rather than retrying every minute
     const lastAttempt = this.db
@@ -2870,6 +3331,10 @@ export class FleetService {
       .map((o) => Date.parse(o.created_at))
       .sort((a, b) => b - a)[0];
     const since = Math.max(last ? Date.parse(last.takenAt) : 0, lastAttempt ?? 0);
+    // a node upgrade (or reset) just made every backup unusable: take one
+    // now rather than leave the fleet up to a day without
+    const broke = lastDataBreak(this.db, launchId);
+    if (broke !== undefined && broke > since) return true;
     return now - since >= every;
   }
 
@@ -2879,7 +3344,7 @@ export class FleetService {
    * validator round-robin would give it); the op builds its home and places
    * it. `size` records a per-node size for it, as resize does.
    */
-  requestAddSentry(launch: LaunchRow, opts: { size?: "small" | "standard" | "large" } = {}): { opId: number; key: string } {
+  requestAddSentry(launch: LaunchRow, opts: { size?: "small" | "standard" | "large"; manualBid?: boolean } = {}): { opId: number; key: string } {
     const spec = this.spec(launch);
     if (isServicesFleet(spec)) throw new Error("a services fleet runs no chain");
     if (this.db.getStep(launch.id, "finalize")?.status !== "done") {
@@ -2903,9 +3368,12 @@ export class FleetService {
     const { errors } = validateSpec(withDefaults(stored));
     if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
     this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+    const avoid = this.providerPrefs(launch.owner).avoid;
     const opId = this.db.createFleetOp(launch.id, "add-sentry", {
       key,
       sentriesBefore: JSON.parse(launch.spec_json).topology.sentries,
+      ...(avoid.length > 0 ? { avoidProviders: avoid } : {}),
+      ...(opts.manualBid ? { manualBid: true } : {}),
     } satisfies AddSentryParams);
     return { opId, key };
   }
@@ -3149,6 +3617,8 @@ export class FleetService {
       /** The kind's own settings (its spec toggle's fields: mastodon's owner
        *  and bridge, ...), merged over what the stored spec has. */
       settings?: Record<string, unknown>;
+      /** The operator picks the bid for the new deployment. */
+      manualBid?: boolean;
     } = {},
   ): number {
     if (!isComponentKey(key)) throw new Error(`${key} is not a component kind this launcher can add`);
@@ -3221,9 +3691,13 @@ export class FleetService {
     resolveSmtpPasswordSource(this.db, this.workRoot, launch.owner, spec);
     stashSmtpPassword(launchDirs(this.workRoot, launch.id).secrets, spec);
     this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    const avoid = this.providerPrefs(launch.owner).avoid;
     return this.db.createFleetOp(launch.id, "add-component", {
       key,
       generation: row ? row.generation + 1 : 0,
+      // the wallet's avoid list holds for a new placement as for a move
+      ...(avoid.length > 0 ? { avoidProviders: avoid } : {}),
+      ...(opts.manualBid ? { manualBid: true } : {}),
     } satisfies AddComponentParams);
   }
 

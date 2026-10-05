@@ -29,6 +29,7 @@ import { fakeServices, FakeSigner } from "./fakes.js";
 import { detectChain, parseMinGasPrice, sisterFleets } from "../src/relayer-settings.js";
 import { fleetRpc } from "../src/peering.js";
 import { launchDirs } from "../src/engine.js";
+import { RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
 import { chainStub, withStub } from "./chain-stub.js";
 
 const OWNER_A = "akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w";
@@ -344,6 +345,12 @@ describe("relayer day-2", () => {
     expect(probe.verdict("relaying\n")).toEqual({ healthy: true, detail: "hermes relaying" });
     expect(probe.verdict("unlinked")).toMatchObject({ healthy: true });
     expect(probe.verdict("down")).toMatchObject({ healthy: false });
+    // hermes runs, but a chain it reaches over the mesh does not answer
+    expect(probe.verdict("dead sparkdream-1 http://127.0.0.1:26657\nrelaying\n")).toMatchObject({
+      healthy: false,
+      status: "stale-tunnel",
+      detail: expect.stringContaining("sparkdream-1 (http://127.0.0.1:26657)"),
+    });
 
     const opId = await fleet.requestChainReset(db.getLaunch("fl")!, JSON.parse(db.getLaunch("fl")!.spec_json));
     const ops = db.listFleetOps("fl", "active");
@@ -499,7 +506,7 @@ describe("relayer funds", () => {
     // fundcheck sees what the founder's send put on chain
     const exec = services.ssh.exec.bind(services.ssh);
     services.ssh.exec = async (target, command, opts) => {
-      if (command === "relayer-fundcheck || true") {
+      if (command === RELAYER_FUNDCHECK) {
         const funded = Object.values(chain.state().balances ?? {}).some((b) => b[s.token.baseDenom]);
         if (funded) services.ssh.unfundedChains.delete(chainId(s));
       }

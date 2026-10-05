@@ -60,7 +60,7 @@ export function servicesSpecDraft(
   const login = d.walletLogin?.enabled ? ` and login.${d.domain} (wallet sign-in)` : "";
   notes.push(`DNS: ${d.domain}, ${streaming}${login}, when the launch pauses with their targets`);
   notes.push(
-    "each chain links this instance with a standalone bridge component: add component → bridge on that chain's fleet, " +
+    "each chain links this instance with a standalone bridge component: add… → bridge on that chain's fleet, " +
       `target ${d.name} (its account there is @bridgedev, @bridgetest or @bridge by network)`,
   );
   return {

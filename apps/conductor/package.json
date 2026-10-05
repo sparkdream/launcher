@@ -23,6 +23,7 @@
     "@sparkdream/akash-tx": "workspace:*",
     "@sparkdream/launch-spec": "workspace:*",
     "@sparkdreamnft/sparkdreamjs": "^0.0.43",
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0",
     "js-yaml": "^4.1.0",

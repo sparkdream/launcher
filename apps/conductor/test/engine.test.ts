@@ -205,3 +205,38 @@ describe("orphaned step cleanup", () => {
     db.close();
   });
 });
+
+describe("aborting an op mid-step", () => {
+  it("unwinds a step polling in a loop at its next sleep, so the ops queued behind it run", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const spec = testnetSpec();
+    db.createLaunch("ab", JSON.stringify(spec), "akash1owner");
+    const stuck = db.createFleetOp("ab", "add-sentry", {});
+    const next = db.createFleetOp("ab", "upgrade", {});
+
+    // a restore or sync wait: polls until the node is done, which a closed
+    // deployment never is (2026-10-05: an aborted add-sentry held the devnet
+    // drive, so the rolling upgrade started after it never ran a step)
+    let polls = 0;
+    const steps: StepDef[] = [
+      {
+        name: `op${stuck}:restore`,
+        async run(ctx) {
+          for (;;) {
+            if (++polls === 3) db.setFleetOpStatus(stuck, "aborted");
+            await ctx.services.sleep(15_000);
+          }
+        },
+      },
+      { name: `op${next}:update`, async run() { return { updated: true }; } },
+    ];
+    const result = await runLaunch(db, "ab", spec, work, steps, fakeServices());
+
+    expect(result.status).toBe("completed");
+    expect(polls).toBe(3);
+    expect(db.getStep("ab", `op${stuck}:restore`)).toBeUndefined();
+    expect(db.getStep("ab", `op${next}:update`)?.status).toBe("done");
+    db.close();
+  });
+});

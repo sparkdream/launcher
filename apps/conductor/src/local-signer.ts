@@ -113,6 +113,13 @@ export interface LocalSignerHost {
   unitLog(unit: string, lines: number, scope?: UnitScope): Promise<string>;
   meshClis(): Promise<MeshCli[]>;
   meshUp(cli: string, args: string[]): Promise<void>;
+  /**
+   * Whether this user's systemd manager outlives its sessions (logind
+   * linger), turning it on when the user may. Without it a user unit stops
+   * once the last session ends, which over SSH is right after each command.
+   * Absent: not checked.
+   */
+  ensureLinger?(): Promise<boolean>;
 }
 
 // --- tmkms.toml (pure) ---
@@ -538,6 +545,15 @@ export async function adoptSigner(
           "(as the user the launcher connects as), then adopt again; it was left running",
       );
     }
+    // a user unit lives only as long as the user's systemd manager: without
+    // linger that ends with the last session (over SSH, right after each
+    // command), and the signer would stop as soon as the launcher let go
+    if (host.ensureLinger && !(await host.ensureLinger())) {
+      throw new Error(
+        "this user's systemd does not outlive its sessions (no linger), so a launcher unit would stop " +
+          `between commands: run \`sudo loginctl enable-linger ${args.remote?.user ?? "$USER"}\` on the signer machine, then adopt again; it was left running`,
+      );
+    }
     await host.installUnit(unit, renderUnit(binding));
     await host.kill(proc.pid);
     await host.startUnit(unit);
@@ -622,6 +638,15 @@ export class SystemdSignerHost implements LocalSignerHost {
     fs.writeFileSync(path.join(this.unitDir, unit), contents);
     await run("systemctl", ["--user", "daemon-reload"]);
     await run("systemctl", ["--user", "enable", unit]);
+  }
+
+  async ensureLinger(): Promise<boolean> {
+    const user = os.userInfo().username;
+    const linger = async () =>
+      (await run("loginctl", ["show-user", user, "-p", "Linger", "--value"]).catch(() => null))?.stdout.trim() === "yes";
+    if (await linger()) return true;
+    await run("loginctl", ["enable-linger", user]).catch(() => undefined);
+    return linger();
   }
 
   /** systemctl for a scope: the user manager, or the system one through passwordless sudo. */
@@ -794,6 +819,14 @@ export class SshSignerHost implements LocalSignerHost {
 
   async rename(from: string, to: string): Promise<void> {
     await this.sh(`mv ${sq(from)} ${sq(to)}`);
+  }
+
+  async ensureLinger(): Promise<boolean> {
+    const probe = `loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true`;
+    if ((await this.sh(probe)).trim() === "yes") return true;
+    // a user may turn on its own linger where polkit allows; passwordless sudo otherwise
+    await this.sh(`loginctl enable-linger "$(id -un)" 2>/dev/null || sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null || true`);
+    return (await this.sh(probe)).trim() === "yes";
   }
 
   async installUnit(unit: string, contents: string, scope: UnitScope = "user"): Promise<void> {

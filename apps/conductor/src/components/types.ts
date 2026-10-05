@@ -101,8 +101,12 @@ export interface ComponentDescriptor {
    *  https://<domain>/ (verify-chain's DNS gate and the health monitor). */
   ingress?(spec: LaunchSpec): Array<{ domain: string; healthUrl: string }>;
   /** A health probe run in the container over SSH (kinds without a public
-   *  domain): the command, and what its output means. */
-  probe?: { command: string; verdict(stdout: string): { healthy: boolean; detail: string } };
+   *  domain): the command, and what its output means. An unhealthy verdict
+   *  reads as "unreachable" unless it names a more specific status. */
+  probe?: {
+    command: string;
+    verdict(stdout: string): { healthy: boolean; detail: string; status?: string };
+  };
   /** Providers this kind must not land on, decided at placement time (the
    *  verifier avoids whichever provider hosts the Mastodon it checks).
    *  `assigned` holds this launch's placements made so far. */

@@ -3,15 +3,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { chainId, headscaleDomain, isServicesFleet, nodes, resolveTopology, serviceComponents, tunnelPort, type NodeRef } from "@sparkdream/launch-spec";
 import { ensureSession } from "../sessions.js";
-import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
+import { AwaitUser, RerunFrom, type StepCtx, type StepDef } from "../engine.js";
+import { replaceRerunSteps } from "../services-steps.js";
+import { TypeUrl } from "@sparkdream/akash-tx";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { linkPeersStep, linkRelayerStep } from "./relayer-link.js";
 import { configureMastodonStep, linkStandaloneBridge } from "./mastodon.js";
 import { configureVerifierStep } from "./verifier.js";
 import { descriptorFor } from "../components/index.js";
+import { useNtfyForAlerts } from "../components/ntfy.js";
 import { isManifestVersionRejected } from "../akash/client.js";
 import { placeholder, type GenerateKeysOutput } from "./phase-a.js";
-import { loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
+import { originInstruction, pointDns, pointOrigins, publicEndpointRecords } from "../dns-steps.js";
+import { extractForwardedPort, loadCert, nodeRpcUrl, nodeTarget, type Assignments, type DeploymentPlan, type PreauthKeys, type SshEndpoints } from "./phase-bcd.js";
 import type { SshTarget } from "../services.js";
 import { NODE_HOME, rpcUrl, socatTunnelCmd, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "../node-ops.js";
 import { buildTmkmsSetup, SIGNER_CONNECTED_PROBE, VALIDATOR_STATUS_PROBE, probeSaysConnected, statusConsensusPubkey } from "../tmkms.js";
@@ -823,28 +827,57 @@ export async function verifyPublicDomains(ctx: StepCtx, stepName: string): Promi
         behind: "sentry-0",
       });
     }
-    const failures: string[] = [];
+    const answers = async (t: (typeof targets)[number], tries: number) => {
+      for (let i = 0; i < tries; i++) {
+        if (i > 0) await ctx.services.sleep(5000);
+        if (await ctx.services.rpc.httpOk(t.url)) return true;
+      }
+      return false;
+    };
+    const dark: { t: (typeof targets)[number]; instruction: string; automated: boolean }[] = [];
     for (const t of targets) {
       // ~1 min per target — persist-start restarts the pods just before this
-      let ok = false;
-      for (let i = 0; i < 12 && !ok; i++) {
-        if (i > 0) await ctx.services.sleep(5000);
-        ok = await ctx.services.rpc.httpOk(t.url);
-      }
-      if (ok) {
+      if (await answers(t, 12)) {
         http[t.name] = t.url;
         ctx.log(`${t.name}: reachable at ${t.url}`);
         continue;
       }
       const a = assignments.perNode[t.behind]!;
-      const ingress = await ingressHost(
-        ctx, a.hostUri, plan.perNode[t.behind]!.dseq, a.gseq, a.oseq, t.domain,
-      );
-      failures.push(
-        `${t.name}: not reachable at ${t.url} — create a DNS record for ${t.domain} → ` +
-          `CNAME ${ingress} (or an A record to that host's IP). ` +
-          `Cloudflare: proxy on, SSL=Flexible.`,
-      );
+      const dseq = plan.perNode[t.behind]!.dseq;
+      if (t.behind === "sentry-0") {
+        // a forwarded port on the provider's host: CNAME plus Origin Rule
+        const status = await ctx.services.provider.leaseStatus(loadCert(ctx), a.hostUri, dseq, a.gseq, a.oseq);
+        const [record] = publicEndpointRecords(status, [{ name: t.name === "public-api" ? "API" : "RPC", domain: t.domain }]);
+        if (!record) {
+          dark.push({ t, automated: false, instruction: `${t.domain} → sentry-0's provider (its lease lists no forwarded port for it yet)` });
+          continue;
+        }
+        const automated = (await pointOrigins(ctx, [record])).length > 0;
+        dark.push({ t, automated, instruction: originInstruction(record) });
+      } else {
+        const ingress = await ingressHost(ctx, a.hostUri, dseq, a.gseq, a.oseq, t.domain);
+        const automated = (await pointDns(ctx, [{ domain: t.domain, target: ingress }])).length > 0;
+        dark.push({ t, automated, instruction: `${t.domain} → CNAME ${ingress} (or an A record to that host's IP)` });
+      }
+    }
+    // records the token just set: a few minutes for them to take
+    const failures: string[] = [];
+    for (const d of dark) {
+      if (d.automated && (await answers(d.t, 36))) {
+        http[d.t.name] = d.t.url;
+        ctx.log(`${d.t.name}: reachable at ${d.t.url} after its DNS was set`);
+        continue;
+      }
+      // DNS or the provider? A service component whose provider does not
+      // serve it on its own hostname either is re-placed, like a dead one
+      let verdict = "";
+      if (d.t.behind !== "sentry-0") {
+        const a = assignments.perNode[d.t.behind]!;
+        const v = await ingressVerdict(ctx, { hostUri: a.hostUri, dseq: plan.perNode[d.t.behind]!.dseq, gseq: a.gseq, oseq: a.oseq }, d.t.domain, new URL(d.t.url).pathname);
+        if (v.broken) await replaceAtLaunch(ctx, stepName, d.t.behind, a, plan.perNode[d.t.behind]!.dseq, v.detail);
+        verdict = ` (checked past DNS: ${v.detail})`;
+      }
+      failures.push(`${d.t.name}: not reachable at ${d.t.url}${verdict} — set ${d.instruction}. Cloudflare: proxy on, SSL=Flexible.`);
     }
     if (failures.length > 0) {
       throw new AwaitUser(stepName, `${failures.join("\n")}\nThen resume.`);
@@ -873,6 +906,132 @@ export async function ingressHost(
     loadCert(ctx), hostUri, dseq, gseq, oseq,
   );
   return serviceIngressHost(status, domain) ?? new URL(hostUri).hostname;
+}
+
+/** Re-placements a launch makes of one component off a broken ingress before it pauses. */
+const MAX_LAUNCH_REPLACEMENTS = 2;
+
+/**
+ * Move a component the launch placed on a provider whose ingress serves
+ * nothing: avoid the provider (the wallet's list, which send-manifests'
+ * re-bid honors), close the deployment, and run send-manifests and every
+ * later step again, the way the fleet card's re-place does. Returns only
+ * when it has already tried MAX_LAUNCH_REPLACEMENTS times.
+ */
+async function replaceAtLaunch(
+  ctx: StepCtx,
+  stepName: string,
+  key: string,
+  a: { hostUri: string; provider: string },
+  dseq: string,
+  detail: string,
+): Promise<void> {
+  const counter = `ingress-replace:${ctx.launchId}:${key}`;
+  const done = Number(ctx.db.getSetting(counter) ?? 0);
+  if (done >= MAX_LAUNCH_REPLACEMENTS) return;
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const host = new URL(a.hostUri).hostname;
+  ctx.log(`${key}: ${detail}; moving it off ${host} (attempt ${done + 1} of ${MAX_LAUNCH_REPLACEMENTS})`);
+  ctx.db.setProviderPref(owner, a.provider, "avoid", host);
+  const info = await ctx.services.api.deploymentInfo(owner, dseq).catch(() => undefined);
+  if (info?.state === "active") {
+    await ctx.requireTx(`${stepName}:replace-close:${dseq}`, [
+      { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq } } },
+    ]);
+  }
+  ctx.db.setSetting(counter, String(done + 1));
+  throw new RerunFrom(replaceRerunSteps(ctx.spec), `${key}: deployment ${dseq} closed, ${host}'s ingress served nothing`);
+}
+
+/**
+ * Whether a dark domain is the provider's fault, read past DNS and
+ * Cloudflare: the service's own provider-generated hostname, over plain
+ * HTTP on the provider's ingress. When the lease says the container is
+ * ready and that hostname does not serve `healthPath` either, the ingress
+ * routes nowhere (seen live: a provider listing the host and answering 404
+ * from its nginx while the container logged no visitor), and no DNS record
+ * can fix it: the placement has to move. Anything less certain (the
+ * container not ready, no generated hostname, the lease unreadable) is not
+ * blamed on the provider.
+ */
+export async function ingressVerdict(
+  ctx: StepCtx,
+  lease: { hostUri: string; dseq: string; gseq: number; oseq: number },
+  domain: string,
+  healthPath: string,
+): Promise<{ broken: boolean; detail: string; provider?: string }> {
+  const status: any = await ctx.services.provider
+    .leaseStatus(loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq)
+    .catch(() => undefined);
+  if (!status) return { broken: false, detail: "the lease status could not be read" };
+  const services: any[] = Object.values(status?.services ?? {});
+  const own = services.find((sv) => (sv?.uris ?? []).includes(domain)) ?? services[0];
+  const ready = Number(own?.available_replicas ?? own?.available ?? own?.ready_replicas ?? 0);
+  if (ready < 1) return { broken: false, detail: "its container is not ready yet" };
+  const generated = serviceIngressHost(status, domain);
+  if (!generated) return { broken: false, detail: "the provider lists no hostname of its own for it" };
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) await ctx.services.sleep(5000);
+    if (await ctx.services.rpc.httpOk(`http://${generated}${healthPath}`)) {
+      return { broken: false, detail: `the provider serves it at ${generated}: the DNS record is what is missing` };
+    }
+  }
+  return {
+    broken: true,
+    detail: `the container is ready, but the provider's own hostname ${generated} does not serve it either: its ingress routes nowhere`,
+    provider: new URL(lease.hostUri).hostname,
+  };
+}
+
+/**
+ * ingressVerdict for a node's public endpoints, which are forwarded ports on
+ * the provider's host, not its port-80 ingress: blamed on the provider when
+ * none of `ports` answers on host:externalPort directly (no DNS, no
+ * Cloudflare) while the node itself answers on its own localhost over SSH.
+ * A node that does not answer even there (still restoring or starting) is
+ * not the provider's fault.
+ */
+export async function forwardedVerdict(
+  ctx: StepCtx,
+  lease: { hostUri: string; dseq: string; gseq: number; oseq: number },
+  target: SshTarget,
+  ports: { port: number; path: string }[],
+): Promise<{ broken: boolean; detail: string; provider?: string }> {
+  const status: any = await ctx.services.provider
+    .leaseStatus(loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq)
+    .catch(() => undefined);
+  if (!status) return { broken: false, detail: "the lease status could not be read" };
+  const forwarded: { host: string; port: number; path: string }[] = [];
+  for (const p of ports) {
+    try {
+      const fp = extractForwardedPort(status, p.port);
+      forwarded.push({ host: fp.host, port: fp.port, path: p.path });
+    } catch {
+      // not forwarded (yet)
+    }
+  }
+  if (forwarded.length === 0) return { broken: false, detail: "the lease lists none of the node's public ports" };
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) await ctx.services.sleep(5000);
+    for (const f of forwarded) {
+      if (await ctx.services.rpc.httpOk(`http://${f.host}:${f.port}${f.path}`)) {
+        return { broken: false, detail: `the provider forwards ${f.host}:${f.port}: the DNS record or origin rule is what is wrong` };
+      }
+    }
+  }
+  const local = await ctx.services.ssh
+    .exec(target, "curl -s -m 5 localhost:26657/status", { quick: true })
+    .catch(() => ({ stdout: "" }));
+  if (!/latest_block_height/.test(local.stdout)) {
+    return { broken: false, detail: "the node does not answer on its own host yet" };
+  }
+  return {
+    broken: true,
+    detail: `the node answers on its own host, but its provider's forwarded ports (${forwarded
+      .map((f) => `${f.host}:${f.port}`)
+      .join(", ")}) do not`,
+    provider: new URL(lease.hostUri).hostname,
+  };
 }
 
 /**
@@ -929,6 +1088,14 @@ export const configureBridgeStep: StepDef = {
   },
 };
 
+export const configureNtfyStep: StepDef = {
+  name: "configure-ntfy",
+  async run(ctx) {
+    if (!ctx.spec.topology.components.ntfy?.enabled) return { skipped: true };
+    return useNtfyForAlerts(ctx, ctx.spec);
+  },
+};
+
 export function phaseEFSteps(): StepDef[] {
   return [
     uploadNodeDataStep,
@@ -958,6 +1125,8 @@ export function phaseEFSteps(): StepDef[] {
     configureBridgeStep,
     // verifier (no-op without one): its federation-verifier bond
     configureVerifierStep,
+    // the alerts server (no-op without one): the launcher's alerts go to it
+    configureNtfyStep,
     finalizeStep,
   ];
 }

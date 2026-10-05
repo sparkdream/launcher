@@ -298,6 +298,19 @@ const bridgeLink = z.object({
  * instance's identity for good -- ActivityPub ids embed it -- so it cannot be
  * retargeted later.
  */
+/**
+ * A self-hosted ntfy server for the launcher's incident alerts: the launcher
+ * posts to `topic` with a token of its own, the phone app logs in as `user`
+ * (password generated, shown in the fleet's accounts panel) and can only
+ * read. Logins are declared in the deployment's env, so a move keeps them.
+ */
+const ntfyComponent = z.object({
+  enabled: z.boolean(),
+  domain: domain.optional(),
+  topic: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).default("sparkdream-alerts"),
+  user: z.string().regex(/^[A-Za-z0-9_-]{1,32}$/).default("phone"),
+});
+
 const mastodonComponent = z.object({
   enabled: z.boolean(),
   /** LOCAL_DOMAIN: https://<domain> is the instance, @user@<domain> its accounts. */
@@ -637,6 +650,7 @@ export const launchSpecSchema = z.object({
       mastodon: mastodonComponent.optional(),
       verifier: verifierComponent.optional(),
       bridge: bridgeComponent.optional(),
+      ntfy: ntfyComponent.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress
@@ -701,6 +715,7 @@ export const launchSpecSchema = z.object({
         mastodon: componentProviderRules.optional(),
         verifier: componentProviderRules.optional(),
         bridge: componentProviderRules.optional(),
+        ntfy: componentProviderRules.optional(),
       })
       .strict()
       .default({}),
@@ -777,6 +792,8 @@ export const launchSpecSchema = z.object({
     verifier: z.string().optional(),
     /** sdapbridge (the standalone bridge component): the sdap image by default. */
     bridge: z.string().optional(),
+    /** The ntfy server (upstream binwiederhier/ntfy). */
+    ntfy: z.string().optional(),
   }),
 
   security: z.object({

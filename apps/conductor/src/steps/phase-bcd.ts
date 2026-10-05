@@ -1,9 +1,11 @@
 import { descriptorFor } from "../components/index.js";
+import { pointDns } from "../dns-steps.js";
+import { ingressVerdict } from "./phase-ef.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
 import { chainId, headscaleDomain, isServicesFleet, nodes, serviceComponents } from "@sparkdream/launch-spec";
-import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
+import { AwaitUser, RerunFrom, type StepCtx, type StepDef } from "../engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import {
   accountDepositMsg,
@@ -451,12 +453,46 @@ export const deployHeadscaleStep: StepDef = {
     );
     const ingress = uris.find((u) => u !== domain) ?? new URL(info.hostUri).hostname;
 
-    // DNS gate (§5 step 9): headscale must answer on its public domain
+    // DNS gate (§5 step 9): headscale must answer on its public domain; the
+    // launcher's DNS token sets the record first when it has one
     const url = `https://${domain}/health`;
-    if (!(await ctx.services.rpc.httpOk(url))) {
+    let up = await ctx.services.rpc.httpOk(url);
+    if (!up && (await pointDns(ctx, [{ domain, target: ingress }])).length > 0) {
+      for (let i = 0; i < 36 && !up; i++) {
+        await ctx.services.sleep(5000);
+        up = await ctx.services.rpc.httpOk(url);
+      }
+    }
+    // DNS or the provider? headscale's own provider hostname tells: one that
+    // does not serve it either means the ingress is broken, and headscale
+    // is placed again elsewhere (twice at most), before any mesh exists
+    let verdict = "";
+    if (!up) {
+      const v = await ingressVerdict(ctx, { hostUri: info.hostUri, dseq, gseq: bidId.gseq, oseq: bidId.oseq }, domain, "/health");
+      const counter = `ingress-replace:${ctx.launchId}:headscale`;
+      const done = Number(ctx.db.getSetting(counter) ?? 0);
+      if (v.broken && done < 2) {
+        ctx.log(`headscale: ${v.detail}; moving it off ${v.provider} (attempt ${done + 1} of 2)`);
+        ctx.db.setProviderPref(addr, bidId.provider, "avoid", v.provider ?? null);
+        // a close of its own, not redeploy's: this step drops any pending
+        // deploy-headscale:close:<dseq> on every pass while the lease lives
+        // (a guard against an old bug), which would throw away the
+        // signature this close is waiting for, pass after pass
+        if ((await ctx.services.api.deploymentInfo(addr, dseq))?.state === "active") {
+          await ctx.requireTx(`deploy-headscale:replace-close:${dseq}`, [closeDeploymentMsg(addr, dseq)]);
+        }
+        clearPin(ctx, "headscale-dseq");
+        ctx.db.deletePendingTx(ctx.launchId, "deploy-headscale:deployment");
+        ctx.db.deletePendingTx(ctx.launchId, "deploy-headscale:lease");
+        ctx.db.setSetting(counter, String(done + 1));
+        throw new RerunFrom(["deploy-headscale"], `headscale deployment ${dseq} closed, its provider's ingress served nothing`);
+      }
+      verdict = ` (checked past DNS: ${v.detail})`;
+    }
+    if (!up) {
       throw new AwaitUser(
         "deploy-headscale",
-        `headscale not reachable at ${url} — create a DNS record for ${domain} → ` +
+        `headscale not reachable at ${url}${verdict} — create a DNS record for ${domain} → ` +
           `CNAME ${ingress} (or an A record to that host's IP). ` +
           `Cloudflare: proxy on, SSL=Flexible, WebSockets on. Then resume.`,
       );

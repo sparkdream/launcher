@@ -30,6 +30,7 @@ export interface Profile {
     verifier: string;
     bridge: string;
     hub: string;
+    ntfy: string;
   };
   security: { keyMode: "softsign" | "tmkms" };
   infra: {
@@ -81,6 +82,8 @@ const SDAP_IMAGE = `sparkdreamnft/sdap:${VENDORED_CHAIN_VERSION}`;
 // the landing page (the hub repo's Dockerfile: its Vite build behind nginx);
 // versioned on its own, not with the chain
 const HUB_IMAGE = "sparkdreamnft/hub:v1.0.2";
+/** Upstream ntfy: the alerts component runs it unmodified (logins come from env). */
+const NTFY_IMAGE = "binwiederhier/ntfy:v2.28.0";
 
 export type NodeSize = "small" | "standard" | "large";
 
@@ -113,7 +116,7 @@ export const NODE_SIZES: Record<NodeSize, { validator: RoleResources; sentry: Ro
     sentry: {
       cpu: 2,
       memory: "8Gi",
-      storage: { root: "5Gi", data: "8Gi", persistent: true, class: "beta3" },
+      storage: { root: "5Gi", data: "20Gi", persistent: true, class: "beta3" },
     },
   },
   large: {
@@ -179,6 +182,7 @@ export const profiles: Record<NetworkType, Profile> = {
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
       hub: HUB_IMAGE,
+      ntfy: NTFY_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -222,6 +226,7 @@ export const profiles: Record<NetworkType, Profile> = {
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
       hub: HUB_IMAGE,
+      ntfy: NTFY_IMAGE,
     },
     security: { keyMode: "softsign" },
     infra: {
@@ -263,6 +268,7 @@ export const profiles: Record<NetworkType, Profile> = {
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
       hub: HUB_IMAGE,
+      ntfy: NTFY_IMAGE,
     },
     security: { keyMode: "tmkms" },
     infra: {

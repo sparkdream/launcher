@@ -101,7 +101,7 @@ export function isServicesFleet(spec: Pick<LaunchSpec, "kind"> | { kind?: string
 }
 
 /** The kinds a services fleet may run: chain-independent ones. */
-export const SERVICES_FLEET_COMPONENTS: readonly ComponentKey[] = ["mastodon", "hub"];
+export const SERVICES_FLEET_COMPONENTS: readonly ComponentKey[] = ["mastodon", "hub", "ntfy"];
 
 export function nodes(spec: LaunchSpec): NodeRef[] {
   if (isServicesFleet(spec)) return [];

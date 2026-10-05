@@ -5,6 +5,7 @@ import { AwaitUser, type StepCtx, type StepDef } from "./engine.js";
 import { TypeUrl } from "./akash/messages.js";
 import { loadSdl, sdlArtifacts } from "./akash/sdl-groups.js";
 import {
+  acceptMeshPeers,
   componentRow,
   nodeSelfHeight,
   prepareNodeHome,
@@ -356,6 +357,8 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
         while (samples.length > 2 && samples.at(-1)!.at - samples[0]!.at > PACE_WINDOW_MS) samples.shift();
       }
       const pace = syncPace(samples);
+      // the fleet's own replay rate: what the next "no backup" warning estimates with
+      if (pace.rate && pace.rate > 0) ctx.db.setSetting(`sync-rate:${ctx.launchId}`, String(Math.round(pace.rate * 100) / 100));
       ctx.db.setFleetOpProgress(opId, {
         label: `${key}: syncing the ${size} deployment`,
         current: height,
@@ -466,6 +469,25 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
     {
       name: p("sync"),
       async run(ctx) {
+        // the sentries it syncs from must take it: each mesh peer reaches
+        // them from 127.0.0.1, which a sentry refusing duplicate IPs turns
+        // away after its first peer ("secret conn failed: EOF" here, the
+        // staged node never syncing). One that changes restarts once.
+        const stage = ctx.output<StageOutput>(p("stage"));
+        let opened = false;
+        for (const peer of stage?.peers ?? []) {
+          if (!peer.key.startsWith("sentry-")) continue;
+          const row = componentRow(ctx, peer.key);
+          const changed = await acceptMeshPeers(ctx, rowTarget(ctx, row), { restart: true }).catch(() => false);
+          if (changed) ctx.log(`${peer.key}: now accepts several mesh peers (allow_duplicate_ip = true); restarted so the new deployment can sync from it`);
+          opened ||= changed;
+        }
+        // refused until now, the staged node sits in CometBFT's redial
+        // backoff (minutes, growing): restart it so it dials at once
+        if (opened) {
+          await restartNode(ctx.services.ssh, stagedTarget(ctx)).catch(() => undefined);
+          ctx.log(`${key}: new deployment restarted to dial its sync peers now`);
+        }
         await ensureSyncing(ctx).catch(() => false);
         const height = await waitSynced(ctx, SYNC_MAX_HOURS * 3_600_000);
         ctx.log(`${key}: new deployment caught up at height ${height}`);

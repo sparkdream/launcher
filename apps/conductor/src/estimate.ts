@@ -5,6 +5,7 @@ import {
   nodes,
   nodeSize,
   serviceComponents,
+  type ComponentKey,
   type LaunchSpec,
   type RoleResources,
 } from "@sparkdream/launch-spec";
@@ -181,4 +182,25 @@ export function estimateLaunchCost(spec: LaunchSpec): CostEstimate {
     feeLowUsd: cents(totalHigh * COMPETITIVE_BID_FACTOR * (fee.launchBps / 10_000)),
     feeHighUsd: cents(totalHigh * (fee.launchBps / 10_000)),
   };
+}
+
+/** One node at `r` resources, USD/month: the competitive bid and the stock-script ceiling. */
+export function estimateNode(r: RoleResources): { lowUsd: number; highUsd: number } {
+  const high = monthlyUsd({
+    cpuThreads: r.cpu,
+    memoryBytes: sizeToBytes(r.memory),
+    ephemeralBytes: sizeToBytes(r.storage.root),
+    persistentBytes: r.storage.persistent ? { [r.storage.class]: sizeToBytes(r.storage.data) } : {},
+  });
+  return { lowUsd: cents(high * COMPETITIVE_BID_FACTOR), highUsd: cents(high) };
+}
+
+/** One service component as `spec` would deploy it, USD/month; undefined when its resources need settings it lacks. */
+export function estimateComponent(spec: LaunchSpec, key: ComponentKey): { lowUsd: number; highUsd: number } | undefined {
+  try {
+    const high = descriptor(key).resources(spec).map(sdlResourcesToWorkload).reduce((sum, w) => sum + monthlyUsd(w), 0);
+    return { lowUsd: cents(high * COMPETITIVE_BID_FACTOR), highUsd: cents(high) };
+  } catch {
+    return undefined;
+  }
 }

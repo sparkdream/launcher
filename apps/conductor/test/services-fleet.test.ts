@@ -13,7 +13,11 @@ import { descriptorFor } from "../src/components/index.js";
 import { readSessions } from "../src/sessions.js";
 import { buildServer } from "../src/server.js";
 import { readMastodonSecrets, updateMastodonSecrets } from "../src/components/mastodon-secrets.js";
+import { readNtfySecrets } from "../src/components/ntfy.js";
+import { alertSettings, setAlertSettings } from "../src/incidents.js";
+import bcrypt from "bcryptjs";
 import { fakeServices, FakeSigner } from "./fakes.js";
+import type { Assignments } from "../src/steps/phase-bcd.js";
 import { chainStub, withStub } from "./chain-stub.js";
 
 /**
@@ -159,6 +163,253 @@ describe("landing page hub", () => {
     expect(db.listFleetOps("svc").find((o) => o.kind === "add-component")!.status).toBe("done");
     const rows = db.listFleetComponents("svc").filter((c) => c.state !== "closed");
     expect(rows.map((c) => c.key).sort()).toEqual(["hub", "mastodon"]);
+    db.close();
+  }, 120_000);
+});
+
+describe("alerts server (ntfy)", () => {
+  it("renders stateless logins: the phone reads the topic, the launcher's token only writes it", () => {
+    const s = servicesSpec();
+    (s.topology.components as any).ntfy = { enabled: true, domain: "ntfy.zenith.example" };
+    const spec = withDefaults(s as any);
+    expect(validateSpec(spec).errors).toEqual([]);
+    expect(spec.images.ntfy).toMatch(/^binwiederhier\/ntfy:v2\./);
+    const secretsDir = path.join(tmp(), "secrets");
+    const render = () =>
+      descriptorFor("ntfy")!.render({
+        spec,
+        component: { key: "ntfy", image: spec.images.ntfy, domain: "ntfy.zenith.example" },
+        secretsDir,
+      } as any) as any;
+    const out = render();
+    const env: string[] = out.ntfy.service.env;
+    const secrets = readNtfySecrets(secretsDir)!;
+    expect(out.ntfy.service.args).toEqual(["serve"]);
+    expect(env).toContain("NTFY_BASE_URL=https://ntfy.zenith.example");
+    expect(env).toContain("NTFY_AUTH_DEFAULT_ACCESS=deny-all");
+    expect(env).toContain(`NTFY_AUTH_ACCESS=phone:sparkdream-alerts:ro,launcher:sparkdream-alerts:wo`);
+    expect(env).toContain(`NTFY_AUTH_TOKENS=launcher:${secrets.launcherToken}:sparkdream launcher`);
+    expect(secrets.launcherToken).toMatch(/^tk_[a-z0-9]{29}$/);
+    // a hash, never the password, and the same on every render (no drift)
+    expect(env.join("\n")).not.toContain(secrets.phonePassword);
+    expect(bcrypt.compareSync(secrets.phonePassword, secrets.phoneHash)).toBe(true);
+    expect(render().ntfy.service.env).toEqual(env);
+    // a domain is required, as for every public kind
+    (s.topology.components as any).ntfy = { enabled: true };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.ntfy.domain");
+  });
+
+  it("is added to a services fleet, takes over the launcher's alerts, and shows the phone login", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const s = servicesSpec();
+    db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+    expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("svc");
+
+    fleet.requestAddComponent(db.getLaunch("svc")!, "ntfy", { domain: "ntfy.zenith.example" });
+    const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+    const done = await runWithSigner(
+      db, "svc", stored, work,
+      [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")],
+      services, signer,
+    );
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+    const secrets = readNtfySecrets(launchDirs(work, "svc").secrets)!;
+    expect(alertSettings(db).ntfy).toEqual({ server: "https://ntfy.zenith.example", topic: "sparkdream-alerts", token: secrets.launcherToken });
+    const launch = db.getLaunch("svc")!;
+    const login = fleet.accounts(launch).find((a) => a.name === "ntfy-login");
+    expect(login).toMatchObject({ address: "phone @ https://ntfy.zenith.example", hasMnemonic: true });
+    expect(fleet.mnemonic(launch, "ntfy-login")).toBe(secrets.phonePassword);
+    db.close();
+  }, 120_000);
+
+  it("keeps off the wallet's avoided providers, as a relaunch does", async () => {
+    const add = async (avoid?: string) => {
+      const work = tmp();
+      const db = new ConductorDb(path.join(work, "state.db"));
+      const services = fakeServices();
+      const signer = new FakeSigner();
+      const s = servicesSpec();
+      db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+      expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+      const fleet = new FleetService(db, services, work);
+      fleet.materialize("svc");
+      if (avoid) fleet.setProviderPref("akash1owner", avoid, "avoid");
+      fleet.requestAddComponent(db.getLaunch("svc")!, "ntfy", { domain: "ntfy.zenith.example" });
+      const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+      const done = await runWithSigner(
+        db, "svc", stored, work,
+        [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")],
+        services, signer,
+      );
+      expect(done.status).toBe("completed");
+      const provider = db.listFleetComponents("svc").find((c) => c.key === "ntfy")!.provider;
+      db.close();
+      return provider;
+    };
+    const usual = await add();
+    expect(await add(usual)).not.toBe(usual);
+  }, 240_000);
+
+  it("moves off a provider whose ingress serves nothing, with no resume, and avoids it", async () => {
+    const world = async () => {
+      const work = tmp();
+      const db = new ConductorDb(path.join(work, "state.db"));
+      const services = fakeServices();
+      const signer = new FakeSigner();
+      const s = servicesSpec();
+      db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+      expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+      const fleet = new FleetService(db, services, work);
+      fleet.materialize("svc");
+      // DNS that works once set: the domain answers when its record points at
+      // an ingress that serves (a broken one stays dark however it is pointed)
+      services.dns = {
+        async pointCname(name, target) {
+          if ([...services.rpc.darkUrls].some((d) => target.includes(d))) services.rpc.darkUrls.add(name);
+          else services.rpc.darkUrls.delete(name);
+          return true;
+        },
+      };
+      const drive = () => {
+        const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+        return runWithSigner(db, "svc", stored, work, [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")], services, signer);
+      };
+      return { db, services, fleet, drive };
+    };
+    // where an add lands with nothing in the way
+    const first = await world();
+    first.fleet.requestAddComponent(first.db.getLaunch("svc")!, "ntfy", { domain: "ntfy.zenith.example" });
+    expect((await first.drive()).status).toBe("completed");
+    const usual = first.db.listFleetComponents("svc").find((c) => c.key === "ntfy")!;
+    const usualHost = new URL(usual.host_uri).hostname;
+
+    // that provider's ingress routes nowhere: its own hostname 404s too
+    const w = await world();
+    w.services.rpc.darkUrls.add("ntfy.zenith.example");
+    w.services.rpc.darkUrls.add(`fake.ingress.${usualHost}`);
+    // the record a pointCname makes names the generated host: dark here
+    w.fleet.requestAddComponent(w.db.getLaunch("svc")!, "ntfy", { domain: "ntfy.zenith.example" });
+    const done = await w.drive();
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+    const row = w.db.listFleetComponents("svc").find((c) => c.key === "ntfy")!;
+    expect(row.state).toBe("active");
+    expect(row.provider).not.toBe(usual.provider);
+    expect(w.fleet.providerPrefs("akash1owner").avoid).toContain(usual.provider);
+    const op = w.db.listFleetOps("svc").find((o) => o.kind === "add-component")!;
+    expect(op.status).toBe("done");
+    expect(JSON.parse(op.params_json).ingressReplacements).toBe(1);
+    first.db.close();
+    w.db.close();
+  }, 240_000);
+
+  it("a launch re-places a component whose provider's ingress serves nothing", async () => {
+    const launch = async (broken?: string) => {
+      const work = tmp();
+      const db = new ConductorDb(path.join(work, "state.db"));
+      const services = fakeServices();
+      const s = servicesSpec();
+      (s.topology.components as any).hub = { enabled: true, domain: "zenith.example" };
+      if (broken) {
+        services.rpc.darkUrls.add("//zenith.example/");
+        services.rpc.darkUrls.add(`fake.ingress.${broken}`);
+      }
+      services.dns = {
+        async pointCname(name, target) {
+          if ([...services.rpc.darkUrls].some((d) => target.includes(d))) return true;
+          services.rpc.darkUrls.delete(`//${name}/`);
+          return true;
+        },
+      };
+      // a closed deployment has no lease at its provider any more
+      const signer = new FakeSigner();
+      const sign = signer.sign.bind(signer);
+      signer.sign = async (msgs) => {
+        for (const m of msgs) if (m.typeUrl.endsWith("MsgCloseDeployment")) services.provider.leaselessDseqs.add((m.value as any).id.dseq);
+        return sign(msgs);
+      };
+      db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+      const res = await runWithSigner(db, "svc", s, work, allSteps(s), services, signer);
+      const hub = db.stepOutput<Assignments>("svc", "collect-bids")!.perNode.hub!;
+      const avoid = db.providerPrefs("akash1owner").avoid;
+      db.close();
+      return { res, hub, avoid };
+    };
+    const usual = await launch();
+    expect(usual.res.status).toBe("completed");
+    const moved = await launch(new URL(usual.hub.hostUri).hostname);
+    expect(moved.res.status).toBe("completed");
+    expect(moved.hub.provider).not.toBe(usual.hub.provider);
+    expect(moved.avoid).toContain(usual.hub.provider);
+  }, 240_000);
+
+  it("leaves alerts that already go elsewhere alone", async () => {
+    const db = new ConductorDb(path.join(tmp(), "state.db"));
+    setAlertSettings(db, { ntfy: { server: "https://ntfy.sh", topic: "mine" } });
+    const s = servicesSpec();
+    (s.topology.components as any).ntfy = { enabled: true, domain: "ntfy.zenith.example" };
+    const spec = withDefaults(s as any);
+    const step = descriptorFor("ntfy")!.configureSteps!((n) => n, spec)[0]!;
+    await step.run({ db, spec, dirs: launchDirs(tmp(), "x"), log: () => {} } as any);
+    expect(alertSettings(db).ntfy).toEqual({ server: "https://ntfy.sh", topic: "mine" });
+    db.close();
+  });
+});
+
+describe("the add dialog's options", () => {
+  it("lists the kinds a services fleet can still add, each with an estimate, its version and its steps", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = servicesSpec();
+    db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+    expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, new FakeSigner())).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("svc");
+    const o = await fleet.addOptions(db.getLaunch("svc")!);
+    // mastodon runs already; no nodes in a services fleet, so no sentry
+    expect(o.kinds.map((k) => k.key).sort()).toEqual(["hub", "ntfy"]);
+    expect(o.sentry).toBeUndefined();
+    const ntfy = o.kinds.find((k) => k.key === "ntfy")!;
+    expect(ntfy).toMatchObject({ label: "Alerts (ntfy)", needsDomain: true, signatures: 2, version: "v2.28.0" });
+    expect(ntfy.lowUsd).toBeGreaterThan(0);
+    expect(ntfy.highUsd).toBeGreaterThan(ntfy.lowUsd!);
+    expect(ntfy.steps).toHaveLength(4);
+    db.close();
+  }, 120_000);
+});
+
+describe("adding a component with a hand-picked bid", () => {
+  it("parks at its lease with every bid, then leases the pick", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const s = servicesSpec();
+    db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+    expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("svc");
+    const opId = fleet.requestAddComponent(db.getLaunch("svc")!, "hub", { domain: "zenith.example", manualBid: true });
+    const drive = () => {
+      const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+      return runWithSigner(db, "svc", stored, work, [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")], services, signer);
+    };
+    const parked = await drive();
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:lease`);
+    const offers = JSON.parse(db.listFleetOps("svc").find((o) => o.id === opId)!.params_json).offeredBids;
+    expect(offers.bids.length).toBeGreaterThan(1);
+    const pick = offers.bids.at(-1).provider;
+    fleet.chooseBid(db.getLaunch("svc")!, opId, pick);
+    expect((await drive()).status).toBe("completed");
+    expect(db.listFleetComponents("svc").find((c) => c.key === "hub")!.provider).toBe(pick);
     db.close();
   }, 120_000);
 });

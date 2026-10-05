@@ -151,6 +151,17 @@ describe("the unit file", () => {
 });
 
 describe("adopting the local signer", () => {
+  it("refuses, leaving it running, when the user's systemd would not outlive the session (no linger)", async () => {
+    const w = await launched();
+    (w.host as any).ensureLinger = async () => false;
+    await expect(w.fleet.adoptLocalSigner(w.db.getLaunch("fl")!, "val-0")).rejects.toThrow(/enable-linger/);
+    expect(w.host.killed).toEqual([]);
+    expect(w.host.units.size).toBe(0);
+    (w.host as any).ensureLinger = async () => true;
+    await w.fleet.adoptLocalSigner(w.db.getLaunch("fl")!, "val-0");
+    expect(w.host.killed).toEqual([4242]);
+  }, 120_000);
+
   it("refuses, leaving it running, a tmkms whose binary was replaced while it ran", async () => {
     const w = await launched();
     w.host.procs[0]!.bin = `${DIR}/target/release/tmkms (deleted)`;

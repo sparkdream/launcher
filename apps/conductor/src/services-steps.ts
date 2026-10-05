@@ -7,7 +7,9 @@ import {
   ensureCertificateStep,
   sendManifestsStep,
 } from "./steps/phase-bcd.js";
-import { finalizeStep, verifyServicesStep } from "./steps/phase-ef.js";
+import type { LaunchSpec } from "@sparkdream/launch-spec";
+import { isServicesFleet } from "@sparkdream/launch-spec";
+import { configureNtfyStep, finalizeStep, phaseEFSteps, verifyServicesStep } from "./steps/phase-ef.js";
 import { configureMastodonStep } from "./steps/mastodon.js";
 
 /**
@@ -28,6 +30,21 @@ export function servicesSteps(): StepDef[] {
     sendManifestsStep,
     verifyServicesStep,
     configureMastodonStep,
+    configureNtfyStep,
     finalizeStep,
   ];
+}
+
+/**
+ * The launch steps a mid-launch re-place runs again: send-manifests (whose
+ * "lease is gone" recovery re-deploys and re-bids the closed component) and
+ * everything after it, since a launch caught mid-flight has not done them
+ * and one re-opened after it finished has them all marked done.
+ */
+export function replaceRerunSteps(spec: LaunchSpec): string[] {
+  if (isServicesFleet(spec)) {
+    const names = servicesSteps().map((s) => s.name);
+    return names.slice(names.indexOf("send-manifests"));
+  }
+  return ["send-manifests", "upload-node-data", ...phaseEFSteps().map((s) => s.name)];
 }

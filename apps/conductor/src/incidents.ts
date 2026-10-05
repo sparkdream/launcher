@@ -17,10 +17,11 @@ export const CONFIRM_CHECKS = 3;
 const NOT_AN_OUTAGE = new Set(["healthy", "closed", "catching-up"]);
 
 /** What the provider looked like when the incident was confirmed. */
-export type ProviderProbe = "unreachable" | "service-down" | "up" | "unknown";
+/** "ingress-broken": the container runs, but the provider's own hostname for it serves nothing either. */
+export type ProviderProbe = "unreachable" | "service-down" | "ingress-broken" | "up" | "unknown";
 
 /** Fleet actions an incident can suggest (the UI's fleetAction names). */
-export type IncidentAction = "relaunch" | "force-redeploy" | "restart" | "unjail" | "topup";
+export type IncidentAction = "relaunch" | "force-redeploy" | "restart" | "unjail" | "topup" | "repair";
 
 export interface Classified {
   cause: string;
@@ -51,6 +52,12 @@ export function classify(key: string, status: string, probe: ProviderProbe): Cla
       return { cause: "the validator was jailed for downtime", action: "unjail", severity: "down" };
     case "low-gas":
       return { cause: "a relayer key is out of funds (top it up from the relayer's funds panel)", action: null, severity: "warn" };
+    case "stale-tunnel":
+      return {
+        cause: "it runs, but a chain it relays does not answer through its mesh tunnel",
+        action: "repair",
+        severity: "down",
+      };
     case "unreachable":
       if (probe === "unreachable") {
         return { cause: "the provider cannot be reached", action: "relaunch", severity: "down" };
@@ -59,6 +66,13 @@ export function classify(key: string, status: string, probe: ProviderProbe): Cla
         return {
           cause: "the container is not running, while its provider answers",
           action: "force-redeploy",
+          severity: "down",
+        };
+      }
+      if (probe === "ingress-broken") {
+        return {
+          cause: "the container runs, but its provider's ingress serves nothing (not even the provider's own hostname for it)",
+          action: "relaunch",
           severity: "down",
         };
       }
@@ -135,8 +149,14 @@ export async function trackIncident(
 // --- alerts ---
 
 export interface AlertSettings {
-  /** ntfy.sh (or a self-hosted ntfy): POST <server>/<topic>. */
-  ntfy?: { server: string; topic: string };
+  /** ntfy.sh (or a self-hosted ntfy): POST <server>/<topic>. `token`: an ntfy
+   *  access token (tk_...) for a server that refuses anonymous posts; stored,
+   *  never sent back to the browser (publicAlertSettings). */
+  ntfy?: { server: string; topic: string; token?: string };
+  /** Where an alert goes when `ntfy` does not take it (the server itself is
+   *  down, often the very outage being reported): a second ntfy topic, e.g.
+   *  a long random one on ntfy.sh. Never sent the token. */
+  ntfyFallback?: { server: string; topic: string };
   /** Any URL that takes a JSON POST. */
   webhook?: string;
 }
@@ -148,6 +168,17 @@ export function alertSettings(db: ConductorDb): AlertSettings {
   return raw ? (JSON.parse(raw) as AlertSettings) : {};
 }
 
+/** What the browser sees: the settings without the ntfy token, and whether one is set. */
+export function publicAlertSettings(db: ConductorDb): AlertSettings & { ntfyTokenSet: boolean } {
+  const s = alertSettings(db);
+  const { token, ...ntfy } = s.ntfy ?? ({} as NonNullable<AlertSettings["ntfy"]>);
+  return { ...s, ...(s.ntfy ? { ntfy } : {}), ntfyTokenSet: Boolean(token) };
+}
+
+/**
+ * Save the alert settings. The ntfy token is write-only: absent keeps the
+ * stored one (the browser never holds it), "" removes it.
+ */
 export function setAlertSettings(db: ConductorDb, settings: AlertSettings): void {
   const clean: AlertSettings = {};
   if (settings.ntfy?.topic?.trim()) {
@@ -155,7 +186,17 @@ export function setAlertSettings(db: ConductorDb, settings: AlertSettings): void
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw new Error("an ntfy topic is letters, digits, - and _ only");
     const server = (settings.ntfy.server?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
     if (!/^https?:\/\//.test(server)) throw new Error("the ntfy server must be an http(s) URL");
-    clean.ntfy = { server, topic };
+    const given = settings.ntfy.token?.trim();
+    const token = given === undefined ? alertSettings(db).ntfy?.token : given || undefined;
+    if (token && !/^tk_[A-Za-z0-9]{20,64}$/.test(token)) throw new Error("an ntfy access token starts with tk_ (ntfy token add <user>)");
+    clean.ntfy = { server, topic, ...(token ? { token } : {}) };
+  }
+  if (settings.ntfyFallback?.topic?.trim()) {
+    const topic = settings.ntfyFallback.topic.trim();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw new Error("an ntfy topic is letters, digits, - and _ only");
+    const server = (settings.ntfyFallback.server?.trim() || "https://ntfy.sh").replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(server)) throw new Error("the fallback ntfy server must be an http(s) URL");
+    clean.ntfyFallback = { server, topic };
   }
   if (settings.webhook?.trim()) {
     const url = settings.webhook.trim();
@@ -183,6 +224,7 @@ const ACTION_TEXT: Record<IncidentAction, string> = {
   restart: "restart it",
   unjail: "unjail it",
   topup: "top up its escrow",
+  repair: "repair the fleet (re-aims its tunnels at the current addresses)",
 };
 
 export function alertFor(fleet: string, ev: IncidentEvent): Alert {
@@ -221,21 +263,35 @@ export async function sendAlert(
   fetchImpl: typeof fetch = fetch,
 ): Promise<string[]> {
   const failures: string[] = [];
-  if (settings.ntfy) {
+  const toNtfy = async (target: { server: string; topic: string; token?: string }): Promise<string | null> => {
     try {
-      const res = await fetchImpl(`${settings.ntfy.server}/${settings.ntfy.topic}`, {
+      const res = await fetchImpl(`${target.server}/${target.topic}`, {
         method: "POST",
         body: alert.message,
         headers: {
+          ...(target.token ? { Authorization: `Bearer ${target.token}` } : {}),
           Title: alert.title,
           Priority: alert.kind === "opened" && alert.severity === "down" ? "high" : "default",
           Tags: alert.kind === "resolved" ? "white_check_mark" : alert.severity === "down" ? "rotating_light" : "warning",
         },
       });
-      if (!res.ok) failures.push(`ntfy answered ${res.status}`);
+      return res.ok ? null : `answered ${res.status}`;
     } catch (e) {
-      failures.push(`ntfy: ${String(e instanceof Error ? e.message : e)}`);
+      return String(e instanceof Error ? e.message : e);
     }
+  };
+  if (settings.ntfy) {
+    const failed = await toNtfy(settings.ntfy);
+    if (failed) {
+      failures.push(`ntfy: ${failed}`);
+      if (settings.ntfyFallback) {
+        const also = await toNtfy(settings.ntfyFallback);
+        failures.push(also ? `fallback ntfy: ${also}` : `sent to the fallback ${settings.ntfyFallback.server}/${settings.ntfyFallback.topic} instead`);
+      }
+    }
+  } else if (settings.ntfyFallback) {
+    const failed = await toNtfy(settings.ntfyFallback);
+    if (failed) failures.push(`fallback ntfy: ${failed}`);
   }
   if (settings.webhook) {
     try {

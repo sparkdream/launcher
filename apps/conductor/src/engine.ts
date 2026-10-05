@@ -130,6 +130,31 @@ export class AwaitUser extends Error {
   }
 }
 
+/**
+ * Thrown by a step that found its earlier steps' result unusable (a
+ * placement on a provider whose ingress serves nothing): the engine forgets
+ * `steps` (the thrower included, when listed) and runs the plan again from
+ * the top in the same drive, so the re-placement goes on without a resume.
+ */
+export class RerunFrom extends Error {
+  constructor(
+    readonly steps: string[],
+    reason: string,
+  ) {
+    super(reason);
+  }
+}
+
+/**
+ * Thrown from an op step's sleep once the op has been aborted, so a step
+ * polling a node (a restore, a sync, a health wait) unwinds at its next poll
+ * instead of holding the drive, and every op queued behind it, for hours.
+ */
+class OpAbortedWhileRunning extends Error {}
+
+/** Reruns one drive allows before it gives up (each is a re-placement). */
+const MAX_RERUNS = 6;
+
 /** Thrown by build-genesis to pause for an external-operator gentx (§5 3b). */
 export class AwaitGentx extends Error {
   constructor(readonly valIndex: number) {
@@ -287,73 +312,97 @@ export async function runLaunch(
     const op = db.listFleetOps(launchId).find((o) => o.id === Number(m[1]));
     return op?.status === "aborted" ? op.id : undefined;
   };
-  for (const step of steps) {
-    const existing = db.getStep(launchId, step.name);
-    if (existing?.status === "done") {
-      continue;
-    }
-    if (abortedOp(step.name) !== undefined) continue;
-    log(`run ${step.name}`);
-    db.stepStarted(launchId, step.name);
-    try {
-      // §13: every step runs inside this launch's chain-assets context so
-      // sparkdreamd()/vendorDir() resolve the per-version binary and deploy
-      // data. Null (nothing resolved yet — before prepare-chain-assets
-      // materializes, or a pre-M9 launch) falls through to baked behavior.
-      const output = await runWithAssets(resolveChainAssets(spec, workRoot), () => step.run(ctx));
-      const gone = abortedOp(step.name);
-      if (gone !== undefined) {
-        db.deleteOpSteps(launchId, gone);
+  let reruns = 0;
+  pass: for (;;) {
+    for (const step of steps) {
+      const existing = db.getStep(launchId, step.name);
+      if (existing?.status === "done") {
         continue;
       }
-      db.stepDone(launchId, step.name, output);
-    } catch (cause) {
-      const gone = abortedOp(step.name);
-      if (gone !== undefined) {
-        db.deleteOpSteps(launchId, gone);
-        log(`${step.name} stopped: its operation was aborted`);
-        continue;
-      }
-      if (cause instanceof AwaitSignature) {
-        db.stepWaiting(launchId, step.name, "awaiting signature");
+      if (abortedOp(step.name) !== undefined) continue;
+      log(`run ${step.name}`);
+      db.stepStarted(launchId, step.name);
+      // abort only flips the op's row; the step itself learns of it here
+      const stepCtx: StepCtx = /^op\d+:/.test(step.name)
+        ? {
+            ...ctx,
+            services: {
+              ...services,
+              sleep: async (ms: number) => {
+                await services.sleep(ms);
+                if (abortedOp(step.name) !== undefined) throw new OpAbortedWhileRunning(step.name);
+              },
+            },
+          }
+        : ctx;
+      try {
+        // §13: every step runs inside this launch's chain-assets context so
+        // sparkdreamd()/vendorDir() resolve the per-version binary and deploy
+        // data. Null (nothing resolved yet — before prepare-chain-assets
+        // materializes, or a pre-M9 launch) falls through to baked behavior.
+        const output = await runWithAssets(resolveChainAssets(spec, workRoot), () => step.run(stepCtx));
+        const gone = abortedOp(step.name);
+        if (gone !== undefined) {
+          db.deleteOpSteps(launchId, gone);
+          continue;
+        }
+        db.stepDone(launchId, step.name, output);
+      } catch (cause) {
+        const gone = abortedOp(step.name);
+        if (gone !== undefined) {
+          db.deleteOpSteps(launchId, gone);
+          log(`${step.name} stopped: its operation was aborted`);
+          continue;
+        }
+        if (cause instanceof AwaitSignature) {
+          db.stepWaiting(launchId, step.name, "awaiting signature");
+          db.setLaunchStatus(launchId, "paused");
+          return { status: "awaiting-signature", failedStep: step.name };
+        }
+        if (cause instanceof AwaitUser) {
+          // a pause with funding rows stores both under one object; one with a
+          // wallet request only keeps the bare WalletRequest it always stored
+          db.stepWaiting(
+            launchId,
+            step.name,
+            cause.reason,
+            cause.funding?.length || cause.peerSetup
+              ? {
+                  wallet: cause.wallet,
+                  ...(cause.funding?.length ? { funding: cause.funding } : {}),
+                  ...(cause.peerSetup ? { peerSetup: cause.peerSetup } : {}),
+                }
+              : cause.wallet,
+          );
+          db.setLaunchStatus(launchId, "paused");
+          return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
+        }
+        if (cause instanceof AwaitGentx) {
+          db.stepWaiting(launchId, step.name, `awaiting gentx for validator ${cause.valIndex}`);
+          db.setLaunchStatus(launchId, "paused");
+          return { status: "awaiting-gentx", failedStep: step.name };
+        }
+        if (cause instanceof RerunFrom && reruns < MAX_RERUNS) {
+          reruns++;
+          for (const name of cause.steps) db.resetStep(launchId, name);
+          db.resetStep(launchId, step.name);
+          log(`${step.name}: ${cause.message}; running the plan again from ${cause.steps[0] ?? step.name}`);
+          continue pass;
+        }
+        // some libraries throw Errors with EMPTY messages — fall back to the
+        // error name + first stack frame so the UI never shows a blank banner
+        const message =
+          cause instanceof Error
+            ? cause.message ||
+              `${cause.name || "Error"} (no message): ${(cause.stack ?? "").split("\n")[1]?.trim() ?? "no stack"}`
+            : String(cause);
+        db.stepFailed(launchId, step.name, message);
         db.setLaunchStatus(launchId, "paused");
-        return { status: "awaiting-signature", failedStep: step.name };
+        log(`pause at ${step.name}: ${message}`);
+        return { status: "paused", failedStep: step.name };
       }
-      if (cause instanceof AwaitUser) {
-        // a pause with funding rows stores both under one object; one with a
-        // wallet request only keeps the bare WalletRequest it always stored
-        db.stepWaiting(
-          launchId,
-          step.name,
-          cause.reason,
-          cause.funding?.length || cause.peerSetup
-            ? {
-                wallet: cause.wallet,
-                ...(cause.funding?.length ? { funding: cause.funding } : {}),
-                ...(cause.peerSetup ? { peerSetup: cause.peerSetup } : {}),
-              }
-            : cause.wallet,
-        );
-        db.setLaunchStatus(launchId, "paused");
-        return { status: "awaiting-user", failedStep: step.name, reason: cause.reason };
-      }
-      if (cause instanceof AwaitGentx) {
-        db.stepWaiting(launchId, step.name, `awaiting gentx for validator ${cause.valIndex}`);
-        db.setLaunchStatus(launchId, "paused");
-        return { status: "awaiting-gentx", failedStep: step.name };
-      }
-      // some libraries throw Errors with EMPTY messages — fall back to the
-      // error name + first stack frame so the UI never shows a blank banner
-      const message =
-        cause instanceof Error
-          ? cause.message ||
-            `${cause.name || "Error"} (no message): ${(cause.stack ?? "").split("\n")[1]?.trim() ?? "no stack"}`
-          : String(cause);
-      db.stepFailed(launchId, step.name, message);
-      db.setLaunchStatus(launchId, "paused");
-      log(`pause at ${step.name}: ${message}`);
-      return { status: "paused", failedStep: step.name };
     }
+    break;
   }
 
   db.setLaunchStatus(launchId, "completed");

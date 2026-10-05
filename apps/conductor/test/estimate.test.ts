@@ -23,7 +23,7 @@ describe("launch cost estimate", () => {
       { role: "validators", count: 2, unitLowUsd: 5.05, unitHighUsd: 10.1 },
       // 4cpu + 16Gi + 5Gi eph + 50Gi beta3 = 6.4 + 12.8 + 0.1 + 2.0
       { role: "sentries (large)", count: 1, unitLowUsd: 10.65, unitHighUsd: 21.3 },
-      { role: "sentries (standard)", count: 1, unitLowUsd: 5.01, unitHighUsd: 10.02 },
+      { role: "sentries (standard)", count: 1, unitLowUsd: 5.25, unitHighUsd: 10.5 },
     ]);
   });
 
@@ -34,8 +34,8 @@ describe("launch cost estimate", () => {
     expect(est.perRole).toEqual([
       // 1cpu + 8Gi + 5Gi eph + 50Gi beta3 = 1.6 + 6.4 + 0.1 + 2.0
       { role: "validators", count: 2, unitLowUsd: 5.05, unitHighUsd: 10.1 },
-      // 2cpu + 8Gi + 5Gi eph + 8Gi beta3 = 3.2 + 6.4 + 0.1 + 0.32
-      { role: "sentries", count: 2, unitLowUsd: 5.01, unitHighUsd: 10.02 },
+      // 2cpu + 8Gi + 5Gi eph + 20Gi beta3 = 3.2 + 6.4 + 0.1 + 0.8
+      { role: "sentries", count: 2, unitLowUsd: 5.25, unitHighUsd: 10.5 },
       // vendored SDL: 1cpu + 1Gi + 512Mi eph + 2×512Mi beta3 (bumped
       // 2026-07-22: the embedded DERP relay hairpins all mesh traffic
       // through this box, 0.5cpu/512Mi was control-plane sizing)
@@ -45,12 +45,12 @@ describe("launch cost estimate", () => {
       // 0.5cpu + 512Mi + 1Gi eph
       { role: "frontend", count: 1, unitLowUsd: 0.61, unitHighUsd: 1.22 },
     ]);
-    expect(est.totalHighUsd).toBe(45.16);
-    expect(est.totalLowUsd).toBe(22.58);
+    expect(est.totalHighUsd).toBe(46.12);
+    expect(est.totalLowUsd).toBe(23.06);
     // one-time launch fee: 10% of the monthly range
     expect(est.feeBps).toBe(1000);
-    expect(est.feeLowUsd).toBe(2.26);
-    expect(est.feeHighUsd).toBe(4.52);
+    expect(est.feeLowUsd).toBe(2.31);
+    expect(est.feeHighUsd).toBe(4.61);
   });
 
   it("LAUNCH_FEE_BPS=0 disables the fee", () => {

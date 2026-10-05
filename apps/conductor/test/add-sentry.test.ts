@@ -166,6 +166,55 @@ describe("adding a sentry to a running fleet", () => {
     expect(res.status).toBe("completed");
   }, 240_000);
 
+  it("removes a closed, highest-numbered sentry: spec, row, id and every peer list", async () => {
+    const w = await launched(spec1x1());
+    w.fleet.requestAddSentry(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    const id1 = ids(w)["sentry-1"]!;
+    // its provider went away and the row was closed
+    w.db.setComponentState("fl", "sentry-1", "closed");
+
+    // sentry-0 and a sentry still running are never removed this way
+    await expect(w.fleet.removeSentry(w.db.getLaunch("fl")!, "sentry-0")).rejects.toThrow(/public endpoints/);
+    const s0 = row(w, "sentry-0")!;
+    const s0Id = `${s0.ssh_host}:${s0.ssh_port}`;
+    const v0 = row(w, "val-0")!;
+    const v0Id = `${v0.ssh_host}:${v0.ssh_port}`;
+
+    const { unreachable } = await w.fleet.removeSentry(w.db.getLaunch("fl")!, "sentry-1");
+    expect(unreachable).toEqual([]);
+    expect(JSON.parse(w.db.getLaunch("fl")!.spec_json).topology.sentries.count).toBe(1);
+    expect(row(w, "sentry-1")).toBeUndefined();
+    expect(ids(w)["sentry-1"]).toBeUndefined();
+    const s0Config = fs.readFileSync(path.join(w.work, "launches/fl/nodes/sentry-0/config/config.toml"), "utf8");
+    expect(s0Config).not.toContain(id1);
+    // the running nodes' peer lists are edited too
+    const edited = (t: string) => w.services.ssh.execLog.some((e) => e.target === t && e.command.includes(`awk -v id=${id1}`));
+    expect(edited(s0Id)).toBe(true);
+    expect(edited(v0Id)).toBe(true);
+    // and a sentry can be added again afterwards, fresh
+    expect(w.fleet.requestAddSentry(w.db.getLaunch("fl")!).key).toBe("sentry-1");
+  }, 240_000);
+
+  it("refuses to remove a sentry that is running", async () => {
+    const w = await launched(spec1x1());
+    w.fleet.requestAddSentry(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    await expect(w.fleet.removeSentry(w.db.getLaunch("fl")!, "sentry-1")).rejects.toThrow(/close sentry-1 first/);
+  }, 240_000);
+
+  it("the add dialog offers the next sentry with priced sizes, and says when it would replay the chain", async () => {
+    const w = await launched(spec1x1());
+    const o = await w.fleet.addOptions(w.db.getLaunch("fl")!);
+    expect(o.sentry?.name).toBe("sentry-1");
+    expect(o.sentry?.have).toBe(1);
+    expect(o.sentry?.sizes.map((z) => z.id)).toEqual(["small", "standard", "large"]);
+    const [small, , large] = o.sentry!.sizes;
+    expect(large!.lowUsd).toBeGreaterThan(small!.lowUsd);
+    // no chain-data backup in this fleet: step 3 says it replays from block 1
+    expect(o.sentry!.steps[2]).toMatch(/No chain-data backup: replays all/);
+  }, 120_000);
+
   it("refuses while another operation runs", async () => {
     const w = await launched(spec1x1());
     w.fleet.requestAddSentry(w.db.getLaunch("fl")!);

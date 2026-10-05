@@ -59,6 +59,8 @@ describe("what may be signed unattended", () => {
   });
   it("not past the daily cap, nor for another owner, nor off or expired", () => {
     expect(ok([create("6000000")], { spent: 5_000_000n })).toMatch(/daily cap/);
+    // each under the cap alone, over it together in one tx
+    expect(ok([create("6000000"), create("6000000")])).toMatch(/daily cap/);
     expect(ok([{ typeUrl: TypeUrl.CloseDeployment, value: { id: { owner: "akash1other", dseq: "1" } } }])).toMatch(/another owner/);
     expect(ok([create("1")], { settings: { ...settings, enabled: false } })).toMatch(/is off/);
     expect(ok([create("1")], { grants: grants.map((g) => ({ ...g, expiration: "2020-01-01T00:00:00Z" })) })).toMatch(/expired/);
@@ -197,6 +199,32 @@ describe("automatic recovery", () => {
     const op = w.db.listFleetOps("fl", "active")[0];
     expect(op?.kind).toBe("relaunch");
     expect(JSON.parse(op!.params_json)).toMatchObject({ key: "sentry-1", auto: true });
+  }, 240_000);
+});
+
+describe("signing one pending tx at a time", () => {
+  it("a second call while the first signs does nothing", async () => {
+    const w = await launched();
+    const { address } = await opsKey(w.work, OWNER);
+    w.chain.grantAll(OWNER, address, UNATTENDED_MSG_TYPES);
+    setUnattendedSettings(w.db, OWNER, { enabled: true });
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    await sentryDies(w);
+    // drive to the first signature of the auto relaunch
+    const s = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    await runLaunch(w.db, "fl", s, w.work, [...buildPreLaunchOpSteps(w.db, "fl"), ...allSteps(), ...buildOpSteps(w.db, "fl")], w.services, () => {});
+    let release!: () => void;
+    const exec = w.chain.exec.bind(w.chain);
+    w.chain.exec = async (...a) => {
+      await new Promise<void>((r) => (release = r));
+      return exec(...a);
+    };
+    const first = w.fleet.signUnattended("fl");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await w.fleet.signUnattended("fl")).toBe(false);
+    release();
+    expect(await first).toBe(true);
+    expect(w.chain.execs).toHaveLength(1);
   }, 240_000);
 });
 

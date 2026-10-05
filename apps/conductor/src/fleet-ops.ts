@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { originInstruction, pointDns, pointOrigins, publicEndpointRecords, type OriginRecord } from "./dns-steps.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -19,7 +20,7 @@ import {
 } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { backupMastodon, restoreMastodon, type MastodonBackup } from "./steps/mastodon-migrate.js";
-import { AwaitUser, launchDirs, type StepCtx, type StepDef } from "./engine.js";
+import { AwaitUser, launchDirs, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
 import { feeCoin, feeConfig } from "./fee.js";
@@ -28,7 +29,7 @@ import { pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { gateForFreshVolume } from "./akash/update.js";
-import { ageIdentityAt, extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
+import { ageIdentityAt, clearPin, extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
   createNamedAccounts,
@@ -45,7 +46,7 @@ import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relaye
 import { reconcileSessions, type SessionRole } from "./sessions.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { fleetResolver } from "./verifier.js";
-import { deploymentInfoWithRetry, ingressHost, pushManifest, wireValidatorPeers } from "./steps/phase-ef.js";
+import { deploymentInfoWithRetry, forwardedVerdict, ingressHost, ingressVerdict, pushManifest, wireValidatorPeers } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
 import {
@@ -106,6 +107,10 @@ export interface RelaunchParams {
   /** The pick, once made. Scoped to the deployment the bids belong to — a
    *  later attempt (new dseq) draws new bids, so an old pick never applies. */
   bidChoice?: { dseq: string; provider: string };
+  /** Re-placements made because the provider's ingress served nothing (verify). */
+  ingressReplacements?: number;
+  /** A re-placement under way: the deployment being closed, and its provider. */
+  replacing?: { dseq: string; provider: string };
   /** Bids on offer for the pick, refreshed each time the step parks; with a
    *  reason when the op asked on its own (the policy's pick is then also a
    *  choice: AUTO_BID). */
@@ -541,6 +546,79 @@ export async function refreshSshEndpoints(
   return { corrected, unreadable };
 }
 
+/** Times a placement moves off a provider whose ingress served nothing, before it pauses. */
+const MAX_INGRESS_REPLACEMENTS = 2;
+
+/** Whether a placement's provider is at fault (ingressVerdict, forwardedVerdict). */
+export interface PlacementVerdict {
+  broken: boolean;
+  detail: string;
+  provider?: string;
+}
+
+/**
+ * Re-place an op's placement whose provider serves nothing (its ingress, or
+ * its forwarded ports): put the provider on the op's and the wallet's avoid
+ * lists, close the deployment (the escrow comes back), and run the op's
+ * steps from `deploy` to `to` again for fresh bids (RerunFrom). At most
+ * MAX_INGRESS_REPLACEMENTS times. Returns what `judge` found when it does
+ * not re-place. Re-entrant: a re-placement under way (op params
+ * `replacing`) skips the judging and goes on with its close.
+ */
+export async function replacePlacement(
+  ctx: StepCtx,
+  o: {
+    opId: number;
+    key: string;
+    p: (s: string) => string;
+    steps: StepDef[];
+    deploy: { dseq: string };
+    lease: { provider?: string };
+    to: string;
+    judge: () => Promise<PlacementVerdict>;
+  },
+): Promise<string | undefined> {
+  const { opId, key, p, deploy, lease } = o;
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const live = (): RelaunchParams =>
+    JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((x) => x.id === opId)?.params_json ?? "{}") as RelaunchParams;
+  let params = live();
+  if (params.replacing?.dseq !== deploy.dseq) {
+    const verdict = await o.judge();
+    if (!verdict.broken) return verdict.detail ? `Checked past DNS: ${verdict.detail}` : undefined;
+    const done = params.ingressReplacements ?? 0;
+    if (done >= MAX_INGRESS_REPLACEMENTS || !lease.provider) {
+      return `${verdict.detail}; already moved ${done} time(s) for this, so it is left to you (relaunch it, or pick a bid by hand)`;
+    }
+    ctx.log(`${key}: ${verdict.detail}; moving it off ${verdict.provider ?? lease.provider} (attempt ${done + 1} of ${MAX_INGRESS_REPLACEMENTS})`);
+    ctx.db.setProviderPref(owner, lease.provider, "avoid", verdict.provider ?? null);
+    params = {
+      ...params,
+      replacing: { dseq: deploy.dseq, provider: lease.provider },
+      avoidProviders: [...new Set([...(params.avoidProviders ?? []), lease.provider])],
+    };
+    ctx.db.updateFleetOpParams(opId, params);
+  }
+  // close it (a signature; the step resumes here), then place again
+  const info = await ctx.services.api.deploymentInfo(owner, deploy.dseq).catch(() => undefined);
+  if (info?.state === "active") {
+    await ctx.requireTx(p(`replace-close:${deploy.dseq}`), [
+      { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq: deploy.dseq } } },
+    ]);
+  }
+  const { replacing: _r, bidChoice: _b, offeredBids: _o, ...rest } = params;
+  ctx.db.updateFleetOpParams(opId, { ...rest, ingressReplacements: (params.ingressReplacements ?? 0) + 1 });
+  ctx.db.deletePendingTx(ctx.launchId, p("deploy"));
+  ctx.db.deletePendingTx(ctx.launchId, p("lease"));
+  clearPin(ctx, `op${opId}-dseq`);
+  const from = o.steps.findIndex((st) => st.name === p("deploy"));
+  const to = o.steps.findIndex((st) => st.name === o.to);
+  throw new RerunFrom(
+    o.steps.slice(from, to + 1).map((st) => st.name),
+    `${key}: deployment ${deploy.dseq} closed, its provider served nothing`,
+  );
+}
+
 /** Polls of the double-sign window with no new block before it calls the chain halted. */
 const HALT_POLLS = 24;
 
@@ -936,6 +1014,10 @@ export interface AddComponentParams {
   key: ComponentKey;
   /** Continues the row's move count when a closed component comes back. */
   generation: number;
+  /** The wallet's avoided providers at request time (relaunch takes the same). */
+  avoidProviders?: string[];
+  /** The operator picks the bid: the lease step parks with every bid (as a relaunch's pick bid). */
+  manualBid?: boolean;
 }
 
 /** Open what the current spec needs on one of this fleet's sentries — plus
@@ -1020,7 +1102,16 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
   }
 
   steps.push(
-    ...relaunchSteps(opId, { key, generation: params.generation }, spec).filter(
+    ...relaunchSteps(
+      opId,
+      {
+        key,
+        generation: params.generation,
+        ...(params.avoidProviders?.length ? { avoidProviders: params.avoidProviders } : {}),
+        ...(params.manualBid ? { manualBid: true } : {}),
+      },
+      spec,
+    ).filter(
       (s) => s.name !== p("close"),
     ),
   );
@@ -1300,6 +1391,28 @@ export function sessionsSteps(opId: number, params: SessionsParams, spec: Launch
  * anchor. The relaunch's configure step and a node resize's staging both
  * start a node this way.
  */
+/**
+ * A sentry must accept several peers from one IP: under userspace tailscale
+ * every mesh peer reaches it from 127.0.0.1 (its validator's link is a local
+ * tunnel too), and with allow_duplicate_ip = false CometBFT refuses all but
+ * the first, closing the rest before the handshake ("secret conn failed:
+ * EOF" on the dialer). Seen live 2026-10-04: devnet's sentry-0 kept only its
+ * val-0 link and refused sentry-1 and a resize's staged copy. Sets it in the
+ * node's config.toml; with `restart`, restarts the node when it changed
+ * (the setting is read at start). Returns whether it changed.
+ */
+export async function acceptMeshPeers(ctx: StepCtx, target: SshTarget, opts: { restart: boolean }): Promise<boolean> {
+  const config = `${NODE_HOME}/config/config.toml`;
+  const out = await ctx.services.ssh.exec(
+    target,
+    `grep -q '^allow_duplicate_ip = true' ${config} && echo ok || ` +
+      `{ sed -i 's|^allow_duplicate_ip = .*|allow_duplicate_ip = true|' ${config} && echo changed; }`,
+  );
+  const changed = out.stdout.includes("changed");
+  if (changed && opts.restart) await restartNode(ctx.services.ssh, target);
+  return changed;
+}
+
 export async function prepareNodeHome(
   ctx: StepCtx,
   spec: LaunchSpec,
@@ -1323,7 +1436,12 @@ export async function prepareNodeHome(
   // the bundle was rendered at launch; a component added since may need
   // the sentry to open more (its LCD) — converge on the current spec
   // before the node first starts
-  if (key.startsWith("sentry-")) await ensureSentryServes(ctx, spec, key, target);
+  if (key.startsWith("sentry-")) {
+    await ensureSentryServes(ctx, spec, key, target);
+    // a bundle packed before sentries took duplicate IPs (every mesh peer
+    // arrives from 127.0.0.1) would refuse all but one peer
+    await acceptMeshPeers(ctx, target, { restart: false });
+  }
   // the bundle carries the app.toml rendered at launch: a gas price
   // corrected since (or hand-edited on the old node) would otherwise come
   // back with the relaunch, as a 25000 one did on 2026-10-02
@@ -1802,8 +1920,17 @@ export function relaunchSteps(
       // provider defeats the purpose. exclude (per the policy's anti-affinity
       // mode): other active components' providers. Stateless components are
       // exempt from anti-affinity (§6) — only the avoid list constrains them.
+      // the op's live params: a re-placement off a broken ingress adds the
+      // provider it left after these steps were built
+      const live = JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as RelaunchParams;
+      // and the wallet's avoid list as it stands now (an op requested before
+      // a provider was avoided keeps off it too), except where the component
+      // runs: a resize may stay on its own provider
+      const current = (ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]).find((c) => c.key === key)?.provider;
       const avoidProviders = new Set<string>([
         ...(params.avoidProviders ?? []),
+        ...(live.avoidProviders ?? []),
+        ...ctx.db.providerPrefs(owner).avoid.filter((pr) => pr !== current || params.avoidProviders?.includes(pr)),
         // a kind that must keep off a host decided elsewhere (the verifier
         // off the Mastodon it checks)
         ...(descriptorFor(key)?.avoidProviders?.({ db: ctx.db, launchId: ctx.launchId, spec, assigned: {} }) ?? []),
@@ -1949,6 +2076,15 @@ export function relaunchSteps(
   const configure = stateless ? (descriptorFor(key)?.configureSteps?.(p, spec) ?? []) : [];
   const finishAtGate = configure.length === 0;
 
+  /** replacePlacement for this relaunch's own steps, from deploy up to `to`. */
+  const replaceOffBrokenIngress = (
+    ctx: StepCtx,
+    deploy: { dseq: string },
+    lease: { hostUri: string; gseq: number; oseq: number; provider?: string },
+    judge: () => Promise<PlacementVerdict>,
+    to = p("verify"),
+  ) => replacePlacement(ctx, { opId, key, p, steps, deploy, lease, to, judge });
+
   if (stateless) {
     // §5: stateless components skip the node rewiring and guarded start —
     // the container is live once it answers on its domain. Its tunnels come
@@ -1965,6 +2101,13 @@ export function relaunchSteps(
           return { healthy: true };
         }
         const url = `https://${domain}/`;
+        // a re-placement this step started, back from its close signature
+        const placed = ctx.output<{ dseq: string }>(p("deploy"));
+        const leased = ctx.output<{ hostUri: string; gseq: number; oseq: number; provider?: string }>(p("lease"));
+        const pending = (JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as RelaunchParams).replacing;
+        if (placed && leased && pending?.dseq === placed.dseq) {
+          await replaceOffBrokenIngress(ctx, placed, leased, async () => ({ broken: true, detail: "" }));
+        }
         // every domain the component serves, each on its health path: a
         // move can add one (Mastodon's login.<domain> when sign-in is turned
         // on) that no DNS record points at yet, while the main domain still
@@ -2003,9 +2146,17 @@ export function relaunchSteps(
             return { healthy: true, url, dnsUpdated: true };
           }
         }
+        // DNS or the provider? The provider's own hostname tells: a ready
+        // container it does not serve either means its ingress is broken,
+        // and the component moves (closing this deployment, keeping off
+        // that provider) instead of waiting for a record that cannot help
+        const verdict = await replaceOffBrokenIngress(ctx, deploy, lease, () =>
+          ingressVerdict(ctx, { ...lease, dseq: deploy.dseq }, dark[0]!.domain, new URL(dark[0]!.healthUrl).pathname),
+        );
         const records = targets.filter((t) => dark.some((d) => d.domain === t.domain)).map((t) => `${t.domain} → CNAME ${t.target}`);
         throw new AwaitUser(
           p("verify"),
+          (verdict ? `${verdict}. ` : "") +
           `${key} not answering at ${dark.map((d) => d.healthUrl).join(", ")} — create or update the DNS ` +
             `record${records.length > 1 ? "s" : ""} ${records.join(", ")} ` +
             "(Cloudflare: proxy on, SSL=Flexible), then resume",
@@ -2358,18 +2509,26 @@ export function relaunchSteps(
           if (!row) continue;
           const sdlPath = path.join(dep.sdlDir, `${depKey}.yaml`);
           const retarget = retargetTunnelEnv(ctx, dep.spec, depKey, fs.readFileSync(sdlPath, "utf8"), dep.fleetId);
-          if (retarget.changes.length === 0) continue;
           const label = dep.fleetId === ctx.launchId ? depKey : fleetPeer(depKey, dep.fleetId);
           for (const c of retarget.changes) ctx.log(`${label}: tunnel re-aimed at ${c}`);
-          fs.writeFileSync(sdlPath, retarget.text);
+          if (retarget.changes.length > 0) fs.writeFileSync(sdlPath, retarget.text);
           const artifacts = sdlArtifacts(loadSdl(sdlPath));
           fs.writeFileSync(path.join(dep.sdlDir, `${depKey}.manifest.json`), artifacts.manifestJson);
+          // Pushed whether or not this run rewrote the SDL, as repair's
+          // mesh-env does: the update tx pauses this step for a signature,
+          // and the re-run after it finds the SDL already re-aimed. Skipping
+          // the push then left the update on chain and the provider never
+          // told, so the container kept dialing the old address. Seen live:
+          // a relayer tunnelling to a resized sentry-0's old IP for a day,
+          // its relinks hanging on the dead tunnel. A provider already
+          // running this manifest changes nothing.
           pushes.push({ row, json: artifacts.manifestJson });
           // convergent like retarget: a re-run finds the version already on
           // chain and only re-sends the manifest
           const wantHash = Buffer.from(artifacts.hash).toString("base64");
           const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
           if (onChain?.hash === wantHash) continue;
+          if (retarget.changes.length === 0 && !onChain?.hash) continue;
           msgs.push({
             typeUrl: TypeUrl.UpdateDeployment,
             value: { id: { owner, dseq: row.dseq }, hash: wantHash },
@@ -2401,6 +2560,15 @@ export function relaunchSteps(
     steps.push({
       name: p("public-dns"),
       async run(ctx) {
+        // a re-placement this step started, back from its close signature
+        {
+          const placed = ctx.output<{ dseq: string }>(p("deploy"));
+          const leased = ctx.output<{ hostUri: string; gseq: number; oseq: number; provider?: string }>(p("lease"));
+          const live = JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as RelaunchParams;
+          if (placed && leased && live.replacing?.dseq === placed.dseq) {
+            await replaceOffBrokenIngress(ctx, placed, leased, async () => ({ broken: true, detail: "" }), p("public-dns"));
+          }
+        }
         // the node is serving again (persist booted it); a domain still
         // dark after a few minutes points at the old provider's ingress
         let dark = publicDomains;
@@ -2412,12 +2580,12 @@ export function relaunchSteps(
         if (dark.length > 0) {
           const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
           const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
-          const targets: { domain: string; target: string }[] = [];
-          for (const d of dark) {
-            targets.push({ domain: d.domain, target: await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, d.domain) });
-          }
+          // the API and RPC are forwarded ports on the provider's host, not
+          // its port-80 ingress: a CNAME there plus an Origin Rule per domain
+          const status = await ctx.services.provider.leaseStatus(loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq);
+          const targets = publicEndpointRecords(status, dark);
           // the launcher's DNS token, when it has one, then a few more minutes
-          if ((await pointDns(ctx, targets)).length > 0) {
+          if ((await pointOrigins(ctx, targets)).length > 0) {
             for (let i = 0; i < 36 && dark.length > 0; i++) {
               await ctx.services.sleep(5000);
               const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.url)));
@@ -2428,13 +2596,27 @@ export function relaunchSteps(
               return { answering: publicDomains.map((d) => d.domain), dnsUpdated: true };
             }
           }
-          const records = targets.filter((t) => dark.some((d) => d.domain === t.domain)).map((t) => `${t.domain} → CNAME ${t.target}`);
+          // DNS or the provider? Its forwarded ports, tried directly while
+          // the node answers on its own host, tell: a provider that does not
+          // forward them is left, the node placed again
+          // (not in a resize: past its handover this deployment IS the node,
+          // so it only says what it found)
+          const judge = () =>
+            forwardedVerdict(ctx, { ...lease, dseq: deploy.dseq }, rowTarget(ctx, componentRow(ctx, key)), [
+              ...(dark.some((d) => d.name === "RPC") ? [{ port: 26657, path: "/status" }] : []),
+              ...(dark.some((d) => d.name === "API") ? [{ port: 1317, path: "/cosmos/base/tendermint/v1beta1/node_info" }] : []),
+            ]);
+          const verdict = opts.staged
+            ? await judge().then((v) => (v.detail ? `Checked past DNS: ${v.detail}` : undefined))
+            : await replaceOffBrokenIngress(ctx, deploy, lease, judge, p("public-dns"));
+          const records = targets.filter((t) => dark.some((d) => d.domain === t.domain)).map(originInstruction);
           throw new AwaitUser(
             p("public-dns"),
+            (verdict ? `${verdict}. ` : "") +
             `${key} moved to another provider, and the fleet's public ` +
               `${dark.map((d) => d.name).join(" and ")} no longer answer${dark.length > 1 ? "" : "s"} at ` +
-              `${dark.map((d) => d.url).join(", ")}. Update the DNS record${records.length > 1 ? "s" : ""} ` +
-              `${records.join(", ")} (Cloudflare: proxy on, SSL=Flexible), then resume.`,
+              `${dark.map((d) => d.url).join(", ")}. Set ${records.join("; ")} ` +
+              `(Cloudflare: proxy on, SSL=Flexible), then resume.`,
           );
         }
         ctx.db.setFleetOpStatus(opId, "done");
@@ -2446,26 +2628,7 @@ export function relaunchSteps(
   return steps;
 }
 
-/**
- * Point domains at their new ingress through the launcher's DNS token
- * (dns.ts). Returns the domains it updated; none when no token is set or no
- * zone holds them, and a failure is only logged (the step's own pause with
- * the records to set still follows).
- */
-export async function pointDns(ctx: StepCtx, records: { domain: string; target: string }[]): Promise<string[]> {
-  const dns = ctx.services.dns;
-  if (!dns) return [];
-  const done: string[] = [];
-  for (const r of records) {
-    try {
-      if (await dns.pointCname(r.domain, r.target)) done.push(r.domain);
-    } catch (e) {
-      ctx.log(`DNS update for ${r.domain} failed: ${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
-    }
-  }
-  if (done.length > 0) ctx.log(`DNS pointed through Cloudflare: ${records.filter((r) => done.includes(r.domain)).map((r) => `${r.domain} → ${r.target}`).join(", ")}`);
-  return done;
-}
+export { pointDns } from "./dns-steps.js";
 
 /** The fleet's public API/RPC domains, all served by sentry-0, with the URL
  *  that proves each one reaches the node (the same probes verify-chain uses). */
@@ -2636,8 +2799,14 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
 
       // headscale placement is price-driven like at launch (no anti-affinity
       // against the fleet); the avoid list (old provider + wallet's) and the
-      // spec's headscale exclusions constrain it
-      const avoidProviders = new Set<string>(params.avoidProviders ?? []);
+      // spec's headscale exclusions constrain it; read live, so a provider
+      // a re-placement left (op params, wallet list) is kept off too
+      const live = JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as RelaunchParams;
+      const avoidProviders = new Set<string>([
+        ...(params.avoidProviders ?? []),
+        ...(live.avoidProviders ?? []),
+        ...ctx.db.providerPrefs(owner).avoid,
+      ]);
       const bids = await pollBids(ctx.services.api, owner, deploy.dseq, {
         sleep: ctx.services.sleep,
         minBids: 1,
@@ -2814,7 +2983,12 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
     name: p("dns"),
     async run(ctx) {
       const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
-      const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+      const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number; provider?: string }>(p("lease"))!;
+      // a re-placement this step started, back from its close signature
+      const replace = (judge: () => Promise<PlacementVerdict>) =>
+        replacePlacement(ctx, { opId, key: "headscale", p, steps, deploy, lease, to: p("dns"), judge });
+      const live = JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as RelaunchParams;
+      if (live.replacing?.dseq === deploy.dseq) await replace(async () => ({ broken: true, detail: "" }));
       const ingress = await ingressHost(ctx, lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, domain);
       // the launcher's DNS token flips it here when it can
       const flipped = (await pointDns(ctx, [{ domain, target: ingress }])).length > 0;
@@ -2827,8 +3001,13 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
         if (await ctx.services.rpc.httpOk(`https://${domain}/health`)) return { dns: true };
         await ctx.services.sleep(5000);
       }
+      // DNS or the provider? The provider's own hostname for headscale
+      // tells, whatever the record says: one that does not serve it either
+      // means the ingress is broken, and headscale moves again
+      const verdict = await replace(() => ingressVerdict(ctx, { ...lease, dseq: deploy.dseq }, domain, "/health"));
       throw new AwaitUser(
         p("dns"),
+        (verdict ? `${verdict}. ` : "") +
         `headscale moved to a new provider: update the DNS record for ${domain} → CNAME ${ingress}, ` +
           "then resume. Every mesh client dials this domain, so nothing re-registers until it " +
           "points at the new deployment.",
@@ -3780,6 +3959,7 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
           // name each service component's ingress, so a domain that is new
           // (not repointed) has its target spelled out
           const targets: string[] = [];
+          const cnames: { domain: string; target: string }[] = [];
           for (const key of params.components) {
             const own = serviceComponents(spec).find((c) => c.key === key)?.domain;
             if (!own) continue;
@@ -3788,7 +3968,36 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
             const row = componentRow(ctx, key);
             for (const domain of dark.map((u) => new URL(u).hostname).filter((h) => served.has(h))) {
               const host = await ingressHost(ctx, row.host_uri, row.dseq, 1, 1, domain).catch(() => undefined);
-              if (host) targets.push(`${domain} → CNAME ${host}`);
+              if (host) {
+                targets.push(`${domain} → CNAME ${host}`);
+                cnames.push({ domain, target: host });
+              }
+            }
+          }
+          // the sentry's public endpoints: forwarded ports, so CNAME plus Origin Rule
+          const darkHosts = new Set(dark.map((u) => new URL(u).hostname));
+          const endpoints = sentryPublicDomains(spec).filter((d) => darkHosts.has(d.domain));
+          let origins: OriginRecord[] = [];
+          if (endpoints.length > 0 && params.components.some((k) => k.startsWith("sentry-"))) {
+            const s0 = componentRow(ctx, "sentry-0");
+            const status = await ctx.services.provider.leaseStatus(loadCert(ctx), s0.host_uri, s0.dseq, 1, 1).catch(() => undefined);
+            if (status) {
+              origins = publicEndpointRecords(status, endpoints);
+              targets.push(...origins.map(originInstruction));
+            }
+          }
+          // the launcher's DNS token first, then a few minutes for it to take
+          const set = [...(await pointDns(ctx, cnames)), ...(await pointOrigins(ctx, origins))];
+          if (set.length > 0) {
+            let still = dark;
+            for (let i = 0; i < 36 && still.length > 0; i++) {
+              await ctx.services.sleep(5000);
+              const ok = await Promise.all(still.map((u) => ctx.services.rpc.httpOk(u)));
+              still = still.filter((_, j) => !ok[j]);
+            }
+            if (still.length === 0) {
+              ctx.db.setFleetOpStatus(opId, "done");
+              return { verified: urls, dnsUpdated: set };
             }
           }
           throw new AwaitUser(
@@ -5712,6 +5921,67 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         // node config drifts quietly (hand edits, a relaunch from an old
         // bundle): every node back to the spec's minimum-gas-prices
         return convergeGasPrice(ctx, spec);
+      },
+    },
+    {
+      name: p("mesh-peers"),
+      async run(ctx) {
+        // sentries that refuse a second mesh peer (acceptMeshPeers): only
+        // those change and restart, one at a time
+        const fixed: string[] = [];
+        const unreachable: string[] = [];
+        for (const r of ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[]) {
+          if (!r.key.startsWith("sentry-") || r.state !== "active") continue;
+          try {
+            if (await acceptMeshPeers(ctx, rowTarget(ctx, r), { restart: true })) {
+              fixed.push(r.key);
+              ctx.log(`${r.key}: now accepts several mesh peers (allow_duplicate_ip = true); restarted`);
+            }
+          } catch {
+            unreachable.push(r.key);
+          }
+        }
+        return { fixed, ...(unreachable.length > 0 ? { unreachable } : {}) };
+      },
+    },
+    {
+      name: p("dns"),
+      async run(ctx) {
+        // DNS that drifted from the leases (a record edited by hand, a move
+        // whose DNS pause was skipped): with the launcher's token, every
+        // public domain that does not answer is pointed at where its
+        // component runs now. Domains that answer are left alone, so a
+        // record pointed elsewhere on purpose stays.
+        if (!ctx.services.dns) return { skipped: "no DNS token" };
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const row = (k: string) => rows.find((r) => r.key === k && r.state === "active");
+        const fixed: string[] = [];
+        const dark = async (url: string) => !(await ctx.services.rpc.httpOk(url));
+        for (const c of serviceComponents(spec)) {
+          const r = row(c.key);
+          if (!r || !c.domain) continue;
+          const probes = descriptorFor(c.key)?.ingress?.(spec) ?? [{ domain: c.domain, healthUrl: `https://${c.domain}/` }];
+          for (const pr of probes) {
+            if (!(await dark(pr.healthUrl))) continue;
+            const target = await ingressHost(ctx, r.host_uri, r.dseq, 1, 1, pr.domain).catch(() => undefined);
+            if (target) fixed.push(...(await pointDns(ctx, [{ domain: pr.domain, target }])));
+          }
+        }
+        const s0 = row("sentry-0");
+        const endpoints = [];
+        for (const d of sentryPublicDomains(spec)) if (await dark(d.url)) endpoints.push(d);
+        if (s0 && endpoints.length > 0) {
+          const status = await ctx.services.provider.leaseStatus(loadCert(ctx), s0.host_uri, s0.dseq, 1, 1).catch(() => undefined);
+          if (status) fixed.push(...(await pointOrigins(ctx, publicEndpointRecords(status, endpoints))));
+        }
+        const hs = row("headscale");
+        const hsDomain = isServicesFleet(spec) || spec.topology.headscale.reuseFleet ? undefined : headscaleDomain(spec);
+        if (hs && hsDomain && (await dark(`https://${hsDomain}/health`))) {
+          const target = await ingressHost(ctx, hs.host_uri, hs.dseq, 1, 1, hsDomain).catch(() => undefined);
+          if (target) fixed.push(...(await pointDns(ctx, [{ domain: hsDomain, target }])));
+        }
+        if (fixed.length > 0) ctx.log(`repair: DNS repointed for ${fixed.join(", ")}`);
+        return { repointed: fixed };
       },
     },
     {

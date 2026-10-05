@@ -226,6 +226,28 @@ describe("softsign validator relaunch on a single-validator chain", () => {
   }, 120_000);
 });
 
+describe("sentries take several mesh peers (all arrive from 127.0.0.1)", () => {
+  it("repair turns on allow_duplicate_ip where it is off and restarts only those sentries", async () => {
+    const w = await launched(spec1x1("tmkms"));
+    const s0 = row(w, "sentry-0");
+    const id = `${s0.ssh_host}:${s0.ssh_port}`;
+    w.services.ssh.refusesDuplicateIp.add(id);
+    w.fleet.requestRepair(w.db.getLaunch("fl")!, s0);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.services.ssh.refusesDuplicateIp.has(id)).toBe(false);
+    const op = w.db.listFleetOps("fl").find((o) => o.kind === "repair")!;
+    expect(w.db.getStep("fl", `op${op.id}:mesh-peers`)?.output_json).toContain('"fixed":["sentry-0"]');
+    // restarted: the node reads the setting at start
+    expect(w.services.ssh.execLog.some((e) => e.target === id && /pkill -x sparkdreamd/.test(e.command))).toBe(true);
+
+    // a second repair finds nothing to change and restarts nothing
+    const before = w.services.ssh.execLog.length;
+    w.fleet.requestRepair(w.db.getLaunch("fl")!, row(w, "sentry-0"));
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.services.ssh.execLog.slice(before).some((e) => /pkill -x sparkdreamd/.test(e.command))).toBe(false);
+  }, 240_000);
+});
+
 describe("sentry relaunch", () => {
   it("finishes when its validator cannot be reached, leaving that link to the validator's own recovery", async () => {
     const w = await launched(spec1x1("tmkms"));

@@ -45,6 +45,15 @@ import {
 } from "../peering.js";
 import { fundAmount, relayerFunds, SEND_GAS, type FundingRequest } from "../relayer-funds.js";
 
+/** The link's fund check, bounded (hermes waits on an unanswering gRPC forever). */
+export const RELAYER_FUNDCHECK = "timeout 150 relayer-fundcheck || true";
+
+/** "<chain> <rpc>" for every chain in the relayer's Hermes config whose RPC
+ *  does not answer from inside the relayer. */
+const RELAYER_DEAD_RPCS =
+  `awk -F"'" '/^id = /{id=$2} /^rpc_addr = /{print id, $2}' ${RELAYER_DIR}/config.toml 2>/dev/null | ` +
+  'while read id url; do curl -s -m 5 -o /dev/null "$url/status" || echo "$id $url"; done';
+
 /** What linking produced: the relayer's address on each chain and the
  *  channels it opened. Also saved to <launch>/relayer/state.json for the
  *  fleet panel, since the step that last linked may be a launch step or any
@@ -269,8 +278,34 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     account: boolean | null;
     ready: boolean;
   }>;
-  const fundcheck = async () =>
-    JSON.parse((await ctx.services.ssh.exec(target, "relayer-fundcheck || true")).stdout) as FundCheck;
+  // Bounded: hermes queries a chain's gRPC with no deadline of its own, so
+  // one endpoint that accepts and never answers (a mesh tunnel aimed at a
+  // node that moved) used to hang this past the lease-shell timeout with
+  // nothing to say which chain. On a timeout, ask each chain's RPC from the
+  // relayer and name the ones that do not answer.
+  const fundcheck = async (): Promise<FundCheck> => {
+    const out = (
+      await ctx.services.ssh.exec(target, RELAYER_FUNDCHECK, { timeoutMs: 180_000 })
+    ).stdout;
+    try {
+      return JSON.parse(out) as FundCheck;
+    } catch {
+      const dead = (await ctx.services.ssh.exec(target, RELAYER_DEAD_RPCS, { timeoutMs: 120_000 })).stdout
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      throw new Error(
+        "relayer-fundcheck did not answer within 150s" +
+          (dead.length > 0
+            ? `; from the relayer, these chains' RPC does not answer: ${dead.join(", ")}` +
+              (dead.some((d) => d.includes("127.0.0.1"))
+                ? ". 127.0.0.1 is a mesh tunnel to a fleet's sentry-0: if that sentry is up, its address " +
+                  "changed and the relayer's deployment still names the old one (repair fleet re-aims it)"
+                : "")
+            : "; every chain's RPC answers from the relayer, so a gRPC endpoint is the likely hold-up"),
+      );
+    }
+  };
   let status = await fundcheck();
 
   // a chain reached only by unopened openWhenFunded paths waits for its

@@ -7,7 +7,7 @@ import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
 import { FleetService } from "../src/fleet.js";
 import { allSteps } from "../src/index.js";
-import { classify, setAlertSettings, trackIncident } from "../src/incidents.js";
+import { alertSettings, classify, publicAlertSettings, sendAlert, setAlertSettings, trackIncident } from "../src/incidents.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 
 const tmpDirs: string[] = [];
@@ -45,6 +45,12 @@ describe("classifying an outage", () => {
     expect(classify("sentry-0", "unreachable", "unreachable").action).toBe("relaunch");
     expect(classify("sentry-0", "unreachable", "service-down").action).toBe("force-redeploy");
     expect(classify("sentry-0", "unreachable", "up").action).toBe("restart");
+    // a relayer whose mesh tunnel dials a dead address: repair re-aims it,
+    // where a relaunch would only move a container that is fine
+    expect(classify("relayer", "stale-tunnel", "unknown")).toMatchObject({ action: "repair", severity: "down" });
+    // the container runs but the provider's own hostname serves nothing: a
+    // restart cannot fix the provider's ingress, a move can
+    expect(classify("explorer", "unreachable", "ingress-broken")).toMatchObject({ action: "relaunch", severity: "down" });
     expect(classify("val-0", "lease-not-active", "unknown").action).toBe("relaunch");
     expect(classify("val-0", "jailed", "unknown").action).toBe("unjail");
     expect(classify("val-0", "low-escrow", "unknown")).toMatchObject({ action: "topup", severity: "warn" });
@@ -134,8 +140,101 @@ describe("monitor to alert", () => {
     expect(sentryAlerts()[1]!.headers.Title).toBe("sparkdream: sentry-0 is back");
   }, 120_000);
 
+  it("keeps watching a fleet paused inside an op, leaving out what the op is working on", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    db.createLaunch("fl", JSON.stringify(spec()), "akash1owner");
+    expect((await runWithSigner(db, "fl", spec(), work, allSteps(), services, new FakeSigner())).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    const sent: string[] = [];
+    fleet.alertFetch = (async (_url: string, init: RequestInit) => {
+      sent.push((init.headers as Record<string, string>).Title!);
+      return new Response("ok");
+    }) as typeof fetch;
+    setAlertSettings(db, { ntfy: { server: "https://ntfy.sh", topic: "sparkdream-alerts" } });
+
+    // a relaunch of val-0 failed and left the launch paused; meanwhile
+    // sentry-0's provider closes its lease
+    db.createFleetOp("fl", "relaunch", { key: "val-0", generation: 1 });
+    db.setLaunchStatus("fl", "paused");
+    const rows = db.listFleetComponents("fl");
+    for (const key of ["sentry-0", "val-0"]) {
+      services.api.leaseStates.set(rows.find((c) => c.key === key)!.dseq, "closed");
+    }
+    for (let i = 0; i < 2; i++) {
+      await fleet.tick("fl");
+      await fleet.trackIncidents("fl");
+    }
+    expect(sent).toContain("sparkdream: sentry-0 is down");
+    // val-0 is the op's to move: no reading, no alert
+    expect(sent.some((t) => t.includes("val-0"))).toBe(false);
+    expect(db.listComponentHealth("fl").find((h) => h.component === "val-0")).toBeUndefined();
+
+    // an op that may touch anything (a chain reset) leaves the fleet alone
+    const sentBefore = sent.length;
+    db.createFleetOp("fl", "reset-chain", {});
+    services.api.leaseStates.set(rows.find((c) => c.key === "sentry-0")!.dseq, "active");
+    await fleet.tick("fl");
+    await fleet.trackIncidents("fl");
+    expect(sent).toHaveLength(sentBefore);
+    expect(db.listComponentHealth("fl").find((h) => h.component === "sentry-0")?.status).toBe("lease-not-active");
+  }, 120_000);
+
   it("refuses an ntfy topic that would not be a URL path segment", () => {
     const db = bareDb();
     expect(() => setAlertSettings(db, { ntfy: { server: "", topic: "a/b" } })).toThrow(/letters, digits/);
+  });
+
+  it("falls back to a second ntfy topic when the server does not take the alert, never sending it the token", async () => {
+    const db = bareDb();
+    const token = "tk_0123456789abcdefghijklmnopqrs";
+    setAlertSettings(db, {
+      ntfy: { server: "https://ntfy.sparkdream.io", topic: "sparkdream-alerts", token },
+      ntfyFallback: { server: "", topic: "sparkdream-k3v9x2q7" },
+    });
+    const sent: { url: string; headers: Record<string, string> }[] = [];
+    let down = true;
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      sent.push({ url, headers: init.headers as Record<string, string> });
+      if (down && url.startsWith("https://ntfy.sparkdream.io")) throw new Error("connect ECONNREFUSED");
+      return new Response("ok");
+    }) as typeof fetch;
+    const alert = { fleet: "f", component: "ntfy", kind: "opened" as const, severity: "down" as const, title: "f: ntfy is down", message: "m" };
+    const failures = await sendAlert(alertSettings(db), alert, fetchImpl);
+    expect(sent.map((x) => x.url)).toEqual(["https://ntfy.sparkdream.io/sparkdream-alerts", "https://ntfy.sh/sparkdream-k3v9x2q7"]);
+    expect(sent[1]!.headers.Authorization).toBeUndefined();
+    expect(failures.join(" ")).toMatch(/sent to the fallback/);
+    // while the server takes alerts, the fallback stays quiet
+    down = false;
+    sent.length = 0;
+    expect(await sendAlert(alertSettings(db), alert, fetchImpl)).toEqual([]);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("logs in to a self-hosted ntfy with a token it never sends back to the browser", async () => {
+    const db = bareDb();
+    const token = "tk_0123456789abcdefghijklmnopqrs";
+    setAlertSettings(db, { ntfy: { server: "https://ntfy.sparkdream.io/", topic: "sparkdream-alerts", token } });
+    expect(publicAlertSettings(db)).toEqual({
+      ntfy: { server: "https://ntfy.sparkdream.io", topic: "sparkdream-alerts" },
+      ntfyTokenSet: true,
+    });
+    // the form saves without the token (it never had it): the stored one stays
+    setAlertSettings(db, { ntfy: { server: "https://ntfy.sparkdream.io", topic: "sparkdream-alerts" } });
+    expect(alertSettings(db).ntfy?.token).toBe(token);
+
+    const sent: Record<string, string>[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      sent.push(init.headers as Record<string, string>);
+      return new Response("ok");
+    }) as typeof fetch;
+    await sendAlert(alertSettings(db), { fleet: "f", component: "c", kind: "test", severity: "warn", title: "t", message: "m" }, fetchImpl);
+    expect(sent[0]!.Authorization).toBe(`Bearer ${token}`);
+
+    setAlertSettings(db, { ntfy: { server: "https://ntfy.sparkdream.io", topic: "sparkdream-alerts", token: "" } });
+    expect(publicAlertSettings(db).ntfyTokenSet).toBe(false);
+    expect(() => setAlertSettings(db, { ntfy: { server: "", topic: "t", token: "hunter2" } })).toThrow(/starts with tk_/);
   });
 });
