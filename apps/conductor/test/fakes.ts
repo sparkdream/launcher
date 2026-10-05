@@ -15,7 +15,7 @@ import type { Signer } from "../src/engine.js";
 import { templatePath } from "../src/vendor.js";
 import type { LocalSignerHost, MeshCli, TmkmsProcess } from "../src/local-signer.js";
 import type { AllowanceInfo, GrantInfo, UnattendedChain } from "../src/unattended.js";
-import { RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
+import { RELAYER_DEAD_RPCS, RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -603,6 +603,8 @@ export class FakeSsh {
   files = new Map<string, string>();
   /** Relayer: chain ids whose key relayer-fundcheck reports as unfunded. */
   unfundedChains = new Set<string>();
+  /** Relayer: chain ids the relayer cannot reach (its balance query and RPC go unanswered). */
+  unreachableChains = new Set<string>();
   /** Relayer: containers holding the ready marker (hermes running). */
   relayerReady = new Set<string>();
   /** Relayer: container restarts so far, per target (PID 1's start time). */
@@ -870,11 +872,15 @@ export class FakeSsh {
       return ok(
         JSON.stringify(
           manifest().chains.map((c) => {
-            const funded = !this.unfundedChains.has(c.id);
-            return { chain: c.id, address: "", balance: funded ? "1000000" : "0", denom: "", account: null, ready: funded };
+            const reachable = !this.unreachableChains.has(c.id);
+            const funded = reachable && !this.unfundedChains.has(c.id);
+            return { chain: c.id, address: "", balance: funded ? "1000000" : "0", denom: "", account: null, reachable, ready: funded };
           }),
         ),
       );
+    }
+    if (command === RELAYER_DEAD_RPCS) {
+      return ok([...this.unreachableChains].map((c) => `${c} http://127.0.0.1:26657`).join("\n"));
     }
     if (command === "relayer-bringup") {
       const m = manifest();

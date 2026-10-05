@@ -526,6 +526,30 @@ describe("relayer funds", () => {
   }, 120_000);
 });
 
+describe("relayer that cannot reach a chain", () => {
+  it("stops before funding and names the dead tunnel, instead of topping up a key it cannot read", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    // the mesh tunnel to its own sentry-0 is dead: the balance query gets no
+    // answer, which reads as balance 0 though the key may hold plenty
+    services.ssh.unreachableChains.add(chainId(s));
+    const chain = chainStub();
+    db.createLaunch("fl", JSON.stringify(s), "akash1owner");
+    const result = await withStub(chain, () =>
+      runWithSigner(db, "fl", s, work, allSteps(), services, new FakeSigner()),
+    );
+    expect(result.status).not.toBe("completed");
+    const failed = db.listSteps("fl").find((x) => x.status === "error")!;
+    expect(failed.error).toContain(`the relayer cannot query ${chainId(s)}`);
+    expect(failed.error).toContain("repair fleet re-aims it");
+    // the founder's account sent nothing
+    expect(chain.state().log.filter((l) => l.types.includes("/cosmos.bank.v1beta1.MsgSend"))).toHaveLength(0);
+    db.close();
+  }, 120_000);
+});
+
 describe("relayer path waiting for funds", () => {
   it("leaves an unfunded openWhenFunded path unopened without pausing, then opens it on a relink once funded", async () => {
     const work = tmp();

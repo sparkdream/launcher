@@ -50,7 +50,7 @@ export const RELAYER_FUNDCHECK = "timeout 150 relayer-fundcheck || true";
 
 /** "<chain> <rpc>" for every chain in the relayer's Hermes config whose RPC
  *  does not answer from inside the relayer. */
-const RELAYER_DEAD_RPCS =
+export const RELAYER_DEAD_RPCS =
   `awk -F"'" '/^id = /{id=$2} /^rpc_addr = /{print id, $2}' ${RELAYER_DIR}/config.toml 2>/dev/null | ` +
   'while read id url; do curl -s -m 5 -o /dev/null "$url/status" || echo "$id $url"; done';
 
@@ -276,13 +276,34 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     balance: string;
     denom: string;
     account: boolean | null;
+    /** false: the key exists but its chain did not answer the balance query
+     *  (absent from images before the field) */
+    reachable?: boolean;
     ready: boolean;
   }>;
-  // Bounded: hermes queries a chain's gRPC with no deadline of its own, so
-  // one endpoint that accepts and never answers (a mesh tunnel aimed at a
-  // node that moved) used to hang this past the lease-shell timeout with
-  // nothing to say which chain. On a timeout, ask each chain's RPC from the
-  // relayer and name the ones that do not answer.
+  // A chain the relayer cannot reach is a different fault from a key with no
+  // funds: name the chains whose RPC does not answer from the relayer, so the
+  // error says what to fix instead of asking for gas (seen live: a mesh tunnel
+  // aimed at a resized sentry-0's old address)
+  const unreachable = async (what: string): Promise<Error> => {
+    const dead = (await ctx.services.ssh.exec(target, RELAYER_DEAD_RPCS, { timeoutMs: 120_000 })).stdout
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    return new Error(
+      what +
+        (dead.length > 0
+          ? `; from the relayer, these chains' RPC does not answer: ${dead.join(", ")}` +
+            (dead.some((d) => d.includes("127.0.0.1"))
+              ? ". 127.0.0.1 is a mesh tunnel to a fleet's sentry-0: if that sentry is up, its address " +
+                "changed and the relayer's deployment still names the old one (repair fleet re-aims it)"
+              : "")
+          : "; every chain's RPC answers from the relayer, so a gRPC endpoint is the likely hold-up"),
+    );
+  };
+  // Bounded: hermes queries a chain's gRPC with no deadline of its own, so on
+  // images whose fund check does not time each query out, one endpoint that
+  // accepts and never answers hung this past the lease-shell timeout
   const fundcheck = async (): Promise<FundCheck> => {
     const out = (
       await ctx.services.ssh.exec(target, RELAYER_FUNDCHECK, { timeoutMs: 180_000 })
@@ -290,20 +311,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     try {
       return JSON.parse(out) as FundCheck;
     } catch {
-      const dead = (await ctx.services.ssh.exec(target, RELAYER_DEAD_RPCS, { timeoutMs: 120_000 })).stdout
-        .trim()
-        .split("\n")
-        .filter(Boolean);
-      throw new Error(
-        "relayer-fundcheck did not answer within 150s" +
-          (dead.length > 0
-            ? `; from the relayer, these chains' RPC does not answer: ${dead.join(", ")}` +
-              (dead.some((d) => d.includes("127.0.0.1"))
-                ? ". 127.0.0.1 is a mesh tunnel to a fleet's sentry-0: if that sentry is up, its address " +
-                  "changed and the relayer's deployment still names the old one (repair fleet re-aims it)"
-                : "")
-            : "; every chain's RPC answers from the relayer, so a gRPC endpoint is the likely hold-up"),
-      );
+      throw await unreachable("relayer-fundcheck did not answer within 150s");
     }
   };
   let status = await fundcheck();
@@ -321,6 +329,14 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     return ps.length > 0 && ps.every((p) => p.openWhenFunded && !previous?.channels.some((c) => c.id === p.id));
   };
   const unreadyOf = (st: FundCheck) => st.filter((s) => !s.ready && !canWait(s.chain));
+
+  // a chain that did not answer reads as balance 0: funding it would top up a
+  // key that may hold plenty and then ask for more, so stop and say why
+  // (a chain that can wait for its funds can also wait to be reachable)
+  const silent = status.filter((s) => s.reachable === false && !canWait(s.chain)).map((s) => s.chain);
+  if (silent.length > 0) {
+    throw await unreachable(`the relayer cannot query ${silent.join(", ")} (its balance query got no answer)`);
+  }
 
   // a launcher fleet's chain whose founder key the launcher holds is funded
   // from it, capped like any top-up; only what is left asks the user
