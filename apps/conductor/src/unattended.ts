@@ -22,6 +22,15 @@ import { readSecretFile, writeSecretFile } from "./secrets.js";
  * hot wallet with limited funds by design.
  */
 
+/**
+ * What unattended txs pay their fee in, so what the fee allowance must be
+ * capped in. Akash nodes take fees in uakt only: until 2026-10-07 the
+ * launcher paid in uact and every broadcast was refused ("insufficient
+ * fees; got: 10056uact required: 1006uakt"). Deposits are uact but never
+ * touch the allowance: they come from the owner's balance.
+ */
+export const UNATTENDED_FEE_DENOM = "uakt";
+
 export interface GrantInfo {
   msgType: string;
   expiration: string | null;
@@ -179,10 +188,16 @@ export function unattendedBlocker(args: {
   settings: UnattendedSettings;
   grants: GrantInfo[];
   spent: bigint;
+  /** the fee allowance on chain; undefined when it could not be read */
+  allowance?: AllowanceInfo | null | undefined;
   now?: number;
 }): string | null {
   const now = args.now ?? Date.now();
   if (!args.settings.enabled) return "unattended signing is off for this wallet";
+  if (args.allowance !== undefined) {
+    const problem = allowanceProblem(args.allowance, now);
+    if (problem) return problem;
+  }
   for (const m of args.msgs) {
     if (!(UNATTENDED_MSG_TYPES as readonly string[]).includes(m.typeUrl)) return `${m.typeUrl} is never signed unattended`;
     if (msgOwner(m) !== args.owner) return "a msg acts for another owner";
@@ -199,6 +214,18 @@ export function unattendedBlocker(args: {
     if (total > BigInt(args.settings.dailyCap.amount)) {
       return `the daily cap (${args.settings.dailyCap.amount}${d.denom}) would be exceeded`;
     }
+  }
+  return null;
+}
+
+/** Why the fee allowance cannot pay an unattended tx's fee, or null when it can. */
+export function allowanceProblem(allowance: AllowanceInfo | null, now = Date.now()): string | null {
+  if (!allowance) return "no fee allowance for the launcher's key: grant again";
+  if (allowance.expiration && Date.parse(allowance.expiration) <= now) return "the fee allowance expired: grant again";
+  // an empty spend limit is unlimited
+  if (allowance.spendLimit.length > 0 && !allowance.spendLimit.some((c) => c.denom === UNATTENDED_FEE_DENOM && BigInt(c.amount) > 0n)) {
+    const has = allowance.spendLimit.map((c) => c.denom).join(", ");
+    return `the fee allowance is in ${has}, but Akash takes fees in ${UNATTENDED_FEE_DENOM}: grant again`;
   }
   return null;
 }

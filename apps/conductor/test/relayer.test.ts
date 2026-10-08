@@ -278,6 +278,40 @@ describe("relayer launch", () => {
     db.close();
   }, 120_000);
 
+  it("a relaunch links only once the new container is up (2026-10-07: no active replicaset for service)", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    if ((await launch(db, work, services, "fl", s)).status !== "completed") throw new Error(explain(db, "fl"));
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("fl");
+    const old = db.listFleetComponents("fl").find((c) => c.key === "relayer")!;
+    await fleet.requestRelaunch(db.getLaunch("fl")!, old);
+
+    // the new lease answers its status while the image pulls: no ready
+    // replica for the next few reads, and a shell into it fails meanwhile
+    let pulling = 8;
+    const status = services.provider.leaseStatus.bind(services.provider);
+    services.provider.leaseStatus = async (...a: Parameters<typeof status>) => {
+      const st = (await status(...a)) as any;
+      if (a[2] === old.dseq || pulling <= 0) return st;
+      pulling--;
+      return { ...st, services: Object.fromEntries(Object.entries(st.services).map(([k, v]: [string, any]) => [k, { ...v, available: 0 }])) };
+    };
+    const exec = services.ssh.exec.bind(services.ssh);
+    services.ssh.exec = async (target, command) => {
+      if (pulling > 0 && command.includes("/data/relayer/mnemonics")) throw new Error("lease shell: no active replicaset for service");
+      return exec(target, command);
+    };
+
+    const moved = await runWithSigner(db, "fl", s, work, [...buildPreLaunchOpSteps(db, "fl"), ...allSteps(), ...buildOpSteps(db, "fl")], services, new FakeSigner());
+    if (moved.status !== "completed") throw new Error(explain(db, "fl"));
+    expect(pulling).toBe(0);
+    expect(db.listFleetComponents("fl").find((c) => c.key === "relayer")!.dseq).not.toBe(old.dseq);
+    db.close();
+  }, 120_000);
+
   it("pauses with the address and a capped amount to fund when a counterparty key cannot pay gas, then links", async () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));

@@ -167,6 +167,56 @@ describe("landing page hub", () => {
   }, 120_000);
 });
 
+describe("battle royale game", () => {
+  it("renders the game server on its domain, with its leaderboard on a persistent volume", () => {
+    const s = servicesSpec();
+    (s.topology.components as any).battle = { enabled: true, domain: "battle.zenith.example" };
+    const spec = withDefaults(s as any);
+    expect(validateSpec(spec).errors).toEqual([]);
+    expect(spec.images.battle).toMatch(/^sparkdreamnft\/battle-royale:v/);
+    const out = descriptorFor("battle")!.render({
+      spec,
+      component: { key: "battle", image: spec.images.battle, domain: "battle.zenith.example" },
+    } as any) as any;
+    expect(out.battle.service).toEqual({
+      image: spec.images.battle,
+      expose: [{ port: 2567, as: 80, accept: ["battle.zenith.example"], to: [{ global: true }] }],
+      params: { storage: { data: { mount: "/app/data", readOnly: false } } },
+    });
+    expect(out.battle.resources.storage[1]).toMatchObject({ name: "data", attributes: { persistent: true } });
+    (s.topology.components as any).battle = { enabled: true };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.battle.domain");
+  });
+
+  it("is added to a running services fleet", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const s = servicesSpec();
+    db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+    expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("svc");
+
+    fleet.requestAddComponent(db.getLaunch("svc")!, "battle", { domain: "battle.zenith.example" });
+    const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+    expect(stored.topology.components.battle).toMatchObject({ enabled: true, domain: "battle.zenith.example" });
+    expect(stored.images.battle).toMatch(/^sparkdreamnft\/battle-royale:v/);
+    const done = await runWithSigner(
+      db, "svc", stored, work,
+      [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")],
+      services, signer,
+    );
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+    expect(db.listFleetOps("svc").find((o) => o.kind === "add-component")!.status).toBe("done");
+    const rows = db.listFleetComponents("svc").filter((c) => c.state !== "closed");
+    expect(rows.map((c) => c.key).sort()).toEqual(["battle", "mastodon"]);
+    db.close();
+  }, 120_000);
+});
+
 describe("alerts server (ntfy)", () => {
   it("renders stateless logins: the phone reads the topic, the launcher's token only writes it", () => {
     const s = servicesSpec();
@@ -374,7 +424,7 @@ describe("the add dialog's options", () => {
     fleet.materialize("svc");
     const o = await fleet.addOptions(db.getLaunch("svc")!);
     // mastodon runs already; no nodes in a services fleet, so no sentry
-    expect(o.kinds.map((k) => k.key).sort()).toEqual(["hub", "ntfy"]);
+    expect(o.kinds.map((k) => k.key).sort()).toEqual(["battle", "hub", "ntfy"]);
     expect(o.sentry).toBeUndefined();
     const ntfy = o.kinds.find((k) => k.key === "ntfy")!;
     expect(ntfy).toMatchObject({ label: "Alerts (ntfy)", needsDomain: true, signatures: 2, version: "v2.28.0" });

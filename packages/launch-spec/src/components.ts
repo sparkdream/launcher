@@ -10,7 +10,7 @@ import type { LaunchSpec } from "./schema.js";
  * kind is an entry here plus a descriptor there — not a sweep for
  * `key === "explorer"`.
  */
-export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub", "ntfy"] as const;
+export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub", "ntfy", "battle"] as const;
 export type ComponentKey = (typeof COMPONENT_KEYS)[number];
 
 export interface ComponentKind {
@@ -135,6 +135,19 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
     summary: "Push server for the launcher's alerts to your phone",
     // a push server the launcher posts incident alerts to and a phone app
     // reads: chain-independent, so it runs in a services fleet as well
+    mesh: false,
+    ssh: false,
+    domain: true,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
+  battle: {
+    key: "battle",
+    label: "Battle royale",
+    summary: "Browser battle royale game, with bots and a leaderboard",
+    // a game server (the battle-royale repo's image): reads nothing from any
+    // chain, so it runs the same beside a chain or in a services fleet
     mesh: false,
     ssh: false,
     domain: true,

@@ -45,6 +45,8 @@ describe("classifying an outage", () => {
     expect(classify("sentry-0", "unreachable", "unreachable").action).toBe("relaunch");
     expect(classify("sentry-0", "unreachable", "service-down").action).toBe("force-redeploy");
     expect(classify("sentry-0", "unreachable", "up").action).toBe("restart");
+    // answering inside its container: the public path is broken, a restart fixes nothing
+    expect(classify("headscale", "unreachable", "public-only")).toMatchObject({ action: null, severity: "down" });
     // a relayer whose mesh tunnel dials a dead address: repair re-aims it,
     // where a relaunch would only move a container that is fine
     expect(classify("relayer", "stale-tunnel", "unknown")).toMatchObject({ action: "repair", severity: "down" });

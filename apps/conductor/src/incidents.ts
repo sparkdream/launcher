@@ -18,7 +18,8 @@ const NOT_AN_OUTAGE = new Set(["healthy", "closed", "catching-up"]);
 
 /** What the provider looked like when the incident was confirmed. */
 /** "ingress-broken": the container runs, but the provider's own hostname for it serves nothing either. */
-export type ProviderProbe = "unreachable" | "service-down" | "ingress-broken" | "up" | "unknown";
+/** "public-only": the service answers inside its own container; only the way in from outside fails. */
+export type ProviderProbe = "unreachable" | "service-down" | "ingress-broken" | "public-only" | "up" | "unknown";
 
 /** Fleet actions an incident can suggest (the UI's fleetAction names). */
 export type IncidentAction = "relaunch" | "force-redeploy" | "restart" | "unjail" | "topup" | "repair";
@@ -66,6 +67,16 @@ export function classify(key: string, status: string, probe: ProviderProbe): Cla
         return {
           cause: "the container is not running, while its provider answers",
           action: "force-redeploy",
+          severity: "down",
+        };
+      }
+      if (probe === "public-only") {
+        // restarting a service that answers fixes nothing outside it, and for
+        // headscale it costs the whole mesh its control plane and relay
+        // (2026-10-07: a one-minute provider blip read as a dead headscale)
+        return {
+          cause: "it answers inside its container, but not at its public address (DNS, Cloudflare or the provider's ingress)",
+          action: null,
           severity: "down",
         };
       }

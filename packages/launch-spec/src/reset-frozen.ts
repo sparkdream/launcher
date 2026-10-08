@@ -35,6 +35,7 @@ export const RESET_FROZEN_PATHS = [
   "images.frontend",
   "images.hub",
   "images.ntfy",
+  "images.battle",
   "images.relayer",
   "images.mastodon",
   "images.mastodonStreaming",

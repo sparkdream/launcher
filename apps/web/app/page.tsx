@@ -4434,6 +4434,9 @@ export default function Page() {
                         </span>
                       )}
                     </div>
+                    {unattended.allowanceProblem && (
+                      <div style={{ color: "var(--amber-text)" }}>{unattended.allowanceProblem}</div>
+                    )}
                     <label>
                       <input
                         type="checkbox"

@@ -184,6 +184,12 @@ describe("taking a chain-data backup", () => {
     expect(two.fleet.dataBackupDue("fl")).toBe(false); // off by default
     two.fleet.setDataBackupSchedule(two.db.getLaunch("fl")!, "daily");
     expect(two.fleet.dataBackupDue("fl")).toBe(true);
+    // not while an outage is open: holding a node then can take the last one down
+    const outage = two.db.insertIncident({ launchId: "fl", component: "headscale", status: "unreachable", detail: null, cause: "x", action: null });
+    two.db.updateIncident(outage, { confirmed_at: new Date().toISOString() });
+    expect(two.fleet.dataBackupDue("fl")).toBe(false);
+    two.db.updateIncident(outage, { closed_at: new Date().toISOString() });
+    expect(two.fleet.dataBackupDue("fl")).toBe(true);
     two.fleet.requestDataBackup(two.db.getLaunch("fl")!, { auto: true });
     expect((await driveOps(two)).status).toBe("completed");
     expect(two.fleet.dataBackupDue("fl")).toBe(false);

@@ -81,7 +81,7 @@ import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
 import { autoRestoreEnabled } from "./data-backup.js";
 import { publicAlertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
-import { setUnattendedSettings } from "./unattended.js";
+import { setUnattendedSettings, UNATTENDED_FEE_DENOM } from "./unattended.js";
 import { CloudflareDns, cloudflareToken, setCloudflareToken } from "./dns.js";
 
 export interface ServerDeps {
@@ -246,7 +246,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           .map(async (launch) => {
             if (await fleet.peerSetupReady(launch.id).catch(() => false)) {
               drive(launch.id, JSON.parse(launch.spec_json));
-            } else if (await fleet.signUnattended(launch.id).catch(() => false)) {
+            } else if (
+              await fleet
+                .signUnattended(launch.id)
+                .catch((e) => (app.log.warn(`launch ${launch.id}: unattended signing: ${e}`), false))
+            ) {
               // an auto-recovery op parked on a signature the grant now covers
               drive(launch.id, JSON.parse(launch.spec_json));
             } else {
@@ -1747,7 +1751,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           owner,
           q.kind === "revoke" ? "revoke" : "grant",
           q.days ? Number(q.days) : undefined,
-          q.feeLimit ? { denom: "uact", amount: q.feeLimit } : undefined,
+          q.feeLimit ? { denom: UNATTENDED_FEE_DENOM, amount: q.feeLimit } : undefined,
         ),
       };
     } catch (e) {

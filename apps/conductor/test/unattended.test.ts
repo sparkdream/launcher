@@ -6,7 +6,7 @@ import { TypeUrl, UNATTENDED_MSG_TYPES, type Msg } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runLaunch, runWithSigner } from "../src/engine.js";
-import { FleetService } from "../src/fleet.js";
+import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { setAlertSettings } from "../src/incidents.js";
@@ -65,6 +65,16 @@ describe("what may be signed unattended", () => {
     expect(ok([create("1")], { settings: { ...settings, enabled: false } })).toMatch(/is off/);
     expect(ok([create("1")], { grants: grants.map((g) => ({ ...g, expiration: "2020-01-01T00:00:00Z" })) })).toMatch(/expired/);
     expect(ok([create("1")], { grants: [] })).toMatch(/no grant/);
+  });
+  it("not with a fee allowance that cannot pay a uakt fee (2026-10-07: granted in uact, every broadcast refused)", () => {
+    const allowance = (denom: string, expiration: string | null = null) => ({ spendLimit: [{ denom, amount: "5000000" }], expiration });
+    expect(ok([create("1")], { allowance: allowance("uakt") })).toBeNull();
+    expect(ok([create("1")], { allowance: { spendLimit: [], expiration: null } })).toBeNull();
+    expect(ok([create("1")], { allowance: allowance("uact") })).toMatch(/fee allowance is in uact.*uakt: grant again/);
+    expect(ok([create("1")], { allowance: allowance("uakt", "2020-01-01T00:00:00Z") })).toMatch(/allowance expired/);
+    expect(ok([create("1")], { allowance: null })).toMatch(/no fee allowance/);
+    // unreadable: left to the broadcast
+    expect(ok([create("1")], { allowance: undefined })).toBeNull();
   });
 });
 
@@ -187,6 +197,68 @@ describe("automatic recovery", () => {
     expect(w.alerts).toContain("sparkdream: sentry-1 still down, giving up on automatic recovery");
   }, 240_000);
 
+  /** headscale's public /health stops answering for long enough to confirm an incident. */
+  async function headscaleDark(w: World) {
+    for (const c of w.db.listFleetComponents("fl")) {
+      w.services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+    w.services.rpc.darkUrls.add("headscale.sparkdream.io");
+    for (let i = 0; i < 3; i++) {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    }
+    return w.db.openIncident("fl", "headscale")!;
+  }
+
+  it("leaves a headscale alone that answers inside its container (2026-10-07: a provider blip restarted it)", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    const shells = w.services.provider.shellLog.length;
+    const incident = await headscaleDark(w);
+    expect(incident.confirmed_at).toBeTruthy();
+    expect(incident.action).toBeNull();
+    expect(incident.cause).toMatch(/answers inside its container/);
+    const ran = w.services.provider.shellLog.slice(shells).map((s) => s.script);
+    expect(ran.some((s) => s.includes("pkill") || s.includes("kill 1"))).toBe(false);
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+  }, 240_000);
+
+  it("restarts a wedged headscale by its own process, and re-creates the container when that does not take", async () => {
+    const w = await launched();
+    const { address } = await opsKey(w.work, OWNER);
+    w.chain.grantAll(OWNER, address, UNATTENDED_MSG_TYPES);
+    setUnattendedSettings(w.db, OWNER, { enabled: true });
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    w.services.provider.headscaleSelf = "wedged";
+    const incident = await headscaleDark(w);
+    expect(incident.action).toBe("restart");
+    const restart = w.services.provider.shellLog.find((s) => s.script === HEADSCALE_RESTART);
+    expect(restart).toBeTruthy();
+    expect(w.alerts).toContain("sparkdream: restarted headscale");
+
+    // inside the grace period nothing more is tried
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+
+    // still down past it: the restart is pushed back past the grace period
+    const past = new Date(Date.now() - RESTART_GRACE_MS - 1000).toISOString();
+    w.db.updateIncident(incident.id, { confirmed_at: new Date(Date.now() - RESTART_GRACE_MS - 60_000).toISOString() });
+    w.db.setSetting("auto-restarts:fl:headscale", JSON.stringify([past]));
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    const ops = w.db.listFleetOps("fl", "active");
+    expect(ops.map((o) => o.kind)).toEqual(["force-redeploy"]);
+    expect(JSON.parse(ops[0]!.params_json)).toMatchObject({ key: "headscale", auto: true });
+    expect(w.fleet.autoStarted.has("fl")).toBe(true);
+
+    // one escalation, not one per pass
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.listFleetOps("fl").filter((o) => o.kind === "force-redeploy")).toHaveLength(1);
+    const done = await driveUnattended(w);
+    expect(done.status).toBe("completed");
+    expect(w.chain.execs.flatMap((e) => e.msgs.map((m) => m.typeUrl))).toEqual([TypeUrl.UpdateDeployment]);
+  }, 240_000);
+
   it("an outage that starts during another op is recovered once that op is done", async () => {
     const w = await launched();
     w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
@@ -228,6 +300,26 @@ describe("signing one pending tx at a time", () => {
   }, 240_000);
 });
 
+describe("a refused broadcast", () => {
+  it("is alerted once, not swallowed, and leaves the tx for Keplr", async () => {
+    const w = await launched();
+    const { address } = await opsKey(w.work, OWNER);
+    w.chain.grantAll(OWNER, address, UNATTENDED_MSG_TYPES);
+    setUnattendedSettings(w.db, OWNER, { enabled: true });
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    await sentryDies(w);
+    const s = withDefaults(JSON.parse(w.db.getLaunch("fl")!.spec_json));
+    await runLaunch(w.db, "fl", s, w.work, [...buildPreLaunchOpSteps(w.db, "fl"), ...allSteps(), ...buildOpSteps(w.db, "fl")], w.services, () => {});
+    w.chain.exec = async () => {
+      throw new Error("insufficient fees; got: 10056uact required: 1006uakt");
+    };
+    await expect(w.fleet.signUnattended("fl")).rejects.toThrow(/insufficient fees/);
+    await expect(w.fleet.signUnattended("fl")).rejects.toThrow(/insufficient fees/);
+    expect(w.alerts.filter((a) => a === "sparkdream: automatic recovery could not sign")).toHaveLength(1);
+    expect(w.db.nextPendingTx("fl")?.status).toBe("pending");
+  }, 240_000);
+});
+
 describe("granting", () => {
   it("refuses an owner that is not an address shape (it names the key file)", async () => {
     const work = tmp();
@@ -246,6 +338,8 @@ describe("granting", () => {
     const allowance = msgs.find((m) => m.typeUrl === TypeUrl.GrantAllowance)!.value as any;
     expect(allowance.grantee).toBe(address);
     expect(allowance.allowed_messages).toEqual([TypeUrl.Exec]);
+    // fees are paid in uakt, the only fee denom Akash nodes take
+    expect(allowance.spend_limit).toEqual([{ denom: "uakt", amount: "5000000" }]);
     // the same key every time, kept in the launcher's secrets
     expect((await opsKey(w.work, OWNER)).address).toBe(address);
     expect(fs.existsSync(path.join(w.work, "secrets", `unattended-${OWNER}.mnemonic`))).toBe(true);

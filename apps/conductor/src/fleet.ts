@@ -48,6 +48,28 @@ import {
 /** Automatic recovery attempts per component per 24 hours before it gives up and alerts. */
 const AUTO_ATTEMPTS_PER_DAY = 2;
 
+/** How long an automatic restart gets to bring a component back before its container is re-created. */
+export const RESTART_GRACE_MS = 5 * 60_000;
+
+/** Run inside the headscale container: "answers", "wedged" (running, its listener silent) or "gone". */
+export const HEADSCALE_SELF_CHECK =
+  "if wget -qO- -T5 http://127.0.0.1:8080/health >/dev/null 2>&1; then echo answers; " +
+  "elif pidof headscale >/dev/null; then echo wedged; else echo gone; fi";
+
+/**
+ * Restart headscale by signalling headscale itself, not PID 1. With a mesh
+ * backup PID 1 is litestream, which handles one SIGTERM by waiting on
+ * headscale and then ignores every later signal: on 2026-10-07 headscale
+ * took 18 minutes to shut down (its long-poll handlers panicking on a closed
+ * channel), litestream never exited after it, and the container was never
+ * re-created. A headscale that ignores the TERM is killed 20s later; its
+ * exit ends litestream's -exec, which ends the container. Whatever is still
+ * down after RESTART_GRACE_MS is re-created by a force redeploy.
+ */
+export const HEADSCALE_RESTART =
+  "pkill -TERM -x headscale || kill 1; " +
+  "setsid sh -c 'sleep 20; pkill -KILL -x headscale' </dev/null >/dev/null 2>&1 &";
+
 /** Which components auto-recovery may act on, per fleet (all off by default). */
 export interface AutoRecoverPolicy {
   enabled: boolean;
@@ -73,6 +95,8 @@ export interface UnattendedStatus {
   /** null: could not be read */
   grants: GrantInfo[] | null;
   allowance: AllowanceInfo | null;
+  /** why the allowance cannot pay unattended fees (granted in the wrong denom, expired, missing) */
+  allowanceProblem: string | null;
   spentToday: string;
   /** msg types a full grant covers */
   covers: string[];
@@ -210,8 +234,10 @@ import {
   opsKey,
   recordSpend,
   spentToday,
+  allowanceProblem,
   unattendedBlocker,
   unattendedSettings,
+  UNATTENDED_FEE_DENOM,
   type AllowanceInfo,
   type GrantInfo,
   type UnattendedSettings,
@@ -1634,13 +1660,14 @@ export class FleetService {
   /** Restart the component (no signature — §2 scoping rule). Nodes restart
    *  over SSH; headscale (no sshd) and the stateless components restart via
    *  provider lease-shell — killing PID 1 makes the provider recreate the
-   *  container, which re-reads its env (tunnels included) at boot. */
+   *  container, which re-reads its env (tunnels included) at boot. headscale
+   *  is the exception: see HEADSCALE_RESTART. */
   async restart(launch: LaunchRow, component: FleetComponentRow): Promise<void> {
     if (component.key === "headscale" || descriptorFor(component.key)) {
       await this.services.provider
         .shellExec(
           this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, leaseServiceName(component.key),
-          ["sh", "-c", "kill 1"],
+          ["sh", "-c", component.key === "headscale" ? HEADSCALE_RESTART : "kill 1"],
         )
         .catch(() => {
           // killing PID 1 drops the shell connection — expected
@@ -1831,7 +1858,29 @@ export class FleetService {
         }
       }
     }
+    // a restart that did not take: re-create the container instead. Without
+    // this the incident stayed open with nothing more tried, because
+    // auto-recovery only ever acts when an incident opens
+    for (const incident of this.db.listIncidents(launchId, 0)) {
+      if (scope.has(incident.component) || !this.restartDidNotTake(launchId, incident)) continue;
+      await this.autoRecover(launch, incident, { escalate: true }).catch((e) => console.log(`[auto-recover] ${e}`));
+    }
     return events;
+  }
+
+  /**
+   * The incident's automatic restart is RESTART_GRACE_MS old and nothing
+   * automatic has been tried on the component since.
+   */
+  private restartDidNotTake(launchId: string, incident: IncidentRow, now = Date.now()): boolean {
+    if (incident.action !== "restart" || !incident.confirmed_at || incident.closed_at) return false;
+    const raw = this.db.getSetting(`auto-restarts:${launchId}:${incident.component}`);
+    const last = Math.max(0, ...(raw ? (JSON.parse(raw) as string[]) : []).map((t) => Date.parse(t)));
+    if (last < Date.parse(incident.confirmed_at) || now - last < RESTART_GRACE_MS) return false;
+    return !this.db.listFleetOps(launchId).some((o) => {
+      const p = JSON.parse(o.params_json) as { auto?: boolean; key?: string };
+      return p.auto && p.key === incident.component && Date.parse(o.created_at) >= last;
+    });
   }
 
   /**
@@ -1898,7 +1947,7 @@ export class FleetService {
    * covers the component and it is safe to. The op it starts carries
    * auto: true, which is what lets signUnattended sign its txs.
    */
-  private async autoRecover(launch: LaunchRow, incident: IncidentRow): Promise<void> {
+  private async autoRecover(launch: LaunchRow, incident: IncidentRow, opts: { escalate?: boolean } = {}): Promise<void> {
     const policy = this.autoRecoverPolicy(launch.id);
     const key = incident.component;
     const group: keyof AutoRecoverPolicy = key.startsWith("val-")
@@ -1909,11 +1958,13 @@ export class FleetService {
           ? "headscale"
           : "services";
     if (!policy.enabled || !policy[group]) return;
-    const action = incident.action;
+    const action = opts.escalate ? "force-redeploy" : incident.action;
     if (action !== "relaunch" && action !== "force-redeploy" && action !== "restart") return;
     const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === key);
     if (!row || row.state === "closed") return;
     if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      // an escalation is looked for on every pass anyway
+      if (opts.escalate) return;
       // not now, but not never: tried again once the running op is done
       let deferred = this.deferredRecoveries.get(launch.id);
       if (!deferred) this.deferredRecoveries.set(launch.id, (deferred = new Set()));
@@ -1969,13 +2020,15 @@ export class FleetService {
       launch,
       key,
       `recovering ${key} automatically`,
-      `${incident.cause}: started ${action} of ${key}.` +
+      (opts.escalate
+        ? `${key} is still down ${RESTART_GRACE_MS / 60_000} min after an automatic restart (${incident.cause}): started ${action} of ${key} to re-create its container.`
+        : `${incident.cause}: started ${action} of ${key}.`) +
         (signing ? " Its transactions are signed with the launcher's grant." : " Its transactions wait for your Keplr signature (unattended signing is off)."),
     );
   }
 
   /** Grant info is a chain round trip; a minute's cache serves a whole relaunch. */
-  private readonly grantCache = new Map<string, { at: number; grants: GrantInfo[] }>();
+  private readonly grantCache = new Map<string, { at: number; grants: GrantInfo[]; allowance?: AllowanceInfo | null | undefined }>();
   /** Steps whose unattended refusal was already alerted. */
   private readonly refusedSteps = new Set<string>();
 
@@ -2014,7 +2067,12 @@ export class FleetService {
     const { mnemonic, address } = await opsKey(this.workRoot, launch.owner);
     let cached = this.grantCache.get(launch.owner);
     if (!cached || Date.now() - cached.at > 60_000) {
-      cached = { at: Date.now(), grants: await chain.grants(launch.owner, address).catch(() => []) };
+      cached = {
+        at: Date.now(),
+        grants: await chain.grants(launch.owner, address).catch(() => []),
+        // unreadable: left to the broadcast to tell
+        allowance: await chain.allowance(launch.owner, address).catch(() => undefined),
+      };
       this.grantCache.set(launch.owner, cached);
     }
     const blocker = unattendedBlocker({
@@ -2022,6 +2080,7 @@ export class FleetService {
       msgs,
       settings,
       grants: cached.grants,
+      allowance: cached.allowance,
       spent: spentToday(this.db, launch.owner, settings.dailyCap.denom),
     });
     if (blocker) {
@@ -2032,7 +2091,20 @@ export class FleetService {
       }
       return false;
     }
-    const hash = await chain.exec(mnemonic, launch.owner, msgs);
+    let hash: string;
+    try {
+      hash = await chain.exec(mnemonic, launch.owner, msgs);
+    } catch (e) {
+      // retried on every monitor pass, alerted once: a refused broadcast
+      // (2026-10-07: fees in a denom the node does not take) otherwise
+      // left the step on "Signature needed" for hours with no word why
+      const tag = `${launchId}:${pending.step}:exec`;
+      if (!this.refusedSteps.has(tag)) {
+        this.refusedSteps.add(tag);
+        await this.notify(launch, op.kind, "automatic recovery could not sign", `${pending.step}: ${String(e instanceof Error ? e.message : e)}. Sign it in the launcher (Keplr) to continue.`);
+      }
+      throw e;
+    }
     this.db.setPendingTxSigned(launchId, pending.step, hash);
     const deposits = depositsOf(msgs).map((d) => ({
       at: new Date().toISOString(),
@@ -2050,21 +2122,23 @@ export class FleetService {
     const settings = unattendedSettings(this.db, owner);
     const chain = this.services.unattended;
     const grants = chain ? await chain.grants(owner, address).catch(() => null) : null;
-    const allowance = chain ? await chain.allowance(owner, address).catch(() => null) : null;
-    if (grants) this.grantCache.set(owner, { at: Date.now(), grants });
+    // undefined: could not be read (no warning on a guess)
+    const allowance = chain ? await chain.allowance(owner, address).catch(() => undefined) : undefined;
+    if (grants) this.grantCache.set(owner, { at: Date.now(), grants, allowance });
     return {
       available: Boolean(chain),
       grantee: address,
       settings,
       grants,
-      allowance,
+      allowance: allowance ?? null,
+      allowanceProblem: allowance === undefined ? null : allowanceProblem(allowance),
       spentToday: spentToday(this.db, owner, settings.dailyCap.denom).toString(),
       covers: UNATTENDED_MSG_TYPES as unknown as string[],
     };
   }
 
   /** What the wallet signs (Keplr) to grant or revoke unattended recovery. */
-  async unattendedMsgs(owner: string, kind: "grant" | "revoke", days = 30, feeLimit = { denom: "uact", amount: "5000000" }): Promise<Msg[]> {
+  async unattendedMsgs(owner: string, kind: "grant" | "revoke", days = 30, feeLimit = { denom: UNATTENDED_FEE_DENOM, amount: "5000000" }): Promise<Msg[]> {
     const { address } = await opsKey(this.workRoot, owner);
     // what the chain holds now: a renewal must replace a live fee allowance
     // (a second one is refused), and a revoke may only name what is there
@@ -2100,6 +2174,21 @@ export class FleetService {
     );
     if (services.some((s) => (s.total ?? 0) > 0 && (s.available ?? 0) === 0)) return "service-down";
     if (services.length === 0) return "unknown";
+    // headscale is judged by its public URL alone, which a provider or
+    // Cloudflare blip fails as surely as a dead headscale: ask the container
+    if (row.key === "headscale") {
+      const self = await this.services.provider
+        .shellExec(this.mtlsCreds(launch), row.host_uri, row.dseq, 1, 1, leaseServiceName(row.key), [
+          "sh",
+          "-c",
+          HEADSCALE_SELF_CHECK,
+        ])
+        .then((r) => r.stdout.trim())
+        .catch(() => "");
+      if (self === "answers") return "public-only";
+      // the process is gone while litestream (PID 1) keeps the container up
+      if (self === "gone") return "service-down";
+    }
     // a public component: does the provider serve it on its own hostname?
     // Not doing so while the container runs is the ingress, not the service
     const ingress = isComponentKey(row.key) && COMPONENT_KINDS[row.key].domain ? descriptorFor(row.key)?.ingress?.(this.spec(launch)) : undefined;
@@ -3310,8 +3399,8 @@ export class FleetService {
 
   /**
    * A scheduled backup is due: on schedule, past its interval, nothing else
-   * running, and a sentry to copy other than sentry-0 (a schedule never
-   * takes the public endpoints down).
+   * running, no outage open, and a sentry to copy other than sentry-0 (a
+   * schedule never takes the public endpoints down).
    */
   dataBackupDue(launchId: string, now = Date.now()): boolean {
     const schedule = this.dataBackupSchedule(launchId);
@@ -3319,6 +3408,9 @@ export class FleetService {
     const launch = this.db.getLaunch(launchId);
     if (!launch || launch.status !== "completed") return false;
     if (this.db.listFleetOps(launchId, "active").length > 0) return false;
+    // never take a node down while anything is: on 2026-10-07 the schedule
+    // held sentry-1, the only node still up, an hour into a mesh outage
+    if (this.db.listIncidents(launchId, 0).length > 0) return false;
     const source = this.backupSourceFor(launchId, { auto: true });
     if (!source || source.key === "sentry-0") return false;
     // a backup that never passed its check does not count as taken

@@ -651,6 +651,7 @@ export const launchSpecSchema = z.object({
       verifier: verifierComponent.optional(),
       bridge: bridgeComponent.optional(),
       ntfy: ntfyComponent.optional(),
+      battle: componentToggle.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress
@@ -716,6 +717,7 @@ export const launchSpecSchema = z.object({
         verifier: componentProviderRules.optional(),
         bridge: componentProviderRules.optional(),
         ntfy: componentProviderRules.optional(),
+        battle: componentProviderRules.optional(),
       })
       .strict()
       .default({}),
@@ -794,6 +796,8 @@ export const launchSpecSchema = z.object({
     bridge: z.string().optional(),
     /** The ntfy server (upstream binwiederhier/ntfy). */
     ntfy: z.string().optional(),
+    /** The battle royale game server (sparkdreamnft/battle-royale). */
+    battle: z.string().optional(),
   }),
 
   security: z.object({

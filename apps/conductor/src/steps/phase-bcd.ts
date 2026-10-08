@@ -1493,7 +1493,10 @@ export async function waitLeaseStatus(
   dseq: string,
   gseq: number,
   oseq: number,
-  opts: { forwardedPort?: number; attempts?: number } = {},
+  /** ready: also wait until every service has a ready replica (a lease
+   *  answers its status while the image is still pulling, and a shell
+   *  opened then finds "no active replicaset for service") */
+  opts: { forwardedPort?: number; attempts?: number; ready?: boolean } = {},
 ): Promise<unknown> {
   const attempts = opts.attempts ?? 36; // × 5s ≈ 3 min (image pulls are slow)
   let lastError = "";
@@ -1501,6 +1504,14 @@ export async function waitLeaseStatus(
     if (i > 0) await ctx.services.sleep(5000);
     try {
       const status = await ctx.services.provider.leaseStatus(cert, hostUri, dseq, gseq, oseq);
+      if (opts.ready) {
+        const services = Object.entries(((status as any)?.services ?? {}) as Record<string, any>);
+        const waiting = services.filter(([, sv]) => Number(sv?.available_replicas ?? sv?.available ?? sv?.ready_replicas ?? 0) < 1);
+        if (services.length === 0 || waiting.length > 0) {
+          lastError = services.length === 0 ? "no services listed yet" : `not ready: ${waiting.map(([name]) => name).join(", ")}`;
+          continue;
+        }
+      }
       if (opts.forwardedPort === undefined) return status;
       try {
         extractForwardedPort(status, opts.forwardedPort);

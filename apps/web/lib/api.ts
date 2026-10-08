@@ -881,6 +881,8 @@ export interface UnattendedStatus {
   settings: { enabled: boolean; dailyCap: { denom: string; amount: string } };
   grants: Array<{ msgType: string; expiration: string | null }> | null;
   allowance: { spendLimit: Array<{ denom: string; amount: string }>; expiration: string | null } | null;
+  /** why the allowance cannot pay unattended fees: re-grant */
+  allowanceProblem: string | null;
   spentToday: string;
   covers: string[];
 }

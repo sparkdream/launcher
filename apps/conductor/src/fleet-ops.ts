@@ -2095,7 +2095,13 @@ export function relaunchSteps(
       async run(ctx) {
         const domain = stateless!.domain;
         if (!domain) {
-          // no public domain to probe: the lease being up is the gate
+          // no public domain to probe: its container running is the gate.
+          // The lease alone was (2026-10-07): the relayer's link step then
+          // shelled in while the image pulled and failed on "no active
+          // replicaset for service"
+          const deploy = ctx.output<{ dseq: string }>(p("deploy"))!;
+          const lease = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"))!;
+          await waitLeaseStatus(ctx, loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq, { ready: true });
           ctx.db.setComponentState(ctx.launchId, key, "active");
           if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
           return { healthy: true };

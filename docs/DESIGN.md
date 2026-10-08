@@ -2715,6 +2715,16 @@ in the fleet's accounts panel. Its configure step (after launch, add and
 every relaunch) points the launcher's alerts at it, unless they already go
 to another server.
 
+The **battle royale component** (`battle`, `components/battle.ts`,
+`sparkdreamnft/battle-royale`, versioned by that repo's git tags) is a
+browser game for a chain or services fleet: one Node process serving the
+game page and its WebSocket server on port 2567, exposed as 80 on its
+domain. It reads no chain and carries no env; the client connects to the
+origin that served the page. Its leaderboard is a JSON file on a 1 Gi
+persistent volume at `/app/data` (the image starts as root only to take
+ownership of the volume), so it survives updates but not a relaunch on
+another provider.
+
 ### Fleet bundle (management portability & DR)
 
 Management capability lives in one instance's SQLite (spec, node keys, SSH

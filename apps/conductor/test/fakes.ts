@@ -445,6 +445,9 @@ export class FakeProviderGateway {
   /** dseq → KiB used on the node's data volume (`df`). */
   diskUsedKb = new Map<string, number>();
 
+  /** What headscale's in-container self-check reports (HEADSCALE_SELF_CHECK). */
+  headscaleSelf: "answers" | "wedged" | "gone" = "answers";
+
   async shellExec(
     _creds: MtlsCredentials,
     _hostUri: string,
@@ -458,6 +461,7 @@ export class FakeProviderGateway {
     this.shellLog.push({ dseq, script });
     if (this.apiDownDseqs.has(dseq)) throw new Error("lease shell: provider reported a failure (pod restarting?)");
     if (cmd[0] === "mastodon-bootstrap") return this.mastodonBootstrap(dseq, cmd.slice(1));
+    if (script.includes("127.0.0.1:8080/health")) return { stdout: `${this.headscaleSelf}\n`, stderr: "" };
     // a node's data volume: 20 GiB, a quarter used unless a test says otherwise
     if (script.startsWith("df -Pk")) {
       const usedKb = this.diskUsedKb.get(dseq) ?? 5 * 1024 * 1024;
@@ -1411,5 +1415,6 @@ export class FakeUnattendedChain implements UnattendedChain {
   grantAll(granter: string, grantee: string, types: readonly string[], days = 30): void {
     const expiration = new Date(Date.now() + days * 86_400_000).toISOString();
     this.grantsByPair.set(`${granter}/${grantee}`, types.map((msgType) => ({ msgType, expiration })));
+    this.allowances.set(`${granter}/${grantee}`, { spendLimit: [{ denom: "uakt", amount: "5000000" }], expiration });
   }
 }
