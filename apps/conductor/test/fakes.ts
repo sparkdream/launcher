@@ -871,7 +871,9 @@ export class FakeSsh {
         chains: Array<{ id: string }>;
         paths: Array<{ id: string; a: string; b: string; port: string; version: string }>;
       };
-    if (command === "relayer-bringup --keys-only") return ok();
+    // the image's script, or the launcher's copy uploaded beside the config
+    const bringup = /^(?:\/data\/relayer\/bin\/)?relayer-bringup$/;
+    if (bringup.test(command.replace(/ --keys-only$/, "")) && command.endsWith(" --keys-only")) return ok();
     if (command === RELAYER_FUNDCHECK) {
       return ok(
         JSON.stringify(
@@ -886,7 +888,7 @@ export class FakeSsh {
     if (command === RELAYER_DEAD_RPCS) {
       return ok([...this.unreachableChains].map((c) => `${c} http://127.0.0.1:26657`).join("\n"));
     }
-    if (command === "relayer-bringup") {
+    if (bringup.test(command)) {
       const m = manifest();
       const out = m.paths.map((p, i) => {
         const key = `${id}|${p.id}`;
@@ -1110,7 +1112,7 @@ export class FakeSsh {
     if (remotePath?.endsWith("/config/app.toml")) {
       this.appToml.set(this.id(target), fs.readFileSync(localPath, "utf8"));
     }
-    if (remotePath && /\.(toml|json|mnemonic|env|age|sh)$/.test(remotePath)) {
+    if (remotePath && /\.(toml|json|mnemonic|env|age|sh)$|\/bin\/[\w-]+$/.test(remotePath)) {
       this.files.set(`${this.id(target)}|${remotePath}`, fs.readFileSync(localPath, "utf8"));
     }
   }

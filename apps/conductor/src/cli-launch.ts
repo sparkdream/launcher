@@ -7,6 +7,7 @@ import { ConductorDb } from "./db.js";
 import { runWithSigner } from "./engine.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
+import { DEFAULT_AKASH_LCDS } from "./akash/rest.js";
 import { CliSigner } from "./signer.js";
 import { resolveSharedHeadscale } from "./headscale-reuse.js";
 
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new ConductorDb(path.join(dataDir, "state.db"));
   const services = productionServices({
-    lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
+    lcd: process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS,
     consoleApi: process.env.CONSOLE_API ?? "https://console-api.akash.network",
   });
 

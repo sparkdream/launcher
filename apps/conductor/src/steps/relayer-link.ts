@@ -23,6 +23,7 @@ import {
   type RelayPlan,
 } from "../relayer.js";
 import { readSecretFile } from "../secrets.js";
+import { relayerScriptPath } from "../vendor.js";
 import { patchSentryAppToml, sentryServe } from "../sentry-serve.js";
 import type { SshTarget } from "../services.js";
 import {
@@ -229,6 +230,25 @@ async function exposePublicSentries(ctx: StepCtx, stepName: string, spec: Launch
   }
 }
 
+/** Where the launcher's copy of relayer-bringup goes on the relayer. */
+export const RELAYER_BRINGUP = `${RELAYER_DIR}/bin/relayer-bringup`;
+
+/**
+ * Put the launcher's vendored relayer-bringup on the relayer's volume and
+ * return the command that runs it, so a fix to the script reaches a relayer
+ * still on an older hermes image (2026-10-08: the image's copy reused the
+ * pre-reset chain's client on Osmosis after a reset, and the relink failed).
+ * A launcher vendored before the scripts were runs the image's own.
+ */
+async function installBringup(ctx: StepCtx, target: SshTarget): Promise<string> {
+  const script = relayerScriptPath("relayer-bringup.sh");
+  if (!script) return "relayer-bringup";
+  await ctx.services.ssh.exec(target, `mkdir -p ${RELAYER_DIR}/bin`);
+  await ctx.services.ssh.upload(target, script, RELAYER_BRINGUP);
+  await ctx.services.ssh.exec(target, `chmod 755 ${RELAYER_BRINGUP}`);
+  return RELAYER_BRINGUP;
+}
+
 /**
  * Link the relayer to every chain in its paths (§5 relayer): configure and
  * key it, wait until every key can pay gas, open each path's clients,
@@ -267,7 +287,8 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
   // HD path and deletes it; the plaintext never outlives the import there
   for (const c of plan.chains) await put(`mnemonics/${c.chainId}.mnemonic`, mnemonic);
   fs.rmSync(path.join(local, "mnemonics"), { recursive: true, force: true });
-  await ctx.services.ssh.exec(target, "relayer-bringup --keys-only");
+  const bringup = await installBringup(ctx, target);
+  await ctx.services.ssh.exec(target, `${bringup} --keys-only`);
 
   // every key must be able to pay gas before a handshake can start
   type FundCheck = Array<{
@@ -431,7 +452,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     }
   }
 
-  const opened = await ctx.services.ssh.exec(target, "relayer-bringup", { timeoutMs: BRINGUP_TIMEOUT_MS });
+  const opened = await ctx.services.ssh.exec(target, bringup, { timeoutMs: BRINGUP_TIMEOUT_MS });
   const channels = JSON.parse(opened.stdout) as RelayChannel[];
 
   // pin the filter to the channels just opened, then (re)start hermes: a

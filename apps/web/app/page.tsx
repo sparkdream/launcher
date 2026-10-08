@@ -2987,7 +2987,12 @@ export default function Page() {
           <pre>{waitingStep.error}</pre>
           {waitingStep.funding && waitingStep.funding.length > 0 && (
             // relayer keys to fund: copy each address, or send from Keplr here
-            <FundingRows rows={waitingStep.funding} toast={showToast} onError={(m) => setError(m)} />
+            <FundingRows
+              rows={waitingStep.funding}
+              toast={showToast}
+              onError={(m) => setError(m)}
+              liveFrom={launchId ?? undefined}
+            />
           )}
           {waitingStep.peerSetup && <PeerSetupRoutes setup={waitingStep.peerSetup} toast={showToast} />}
           {waitingStep.wallet && (
@@ -3045,23 +3050,25 @@ export default function Page() {
               )}
             </div>
           )}
-          {awaitingSigner(waitingStep.name) && (
-            <button className="btn" onClick={() => launchId && showTmkms(launchId)}>
-              Show tmkms signer setup
+          <div className="banner-acts">
+            {awaitingSigner(waitingStep.name) && (
+              <button className="btn" onClick={() => launchId && showTmkms(launchId)}>
+                Show tmkms signer setup
+              </button>
+            )}
+            <button
+              className={waitingStep.funding?.length ? "btn primary" : "btn"}
+              onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
+            >
+              {waitingStep.peerSetup
+                ? "Done elsewhere? Resume now"
+                : waitingStep.wallet
+                ? "Signed another way, resume"
+                : waitingStep.funding?.length
+                  ? "Funded, resume"
+                  : "I did it, resume"}
             </button>
-          )}
-          <button
-            className="btn"
-            onClick={() => launchId && resumeLaunch(launchId).catch((e) => setError(String(e)))}
-          >
-            {waitingStep.peerSetup
-              ? "Done elsewhere? Resume now"
-              : waitingStep.wallet
-              ? "Signed another way, resume"
-              : waitingStep.funding?.length
-                ? "Funded, resume"
-                : "I did it, resume"}
-          </button>
+          </div>
         </div>
       )}
       {failedStep && launch.status !== "aborted" && (

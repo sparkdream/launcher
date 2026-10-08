@@ -270,6 +270,10 @@ describe("relayer launch", () => {
     const id = `${row.ssh_host}:${row.ssh_port}`;
     expect(services.ssh.files.get(`${id}|/data/relayer/config.toml`)).toContain("['transfer', 'channel-0']");
     expect(services.ssh.relayerReady.has(id)).toBe(true);
+    // the launcher's copy of bringup ran, not the image's: a fix to the
+    // script reaches a relayer on an older hermes image
+    expect(services.ssh.files.get(`${id}|/data/relayer/bin/relayer-bringup`)).toContain("client_is_current");
+    expect(services.ssh.execLog.some((e) => e.target === id && e.command === "/data/relayer/bin/relayer-bringup")).toBe(true);
     // mnemonics were uploaded for both chains (bringup deletes them there)
     expect(services.ssh.files.has(`${id}|/data/relayer/mnemonics/osmo-test-5.mnemonic`)).toBe(true);
     // the relayer's SDL tunnels resolved to sentry-0's tailnet IP at persist

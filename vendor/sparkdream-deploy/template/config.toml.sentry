@@ -260,7 +260,10 @@ seed_mode = false
 private_peer_ids = "${VALIDATOR_NODE_ID}"
 
 # Toggle to disable guard against peers connecting from the same ip.
-allow_duplicate_ip = false
+# true: every mesh peer reaches this sentry from 127.0.0.1 (userspace
+# tailscale delivers to localhost, and the validator link is a local
+# tunnel), so the guard would refuse all but the first of them.
+allow_duplicate_ip = true
 
 # Peer connection configuration.
 handshake_timeout = "20s"

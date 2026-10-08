@@ -12,6 +12,12 @@ import { currentAssets } from "./chain-assets/context.js";
 export function vendorDir(): string {
   const fromLaunch = currentAssets()?.vendorDir;
   if (fromLaunch) return fromLaunch;
+  return launcherVendorDir();
+}
+
+/** The launcher's own vendor data (env override, else the baked copy),
+ *  whatever chain version the running launch pins. */
+export function launcherVendorDir(): string {
   const fromEnv = process.env.SPARKDREAM_VENDOR_DIR;
   if (fromEnv) return fromEnv;
   let dir = path.dirname(fileURLToPath(import.meta.url));
@@ -21,6 +27,21 @@ export function vendorDir(): string {
     dir = path.dirname(dir);
   }
   throw new Error("vendor/sparkdream-deploy not found — run scripts/sync-vendor.sh");
+}
+
+/**
+ * A relayer script (chain repo deploy/docker/hermes) as last synced into the
+ * launcher, or undefined when this vendor copy predates them. Taken from the
+ * launcher's copy, not the launch's pinned chain version: the scripts drive
+ * Hermes, not the chain, and the newest copy carries the newest fixes.
+ */
+export function relayerScriptPath(name: string): string | undefined {
+  try {
+    const file = path.join(launcherVendorDir(), "hermes", name);
+    return fs.existsSync(file) ? file : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function templatePath(name: string): string {

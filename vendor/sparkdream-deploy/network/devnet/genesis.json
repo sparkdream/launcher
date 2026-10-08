@@ -2014,6 +2014,7 @@
         "encrypted_batch_enabled": false,
         "max_encrypted_payload_size": 16384,
         "max_execs_per_identity_per_epoch": "50",
+        "max_fee_per_exec": "50000",
         "max_funding_per_day": "200000000",
         "max_gas_per_exec": "500000",
         "max_ops_per_batch": 100,
@@ -2034,9 +2035,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "12",
           "message_type_url": "/sparkdream.blog.v1.MsgCreatePost",
           "min_trust_level": 1,
           "nullifier_domain": 1,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": ""
@@ -2044,9 +2047,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.blog.v1.MsgCreateReply",
           "min_trust_level": 1,
           "nullifier_domain": 2,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": "post_id"
@@ -2054,19 +2059,23 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.blog.v1.MsgReact",
           "min_trust_level": 1,
           "nullifier_domain": 8,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
-          "scope_field_path": "post_id"
+          "scope_field_path": "reply_id|post_id"
         },
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "3",
           "message_type_url": "/sparkdream.forum.v1.MsgCreatePost",
           "min_trust_level": 1,
           "nullifier_domain": 11,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": ""
@@ -2074,9 +2083,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.forum.v1.MsgUpvotePost",
           "min_trust_level": 1,
           "nullifier_domain": 12,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": "post_id"
@@ -2084,9 +2095,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.forum.v1.MsgDownvotePost",
           "min_trust_level": 1,
-          "nullifier_domain": 13,
+          "nullifier_domain": 12,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": "post_id"
@@ -2094,9 +2107,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "288",
           "message_type_url": "/sparkdream.collect.v1.MsgCreateCollection",
           "min_trust_level": 1,
           "nullifier_domain": 21,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": ""
@@ -2104,29 +2119,131 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.collect.v1.MsgUpvoteContent",
           "min_trust_level": 1,
           "nullifier_domain": 22,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
-          "scope_field_path": "target_id"
+          "scope_field_path": "target_type,target_id"
         },
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.collect.v1.MsgDownvoteContent",
           "min_trust_level": 1,
-          "nullifier_domain": 23,
+          "nullifier_domain": 22,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
-          "scope_field_path": "target_id"
+          "scope_field_path": "target_type,target_id"
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgUpdateCollection",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgDeleteCollection",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgAddItem",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgAddItems",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgUpdateItem",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgRemoveItem",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgRemoveItems",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
+        },
+        {
+          "active": true,
+          "batch_mode": "SHIELD_BATCH_MODE_IMMEDIATE_ONLY",
+          "epoch_window": "0",
+          "message_type_url": "/sparkdream.collect.v1.MsgReorderItem",
+          "min_trust_level": 1,
+          "nullifier_domain": 23,
+          "nullifier_mode": "NULLIFIER_MODE_OWNERSHIP",
+          "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
+          "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
+          "scope_field_path": ""
         },
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_ENCRYPTED_ONLY",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.rep.v1.MsgCreateChallenge",
           "min_trust_level": 0,
           "nullifier_domain": 41,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_GLOBAL",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": ""
@@ -2134,9 +2251,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.commons.v1.MsgSubmitAnonymousProposal",
           "min_trust_level": 0,
           "nullifier_domain": 31,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_EPOCH",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": ""
@@ -2144,9 +2263,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.commons.v1.MsgAnonymousVoteProposal",
           "min_trust_level": 0,
           "nullifier_domain": 32,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": "proposal_id"
@@ -2154,9 +2275,11 @@
         {
           "active": true,
           "batch_mode": "SHIELD_BATCH_MODE_EITHER",
+          "epoch_window": "0",
           "message_type_url": "/sparkdream.federation.v1.MsgSubmitArbiterHash",
           "min_trust_level": 2,
           "nullifier_domain": 51,
+          "nullifier_mode": "NULLIFIER_MODE_CONSUME",
           "nullifier_scope_type": "NULLIFIER_SCOPE_MESSAGE_FIELD",
           "proof_domain": "PROOF_DOMAIN_TRUST_TREE",
           "scope_field_path": "content_id"

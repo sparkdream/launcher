@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { FundingRequest, RelayerFunds } from "../lib/api";
 import { toBase, toDisplay } from "../lib/relayer-funds";
 
@@ -11,6 +11,9 @@ const STATUS_NOTE: Record<RelayerFunds["status"], string> = {
   "over-cap": "above its cap: move the excess out",
   unknown: "balance unknown",
 };
+
+/** How often a pause's funding rows re-read the keys' balances. */
+const LIVE_POLL_MS = 10_000;
 
 /**
  * One row per relayer key: the chain, the address (with a copy button), what
@@ -24,6 +27,7 @@ export function FundingRows({
   onError,
   onChanged,
   withdraw,
+  liveFrom,
 }: {
   rows: Array<FundingRequest | RelayerFunds>;
   toast: (msg: string) => void;
@@ -32,8 +36,35 @@ export function FundingRows({
   onChanged?: () => void;
   /** Withdrawal back out; the funds panel offers it, the pause does not. */
   withdraw?: (chainId: string, to?: string) => Promise<{ txHash: string; amount: string; to: string }>;
+  /** Launch whose relayer balances to poll, so a pause's rows (a snapshot
+   *  from when the step reported) follow the keys as they are funded. */
+  liveFrom?: string;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [live, setLive] = useState<Map<string, string>>(new Map());
+
+  const poll = useCallback(async () => {
+    if (!liveFrom) return;
+    try {
+      const { getRelayerFunds } = await import("../lib/api");
+      const funds = await getRelayerFunds(liveFrom);
+      setLive(new Map(funds.filter((f) => f.balance !== undefined).map((f) => [`${f.chainId}/${f.address}`, f.balance!])));
+    } catch {
+      // keep the last balances; the next poll may reach the chain
+    }
+  }, [liveFrom]);
+
+  useEffect(() => {
+    if (!liveFrom) return;
+    poll();
+    const t = setInterval(poll, LIVE_POLL_MS);
+    return () => clearInterval(t);
+  }, [liveFrom, poll]);
+
+  const changed = () => {
+    onChanged?.();
+    poll();
+  };
 
   const send = async (row: FundingRequest) => {
     const shown = window.prompt(
@@ -59,7 +90,7 @@ export function FundingRows({
       const { sendToRelayerKey } = await import("../lib/relayer-funds");
       const { txHash } = await sendToRelayerKey(row, amount);
       toast(`sent ${shown} ${row.displayDenom} to the relayer on ${row.chainId}, tx ${txHash.slice(0, 10)}…`);
-      onChanged?.();
+      changed();
     } catch (e) {
       onError(String(e));
     } finally {
@@ -80,7 +111,7 @@ export function FundingRows({
     try {
       const out = await withdraw(row.chainId, to.trim() || undefined);
       toast(`withdrew ${toDisplay(out.amount, row.decimals)} ${row.displayDenom} to ${out.to}, tx ${out.txHash.slice(0, 10)}…`);
-      onChanged?.();
+      changed();
     } catch (e) {
       onError(String(e));
     } finally {
@@ -89,20 +120,26 @@ export function FundingRows({
   };
 
   return (
-    <div style={{ display: "grid", gap: 10 }}>
-      {rows.map((row) => {
+    <div className="fund-rows">
+      {rows.map((snapshot) => {
+        const balance = live.get(`${snapshot.chainId}/${snapshot.address}`);
+        const row = balance !== undefined ? { ...snapshot, balance } : snapshot;
         const f = row as Partial<RelayerFunds>;
         const note = f.waiting ? "waiting for funds: relink after funding" : f.status ? STATUS_NOTE[f.status] : "";
+        const held = row.balance !== undefined ? BigInt(row.balance) : undefined;
+        const fill =
+          held !== undefined && row.cap && BigInt(row.cap) > 0n
+            ? Math.min(100, Number((held * 1000n) / BigInt(row.cap)) / 10)
+            : undefined;
+        const tone = held === undefined ? "" : held === 0n ? "empty" : f.status === "over-cap" ? "over" : "";
         return (
-          <div key={row.chainId} style={{ display: "grid", gap: 4 }}>
-            <div>
+          <div key={row.chainId} className="fund-row">
+            <div className="fund-head">
               <b>{row.chainId}</b>
-              {note && <span className="dim-note"> · {note}</span>}
+              {note && <span className="dim-note">{note}</span>}
             </div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              <span className="mono" style={{ wordBreak: "break-all" }}>
-                {row.address}
-              </span>
+            <div className="fund-addr">
+              <span className="mono">{row.address}</span>
               <button
                 className="btn small"
                 onClick={() => {
@@ -117,19 +154,32 @@ export function FundingRows({
                 copy
               </button>
             </div>
-            <div className="dim-note">
-              {row.balance !== undefined ? `holds ${toDisplay(row.balance, row.decimals)} ${row.displayDenom}` : f.error ?? ""}
-              {row.cap ? ` · cap ${toDisplay(row.cap, row.decimals)}` : ""}
-              {` · suggested top-up ${toDisplay(row.amount, row.decimals)} ${row.displayDenom}`}
+            <div className="fund-balance">
+              {held !== undefined ? (
+                <span>
+                  holds <b className={tone}>{toDisplay(row.balance!, row.decimals)}</b> {row.displayDenom}
+                  {row.cap && <span className="dim-note"> of {toDisplay(row.cap, row.decimals)} cap</span>}
+                  {liveFrom && <span className="fund-live" title="re-read every few seconds" />}
+                </span>
+              ) : (
+                <span className="dim-note">{f.error ?? "balance unknown"}</span>
+              )}
+              {fill !== undefined && (
+                <div className={`fund-meter ${tone}`}>
+                  <i style={{ width: `${fill}%` }} />
+                </div>
+              )}
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
+            <div className="fund-acts">
               <button
                 className="btn primary small"
                 disabled={busy !== null || !row.keplr}
                 title={row.keplr ? "" : "no public RPC known for this chain: send from another wallet"}
                 onClick={() => send(row)}
               >
-                {busy === `send:${row.chainId}` ? "Sending…" : "Send with Keplr…"}
+                {busy === `send:${row.chainId}`
+                  ? "Sending…"
+                  : `Send ${toDisplay(row.amount, row.decimals)} ${row.displayDenom} with Keplr…`}
               </button>
               {withdraw && (
                 <button

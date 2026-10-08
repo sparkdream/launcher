@@ -27,6 +27,14 @@ rsync -a --delete \
   --include='*.yaml' --include='*.yml' --include='*.sh' \
   --exclude='*' \
   "$MESH/" "$DEST/mesh/"
+# The relayer's scripts: the launcher uploads its own copy of these before
+# running them, so a fix reaches a relayer still on an older hermes image
+# (2026-10-08: the image's bringup reused a pre-reset chain's client)
+mkdir -p "$DEST/hermes"
+rsync -a --delete \
+  --include='*.sh' \
+  --exclude='*' \
+  "$CHAIN_REPO/deploy/docker/hermes/" "$DEST/hermes/"
 
 COMMIT="$(git -C "$CHAIN_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 
@@ -36,12 +44,12 @@ COMMIT="$(git -C "$CHAIN_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 # tree, not that commit. Refuse rather than record something untrue --
 # SYNC_VENDOR_ALLOW_DIRTY=1 marks it "-dirty" instead, for iterating on chain
 # changes before they are committed.
-if [ "$COMMIT" != "unknown" ] && ! git -C "$CHAIN_REPO" diff --quiet HEAD -- deploy/config deploy/mesh; then
+if [ "$COMMIT" != "unknown" ] && ! git -C "$CHAIN_REPO" diff --quiet HEAD -- deploy/config deploy/mesh deploy/docker/hermes; then
   if [ "${SYNC_VENDOR_ALLOW_DIRTY:-0}" = "1" ]; then
     COMMIT="$COMMIT-dirty"
     echo "warning: chain repo has uncommitted deploy changes; recording $COMMIT" >&2
   else
-    echo "error: $CHAIN_REPO has uncommitted changes under deploy/config or deploy/mesh." >&2
+    echo "error: $CHAIN_REPO has uncommitted changes under deploy/config, deploy/mesh or deploy/docker/hermes." >&2
     echo "       Vendoring now would record commit $COMMIT for files that are not in it." >&2
     echo "       Commit the chain repo first, or re-run with SYNC_VENDOR_ALLOW_DIRTY=1." >&2
     exit 1

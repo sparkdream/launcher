@@ -527,6 +527,43 @@ button.launch-row.summary .lbl { color: var(--dim2); font-style: italic; }
   white-space: pre-wrap; margin: 0; flex-basis: 100%; font-size: 11.5px;
   font-family: var(--font-mono); color: var(--mid); max-height: 30vh; overflow-y: auto;
 }
+/* the banner's own buttons: a footer row under whatever the pause shows */
+.banner-acts {
+  flex-basis: 100%; display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap;
+  padding-top: 12px; border-top: 1px solid var(--line);
+}
+/* relayer keys to fund (funding pause, funds panel) */
+.fund-rows {
+  flex-basis: 100%; display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+}
+.fund-row {
+  display: grid; gap: 8px; align-content: start; padding: 12px 14px; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025); border: 1px solid var(--line2); color: var(--mid);
+}
+.fund-head { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+.fund-head b { color: var(--amber-text); font-family: var(--font-mono); font-size: 12.5px; }
+.fund-addr { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.fund-addr .mono {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text); min-width: 0;
+  word-break: break-all;
+}
+.fund-balance { display: grid; gap: 6px; }
+.fund-balance b { color: var(--text); font-family: var(--font-mono); }
+.fund-balance b.empty { color: var(--red-text); }
+.fund-balance b.over { color: var(--amber); }
+.fund-live {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 8px;
+  vertical-align: middle; background: var(--ok); opacity: 0.7;
+  animation: fund-live 2s ease-in-out infinite;
+}
+@keyframes fund-live { 50% { opacity: 0.2; } }
+@media (prefers-reduced-motion: reduce) { .fund-live { animation: none; } }
+.fund-meter { height: 4px; border-radius: 2px; background: var(--rule); overflow: hidden; }
+.fund-meter i { display: block; height: 100%; background: var(--ok); transition: width 0.4s ease; }
+.fund-meter.empty i { background: var(--red); }
+.fund-meter.over i { background: var(--amber); }
+.fund-acts { display: flex; gap: 8px; flex-wrap: wrap; }
 .banner.global-error {
   position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
   z-index: 100; margin: 0; width: min(880px, calc(100vw - 48px));

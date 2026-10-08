@@ -128,6 +128,8 @@ export interface LocalSignerView {
 
 /** How often the monitor reads the relayer's balances. */
 const RELAYER_FUNDS_EVERY_MS = 15 * 60_000;
+/** How often a settled fleet's mesh is swept for leftover nodes. */
+const MESH_STRAY_EVERY_MS = 10 * 60_000;
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
@@ -191,6 +193,7 @@ import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
 import type { OfferedBid } from "./akash/policy.js";
 import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
 import { NODE_HOME, restartNode, rpcUrl, stalled } from "./node-ops.js";
+import { meshSocketFromSdl, sweepMeshStrays } from "./mesh-strays.js";
 import { sparkdreamd } from "./exec.js";
 import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
 import { valoperAddress } from "./gentx.js";
@@ -571,6 +574,7 @@ function opComponents(op: FleetOpRow): string[] | undefined {
 export class FleetService {
   /** Last hourly on-chain look at each fleet's session grants. */
   private readonly sessionChecks = new Map<string, number>();
+  private readonly meshStrayChecks = new Map<string, number>();
   /** Last look at each relayer's balances, and the low keys it found. */
   private readonly relayerFundChecks = new Map<string, { at: number; low: string[] }>();
   /** How a relayer withdrawal reaches a chain; tests swap in a fake. */
@@ -3234,6 +3238,61 @@ export class FleetService {
   relayerState(launch: LaunchRow): RelayerLinkOutput | undefined {
     const file = relayerStatePath(this.workRoot, launch.id);
     return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as RelayerLinkOutput) : undefined;
+  }
+
+  /**
+   * Evict stray mesh nodes (mesh-strays.ts): leftovers of replaced
+   * components that their provider kept running after the lease closed.
+   * Only on a settled fleet (completed and not being driven, so no placement
+   * is mid-flight), at most every MESH_STRAY_EVERY_MS, and alerted when it
+   * finds any: a closed lease still running is the provider's fault and
+   * worth knowing about.
+   */
+  async evictMeshStrays(launchId: string): Promise<void> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return;
+    const last = this.meshStrayChecks.get(launchId) ?? 0;
+    if (Date.now() - last < MESH_STRAY_EVERY_MS) return;
+    this.meshStrayChecks.set(launchId, Date.now());
+    const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
+    const own = rows.find((c) => c.key === "headscale" && c.state === "active");
+    const hs = own
+      ? { hostUri: own.host_uri, dseq: own.dseq, gseq: 1, oseq: 1 }
+      : this.db.stepOutput<{ hostUri: string; dseq: string; gseq: number; oseq: number }>(launchId, "deploy-headscale");
+    if (!hs) return; // services fleet without a mesh
+    const spec = this.spec(launch);
+    const dirs = launchDirs(this.workRoot, launchId);
+    const res = await sweepMeshStrays(spec, rows, {
+      headscale: async (script) =>
+        (await this.services.provider.shellExec(this.mtlsCreds(launch), hs.hostUri, hs.dseq, hs.gseq, hs.oseq, "headscale", ["sh", "-c", script]))
+          .stdout,
+      liveIp: async (row) => {
+        if (!row.ssh_host) return null;
+        let sdl: string | undefined;
+        try {
+          sdl = fs.readFileSync(path.join(dirs.sdl, `${row.key}.yaml`), "utf8");
+        } catch {
+          sdl = undefined;
+        }
+        const { stdout } = await this.services.ssh.exec(
+          this.sshTargetFor(launch, row),
+          `tailscale --socket=${meshSocketFromSdl(sdl, NODE_HOME)} ip -4 2>/dev/null || true`,
+          { quick: true },
+        );
+        return stdout.trim().split("\n")[0] || null;
+      },
+      log: () => {},
+    });
+    if (res.evicted.length > 0) {
+      const names = res.evicted.map((n) => `${n.givenName} (${n.ip}${n.online ? ", online" : ""})`).join(", ");
+      await this.notify(
+        launch,
+        "headscale",
+        "evicted leftover mesh nodes",
+        `Removed from the mesh: ${names}. These are replaced components' old nodes; any marked online ` +
+          "is a container its provider kept running after the lease closed.",
+      ).catch(() => {});
+    }
   }
 
   /**

@@ -7,6 +7,7 @@ import { loadSdl, sdlArtifacts } from "./akash/sdl-groups.js";
 import {
   acceptMeshPeers,
   componentRow,
+  disableAbandonedNode,
   nodeSelfHeight,
   prepareNodeHome,
   refreshSshEndpoints,
@@ -193,6 +194,11 @@ interface OldPlacement {
   dseq: string;
   provider: string;
   tailnetIp: string | null;
+  /** How to reach the old container once the row has moved, so close-old
+   *  can disable it (absent in pins from before this was recorded). */
+  hostUri?: string;
+  sshHost?: string | null;
+  sshPort?: number | null;
 }
 
 /**
@@ -541,6 +547,9 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
               dseq: current.dseq,
               provider: current.provider,
               tailnetIp: current.tailnet_ip,
+              hostUri: current.host_uri,
+              sshHost: current.ssh_host,
+              sshPort: current.ssh_port,
             } satisfies OldPlacement),
           ),
         ) as OldPlacement;
@@ -716,6 +725,23 @@ export function nodeResizeSteps(opId: number, params: NodeResizeParams, spec: La
         const cut = ctx.output<CutoverOutput>(p("cutover"))!;
         const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
         const lease = await ctx.services.api.leaseState(owner, cut.oldDseq, cut.oldProvider);
+        // the retired node still runs as a full node holding every block:
+        // make it inert before the close, while its endpoint still answers,
+        // in case the provider keeps the container after the lease ends
+        const old = JSON.parse(
+          fs.readFileSync(path.join(ctx.dirs.root, `op${opId}-resize-old.pin`), "utf8"),
+        ) as OldPlacement;
+        if (lease === "active" && old.sshHost && old.sshPort && old.hostUri) {
+          await pinnedValue(ctx, `op${opId}-disabled-old`, async () => {
+            const target = sshTarget(
+              ctx,
+              old.sshHost!,
+              old.sshPort!,
+              nodeShellFallback(ctx, old.hostUri!, old.dseq, 1, 1, "sparkdreamd"),
+            );
+            return (await disableAbandonedNode(ctx, target, key)) ? "yes" : "no";
+          });
+        }
         if (lease === "active") {
           await ctx.requireTx(p("close-old"), [
             { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq: cut.oldDseq } } },

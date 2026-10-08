@@ -59,6 +59,7 @@ import {
 import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, STALLED_BEHIND_BLOCKS, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import { nodeResizeSteps } from "./node-resize.js";
+import { disableNodeCmd, pinnedOpKeys, sweepMeshStrays, type StraySweepDeps } from "./mesh-strays.js";
 import { meshBackupSteps } from "./mesh-backup.js";
 import { addSentrySteps, type AddSentryParams } from "./add-sentry.js";
 import {
@@ -377,6 +378,61 @@ function meshSocket(ctx: StepCtx, key: string): string {
     stateDir = undefined;
   }
   return `${stateDir ?? `${NODE_HOME}/tailscale`}/tailscaled.sock`;
+}
+
+/** How a step reaches the mesh to sweep its strays (mesh-strays.ts). */
+function meshStrayDeps(ctx: StepCtx): StraySweepDeps {
+  const hs = headscaleRef(ctx);
+  return {
+    headscale: async (script) =>
+      (
+        await ctx.services.provider.shellExec(loadCert(ctx), hs.hostUri, hs.dseq, hs.gseq, hs.oseq, "headscale", [
+          "sh",
+          "-c",
+          script,
+        ])
+      ).stdout,
+    liveIp: async (row) => {
+      if (!row.ssh_host) return null;
+      const res = await ctx.services.ssh.exec(
+        rowTarget(ctx, row),
+        `tailscale --socket=${meshSocket(ctx, row.key)} ip -4 2>/dev/null || true`,
+        { quick: true },
+      );
+      return res.stdout.trim().split("\n")[0] || null;
+    },
+    log: (m) => ctx.log(m),
+  };
+}
+
+/**
+ * Best-effort disable of a node container about to be closed
+ * (disableNodeCmd). Never fails the op: the old node is often being replaced
+ * because it is unreachable, and the mesh sweep is the backstop for those.
+ */
+export async function disableAbandonedNode(ctx: StepCtx, target: SshTarget, key: string): Promise<boolean> {
+  try {
+    const res = await ctx.services.ssh.exec(target, disableNodeCmd(NODE_HOME, meshSocket(ctx, key)), { quick: true });
+    const moved = /disabled-node:(\S+)/.exec(res.stdout)?.[1];
+    if (!moved) throw new Error("no confirmation from the node");
+    ctx.log(`${key}: old node disabled before its close (config and data moved to ${moved})`);
+    return true;
+  } catch (e) {
+    ctx.log(
+      `${key}: could not disable the old node before its close (${e instanceof Error ? e.message : String(e)}); ` +
+        "the mesh sweep evicts it if its provider keeps it running",
+    );
+    return false;
+  }
+}
+
+/** Preauth keys the fleet's unfinished ops pinned for their placements. */
+function activeOpKeys(ctx: StepCtx): Set<string> {
+  const ids = (ctx.db.listFleetOps(ctx.launchId, "active") as FleetOpRow[]).map((o) => o.id);
+  return pinnedOpKeys((id) => {
+    const file = path.join(ctx.dirs.root, `op${id}-authkey.pin`);
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
+  }, ids);
 }
 
 /**
@@ -1778,6 +1834,15 @@ export function relaunchSteps(
         }
       }
       const lease = await ctx.services.api.leaseState(owner, row.dseq, row.provider);
+      // the old node is abandoned from here on: make it inert while it can
+      // still be reached, since a provider that keeps a closed lease running
+      // leaves it on the mesh with the chain's blocks (2026-10-08 halt)
+      const disabled =
+        lease === "active" && /^(val|sentry)-/.test(key)
+          ? await pinnedValue(ctx, `op${opId}-disabled-old`, async () =>
+              (await disableAbandonedNode(ctx, rowTarget(ctx, row), key)) ? "yes" : "no",
+            )
+          : "no";
       if (lease === "active") {
         await ctx.requireTx(p("close"), [
           { typeUrl: TypeUrl.CloseDeployment, value: { id: { owner, dseq: row.dseq } } },
@@ -1791,7 +1856,9 @@ export function relaunchSteps(
       if (row.ssh_host && row.ssh_port) {
         try {
           const probe = await ctx.services.ssh.exec(rowTarget(ctx, row), "echo zombie-probe");
-          if (probe.stdout.includes("zombie-probe")) {
+          if (probe.stdout.includes("zombie-probe") && disabled === "yes") {
+            ctx.log(`${key}: the old container still answers after the close, but its node was disabled before it`);
+          } else if (probe.stdout.includes("zombie-probe")) {
             throw new AwaitUser(
               p("close"),
               `${key}'s old container still answers SSH after close: wait for the provider to tear it down, then resume`,
@@ -4206,6 +4273,27 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
             await ctx.services.ssh.exec(rowTarget(ctx, row), "pkill -x sparkdreamd || true", {
               quick: true,
             });
+            // A node that crash-loops never takes the wait-mode manifest: a
+            // StatefulSet rolls a new pod template out only once the current
+            // pod is healthy (2026-10-08: val-0, panicking on a WAL poisoned
+            // by a leftover node, kept booting the old env). The reset wipes
+            // the chain data anyway, so set the consensus WAL aside: the
+            // node then stays up and the rollout proceeds.
+            if (i >= 3) {
+              await ctx.services.ssh
+                .exec(
+                  rowTarget(ctx, row),
+                  `tr '\\0' '\\n' < /proc/1/environ | grep -qx WAIT_FOR_CONFIG=true || ` +
+                    `{ [ -d ${NODE_HOME}/data/cs.wal ] && mv ${NODE_HOME}/data/cs.wal ${NODE_HOME}/data/cs.wal.reset-$(date +%s) && echo moved-wal; }; true`,
+                  { quick: true },
+                )
+                .then((r) => {
+                  if (r.stdout.includes("moved-wal")) {
+                    ctx.log(`${row.key}: still on its old manifest; set its consensus WAL aside so it stops crash-looping and the wait-mode one can roll out`);
+                  }
+                })
+                .catch(() => {});
+            }
             return false;
           });
           if (!stopped) throw new Error(`${row.key}: sparkdreamd still running after the wait-mode flip`);
@@ -4347,6 +4435,30 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
           );
         }
         return { wiped: nodeRows(ctx).map((r) => r.key), chainId: cid };
+      },
+    },
+    {
+      name: p("mesh-strays"),
+      async run(ctx) {
+        // The new chain keeps the id and the validator key, so any node of
+        // the old chain that can still reach ours is poison: its stored
+        // blocks verify against the same validator set, and it serves them
+        // as catch-up once the new chain reaches their height (2026-10-08:
+        // a closed-lease sentry its provider never stopped halted the reset
+        // chain at 54). Evict every leftover namesake from the mesh before
+        // anything starts, and refuse to start while a chain node's live
+        // address is unknown, since its leftovers cannot be told apart.
+        const res = await sweepMeshStrays(spec, ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[], meshStrayDeps(ctx), activeOpKeys(ctx));
+        const blind = res.unsure.filter((k) => /^(val|sentry)-/.test(k));
+        if (blind.length > 0) {
+          throw new Error(
+            `cannot read the live mesh address of ${blind.join(", ")}, so leftover nodes by that name ` +
+              "cannot be told apart from it and were not evicted. A leftover node of the old chain on " +
+              "the mesh halts the new one when it reaches that node's height. Bring the node back on " +
+              "the mesh (repair fleet), then retry.",
+          );
+        }
+        return res;
       },
     },
   );

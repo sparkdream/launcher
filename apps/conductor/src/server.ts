@@ -287,6 +287,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           // a tmkms signer on this machine: repoint a stale addr, restart a
           // signer that lost its session (never while the launch is driven)
           if (!running.has(launch.id)) await fleet.signerWatchdog(launch.id).catch(() => {});
+          // leftover nodes of replaced components still on the mesh (a
+          // provider that kept a closed lease's container running): evicted
+          // while the fleet is settled, never mid-op
+          if (!running.has(launch.id)) {
+            await fleet.evictMeshStrays(launch.id).catch((e) => app.log.warn(`launch ${launch.id}: mesh strays: ${e}`));
+          }
           const queued = await fleet.settleFleetTxs(launch.id).catch((): string[] => []);
           for (const other of queued) {
             const l = deps.db.getLaunch(other);

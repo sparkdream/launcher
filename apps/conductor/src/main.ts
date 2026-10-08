@@ -6,6 +6,7 @@ import { ConductorDb } from "./db.js";
 import { buildServer } from "./server.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
+import { DEFAULT_AKASH_LCDS, parseLcds } from "./akash/rest.js";
 import { SshSignerHost, SystemdSignerHost } from "./local-signer.js";
 import { AkashUnattendedChain, UNATTENDED_FEE_DENOM } from "./unattended.js";
 import { CloudflareDns, cloudflareToken } from "./dns.js";
@@ -14,7 +15,8 @@ import { CloudflareDns, cloudflareToken } from "./dns.js";
  * Conductor entrypoint. Env:
  *   DATA_DIR       state + launch workspaces (default ./data)
  *   PORT           HTTP port (default 8080)
- *   AKASH_LCD      chain REST endpoint
+ *   AKASH_LCD      chain REST endpoint(s), comma-separated: tried in order,
+ *                  failing over on 5xx and network errors
  *   CONSOLE_API    Console public API for provider metadata
  */
 const dataDir = process.env.DATA_DIR ?? path.resolve("data");
@@ -22,7 +24,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 
 const db = new ConductorDb(path.join(dataDir, "state.db"));
 const services = productionServices({
-  lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
+  lcd: process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS,
   consoleApi: process.env.CONSOLE_API ?? "https://console-api.akash.network",
 });
 
@@ -33,7 +35,8 @@ const services = productionServices({
  *                  in uakt only, and refused every uact fee as "insufficient")
  */
 services.unattended = new AkashUnattendedChain({
-  lcd: process.env.AKASH_LCD ?? "https://rest.cosmos.directory/akash",
+  // it reads grants from one LCD: the first of the list
+  lcd: parseLcds(process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS)[0]!,
   rpc: process.env.AKASH_RPC ?? "https://rpc.akashnet.net:443",
   gasPrice: process.env.AKASH_GAS_PRICE ?? `0.025${UNATTENDED_FEE_DENOM}`,
 });
