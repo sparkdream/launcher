@@ -3,7 +3,7 @@
 #
 # The sparkdreamd binary is copied from the chain image; keep the tag in sync
 # with the launch-spec profiles (packages/launch-spec/src/profiles.ts).
-ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.49
+ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.53
 
 FROM ${SPARKDREAMD_IMAGE} AS chainbin
 
