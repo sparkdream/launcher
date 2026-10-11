@@ -230,6 +230,38 @@ async function exposePublicSentries(ctx: StepCtx, stepName: string, spec: Launch
   }
 }
 
+/** Bringup's own log on the relayer: its stderr names each path and each
+ *  client, connection and channel as it creates them. */
+export const BRINGUP_LOG = `${RELAYER_DIR}/bringup.log`;
+
+/** Run bringup with its stderr kept in BRINGUP_LOG, so the link can read
+ *  along while it runs; the tail still lands on stderr for a failure's error. */
+export function loggedBringup(bringup: string): string {
+  return `${bringup} 2>${BRINGUP_LOG}; rc=$?; tail -n 40 ${BRINGUP_LOG} >&2; exit $rc`;
+}
+
+/**
+ * Where bringup is, from its log so far: the last line it wrote, and how
+ * many of the `total` paths are finished (each prints "channels:" when its
+ * channel is open or found).
+ */
+export function bringupProgress(log: string, total: number): { label: string; done: number; percent?: number } {
+  const lines = log.split("\n").map((l) => l.trim()).filter(Boolean);
+  const done = lines.filter((l) => l.startsWith("channels:")).length;
+  const paths = lines.filter((l) => l.startsWith("=== path ")).length;
+  const last = lines.filter((l) => /^(===|creating|clients:|connections:|channels:)/.test(l)).pop();
+  const step = last ? last.replace(/^=+\s*|\s*=+$/g, "") : "starting";
+  const label =
+    total > 1 && paths > 0
+      ? `relayer: path ${Math.min(paths, total)} of ${total}, ${step}`
+      : `relayer: ${step}`;
+  return {
+    label: label.length > 140 ? `${label.slice(0, 137)}...` : label,
+    done,
+    ...(total > 0 ? { percent: Math.round((Math.min(done, total) / total) * 100) } : {}),
+  };
+}
+
 /** Where the launcher's copy of relayer-bringup goes on the relayer. */
 export const RELAYER_BRINGUP = `${RELAYER_DIR}/bin/relayer-bringup`;
 
@@ -258,6 +290,36 @@ async function installBringup(ctx: StepCtx, target: SshTarget): Promise<string> 
  * relaunched relayer all run the same thing.
  */
 export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSpec): Promise<RelayerLinkOutput> {
+  // the op chip and the running step row show where the link is: it runs
+  // for many minutes, mostly inside one bringup call (a launch's own link
+  // step has no op to report on)
+  const opId = Number(/^op(\d+):/.exec(stepName)?.[1]);
+  const startedAt = Date.now();
+  const progress = (label: string, extra: { current?: number; target?: number; percent?: number } = {}) => {
+    if (!opId) return;
+    ctx.db.setFleetOpProgress(opId, {
+      label,
+      ...extra,
+      elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+      updatedAt: new Date().toISOString(),
+    });
+  };
+  try {
+    return await linkRelayerStages(ctx, stepName, spec, progress);
+  } finally {
+    if (opId) ctx.db.setFleetOpProgress(opId, null);
+  }
+}
+
+type LinkProgress = (label: string, extra?: { current?: number; target?: number; percent?: number }) => void;
+
+async function linkRelayerStages(
+  ctx: StepCtx,
+  stepName: string,
+  spec: LaunchSpec,
+  progress: LinkProgress,
+): Promise<RelayerLinkOutput> {
+  progress("relayer: opening counterparty sentries");
   // before the plan: a public route's endpoints are only known once opened
   await exposePublicSentries(ctx, stepName, spec);
   const plan = relayPlan(ctx.db, ctx.launchId, spec);
@@ -272,6 +334,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
 
   await openCounterpartySentries(ctx, plan);
 
+  progress("relayer: uploading its config and keys");
   const target = relayerTarget(ctx);
   const local = path.join(ctx.dirs.root, "relayer");
   fs.mkdirSync(path.join(local, "mnemonics"), { recursive: true });
@@ -335,6 +398,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
       throw await unreachable("relayer-fundcheck did not answer within 150s");
     }
   };
+  progress("relayer: checking its balances on every chain");
   let status = await fundcheck();
 
   // a chain reached only by unopened openWhenFunded paths waits for its
@@ -361,6 +425,7 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
 
   // a launcher fleet's chain whose founder key the launcher holds is funded
   // from it, capped like any top-up; only what is left asks the user
+  if (unreadyOf(status).length > 0) progress("relayer: funding its keys from the founder accounts");
   if (await fundFromFounders(ctx, spec, plan, chains, unreadyOf(status))) status = await fundcheck();
 
   // the key lives on the relayer's provider: ask for gas money only, and
@@ -452,8 +517,9 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     }
   }
 
-  const opened = await ctx.services.ssh.exec(target, bringup, { timeoutMs: BRINGUP_TIMEOUT_MS });
+  const opened = await runBringup(ctx, target, bringup, active.paths.length, progress);
   const channels = JSON.parse(opened.stdout) as RelayChannel[];
+  progress("relayer: starting hermes on the new channels", { percent: 100 });
 
   // pin the filter to the channels just opened, then (re)start hermes: a
   // first link only needs the ready marker; a relink restarts the container,
@@ -499,6 +565,68 @@ export async function linkRelayer(ctx: StepCtx, stepName: string, spec: LaunchSp
     ctx.log(`relayer: ${ch.id} open — ${ch.a.chain}/${ch.a.channel} <-> ${ch.b.chain}/${ch.b.channel} (${ch.port})`);
   }
   return out;
+}
+
+/** How often a running bringup's log is read back. */
+const BRINGUP_POLL_MS = 15_000;
+
+/**
+ * Run bringup, reading its log every BRINGUP_POLL_MS while it opens clients,
+ * connections and channels: new lines go to the step log and the latest one
+ * to the op's progress, so a 10-minute handshake shows where it is.
+ */
+async function runBringup(
+  ctx: StepCtx,
+  target: SshTarget,
+  bringup: string,
+  total: number,
+  progress: LinkProgress,
+): Promise<{ stdout: string }> {
+  progress(`relayer: opening ${total} path${total === 1 ? "" : "s"} (clients, connections, channels)`, {
+    current: 0,
+    target: total,
+    percent: 0,
+  });
+  let finished = false;
+  let seen = 0;
+  const read = async () => {
+    const log = (
+      await ctx.services.ssh.exec(target, `cat ${BRINGUP_LOG} 2>/dev/null || true`, { quick: true }).catch(() => ({
+        stdout: "",
+      }))
+    ).stdout;
+    const lines = log.split("\n").filter((l) => l.trim());
+    // a log shorter than what was seen is a restarted bringup's: read it afresh
+    if (lines.length < seen) seen = 0;
+    // hermes' own INFO chatter (health checks) stays in the file
+    for (const l of lines.slice(seen)) {
+      if (!/^\d{4}-\d\d-\d\dT\S+\s+INFO\b/.test(l)) ctx.log(`relayer: ${l.trim().slice(0, 300)}`);
+    }
+    seen = lines.length;
+    if (lines.length === 0) return;
+    const p = bringupProgress(log, total);
+    progress(p.label, { current: p.done, target: total, ...(p.percent !== undefined ? { percent: p.percent } : {}) });
+  };
+  // not awaited at the end: the step should not sit out a poll interval
+  void (async () => {
+    while (!finished) {
+      // an aborted op's sleep rejects: stop reading rather than spin
+      await ctx.services.sleep(BRINGUP_POLL_MS).catch(() => {
+        finished = true;
+      });
+      if (finished) break;
+      await read().catch(() => undefined);
+    }
+  })();
+  try {
+    const out = await ctx.services.ssh.exec(target, loggedBringup(bringup), { timeoutMs: BRINGUP_TIMEOUT_MS });
+    finished = true;
+    // the lines written since the last read (a failure carries its tail in the error)
+    await read().catch(() => undefined);
+    return out;
+  } finally {
+    finished = true;
+  }
 }
 
 /**

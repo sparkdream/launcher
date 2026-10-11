@@ -15,7 +15,7 @@ import type { Signer } from "../src/engine.js";
 import { templatePath } from "../src/vendor.js";
 import type { LocalSignerHost, MeshCli, TmkmsProcess } from "../src/local-signer.js";
 import type { AllowanceInfo, GrantInfo, UnattendedChain } from "../src/unattended.js";
-import { RELAYER_DEAD_RPCS, RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
+import { loggedBringup, RELAYER_DEAD_RPCS, RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -873,6 +873,9 @@ export class FakeSsh {
       };
     // the image's script, or the launcher's copy uploaded beside the config
     const bringup = /^(?:\/data\/relayer\/bin\/)?relayer-bringup$/;
+    // the link runs it with its stderr in the bringup log (loggedBringup)
+    const logged = loggedBringup("");
+    if (command.endsWith(logged)) command = command.slice(0, -logged.length);
     if (bringup.test(command.replace(/ --keys-only$/, "")) && command.endsWith(" --keys-only")) return ok();
     if (command === RELAYER_FUNDCHECK) {
       return ok(

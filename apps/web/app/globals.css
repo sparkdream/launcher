@@ -498,6 +498,10 @@ input.mint-amt {
   margin-left: auto; display: flex; align-items: center; gap: 10px;
   font-size: 11px; color: var(--dim2);
 }
+.launch-row .step-progress-label {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.launch-row .step-progress { min-width: 0; }
 /* accent, not the fleet chip's amber: this bar sits in the launch step list */
 .launch-row .step-bar { width: 150px; flex: none; background: rgba(109, 106, 248, 0.18); }
 .launch-row .step-bar .op-bar-fill { background: var(--accent); }

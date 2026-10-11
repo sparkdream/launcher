@@ -4448,8 +4448,18 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
         // chain at 54). Evict every leftover namesake from the mesh before
         // anything starts, and refuse to start while a chain node's live
         // address is unknown, since its leftovers cannot be told apart.
-        const res = await sweepMeshStrays(spec, ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[], meshStrayDeps(ctx), activeOpKeys(ctx));
-        const blind = res.unsure.filter((k) => /^(val|sentry)-/.test(k));
+        // swap-image only waits for SSH, and a restarted container's
+        // tailscaled can take a while longer to rejoin, so give a blind
+        // node a couple of minutes before calling it off the mesh (the
+        // sweep is convergent, so re-running it is safe)
+        let res = await sweepMeshStrays(spec, ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[], meshStrayDeps(ctx), activeOpKeys(ctx));
+        let blind = res.unsure.filter((k) => /^(val|sentry)-/.test(k));
+        for (let i = 0; i < 12 && blind.length > 0; i++) {
+          ctx.log(`mesh address of ${blind.join(", ")} not readable yet, retrying in 10s`);
+          await ctx.services.sleep(10_000);
+          res = await sweepMeshStrays(spec, ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[], meshStrayDeps(ctx), activeOpKeys(ctx));
+          blind = res.unsure.filter((k) => /^(val|sentry)-/.test(k));
+        }
         if (blind.length > 0) {
           throw new Error(
             `cannot read the live mesh address of ${blind.join(", ")}, so leftover nodes by that name ` +

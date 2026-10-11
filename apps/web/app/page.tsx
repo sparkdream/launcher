@@ -2835,6 +2835,9 @@ export default function Page() {
         <span className="lbl">{s.name}</span>
         {progress && (
           <span className="step-progress" title={progressTitle(progress)}>
+            {/* what it is doing right now (a relayer link names the path and
+                handshake): the step name alone says nothing for minutes */}
+            <span className="step-progress-label">{progress.label}</span>
             {/* no target (archives that do not name their range): the caption
                 carries the height and the bar is left out rather than faked */}
             {progress.percent !== undefined && (

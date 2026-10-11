@@ -23,7 +23,7 @@ import {
   suggestedTopUp,
   type RelayChannel,
 } from "../src/relayer.js";
-import { relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
+import { bringupProgress, loggedBringup, relayerStatePath, type RelayerLinkOutput } from "../src/steps/relayer-link.js";
 import { fundAmount, fundStatus, lowWater, ownerAddressOn } from "../src/relayer-funds.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 import { detectChain, parseMinGasPrice, sisterFleets } from "../src/relayer-settings.js";
@@ -184,6 +184,36 @@ function ibcHermes(): string | null {
   }
 }
 
+describe("relayer bringup progress", () => {
+  const log = [
+    "=== importing relayer key for sparkdream-dev-1 ===",
+    "=== health check (timeout 60s) ===",
+    "",
+    "=== path dev-osmo: sparkdream-dev-1 <-> osmo-test-5 on transfer (ics20-1) ===",
+    "  creating client on sparkdream-dev-1 tracking osmo-test-5",
+    "  clients: sparkdream-dev-1/07-tendermint-3  osmo-test-5/07-tendermint-4000",
+    "  connections: sparkdream-dev-1/connection-2  osmo-test-5/connection-3000",
+    "  channels: sparkdream-dev-1/channel-1  osmo-test-5/channel-11841",
+    "",
+    "=== path dev-test: sparkdream-dev-1 <-> sparkdream-test-1 on transfer (ics20-1) ===",
+    "  creating connection",
+  ].join("\n");
+
+  it("names the path and the handshake under way, and counts finished paths", () => {
+    expect(bringupProgress(log, 2)).toEqual({
+      label: "relayer: path 2 of 2, creating connection",
+      done: 1,
+      percent: 50,
+    });
+  });
+
+  it("reads the stage before any path starts", () => {
+    expect(bringupProgress("=== health check (timeout 60s) ===\n", 1).label).toBe(
+      "relayer: health check (timeout 60s)",
+    );
+  });
+});
+
 describe("relayer on a fee-market chain", () => {
   it("follows the fee market, polls instead of the websocket, and takes its own gas margin", () => {
     const db = new ConductorDb(path.join(tmp(), "state.db"));
@@ -273,7 +303,7 @@ describe("relayer launch", () => {
     // the launcher's copy of bringup ran, not the image's: a fix to the
     // script reaches a relayer on an older hermes image
     expect(services.ssh.files.get(`${id}|/data/relayer/bin/relayer-bringup`)).toContain("client_is_current");
-    expect(services.ssh.execLog.some((e) => e.target === id && e.command === "/data/relayer/bin/relayer-bringup")).toBe(true);
+    expect(services.ssh.execLog.some((e) => e.target === id && e.command === loggedBringup("/data/relayer/bin/relayer-bringup"))).toBe(true);
     // mnemonics were uploaded for both chains (bringup deletes them there)
     expect(services.ssh.files.has(`${id}|/data/relayer/mnemonics/osmo-test-5.mnemonic`)).toBe(true);
     // the relayer's SDL tunnels resolved to sentry-0's tailnet IP at persist
