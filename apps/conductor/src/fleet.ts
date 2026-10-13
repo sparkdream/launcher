@@ -225,6 +225,7 @@ import {
   latestRestorable,
   lastDataBreak,
   deleteDataBackup,
+  abandonBackupCmd,
   type DataBackupParams,
   type DataRestoreParams,
   type DataBackupRecord,
@@ -4200,6 +4201,24 @@ export class FleetService {
         JSON.parse(op.params_json) as AddSentryParams,
       );
       if (note) warning = warning ? `${warning}; ${note}` : note;
+    }
+    // an abandoned backup must not leave its copy running on the node, or
+    // the node held (stopped) until the hold runs out
+    if (op.kind === "data-backup") {
+      this.db.setFleetOpProgress(opId, null);
+      this.db.deleteSetting(`data-backup-pending:${launch.id}`);
+      const key = (JSON.parse(op.params_json) as DataBackupParams).source;
+      const row = this.db.listFleetComponents(launch.id).find((c) => c.key === key);
+      try {
+        if (!row) throw new Error("no such component");
+        const out = await this.services.ssh.exec(this.sshTargetFor(launch, row), abandonBackupCmd());
+        if (!out.stdout.includes("stopped")) throw new Error("the stop did not finish");
+      } catch (e) {
+        const note =
+          `${key} could not be reached to stop the backup (${e instanceof Error ? e.message : String(e)}): ` +
+          "if it was held, its node starts by itself within 30 minutes";
+        warning = warning ? `${warning}; ${note}` : note;
+      }
     }
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error

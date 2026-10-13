@@ -643,6 +643,10 @@ export class FakeSsh {
   /** The bucket chain-data backups land in: bucket/prefix/name. */
   s3Objects = new Set<string>();
   backupFails = false;
+  /** host:port → MB the backup's tar has read; set = the copy hangs there, running. */
+  backupStalledAt = new Map<string, number>();
+  /** host:port → the check's tar samples, [MB read, seconds run]; the check runs until they are used up. */
+  verifyReads = new Map<string, Array<[number, number]>>();
   /** Nodes whose config.toml still says allow_duplicate_ip = false (host:port). */
   refusesDuplicateIp = new Set<string>();
   /** Backup/restore scripts die with their container on these nodes (/tmp emptied, no status). */
@@ -654,6 +658,7 @@ export class FakeSsh {
   backupStatus = new Map<string, string>();
   restoreStatus = new Map<string, string>();
   verifyStatus = new Map<string, string>();
+  verifyVerdict = new Map<string, string>();
   /** The next this-many backup uploads land corrupt in the bucket. */
   corruptUploads = 0;
   /** Corrupt objects: true = the bucket changed them (readback hash differs), false = the node uploaded them broken. */
@@ -755,6 +760,28 @@ export class FakeSsh {
     }
     // --- chain-data backups (data-backup.ts) and the entrypoint's hold ---
     if (command.includes("command -v $t")) return ok(this.backupToolsMissing);
+    if (command.includes("/tmp/sd-backup.pid") && command.includes("/tmp/sd-verify.pid") && command.includes("kill -TERM --")) {
+      // an aborted backup op: stop both scripts and remove the hold
+      for (const name of ["sd-verify", "sd-backup"]) {
+        if ((name === "sd-backup" ? this.backupStatus : this.verifyStatus).get(id) === "running") {
+          this.stoppedScripts.push(`${id}|${name}`);
+        }
+      }
+      this.backupStatus.set(id, "failed");
+      this.verifyStatus.set(id, "failed");
+      this.holds.delete(id);
+      if (this.heldContainers.delete(id)) this.started.add(id);
+      return ok("stopped");
+    }
+    if (command.includes("pgrep -x -P") && command.includes("/tmp/sd-backup.pid")) {
+      // "<MB read> <seconds tar has run>"
+      const mb = this.backupStalledAt.get(id);
+      return ok(mb === undefined ? "" : `${mb} 60`);
+    }
+    if (command.includes("pgrep -x -P") && command.includes("/tmp/sd-verify.pid")) {
+      const read = this.verifyReads.get(id)?.shift();
+      return ok(read === undefined ? "" : `${read[0]} ${read[1]}`);
+    }
     if (command.includes(".launcher-hold")) {
       if (command.startsWith("test -f")) return ok(this.holds.has(id) ? "held" : "");
       if (command.startsWith("rm -f")) {
@@ -779,6 +806,8 @@ export class FakeSsh {
       return ok();
     }
     if (command.includes("localhost:26657/status")) {
+      // a node held stopped serves no RPC
+      if (this.heldContainers.has(id)) return ok("");
       return ok(`{"result":{"sync_info":{"latest_block_height":"${this.chain.next()}"}}}`);
     }
     // the PID 1 probe (restartNode, the hold) answers only for wait mode; other
@@ -793,6 +822,10 @@ export class FakeSsh {
       return ok("stopped");
     }
     if (script && command.includes("kill -0")) {
+      // a check with samples left keeps running until the meter has read them all
+      if (script === "sd-verify" && this.verifyStatus.get(id) === "running" && !this.verifyReads.get(id)?.length) {
+        this.verifyStatus.set(id, this.verifyVerdict.get(id) ?? "done");
+      }
       const status = statusOf(script).get(id);
       return ok(`${status || "none"} ${status === "running" ? "alive" : "dead"}`);
     }
@@ -817,13 +850,16 @@ export class FakeSsh {
     if (command.includes("bash /tmp/sd-verify.sh")) {
       const env = this.envFile(id, "/tmp/sd-verify.env");
       const object = `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`;
-      this.verifyStatus.set(id, this.s3Objects.has(object) && !this.corruptObjects.has(object) ? "done" : "failed");
+      const verdict = this.s3Objects.has(object) && !this.corruptObjects.has(object) ? "done" : "failed";
+      this.verifyStatus.set(id, this.verifyReads.get(id)?.length ? "running" : verdict);
+      this.verifyVerdict.set(id, verdict);
       return ok();
     }
     if (command.includes("bash /tmp/sd-backup.sh")) {
       const env = this.envFile(id, "/tmp/sd-backup.env");
       if (this.started.has(id)) throw new Error("fake: backup taken while the node runs");
       if (this.scriptsDie.has(id)) this.backupStatus.delete(id);
+      else if (this.backupStalledAt.has(id)) this.backupStatus.set(id, "running");
       else if (this.backupFails) this.backupStatus.set(id, "failed");
       else {
         const object = `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}`;

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runWithSigner } from "../src/engine.js";
@@ -104,6 +104,8 @@ describe("taking a chain-data backup", () => {
 
     const [record] = dataBackups(w.db, "fl");
     expect(record!.from).toBe("sentry-1");
+    // read once, while the node ran; the held node does not answer
+    expect(record!.height).toBe(w.db.stepOutput<{ height: number }>("fl", `op${opId}:prepare`)!.height);
     expect(record!.genesisSha).toMatch(/^[0-9a-f]{64}$/);
     // read back and unpacked before it was recorded, with the upload's hash
     expect(record!.verified).toBe(true);
@@ -149,6 +151,11 @@ describe("taking a chain-data backup", () => {
     expect(w.services.ssh.containerRestarts.get(id)).toBe(2);
     expect(w.services.ssh.holds.has(id)).toBe(false);
     expect(dataBackups(w.db, "fl")).toHaveLength(1);
+    // the node ran on between the tries: the record names the height copied, not prepare's
+    const prepared = w.db.stepOutput<{ height: number }>("fl", `op${opId}:prepare`)!.height;
+    const [record] = dataBackups(w.db, "fl");
+    expect(record!.height).toBeGreaterThan(prepared);
+    expect(record!.name).toBe(`${record!.name.replace(/-h\d+\.tar\.zst\.age$/, "")}-h${record!.height}.tar.zst.age`);
   }, 240_000);
 
   it("a copy that dies with its container is stopped, released and paused, not waited on forever", async () => {
@@ -162,6 +169,84 @@ describe("taking a chain-data backup", () => {
     expect(w.services.ssh.stoppedScripts).toContain(`${id()}|sd-backup`);
     expect(w.services.ssh.holds.has(id())).toBe(false);
     expect(dataBackups(w.db, "fl")).toEqual([]);
+  }, 180_000);
+
+  it("a copy that stops reading is given up after ten minutes, not waited on for hours", async () => {
+    const w = await launched();
+    const id = sshId(w, "sentry-1");
+    // 2026-10-12: tar sat at 33 MB behind a hung uploader, the script alive
+    w.services.ssh.backupStalledAt.set(id, 33);
+    w.services.ssh.dataUsageMb.set(id, 1450);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const labels: Array<{ label: string; percent?: number | undefined }> = [];
+      w.services.sleep = async (ms: number) => {
+        vi.setSystemTime(Date.now() + ms);
+        const progress = w.db.listFleetOps("fl").find((o) => o.kind === "data-backup")?.progress_json;
+        if (progress) labels.push(JSON.parse(progress) as { label: string; percent?: number });
+      };
+      const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+      const parked = await driveOps(w);
+      // how far the copy got, out of the data directory's size
+      expect(labels.at(-1)).toMatchObject({
+        label: "copying sentry-1's chain data to the bucket (33 of 1,450 MB, waiting on the upload)",
+        percent: 2.3,
+      });
+      // the pace over tar's whole run (33 MB in 60s), whatever the watch saw
+      expect(labels[0]).toMatchObject({
+        label: "copying sentry-1's chain data to the bucket (33 of 1,450 MB)",
+        etaSeconds: Math.round((1450 - 33) / (33 / 60)),
+      });
+      expect(parked.failedStep).toBe(`op${opId}:upload`);
+      expect(parked.reason).toContain("no progress for 10 minutes (stuck at 33 MB)");
+      expect(w.services.ssh.stoppedScripts).toContain(`${id}|sd-backup`);
+      expect(w.services.ssh.holds.has(id)).toBe(false);
+      expect(w.services.ssh.started.has(id)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 180_000);
+
+  it("shows how far the check has read the backup back", async () => {
+    const w = await launched();
+    const id = sshId(w, "sentry-1");
+    w.services.ssh.dataUsageMb.set(id, 1000);
+    w.services.ssh.verifyReads.set(id, [[100, 20], [400, 50], [400, 65]]);
+    const seen: Array<{ label: string; percent?: number; etaSeconds?: number }> = [];
+    w.services.sleep = async () => {
+      const progress = w.db.listFleetOps("fl").find((o) => o.kind === "data-backup")?.progress_json;
+      if (progress) seen.push(JSON.parse(progress) as { label: string });
+    };
+    w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    const check = seen.filter((s) => s.label.startsWith("reading the backup back"));
+    expect(check.map((s) => s.label.replace(/^.*\(/, "("))).toEqual([
+      "(100 of 1,000 MB)",
+      "(400 of 1,000 MB)",
+      "(400 of 1,000 MB, waiting on the download)",
+    ]);
+    expect(check[1]).toMatchObject({ percent: 40, etaSeconds: 75 });
+    expect(dataBackups(w.db, "fl")[0]!.verified).toBe(true);
+  }, 180_000);
+
+  it("aborting stops the copy on the node and lets it start again", async () => {
+    const w = await launched();
+    const id = sshId(w, "sentry-1");
+    w.services.ssh.backupStalledAt.set(id, 33);
+    const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    let polls = 0;
+    w.services.sleep = async () => {
+      if (++polls === 3) {
+        expect(w.services.ssh.holds.has(id)).toBe(true);
+        await w.fleet.requestAbortOp(w.db.getLaunch("fl")!, opId);
+      }
+    };
+    await driveOps(w);
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("aborted");
+    expect(w.services.ssh.stoppedScripts).toContain(`${id}|sd-backup`);
+    expect(w.services.ssh.holds.has(id)).toBe(false);
+    expect(w.services.ssh.started.has(id)).toBe(true);
+    expect(w.db.getSetting("data-backup-pending:fl")).toBeFalsy();
   }, 180_000);
 
   it("refuses to hold a node in wait mode instead of restarting it into nothing", async () => {

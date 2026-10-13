@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { chainId, type LaunchSpec } from "@sparkdream/launch-spec";
-import type { ConductorDb, FleetComponentRow } from "./db.js";
+import type { ConductorDb, FleetComponentRow, FleetOpProgress } from "./db.js";
 import { AwaitUser, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { componentRow, rowTarget, refreshSshEndpoints } from "./fleet-ops.js";
 import { NODE_HOME, NODE_RUNNING_PROBE } from "./node-ops.js";
@@ -396,6 +396,80 @@ const MAX_COPY_SECS = 12 * 3600;
 const RESTORE_STALL_SECS = 20 * 60;
 /** Consecutive failed polls (15s apart) before the launcher stops waiting on a node. */
 const MAX_POLL_ERRORS = 20;
+/**
+ * A backup copy that read nothing new for this long is given up: 2026-10-12
+ * a devnet upload sat for over 15 minutes with tar stopped at 33 MB (the
+ * uploader hung on a part, holding up the pipe) while the script stayed
+ * alive, which the watch would have waited on for 12 hours.
+ */
+const UPLOAD_STALL_SECS = 10 * 60;
+
+/**
+ * "<MB read> <seconds running>" for the tar a launcher script runs as a
+ * direct child (the backup's tar reading the data dir, the check's tar
+ * walking the unpacked stream), from /proc: reads served from the page
+ * cache count too, and the age lets a re-attached watch (a conductor
+ * restart) still work out the pace of the whole copy. Prints nothing once
+ * tar has exited.
+ */
+export const tarProgressCmd = (script: string) =>
+  `p=$(cat /tmp/${script}.pid 2>/dev/null); [ -n "$p" ] && for t in $(pgrep -x -P "$p" tar 2>/dev/null); do ` +
+  `hz=$(getconf CLK_TCK 2>/dev/null || echo 100); up=$(cut -d' ' -f1 /proc/uptime); ` +
+  `echo "$(awk '/^rchar:/ { print int($2 / 1048576) }' /proc/$t/io 2>/dev/null) ` +
+  `$(awk -v up="$up" -v hz="$hz" '{ print int(up - $22 / hz) }' /proc/$t/stat 2>/dev/null)"; break; done; true`;
+
+/**
+ * Follows a script's tar against the size of the node's data dir, for the
+ * step's progress: a share, a time left, and whether the read is waiting on
+ * the network (tar stops while the uploader or the download catches up,
+ * so a count that does not move between polls is usually that, not a hang).
+ */
+async function tarMeter(ctx: StepCtx, target: () => SshTarget, script: string) {
+  // du counts disk blocks, so the read can end a little off it
+  const totalMb =
+    Number(
+      (
+        await ctx.services.ssh
+          .exec(target(), `du -sm ${NODE_HOME}/data 2>/dev/null | cut -f1`)
+          .catch(() => ({ stdout: "" }))
+      ).stdout.trim(),
+    ) || 0;
+  let latest: { mb: number; secs: number } | undefined;
+  let shown = -1;
+  return {
+    /** watchScript's progressMb */
+    async sample(): Promise<number | null> {
+      const out = (await ctx.services.ssh.exec(target(), tarProgressCmd(script))).stdout.trim();
+      const m = /^(\d+) (\d+)$/.exec(out);
+      if (!m) return null;
+      latest = { mb: Number(m[1]), secs: Number(m[2]) };
+      return latest.mb;
+    },
+    /** progress fields for the copy so far; `waiting` names what a pause waits on */
+    fields(label: string, mb: number, waiting: string): Pick<FleetOpProgress, "label" | "percent" | "etaSeconds"> {
+      if (mb <= 0) return { label };
+      const done = totalMb > 0 ? Math.min(mb, totalMb) : mb;
+      const still = mb === shown && done < totalMb;
+      shown = mb;
+      const of = totalMb > 0 ? ` of ${totalMb.toLocaleString("en-US")}` : "";
+      // the pace over tar's whole run, not since this watch began
+      const rate = latest && latest.secs > 0 ? latest.mb / latest.secs : 0;
+      return {
+        label: `${label} (${done.toLocaleString("en-US")}${of} MB${still ? `, ${waiting}` : ""})`,
+        ...(totalMb > 0 ? { percent: Math.round((done / totalMb) * 1000) / 10 } : {}),
+        ...(totalMb > done && rate > 0 ? { etaSeconds: Math.round((totalMb - done) / rate) } : {}),
+      };
+    },
+  };
+}
+
+/**
+ * Stop whatever an abandoned backup op left on its node (the copy, or the
+ * check reading it back) and remove the hold so the node starts again.
+ */
+export const abandonBackupCmd = () =>
+  `${stopScriptCmd("sd-verify", "rm -f /tmp/sd-verify.age")} >/dev/null; ` +
+  stopScriptCmd("sd-backup", `rm -f ${HOLD_FILE}`);
 
 /**
  * Start a detached launcher script (/tmp/<name>.sh) in its own session, so
@@ -452,7 +526,7 @@ async function watchScript(
   ctx: StepCtx,
   target: () => SshTarget,
   name: string,
-  opts: { maxSecs: number; progressMb?: () => Promise<number>; stallSecs?: number; tick?: (secs: number, mb: number) => Promise<void> | void },
+  opts: { maxSecs: number; progressMb?: () => Promise<number | null>; stallSecs?: number; tick?: (secs: number, mb: number) => Promise<void> | void },
 ): Promise<string | null> {
   const started = Date.now();
   let errors = 0;
@@ -472,7 +546,9 @@ async function watchScript(
       if (!alive) return "the copy stopped without finishing (its container restarted?)";
       if (opts.progressMb) {
         const now = await opts.progressMb();
-        if (now > mb) {
+        // no measure right now (e.g. the read side has finished): not a stall
+        if (now === null) grewAt = Date.now();
+        else if (now > mb) {
           mb = now;
           grewAt = Date.now();
         } else if (opts.stallSecs && Date.now() - grewAt > opts.stallSecs * 1000) {
@@ -521,11 +597,7 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
           );
         }
         // the height the copy will hold: the node's own, read while it runs
-        const status = await ctx.services.ssh
-          .exec(target(ctx), "curl -s -m 5 localhost:26657/status")
-          .catch(() => ({ stdout: "" }));
-        const height = Number(/"latest_block_height":"(\d+)"/.exec(status.stdout)?.[1] ?? 0);
-        return { height };
+        return { height: await nodeHeight(ctx, target(ctx)) };
       },
     },
     holdStep(p, key),
@@ -533,13 +605,21 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
       name: p("upload"),
       async run(ctx) {
         const storage = dataBackupStorage(spec, ctx.dirs.secrets)!;
-        const { height } = ctx.output<{ height: number }>(p("prepare"))!;
+        let { height } = ctx.output<{ height: number }>(p("prepare"))!;
         const keys = ctx.output<GenerateKeysOutput>("generate-keys")!;
-        let name = ctx.output<{ name?: string }>(p("upload"))?.name;
+        // a copy picked back up (a conductor restart) has no step output yet
+        const pendingRecord = ctx.db.getSetting(`data-backup-pending:${ctx.launchId}`);
+        let name =
+          ctx.output<{ name?: string }>(p("upload"))?.name ??
+          (pendingRecord ? (JSON.parse(pendingRecord) as DataBackupRecord).name : undefined);
         const state = await scriptState(ctx, target(ctx), "sd-backup");
         if (!(state.status === "done" || (state.status === "running" && state.alive))) {
           // a resumed copy (the last one failed and let the node start) must
-          // stop it again: never copy a data directory that is changing
+          // stop it again: never copy a data directory that is changing. The
+          // node has moved on since prepare (2026-10-12: a resume hours later
+          // copied height 124488 under prepare's 96468), so read it again
+          // first; a node still held has not moved, and keeps prepare's.
+          height = (await nodeHeight(ctx, target(ctx))) || height;
           await ensureHeld(ctx, key);
           const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
           name = `data-${stamp}-h${height}.tar.zst.age`;
@@ -565,16 +645,19 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
           ctx.db.setSetting(`data-backup-pending:${ctx.launchId}`, JSON.stringify(record));
           await ctx.services.ssh.exec(target(ctx), startScriptCmd("sd-backup"));
         }
+        const meter = await tarMeter(ctx, () => target(ctx), "sd-backup");
         const failure =
           state.status === "done"
             ? null
             : await watchScript(ctx, () => target(ctx), "sd-backup", {
                 maxSecs: MAX_COPY_SECS,
-                // keep the node held while the copy runs, and say how long it has been
-                tick: async (secs) => {
+                stallSecs: UPLOAD_STALL_SECS,
+                progressMb: () => meter.sample(),
+                // keep the node held while the copy runs, and say how far it has got
+                tick: async (secs, mb) => {
                   await refreshHold(ctx).catch(() => undefined);
                   ctx.db.setFleetOpProgress(opId, {
-                    label: `copying ${key}'s chain data to the bucket`,
+                    ...meter.fields(`copying ${key}'s chain data to the bucket`, mb, "waiting on the upload"),
                     elapsedSeconds: secs,
                     updatedAt: new Date().toISOString(),
                   });
@@ -657,14 +740,21 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
         await uploadText(ctx, target(), "/tmp/sd-verify.sh", VERIFY_SCRIPT);
         await ctx.services.ssh.exec(target(), startScriptCmd("sd-verify"));
       }
+      // the check unpacks the whole stream: as much as the data dir holds
+      const meter = await tarMeter(ctx, target, "sd-verify");
       const failure =
         state.status === "done"
           ? null
           : await watchScript(ctx, target, "sd-verify", {
               maxSecs: MAX_COPY_SECS,
-              tick: (secs) => {
+              progressMb: () => meter.sample(),
+              tick: (secs, mb) => {
                 ctx.db.setFleetOpProgress(opId, {
-                  label: `reading the backup back from the bucket to check it (${key} keeps running)`,
+                  ...meter.fields(
+                    `reading the backup back from the bucket to check it (${key} keeps running)`,
+                    mb,
+                    "waiting on the download",
+                  ),
                   elapsedSeconds: secs,
                   updatedAt: new Date().toISOString(),
                 });
@@ -710,6 +800,14 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
       );
     },
   };
+}
+
+/** The node's latest block height, or 0 when it is not running (held) or does not answer. */
+async function nodeHeight(ctx: StepCtx, target: SshTarget): Promise<number> {
+  const status = await ctx.services.ssh
+    .exec(target, "curl -s -m 5 localhost:26657/status")
+    .catch(() => ({ stdout: "" }));
+  return Number(/"latest_block_height":"(\d+)"/.exec(status.stdout)?.[1] ?? 0);
 }
 
 const nodeTarget = (ctx: StepCtx, key: string) => rowTarget(ctx, componentRow(ctx, key));
