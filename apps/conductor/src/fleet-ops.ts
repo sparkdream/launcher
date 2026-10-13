@@ -1858,6 +1858,11 @@ export function relaunchSteps(
           const probe = await ctx.services.ssh.exec(rowTarget(ctx, row), "echo zombie-probe");
           if (probe.stdout.includes("zombie-probe") && disabled === "yes") {
             ctx.log(`${key}: the old container still answers after the close, but its node was disabled before it`);
+          } else if (probe.stdout.includes("zombie-probe") && !/^(val|sentry)-/.test(key)) {
+            // only a chain node is dangerous left running (double-sign, old
+            // blocks on the mesh); a service like the explorer holds no chain
+            // state, and some providers (cpu.dal.aes) keep closed leases up
+            ctx.log(`${key}: the old container still answers after the close; not a chain node, continuing`);
           } else if (probe.stdout.includes("zombie-probe")) {
             throw new AwaitUser(
               p("close"),
