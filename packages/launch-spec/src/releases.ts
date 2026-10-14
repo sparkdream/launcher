@@ -20,6 +20,125 @@ export interface ChainRelease {
 
 export const CHAIN_RELEASES: ChainRelease[] = [
   {
+    "version": "v1.0.54",
+    "commit": "d6847916b36961c961f762e5a480cf63ade3a413",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.54",
+        "digest": "sha256:bcb7f06e74560c470ada4d8af36fccf4a6a0f232c161c4773684219c4a3ea474"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.54"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.54",
+        "digest": "sha256:42195d6972fcae58ea946ddab37087bdff01b8a0fdd0ef2182162c3d73bf0901"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.53",
+    "commit": "e380b1351ef7c5068763607481c903db3dac7627",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.53",
+        "digest": "sha256:1e11c0bd772a58cda123d1ba18cef740608b5d3d88e8ea3e503bacef063eeb0e"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.53"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.53",
+        "digest": "sha256:42c9f0a24145c69b95f9a4809075ea7c8887b6cf0e18925edd8c5d40bea3b0cd"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.52",
+    "commit": "3e142c575938419dd3f89ae88c87d919888184fc",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.52",
+        "digest": "sha256:77c9a6858e707d11f70e37fe2246df0983929044736f61fa4baf1565a15a1ebb"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.52"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.52",
+        "digest": "sha256:75965f5d311531a1a7cade69055cd94430fbad0660ce59d443c5378b761427de"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.51",
+    "commit": "07df4a9c5e381f5c749a3dc47b6d30f3b4f5a176",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.51",
+        "digest": "sha256:f2c573a07abb0ed5511befe1fe5aa047075ce12b544329347249ac298e8260e8"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.51"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.51",
+        "digest": "sha256:5dbb6fe021f0638f0f53d5e986684a071adae79a25aa551e2b88a6408252b976"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.50",
+    "commit": "87bfb384ba2326800a521b31865a5c48eda6a3ed",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.50",
+        "digest": "sha256:0a9795930f259621684a210a113755bfc90bc8ef177250af8a84306b9a214b05"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.50"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.50",
+        "digest": "sha256:06dc54a019f53f966bbdcd2f169f79750c79428e67c7bf16846069b095a8171a"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.49",
+    "commit": "c8e68c68cb9b33e78f9df66295d76abbacf07771",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.49",
+        "digest": "sha256:731fe5a3db50709a38c333804aaa0947726c4c0fb6e865565c306680915e45bd"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.49"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.49",
+        "digest": "sha256:6d5f63b84e7498f6f891936b99aa31e19fa44ec861aabaf8c487677edf1956cb"
+      }
+    ]
+  },
+  {
+    "version": "v1.0.48",
+    "commit": "a1dff972867391e740a34fb60057ab9b1f929ce4",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.48",
+        "digest": "sha256:83fed906a714cd1743e4e30e8a9a110ba37a919e62fbeaebc939e25882592ebe"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.48"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.48",
+        "digest": "sha256:f13a1b92a24eb5ed8607fa7b3ca460765bd92f80694d0d32ad84f6dcfbe027c9"
+      }
+    ]
+  },
+  {
     "version": "v1.0.47",
     "commit": "2fe1ec1e15fb9e1abd78ac4d596c38db94bc9a23",
     "images": [
