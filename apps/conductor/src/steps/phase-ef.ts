@@ -9,6 +9,7 @@ import { TypeUrl } from "@sparkdream/akash-tx";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { linkPeersStep, linkRelayerStep } from "./relayer-link.js";
 import { configureMastodonStep, linkStandaloneBridge } from "./mastodon.js";
+import { configureScannerStep } from "./scanner.js";
 import { configureVerifierStep } from "./verifier.js";
 import { descriptorFor } from "../components/index.js";
 import { useNtfyForAlerts } from "../components/ntfy.js";
@@ -1125,6 +1126,7 @@ export function phaseEFSteps(): StepDef[] {
     configureBridgeStep,
     // verifier (no-op without one): its federation-verifier bond
     configureVerifierStep,
+    configureScannerStep,
     // the alerts server (no-op without one): the launcher's alerts go to it
     configureNtfyStep,
     finalizeStep,

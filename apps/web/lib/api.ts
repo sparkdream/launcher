@@ -774,7 +774,7 @@ export async function getRelayerState(launchId: string): Promise<RelayerState> {
 
 /** A daemon's session grant (§5 session keys). */
 export interface SessionView {
-  role: "verifier" | "bridge" | string;
+  role: "verifier" | "bridge" | "scanner" | string;
   grantee: string;
   granter: string;
   chainId: string;
@@ -790,7 +790,7 @@ export interface SessionView {
 /** Rotate a daemon's session key now (sessions op); every one when no role. */
 export async function postRotateSessions(
   launchId: string,
-  role?: "verifier" | "bridge",
+  role?: "verifier" | "bridge" | "scanner",
 ): Promise<{ status: string; opId: number }> {
   return json(
     await afetch(`/api/fleet/${launchId}/sessions/rotate`, {

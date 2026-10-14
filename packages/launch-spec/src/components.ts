@@ -10,7 +10,7 @@ import type { LaunchSpec } from "./schema.js";
  * kind is an entry here plus a descriptor there — not a sweep for
  * `key === "explorer"`.
  */
-export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "hub", "ntfy", "battle"] as const;
+export const COMPONENT_KEYS = ["explorer", "frontend", "relayer", "mastodon", "verifier", "bridge", "scanner", "hub", "ntfy", "battle"] as const;
 export type ComponentKey = (typeof COMPONENT_KEYS)[number];
 
 export interface ComponentKind {
@@ -112,6 +112,19 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
     mesh: false,
     ssh: false,
     domain: false,
+    needsSentry: false,
+    needsLcd: false,
+    needsGrpc: false,
+  },
+  scanner: {
+    key: "scanner",
+    label: "Content scanner",
+    summary: "Checks labelled content and publishes signed verdicts",
+    // a client of this chain's public api, like the verifier, that serves its
+    // signed verdict feed itself on its own domain (contentscan CS_LISTEN)
+    mesh: false,
+    ssh: false,
+    domain: true,
     needsSentry: false,
     needsLcd: false,
     needsGrpc: false,

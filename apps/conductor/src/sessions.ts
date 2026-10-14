@@ -3,6 +3,7 @@ import path from "node:path";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { fleetBridge, sessionDays, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { BRIDGE_OPERATOR } from "./components/mastodon-secrets.js";
+import { SCANNER_OPERATOR } from "./components/scanner-secrets.js";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
 import { AwaitUser, WALLET_SIGNER, type StepCtx } from "./engine.js";
 import { sparkdreamd } from "./exec.js";
@@ -13,13 +14,14 @@ import { queryJson } from "./steps/phase-g.js";
 import { verifierMember, verifierTargetId } from "./verifier.js";
 
 /**
- * Session keys for the unattended daemons (§5 session keys). sdapverify and
- * sdapbridge run on providers the user does not control, so neither gets its
- * account's key: the verifier's member key holds a DREAM bond, the bridge
- * operator's the service bond. Each daemon instead signs with an x/session
+ * Session keys for the unattended daemons (§5 session keys). sdapverify,
+ * sdapbridge and contentscan run on providers the user does not control, so
+ * none gets its account's key: the verifier's member key holds a DREAM bond,
+ * the bridge and scanner operators' their service bonds. Each daemon instead signs with an x/session
  * SESSION_KEY grant from that account:
  *
- *   scope     one message type (MsgVerifyContent / MsgSubmitFederatedContent)
+ *   scope     one message type (MsgVerifyContent / MsgSubmitFederatedContent /
+ *             MsgSubmitCheckpoint)
  *   budget    spend_limit: the account pays the daemon's fees, up to this
  *   lifetime  the component's session.days, capped by the chain's
  *             max_expiration
@@ -46,7 +48,7 @@ import { verifierMember, verifierTargetId } from "./verifier.js";
  * on chain and delivers that same key rather than minting another.
  */
 
-export type SessionRole = "verifier" | "bridge";
+export type SessionRole = "verifier" | "bridge" | "scanner";
 
 /** Where the key file lives in each daemon's container. Both are on a
  *  persistent volume, so a container restart keeps the key. */
@@ -55,11 +57,13 @@ export const SESSION_KEY_FILE = "/data/session-key";
 const MSG_TYPES: Record<SessionRole, string[]> = {
   verifier: ["/sparkdream.federation.v1.MsgVerifyContent"],
   bridge: ["/sparkdream.federation.v1.MsgSubmitFederatedContent"],
+  scanner: ["/sparkdream.service.v1.MsgSubmitCheckpoint"],
 };
 
 /** The component a role's daemon runs in, and the SDL service inside it. */
 function HOST_OF(spec: LaunchSpec, role: SessionRole): { component: string; service: string } {
   if (role === "verifier") return { component: "verifier", service: "verifier" };
+  if (role === "scanner") return { component: "scanner", service: "scanner" };
   // a fleet's bridge is its Mastodon's sidecar, or a standalone component
   return fleetBridge(spec)?.kind === "standalone"
     ? { component: "bridge", service: "bridge" }
@@ -111,6 +115,7 @@ export function sessionRoles(spec: LaunchSpec): SessionRole[] {
   return [
     ...(c.verifier?.enabled ? (["verifier"] as const) : []),
     ...(fleetBridge(spec) ? (["bridge"] as const) : []),
+    ...(c.scanner?.enabled ? (["scanner"] as const) : []),
   ];
 }
 
@@ -119,7 +124,9 @@ function settings(spec: LaunchSpec, role: SessionRole): { days: number; spendLim
   const s =
     role === "verifier"
       ? spec.topology.components.verifier?.session
-      : fleetBridge(spec)?.link.session;
+      : role === "scanner"
+        ? spec.topology.components.scanner?.session
+        : fleetBridge(spec)?.link.session;
   return { days: sessionDays(spec, s), spendLimit: s?.spendLimit ?? "25000000" };
 }
 
@@ -189,11 +196,13 @@ async function granterActor(ctx: StepCtx, spec: LaunchSpec, role: SessionRole): 
       ? { chain: { ...chain, signer: { ...member.key, address: member.address } }, granter: member.address }
       : { chain: unsigned, granter: member.address };
   }
+  // the bridge and scanner operators: launcher keys in val-0's keyring
+  const operatorKey = role === "scanner" ? SCANNER_OPERATOR : BRIDGE_OPERATOR;
   const chain = await fleetActor(ctx, ctx.launchId, "this fleet");
   const { stdout } = await sparkdreamd([
-    "keys", "show", BRIDGE_OPERATOR, "-a", "--keyring-backend", "test", "--home", ctx.dirs.node("val-0"),
+    "keys", "show", operatorKey, "-a", "--keyring-backend", "test", "--home", ctx.dirs.node("val-0"),
   ]);
-  return { chain: { ...chain, signer: { home: ctx.dirs.node("val-0"), key: BRIDGE_OPERATOR, address: stdout.trim() } }, granter: stdout.trim() };
+  return { chain: { ...chain, signer: { home: ctx.dirs.node("val-0"), key: operatorKey, address: stdout.trim() } }, granter: stdout.trim() };
 }
 
 /** The grant as the chain has it, or undefined when it has none. */
@@ -484,7 +493,7 @@ export async function ensureSession(
       ctx,
       `session-${role}`,
       chain,
-      `fund ${role === "bridge" ? "the bridge operator" : "the verifier account"} ${granter} with ${topUp} ${chain.gasDenom} ` +
+      `fund ${{ bridge: "the bridge operator", scanner: "the scanner operator", verifier: "the verifier account" }[role]} ${granter} with ${topUp} ${chain.gasDenom} ` +
         `so it can grant its daemon's session key (it has ${have} spendable)`,
       [{ "@type": "/cosmos.bank.v1beta1.MsgSend", from_address: WALLET_SIGNER, to_address: granter, amount: [{ denom: chain.gasDenom, amount: topUp.toString() }] }],
       { signerRole: `an account holding ${chain.gasDenom}` },

@@ -341,6 +341,12 @@ topology:
   components:                        # non-node services
     explorer: { enabled: true, domain: explorer.sparkdream.io }
     frontend: { enabled: true, domain: app.sparkdream.io }
+      # optional anonymous-action prover pins (ZK_ASSETS_URL / ZK_VERSION /
+      # ZK_DIGESTS): one chain release's build/zk/<version>/ from the chain
+      # repo's prepare-release.sh, digests = its manifest.json "files" (all
+      # four; needs version). Unset, the UI follows the node's version and
+      # trusts that release's own manifest.
+      # prover: { version: v1.0.53, digests: { shield.wasm: <sha256>, ... } }
     hub:      { enabled: false }     # landing page usually already live
   publicEndpoints:                   # sentry-0 serves these via accept-domain
     api: api.sparkdream.io           # ingress (LCD 1317; flips the sentry's
@@ -1757,18 +1763,63 @@ The same wallet and launcher still hold both the bridge's and the verifier's
 keys, so this is host independence, not operator independence. validate-spec
 says so. A verifier run by another member remains the independent check.
 
+### Content scanner (component `scanner`)
+
+`contentscan` (the `sdap` image) follows this fleet's chain through its
+public api. It judges media-labelled content and the URLs inside rendered
+bodies, and appends signed verdicts to a static feed. Frontends hold a
+flagged body behind "Being checked" until enough trusted scanners call it
+clean. The chain side is the chain repo's `docs/content-scanning.md`.
+
+- **Serves its own feed.** An Akash volume belongs to one service, so a
+  sidecar web server could not read the feed. The worker serves
+  `/data/feed` itself (`CS_LISTEN=:8080`, exposed as 80 on
+  `scanner.domain`), and `ingress()` health-checks
+  `https://<domain>/manifest.json`. The state file and verdict key live
+  beside the feed directory, never inside it; contentscan refuses to start
+  otherwise.
+- **Operator.** Frontends trust only ACTIVE x/service `content-scanner`
+  operators, reading each one's verdict key and feed URL from its operator
+  metadata. A launcher-held `scanner-operator` key (master keyring and
+  `mnemonics.json`, kept across a chain reset, like `bridge-operator`) signs
+  `MsgRegisterOperator` itself; the chain refuses delegation for it. It
+  bonds the service type's `min_bond_amount` under `scanner.controller`, a
+  commons group name (default: Commons Operations Committee) resolved to its
+  policy address, or an address. Genesis funds the operator with
+  `scanner.genesisBalance`. A scanner added later pauses for a wallet
+  `MsgSend` of the bond, gas and session reserve.
+- **Verdict key.** The ed25519 seed is generated once into
+  `secrets/scanner.json`. It reaches the container as `CS_VERDICT_SEED`,
+  which the start command writes to `/data/verdict.key` and unsets. The key
+  outlives moves, so the published metadata stays valid. A fresh volume
+  starts an empty feed, which the worker refills by re-judging from the
+  chain.
+- **Configure.** `register-scanner` (the `configure-scanner` launch step,
+  or `configureSteps` after a placement) registers the operator once. On
+  later runs it only re-publishes metadata that drifted (a retargeted
+  domain changes the feed URL) with `MsgUpdateMetadata`. An UNBONDING
+  operator pauses; an UNDERFUNDED one is logged.
+- **Checkpoints.** The worker signs `MsgSubmitCheckpoint` through a session
+  key (below) granted by the operator. Until the key arrives and the
+  operator is registered, checkpoints fail and are retried while the feed
+  fills.
+- **Classifier.** Without `scanner.classifierUrl`, text-only content clears
+  but media stays unchecked; validate-spec warns.
+
 ### Session keys for the daemons (`sessions.ts`, op `sessions`)
 
-`sdapverify` and `sdapbridge` run unattended on providers the user does not
-control. Their accounts' own keys stay in the launcher: the verifier's member
-key holds a DREAM bond and the bridge operator's key holds the service bond.
+`sdapverify`, `sdapbridge` and `contentscan` run unattended on providers the
+user does not control. Their accounts' own keys stay in the launcher: the
+verifier's member key holds a DREAM bond, and the bridge and scanner
+operators' keys hold their service bonds.
 Each daemon instead signs with an x/session SESSION_KEY grant from its
 account. The daemon wraps every message in `MsgExecSession`, and the account
 pays its fees from the grant's budget (chain repo `internal/sdaptx`, env
-`SDA_SESSION_KEY_FILE` + `SDA_GRANTER`).
+`SDA_SESSION_KEY_FILE` + `SDA_GRANTER`, or `CS_SESSION_KEY_FILE` + `CS_GRANTER`).
 
 - **Scope.** Each grant allows one message: `MsgVerifyContent` for the
-  verifier, `MsgSubmitFederatedContent` for the bridge. It has a fee budget
+  verifier, `MsgSubmitFederatedContent` for the bridge, `MsgSubmitCheckpoint`
+  for the scanner. It has a fee budget
   (`session.spendLimit`, 25 SPARK by default) and the chain's exec cap. A
   leaked key can send that one message until the budget, the cap or the
   expiry runs out, or until the grant is revoked.

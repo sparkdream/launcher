@@ -107,6 +107,45 @@ const componentToggle = z.object({
   domain: domain.optional(),
 });
 
+const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "lowercase sha256 hex");
+
+/**
+ * The frontend's anonymous-action prover (x/shield): shield.wasm and the
+ * ceremony keys, one directory per chain release (<assetsUrl>/<version>/,
+ * built by the chain repo's prepare-release.sh into build/zk/<version>/). A
+ * prover from another release makes proofs the chain rejects ("ZK proof
+ * verification failed"), so the UI refuses to prove when the wasm's version
+ * is not the node's. Rendered as ZK_ASSETS_URL / ZK_VERSION / ZK_DIGESTS.
+ */
+const frontendProver = z
+  .object({
+    /** Where the release directories are served: "/zk" in the image by
+     *  default, or a CORS-enabled bucket (https). */
+    assetsUrl: z
+      .string()
+      .regex(/^(\/[A-Za-z0-9._~/-]*|https:\/\/\S+)$/, "an absolute path or an https URL")
+      .optional(),
+    /** The release to load (e.g. "v1.0.53"). Unset, the node's own version
+     *  picks it, so a chain upgrade needs only the new directory published. */
+    version: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,64}$/)
+      .optional(),
+    /** Pinned sha256 of each file: the "files" of that release's
+     *  manifest.json. Unset, the UI trusts the release's own manifest, which
+     *  catches a stale or corrupt file but not a tampered directory. */
+    digests: z
+      .object({
+        "shield.wasm": sha256Hex,
+        "wasm_exec.js": sha256Hex,
+        "proving_key.raw.bin": sha256Hex,
+        "circuit.r1cs": sha256Hex,
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 /**
  * The far end of a relay path: another fleet on this launcher (resolved at
  * launch creation to its chain id, prefix, gas denom and sentry-0, and
@@ -450,6 +489,39 @@ const verifierComponent = z.object({
 });
 
 /**
+ * A content scanner (contentscan, the sdap image): follows this chain over
+ * its public api, judges media-labelled content and the URLs inside it, and
+ * publishes signed verdicts in a static feed it serves on `domain`
+ * (docs/content-scanning.md in the chain repo). Frontends trust a verdict only
+ * from an ACTIVE x/service content-scanner operator, so the launcher
+ * registers one: a launcher-held operator key bonds the service type's
+ * min_bond under `controller`, publishes the verdict key and feed URL as
+ * operator metadata, and grants the daemon a session key for its feed
+ * checkpoints. The verdict signing key is generated once and kept with the
+ * launch's secrets, so a move keeps the operator's published key valid.
+ */
+const scannerComponent = z.object({
+  enabled: z.boolean(),
+  /** Where the verdict feed is served (its manifest.json at the root). */
+  domain: domain.optional(),
+  /** The council that hires and disciplines the operator (x/service
+   *  controller): a commons group name, or its policy address. */
+  controller: z.string().min(1).default("Commons Operations Committee"),
+  /** Genesis balance for the scanner operator, in the base denom: the
+   *  operator bond (content-scanner min_bond, 100 SPARK by default) plus
+   *  gas and the session key's fee budget. */
+  genesisBalance: z.string().regex(/^[0-9]+$/).default("150000000"),
+  /** Model server for media (CS_CLASSIFIER_URL). Without one, text-only
+   *  content is still judged clean, but media stays unchecked. */
+  classifierUrl: z.string().url().optional(),
+  /** Ruleset version stamped into verdicts and the operator metadata. */
+  rulesetVersion: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("v1"),
+  /** contentscan signs its checkpoints through this session key; the
+   *  operator's own key (it controls the bond) stays with the launcher. */
+  session: sessionKey.default({}),
+});
+
+/**
  * Per component group provider rules (§6). `exclude` entries are either an
  * akash1... provider owner address (exact match) or a case-insensitive
  * substring of the provider's hostname (parsed from its hostUri). Matching is
@@ -644,12 +716,13 @@ export const launchSpecSchema = z.object({
           .regex(/^[a-z0-9-]+$/i)
           .optional(),
       }),
-      frontend: componentToggle,
+      frontend: componentToggle.extend({ prover: frontendProver.optional() }),
       hub: componentToggle,
       relayer: relayerComponent.optional(),
       mastodon: mastodonComponent.optional(),
       verifier: verifierComponent.optional(),
       bridge: bridgeComponent.optional(),
+      scanner: scannerComponent.optional(),
       ntfy: ntfyComponent.optional(),
       battle: componentToggle.optional(),
     }),
@@ -716,6 +789,7 @@ export const launchSpecSchema = z.object({
         mastodon: componentProviderRules.optional(),
         verifier: componentProviderRules.optional(),
         bridge: componentProviderRules.optional(),
+        scanner: componentProviderRules.optional(),
         ntfy: componentProviderRules.optional(),
         battle: componentProviderRules.optional(),
       })
@@ -794,6 +868,8 @@ export const launchSpecSchema = z.object({
     verifier: z.string().optional(),
     /** sdapbridge (the standalone bridge component): the sdap image by default. */
     bridge: z.string().optional(),
+    /** contentscan (the scanner component): the sdap image by default. */
+    scanner: z.string().optional(),
     /** The ntfy server (upstream binwiederhier/ntfy). */
     ntfy: z.string().optional(),
     /** The battle royale game server (sparkdreamnft/battle-royale). */

@@ -45,6 +45,7 @@ import { fleetPeer, peerRow, relayedBy, sisterChainApis } from "./relayer.js";
 import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
 import { reconcileSessions, type SessionRole } from "./sessions.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
+import { ensureScannerOperatorKey } from "./steps/scanner.js";
 import { fleetResolver } from "./verifier.js";
 import { deploymentInfoWithRetry, forwardedVerdict, ingressHost, ingressVerdict, pushManifest, wireValidatorPeers } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
@@ -1106,6 +1107,8 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
       if ((key === "mastodon" && spec.topology.components.mastodon?.bridge?.enabled) || key === "bridge") {
         await ensureBridgeOperatorKey(ctx.dirs.secrets, ctx.dirs.node("val-0"));
       }
+      // likewise a scanner's: its SDL carries the operator's address
+      if (key === "scanner") await ensureScannerOperatorKey(ctx.dirs.secrets, ctx.dirs.node("val-0"));
       renderComponentSdl({
         spec,
         peerChains: sisterChainApis(ctx.db, ctx.launchId, spec),

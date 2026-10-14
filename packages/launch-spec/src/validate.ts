@@ -678,6 +678,16 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       "frontend needs public api + rpc domains (LCD/RPC served by sentry-0 via accept-domain ingress)",
     );
   }
+  // Digests pin one release's files; without a pinned version the UI follows
+  // the node's version, and the first chain upgrade would load a release the
+  // digests do not describe, refusing every anonymous action.
+  const prover = comps.frontend.prover;
+  if (prover?.digests && !prover.version) {
+    err(
+      "topology.components.frontend.prover.version",
+      "pinned prover digests describe one release: set the version they were built for",
+    );
+  }
   // Relayer (one Hermes process, many paths). Fleet counterparties are
   // resolved and mesh-checked by the conductor at launch creation, where the
   // other launch is visible; everything checkable from the spec alone is here.
@@ -845,6 +855,22 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
         : "the verifier runs on its own deployment and provider, but the same wallet and launcher hold its key and " +
             "the bridge's: host independence only. A verifier run by another member is the independent one",
     );
+  }
+
+  // Scanner: its controller is resolved on chain by the conductor
+  const scanner = comps.scanner;
+  if (scanner?.enabled) {
+    if (!pub?.api) err("topology.publicEndpoints.api", "the scanner reads and checkpoints through the public api domain");
+    const ctl = scanner.controller;
+    if (/^[a-z]+1[02-9ac-hj-np-z]{38,58}$/.test(ctl) && !ctl.startsWith(`${spec.network.bech32Prefix}1`)) {
+      err("topology.components.scanner.controller", `"${ctl}" is not a ${spec.network.bech32Prefix} address`);
+    }
+    if (!scanner.classifierUrl) {
+      warn(
+        "topology.components.scanner.classifierUrl",
+        "no classifier: the scanner clears text-only content, but media (images, video) stays unchecked",
+      );
+    }
   }
 
   if ((pub?.api || pub?.rpc) && S === 0) {

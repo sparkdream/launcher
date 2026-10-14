@@ -227,6 +227,20 @@ topology:
     #   # session: { days: 90, spendLimit: "25000000" }
     #   # target: { fleet: <launch id or network name> }
     #   # alarmWebhook: https://hooks.example.com/sdapverify
+    # Content scanner (contentscan): judges media-labelled content and
+    # publishes signed verdicts at https://<domain>/ that frontends read
+    # before showing it. Registers as an x/service content-scanner operator
+    # with a launcher-held key (funded in genesis with genesisBalance, or
+    # asked for when added later), bonding the service type's min_bond under
+    # controller (a commons group name or policy address). Without a
+    # classifierUrl, text-only content clears but media stays unchecked. It
+    # checkpoints through a session key, renewed like the verifier's.
+    # scanner:
+    #   enabled: true
+    #   domain: scan.example.com
+    #   # controller: Commons Operations Committee
+    #   # classifierUrl: https://classifier.example.com/score
+    #   # session: { days: 90, spendLimit: "25000000" }
   # required when frontend is enabled — sentry-0 serves these domains:
   # publicEndpoints:
   #   api: api.example.com
@@ -1037,6 +1051,13 @@ export default function Page() {
                   : `add topology.components.${key} in the spec editor first (see the example spec), then add the ${COMPONENT_KINDS[key].label}`,
             );
           }
+        }
+        // the scanner's settings all have defaults: the spec editor's if it
+        // has some, else just the domain below
+        if (key === "scanner") {
+          const edited = yaml.load(specText) as any;
+          const fromSpec = edited?.topology?.components?.scanner;
+          settings = fromSpec && typeof fromSpec === "object" ? fromSpec : { enabled: true };
         }
         const domain =
           addForm.domain.trim() || (typeof settings?.domain === "string" ? (settings.domain as string) : undefined);
@@ -3965,6 +3986,14 @@ export default function Page() {
                       Its settings come from topology.components.{addForm.key} in the spec editor.
                     </div>
                   )}
+                  {addForm.key === "scanner" && (
+                    <div style={{ fontSize: 12, color: "#9a9bab" }}>
+                      The domain serves its verdict feed. It registers as a content-scanner operator under the
+                      Commons Operations Committee, bonding the service type's minimum (100 SPARK by default) from a
+                      launcher-held operator key you fund when asked. Controller, classifier and session settings come
+                      from topology.components.scanner in the spec editor, if set.
+                    </div>
+                  )}
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "12px 14px", background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.07)", borderRadius: 10 }}>
                     <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: ".06em", textTransform: "uppercase", color: "#9a9bab" }}>What happens</div>
@@ -6501,7 +6530,11 @@ export default function Page() {
                                   {(() => {
                                     // the daemon in this component signs through a session key
                                     const role =
-                                      c.key === "verifier" ? "verifier" : c.key === "mastodon" || c.key === "bridge" ? "bridge" : undefined;
+                                      c.key === "verifier" || c.key === "scanner"
+                                        ? c.key
+                                        : c.key === "mastodon" || c.key === "bridge"
+                                          ? "bridge"
+                                          : undefined;
                                     const session = role ? f.sessions?.find((x) => x.role === role) : undefined;
                                     if (!role || !session) return null;
                                     const days = Math.max(0, Math.floor((Date.parse(session.expiresAt) - Date.now()) / 86_400_000));

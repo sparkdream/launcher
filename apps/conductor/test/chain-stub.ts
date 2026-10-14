@@ -101,6 +101,9 @@ if (a0 === "query" && a1 === "rep" && a2 === "get-member") {
   const m = (st.members || {})[a3]; if (!m) fail("rpc error: code = NotFound desc = member not found"); out({ member: { address: a3, ...m } });
 }
 if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: { service_type: a3, min_bond_amount: "1000000000" } });
+if (a0 === "query" && a1 === "service" && a2 === "operator") {
+  const o = (chain.operators || {})[a3 + "/" + args[4]]; if (!o) fail("rpc error: code = NotFound desc = operator not found"); out({ operator: o });
+}
 if (a0 === "query" && a1 === "federation" && a2 === "get-bridge-binding") {
   const b = (chain.bindings || {})[a3 + "/" + args[4]]; if (!b) fail("rpc error: code = NotFound desc = binding not found"); out({ binding: b });
 }
@@ -138,6 +141,16 @@ if (a0 === "tx" && a1 === "broadcast") {
       if (!p || p.status !== "PEER_STATUS_ACTIVE") throw new Error("peer not active");
       chain.bindings ||= {};
       chain.bindings[m.operator + "/" + m.peer_id] = { operator: m.operator, peer_id: m.peer_id, endpoint: m.endpoint, stake: m.stake_amount, signer: doc.__from };
+    } else if (t === "MsgRegisterOperator") {
+      chain.operators ||= {};
+      const k = m.creator + "/" + m.service_type;
+      if (chain.operators[k]) throw new Error("operator already registered");
+      chain.operators[k] = { address: m.creator, service_type: m.service_type, controller: m.controller,
+        bond_amount: m.bond_amount, metadata: m.metadata, status: "OPERATOR_STATUS_ACTIVE", signer: doc.__from };
+    } else if (t === "MsgUpdateMetadata") {
+      const o = (chain.operators || {})[m.operator + "/" + m.service_type];
+      if (!o) throw new Error("operator not found");
+      o.metadata = m.new_metadata;
     } else if (t === "MsgBondRole") {
       if (st.dreamShort) throw new Error("insufficient DREAM balance to bond");
       const role = m.role_type === "ROLE_TYPE_FEDERATION_VERIFIER" ? "federation-verifier" : m.role_type;

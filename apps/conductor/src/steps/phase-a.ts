@@ -42,7 +42,9 @@ import { renderComponentSdl } from "../render-component-sdl.js";
 import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress, sisterChainApis } from "../relayer.js";
 import { descriptor } from "../components/index.js";
 import { BRIDGE_OPERATOR } from "../components/mastodon-secrets.js";
+import { SCANNER_OPERATOR } from "../components/scanner-secrets.js";
 import { ensureBridgeOperatorKey } from "./mastodon.js";
+import { ensureScannerOperatorKey } from "./scanner.js";
 import { fleetResolver } from "../verifier.js";
 import {
   bakedModeError,
@@ -285,11 +287,13 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
       mnemonics[`acct-${acct.name}`] = parsed.mnemonic;
     }
   }
-  // a chain reset rebuilds every account but the bridge operator's: the
-  // running bridge carries its address (SDA_GRANTER), so it keeps its key
+  // a chain reset rebuilds every account but the bridge and scanner
+  // operators': the running daemons carry their addresses (SDA_GRANTER,
+  // CS_GRANTER, and the scanner's feed), so they keep their keys
   const mnemonicsFile = path.join(dirs.secrets, "mnemonics.json");
   const previous: Record<string, string> = fs.existsSync(mnemonicsFile) ? JSON.parse(readSecretFile(mnemonicsFile)) : {};
   if (previous[BRIDGE_OPERATOR]) mnemonics[BRIDGE_OPERATOR] = previous[BRIDGE_OPERATOR];
+  if (previous[SCANNER_OPERATOR]) mnemonics[SCANNER_OPERATOR] = previous[SCANNER_OPERATOR];
   // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
   writeSecretFile(mnemonicsFile, JSON.stringify(mnemonics, null, 2));
   // the relayer's key (cosmjs-derived: other chains need other prefixes, so
@@ -298,6 +302,11 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
   // with the operator's own key; funded in genesis
   if (fleetBridge(spec)) {
     accounts[BRIDGE_OPERATOR] = await ensureBridgeOperatorKey(dirs.secrets, masterHome(ctx));
+  }
+  // the scanner bonds as a content-scanner operator with its own key; funded
+  // in genesis
+  if (spec.topology.components.scanner?.enabled) {
+    accounts[SCANNER_OPERATOR] = await ensureScannerOperatorKey(dirs.secrets, masterHome(ctx));
   }
   if (spec.topology.components.relayer?.enabled) {
     const mnemonic = await ensureRelayerMnemonic(dirs.secrets);
@@ -392,6 +401,11 @@ export async function buildGenesisFiles(
   const bridge = fleetBridge(spec)?.link;
   if (bridgeOperator && bridge) {
     await addGenesisAccount(bridgeOperator, bridge.genesisBalance);
+  }
+  const scannerOperator = keys.accounts[SCANNER_OPERATOR];
+  const scanner = spec.topology.components.scanner;
+  if (scannerOperator && scanner?.enabled) {
+    await addGenesisAccount(scannerOperator, scanner.genesisBalance);
   }
   const relayerAccount = keys.accounts[RELAYER_ACCOUNT];
   if (relayerAccount && spec.topology.components.relayer?.enabled) {

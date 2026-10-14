@@ -4507,7 +4507,8 @@ export class FleetService {
       this.db.createFleetOp(launch.id, "relink", {});
     }
     // the reset wipes what components set up on the chain (Mastodon's peer
-    // and its bridge's bond, this fleet's verifier's bond): redo it on the
+    // and its bridge's bond, this fleet's verifier's bond, the scanner's
+    // operator registration): redo it on the
     // deployments as they are, before the session grants below
     const staying = new Set(
       this.db.listFleetComponents(launch.id).filter((c) => c.state === "active").map((c) => c.key),
@@ -4517,6 +4518,7 @@ export class FleetService {
       ...(staying.has("mastodon") && comps.mastodon?.enabled && comps.mastodon.bridge?.enabled ? ["mastodon"] : []),
       ...(staying.has("bridge") && comps.bridge?.enabled ? ["bridge"] : []),
       ...(staying.has("verifier") && comps.verifier?.enabled && !comps.verifier.target ? ["verifier"] : []),
+      ...(staying.has("scanner") && comps.scanner?.enabled ? ["scanner"] : []),
     ];
     if (reconfigure.length > 0) {
       this.db.createFleetOp(launch.id, "reconfigure", { keys: reconfigure } satisfies ReconfigureParams);

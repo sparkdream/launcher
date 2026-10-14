@@ -206,28 +206,42 @@ export function activityPubPeerPolicy(authors?: { allow?: string[] | undefined; 
  * back: the operator keeps its address, which the running bridge's env and
  * the new genesis both carry.
  */
-export async function ensureBridgeOperatorKey(secretsDir: string, masterHome: string): Promise<string> {
+export function ensureBridgeOperatorKey(secretsDir: string, masterHome: string): Promise<string> {
+  return ensureOperatorKey(secretsDir, masterHome, BRIDGE_OPERATOR, (a) => writeBridgeOperatorAddress(secretsDir, a));
+}
+
+/**
+ * A launcher-held operator key by keyring name (the bridge's, the
+ * scanner's), as ensureBridgeOperatorKey describes; `record` keeps the
+ * address where the operator's SDL render finds it.
+ */
+export async function ensureOperatorKey(
+  secretsDir: string,
+  masterHome: string,
+  name: string,
+  record: (address: string) => void,
+): Promise<string> {
   const file = path.join(secretsDir, "mnemonics.json");
   const all: Record<string, string> = fs.existsSync(file) ? JSON.parse(readSecretFile(file)) : {};
   const keyring = ["--keyring-backend", "test", "--home", masterHome];
-  if (all[BRIDGE_OPERATOR]) {
-    const shown = await sparkdreamd(["keys", "show", BRIDGE_OPERATOR, "-a", ...keyring]).catch(() => undefined);
+  if (all[name]) {
+    const shown = await sparkdreamd(["keys", "show", name, "-a", ...keyring]).catch(() => undefined);
     if (!shown) {
       // the mnemonic on stdin: never in argv, never in an error message
-      await sparkdreamd(["keys", "add", BRIDGE_OPERATOR, "--recover", ...keyring, "--output", "json"], {
-        input: `${all[BRIDGE_OPERATOR]}\n`,
+      await sparkdreamd(["keys", "add", name, "--recover", ...keyring, "--output", "json"], {
+        input: `${all[name]}\n`,
       });
     }
-    const { stdout } = shown ?? (await sparkdreamd(["keys", "show", BRIDGE_OPERATOR, "-a", ...keyring]));
-    writeBridgeOperatorAddress(secretsDir, stdout.trim());
+    const { stdout } = shown ?? (await sparkdreamd(["keys", "show", name, "-a", ...keyring]));
+    record(stdout.trim());
     return stdout.trim();
   }
-  await sparkdreamd(["keys", "delete", BRIDGE_OPERATOR, "-y", ...keyring]).catch(() => undefined);
-  const { stdout } = await sparkdreamd(["keys", "add", BRIDGE_OPERATOR, ...keyring, "--output", "json"]);
+  await sparkdreamd(["keys", "delete", name, "-y", ...keyring]).catch(() => undefined);
+  const { stdout } = await sparkdreamd(["keys", "add", name, ...keyring, "--output", "json"]);
   const parsed = JSON.parse(stdout) as { address: string; mnemonic: string };
-  all[BRIDGE_OPERATOR] = parsed.mnemonic;
+  all[name] = parsed.mnemonic;
   writeSecretFile(file, JSON.stringify(all, null, 2));
-  writeBridgeOperatorAddress(secretsDir, parsed.address);
+  record(parsed.address);
   return parsed.address;
 }
 

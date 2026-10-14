@@ -60,7 +60,7 @@ import type {
   SshEndpoints,
 } from "./steps/phase-bcd.js";
 import type { SshTarget } from "./services.js";
-import { sessionRoles } from "./sessions.js";
+import { sessionRoles, type SessionRole } from "./sessions.js";
 import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
 import { resolveSmtpPasswordSource, servicesSpecDraft, servicesSpecFrom, type ServicesDraft } from "./services-spec.js";
 import { describePendingTx, FleetService, uploadDirFor } from "./fleet.js";
@@ -1886,12 +1886,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
     const body = (req.body ?? {}) as { role?: unknown };
-    if (body.role !== undefined && body.role !== "verifier" && body.role !== "bridge") {
-      return reply.status(400).send({ error: "role must be verifier or bridge" });
+    if (body.role !== undefined && body.role !== "verifier" && body.role !== "bridge" && body.role !== "scanner") {
+      return reply.status(400).send({ error: "role must be verifier, bridge or scanner" });
     }
     try {
       const roles = body.role
-        ? [body.role as "verifier" | "bridge"]
+        ? [body.role as SessionRole]
         : sessionRoles(withDefaults(JSON.parse(launch.spec_json)));
       if (roles.length === 0) throw new Error("this fleet runs no daemon with a session key");
       const opId = fleet.requestSessions(launch, roles);

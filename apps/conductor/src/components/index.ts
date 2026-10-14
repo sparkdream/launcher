@@ -5,6 +5,7 @@ import { mastodon } from "./mastodon.js";
 import { relayer } from "./relayer.js";
 import { verifier } from "./verifier.js";
 import { bridge } from "./bridge.js";
+import { scanner } from "./scanner.js";
 import { hub } from "./hub.js";
 import { ntfy } from "./ntfy.js";
 import { battle } from "./battle.js";
@@ -13,7 +14,7 @@ import type { ComponentDescriptor } from "./types.js";
 export type { ComponentDescriptor, RenderInput, SdlResources, Tunnel } from "./types.js";
 export { explorerChainEnv } from "./explorer.js";
 
-const REGISTRY: Record<ComponentKey, ComponentDescriptor> = { explorer, frontend, relayer, mastodon, verifier, bridge, hub, ntfy, battle };
+const REGISTRY: Record<ComponentKey, ComponentDescriptor> = { explorer, frontend, relayer, mastodon, verifier, bridge, scanner, hub, ntfy, battle };
 
 export function descriptor(key: ComponentKey): ComponentDescriptor {
   return REGISTRY[key];

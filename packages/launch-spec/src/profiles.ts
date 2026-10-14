@@ -29,6 +29,7 @@ export interface Profile {
     sdap: string;
     verifier: string;
     bridge: string;
+    scanner: string;
     hub: string;
     ntfy: string;
     battle: string;
@@ -185,6 +186,7 @@ export const profiles: Record<NetworkType, Profile> = {
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
+      scanner: SDAP_IMAGE,
       hub: HUB_IMAGE,
       ntfy: NTFY_IMAGE,
       battle: BATTLE_IMAGE,
@@ -230,6 +232,7 @@ export const profiles: Record<NetworkType, Profile> = {
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
+      scanner: SDAP_IMAGE,
       hub: HUB_IMAGE,
       ntfy: NTFY_IMAGE,
       battle: BATTLE_IMAGE,
@@ -273,6 +276,7 @@ export const profiles: Record<NetworkType, Profile> = {
       sdap: SDAP_IMAGE,
       verifier: SDAP_IMAGE,
       bridge: SDAP_IMAGE,
+      scanner: SDAP_IMAGE,
       hub: HUB_IMAGE,
       ntfy: NTFY_IMAGE,
       battle: BATTLE_IMAGE,

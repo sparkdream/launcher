@@ -51,6 +51,13 @@ function render(input: RenderInput) {
   if (input.peerChains && Object.keys(input.peerChains).length > 0) {
     env.push(`PEER_CHAINS=${JSON.stringify(input.peerChains)}`);
   }
+  // the anonymous-action prover (x/shield): which chain release's files to
+  // load and the sha256 each must have; unset, the UI follows the node's
+  // version and trusts that release's own manifest
+  const prover = spec.topology.components.frontend.prover;
+  if (prover?.assetsUrl) env.push(`ZK_ASSETS_URL=${prover.assetsUrl}`);
+  if (prover?.version) env.push(`ZK_VERSION=${prover.version}`);
+  if (prover?.digests) env.push(`ZK_DIGESTS=${JSON.stringify(prover.digests)}`);
   return {
     frontend: {
       service: {
