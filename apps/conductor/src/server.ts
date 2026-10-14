@@ -306,6 +306,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           if (await fleet.sessionsDue(launch.id).catch(() => false)) {
             if (fleet.requestSessions(launch) !== undefined) drive(launch.id, JSON.parse(launch.spec_json));
           }
+          // councils' recurring payments to the operators the launcher holds
+          // keys for are claimed unattended too
+          if (await fleet.claimsDue(launch.id).catch(() => false)) {
+            if (fleet.requestClaims(launch) !== undefined) drive(launch.id, JSON.parse(launch.spec_json));
+          }
           broadcast({ type: "health", launchId: launch.id, health: deps.db.listComponentHealth(launch.id) });
         }),
       );

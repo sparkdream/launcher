@@ -1805,6 +1805,15 @@ clean. The chain side is the chain repo's `docs/content-scanning.md`.
   fills.
 - **Classifier.** Without `scanner.classifierUrl`, text-only content clears
   but media stays unchecked; validate-spec warns.
+- **Pay.** The controller council pays the operator with a recurring
+  payment (`MsgScheduleRecurringSpend` in a council proposal: an x/session
+  RecurringPull grant). Each period must be claimed by the grantee, and only
+  the launcher holds that key. So the monitor checks hourly for a payment
+  due to any launcher-held operator (scanner, bridge) and queues a `claims`
+  op (`pay-claims.ts`). The op signs `MsgClaimRecurringPull` locally,
+  catching up on missed periods in batches within the grant's per-day
+  ceiling. A refused claim (lapsed council term, spent daily cap) is logged
+  and left alone for a day.
 
 ### Session keys for the daemons (`sessions.ts`, op `sessions`)
 

@@ -134,7 +134,9 @@ import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
 import { replaceRerunSteps } from "./services-steps.js";
-import { readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
+import { BRIDGE_OPERATOR, readBridgeOperatorAddress, readMastodonSecrets, stashSmtpPassword } from "./components/mastodon-secrets.js";
+import { SCANNER_OPERATOR, readScannerOperatorAddress } from "./components/scanner-secrets.js";
+import { dueClaims, payClaimants } from "./pay-claims.js";
 import { readNtfySecrets } from "./components/ntfy.js";
 
 /** The accounts-panel entry for the Mastodon instance's Owner. */
@@ -575,6 +577,7 @@ function opComponents(op: FleetOpRow): string[] | undefined {
 export class FleetService {
   /** Last hourly on-chain look at each fleet's session grants. */
   private readonly sessionChecks = new Map<string, number>();
+  private readonly claimChecks = new Map<string, number>();
   private readonly meshStrayChecks = new Map<string, number>();
   /** Last look at each relayer's balances, and the low keys it found. */
   private readonly relayerFundChecks = new Map<string, { at: number; low: string[] }>();
@@ -1545,6 +1548,15 @@ export class FleetService {
     const relayer = this.relayerState(launch)?.chains[0];
     if (!(RELAYER_ACCOUNT in accounts) && RELAYER_ACCOUNT in mnemonics && relayer) {
       accounts[RELAYER_ACCOUNT] = relayer.address;
+    }
+    // likewise a bridge or scanner added after launch: its operator's address
+    // was recorded when the launcher made its key
+    const secrets = launchDirs(this.workRoot, launch.id).secrets;
+    for (const [name, address] of [
+      [BRIDGE_OPERATOR, readBridgeOperatorAddress(secrets)],
+      [SCANNER_OPERATOR, readScannerOperatorAddress(secrets)],
+    ] as const) {
+      if (!(name in accounts) && name in mnemonics && address) accounts[name] = address;
     }
     const out = Object.entries(accounts).map(([name, address]) => ({
       name,
@@ -3321,6 +3333,33 @@ export class FleetService {
       if (!holds) return true;
     }
     return false;
+  }
+
+  /**
+   * Whether a council's recurring payment to one of the fleet's
+   * launcher-held operators can be claimed (pay-claims.ts). Asks the chain at
+   * most hourly: periods are a day or longer.
+   */
+  async claimsDue(launchId: string): Promise<boolean> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return false;
+    const spec = this.spec(launch);
+    const secrets = launchDirs(this.workRoot, launchId).secrets;
+    const claimants = payClaimants(spec, secrets);
+    if (claimants.length === 0) return false;
+    const last = this.claimChecks.get(launchId) ?? 0;
+    if (Date.now() - last < 3_600_000) return false;
+    this.claimChecks.set(launchId, Date.now());
+    const rpc = await this.sentryRpcUrl(launch);
+    if (!rpc) return false;
+    const due = await runWithAssets(resolveChainAssets(spec, this.workRoot), () => dueClaims(rpc, claimants, secrets));
+    return due.length > 0;
+  }
+
+  /** Queue a "claims" op, stepping aside while any other op runs. */
+  requestClaims(launch: LaunchRow): number | undefined {
+    if (this.db.listFleetOps(launch.id, "active").length > 0) return undefined;
+    return this.db.createFleetOp(launch.id, "claims", {});
   }
 
   /**

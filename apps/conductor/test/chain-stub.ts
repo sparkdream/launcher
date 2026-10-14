@@ -101,6 +101,9 @@ if (a0 === "query" && a1 === "rep" && a2 === "get-member") {
   const m = (st.members || {})[a3]; if (!m) fail("rpc error: code = NotFound desc = member not found"); out({ member: { address: a3, ...m } });
 }
 if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: { service_type: a3, min_bond_amount: "1000000000" } });
+if (a0 === "query" && a1 === "session" && a2 === "grants-by-grantee") {
+  out({ grants: Object.values(chain.grants || {}).filter((g) => g.grantee === a3) });
+}
 if (a0 === "query" && a1 === "service" && a2 === "operator") {
   const o = (chain.operators || {})[a3 + "/" + args[4]]; if (!o) fail("rpc error: code = NotFound desc = operator not found"); out({ operator: o });
 }
@@ -147,6 +150,19 @@ if (a0 === "tx" && a1 === "broadcast") {
       if (chain.operators[k]) throw new Error("operator already registered");
       chain.operators[k] = { address: m.creator, service_type: m.service_type, controller: m.controller,
         bond_amount: m.bond_amount, metadata: m.metadata, status: "OPERATOR_STATUS_ACTIVE", signer: doc.__from };
+    } else if (t === "MsgClaimRecurringPull") {
+      const g = (chain.grants || {})[m.grant_id];
+      if (!g || g.grantee !== m.grantee) throw new Error("grant not found");
+      if (g.refuse) throw new Error(g.refuse);
+      const rp = g.recurring_pull;
+      const next = Number(rp.last_claim_advance) + Number(rp.period_seconds);
+      if (next > Date.now() / 1000) throw new Error("next claim not yet eligible");
+      rp.last_claim_advance = String(next);
+      rp.claims_made = String(Number(rp.claims_made || 0) + 1);
+      st.balances ||= {};
+      const to = (st.balances[m.grantee] ||= {});
+      const c = rp.amount_per_period;
+      to[c.denom] = String(BigInt(to[c.denom] || "0") + BigInt(c.amount));
     } else if (t === "MsgUpdateMetadata") {
       const o = (chain.operators || {})[m.operator + "/" + m.service_type];
       if (!o) throw new Error("operator not found");

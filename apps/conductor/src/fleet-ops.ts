@@ -44,6 +44,7 @@ import { applyMinGasPrices, nodeMinGasPrices, patchNodeAppToml, patchSentryAppTo
 import { fleetPeer, peerRow, relayedBy, sisterChainApis } from "./relayer.js";
 import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
 import { reconcileSessions, type SessionRole } from "./sessions.js";
+import { claimPayments } from "./pay-claims.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { ensureScannerOperatorKey } from "./steps/scanner.js";
 import { fleetResolver } from "./verifier.js";
@@ -1411,6 +1412,25 @@ export function reconfigureSteps(opId: number, params: ReconfigureParams, spec: 
       async run(ctx) {
         ctx.db.setFleetOpStatus(opId, "done");
         return { components: params.keys };
+      },
+    },
+  ];
+}
+
+/**
+ * Claim the recurring payments councils make to the fleet's launcher-held
+ * operators (pay-claims.ts). Local signing only, so the monitor starts it
+ * unattended; a refused claim is logged and retried a day later, never
+ * failing the op.
+ */
+export function claimsSteps(opId: number, spec: LaunchSpec): StepDef[] {
+  return [
+    {
+      name: `op${opId}:claims`,
+      async run(ctx) {
+        const out = await claimPayments(ctx, spec);
+        ctx.db.setFleetOpStatus(opId, "done");
+        return out;
       },
     },
   ];
@@ -6252,6 +6272,7 @@ function buildSteps(
     if (op.kind === "data-restore") steps.push(...dataRestoreSteps(op.id, params as DataRestoreParams, spec));
     if (op.kind === "relayer-paths") steps.push(...relayerPathsSteps(op.id, params, spec));
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
+    if (op.kind === "claims") steps.push(...claimsSteps(op.id, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
     if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));
     if (op.kind === "node-resize") steps.push(...nodeResizeSteps(op.id, params, spec));

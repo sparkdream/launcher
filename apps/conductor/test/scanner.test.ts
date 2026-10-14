@@ -172,6 +172,9 @@ describe("scanner added to a running fleet", () => {
     const record = st.operators[`${operator}/content-scanner`];
     expect(record).toMatchObject({ signer: "scanner-operator", status: "OPERATOR_STATUS_ACTIVE" });
     expect(readSessions(secrets).scanner!.granter).toBe(operator);
+    // made after launch, yet listed with the fleet's accounts, key revealable
+    expect(fleet.accounts(db.getLaunch("fl")!)).toContainEqual({ name: "scanner-operator", address: operator, hasMnemonic: true });
+    expect(fleet.mnemonic(db.getLaunch("fl")!, "scanner-operator").split(" ")).toHaveLength(24);
 
     // metadata that no longer matches (another feed URL) is put back by the
     // next configure, with the operator's own key
