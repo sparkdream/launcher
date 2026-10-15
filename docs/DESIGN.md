@@ -1619,7 +1619,8 @@ its provider.
 - **Upload** (`upload`). From inside the web container, which reaches
   postgres over the deployment's network with its own `DB_*` env:
   `pg_dump | age | s5cmd pipe`, then `tar | age | s5cmd pipe`, a `tee`
-  hashing each stream. The database goes first, so media uploaded meanwhile
+  hashing and counting each stream (the record keeps both sizes, which the
+  dialog shows; backups before 2026-10-15 have none). The database goes first, so media uploaded meanwhile
   is in the tar and no restored row points at a file the backup lacks. The
   instance keeps running: `pg_dump` reads one consistent snapshot, and tar's
   "file changed as we read it" (exit 1) is accepted. Progress reads the
@@ -1646,6 +1647,11 @@ its provider.
   dialog's switch). A relaunch without a bucket or backup starts empty as
   before; a restore that fails pauses, and turning automatic restore off
   then resuming starts the instance empty instead.
+- **Disk.** The row shows both volumes the instance fills, media (web
+  container) and database (`db`), read with `df` over lease-shell like a
+  node's chain data (`componentDisk`, cached a minute); the summary line
+  carries the fuller one, and one container not answering leaves the
+  other's reading.
 - **Schedule.** Off, daily or weekly (`mastodon-backup-schedule:<launch>`),
   run by the monitor when nothing else is active; a failed attempt also
   waits a full interval.

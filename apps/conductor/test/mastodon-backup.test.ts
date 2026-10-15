@@ -111,6 +111,9 @@ describe("Mastodon backups: where they go", () => {
     expect(record!.name).toMatch(/^mastodon-\d{8}T\d{6}Z$/);
     expect(record!.dbSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(record!.mediaSha256).toMatch(/^[0-9a-f]{64}$/);
+    // the size of each object as uploaded, for the dialog
+    expect(record!.mediaBytes).toBe("avatars".length);
+    expect(record!.dbBytes).toBeGreaterThan(0);
     const prefix = `meshbk/sparkdream-launcher/${chainId(chainSpec())}/mastodon/${record!.name}`;
     expect(objects(w)).toEqual([`${prefix}/db.dump.age`, `${prefix}/media.tar.age`]);
     // the bucket's secret never crossed a command line as itself
@@ -150,7 +153,9 @@ describe("Mastodon backups: where they go", () => {
       path: `sparkdream-launcher/${chainId(servicesSpec())}/mastodon`,
       own: true,
     });
-    expect(card.mastodonBackups.backups).toEqual([{ name: record!.name, takenAt: record!.takenAt, verified: true }]);
+    expect(card.mastodonBackups.backups).toEqual([
+      { name: record!.name, takenAt: record!.takenAt, verified: true, dbBytes: record!.dbBytes },
+    ]);
     expect(JSON.stringify(card)).not.toContain("own-s3cr3t");
 
     // clearing it leaves a services fleet with nowhere to back up again
@@ -394,5 +399,36 @@ describe("moving a Mastodon whose web container is down", () => {
     const done = await driveOps(w);
     expect(done.reason ?? "").toBe("");
     expect(done.status).toBe("completed");
+  }, 180_000);
+});
+
+describe("Mastodon's disk", () => {
+  it("reads both volumes, reports the fuller one, and keeps the other when one container is down", async () => {
+    const w = await launched(chainSpec());
+    const row = mastodonRow(w);
+    // the fake's df answers 20 GiB with a quarter used unless told otherwise
+    w.services.provider.diskUsedKb.set(row.dseq, 18 * 1024 * 1024);
+    const disk = (await w.fleet.componentDisk(launchRow(w), row as any))!;
+    expect(disk.volumes!.map((v) => v.name)).toEqual(["media", "database"]);
+    expect(disk.percentUsed).toBe(90);
+    const reads = w.services.provider.shellLog.filter((l) => l.dseq === row.dseq && l.script.startsWith("df -Pk"));
+    expect(reads.map((l) => [l.service, l.script])).toEqual([
+      ["mastodon", "df -Pk /opt/mastodon/public/system 2>/dev/null"],
+      ["db", "df -Pk /var/lib/postgresql/data 2>/dev/null"],
+    ]);
+
+    // a fresh read (past the minute's cache) with the web container down
+    const w2 = await launched(chainSpec());
+    w2.services.provider.downServices.add(`${mastodonRow(w2).dseq}/mastodon`);
+    const partial = (await w2.fleet.componentDisk(launchRow(w2), mastodonRow(w2) as any))!;
+    expect(partial.volumes!.map((v) => v.name)).toEqual(["database"]);
+  }, 180_000);
+
+  it("a node keeps its single chain-data reading", async () => {
+    const w = await launched(chainSpec());
+    const sentry = w.db.listFleetComponents(w.id).find((c) => c.key === "sentry-0")!;
+    const disk = (await w.fleet.componentDisk(launchRow(w), sentry as any))!;
+    expect(disk.volumes).toBeUndefined();
+    expect(disk.percentUsed).toBe(25);
   }, 180_000);
 });

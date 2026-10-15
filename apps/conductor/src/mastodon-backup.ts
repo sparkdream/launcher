@@ -61,6 +61,9 @@ export interface MastodonBackupRecord {
   /** sha256 of each encrypted object as the container uploaded it */
   dbSha256?: string;
   mediaSha256?: string;
+  /** bytes of each encrypted object as uploaded (backups before 2026-10-15 lack them) */
+  dbBytes?: number;
+  mediaBytes?: number;
   /** read back from the bucket and decrypted end to end after the upload */
   verified?: boolean;
 }
@@ -186,11 +189,12 @@ export const BACKUP_SCRIPT = `#!/bin/bash
 set -o pipefail
 . /tmp/sd-mbackup.env && rm -f /tmp/sd-mbackup.env
 ST=/tmp/sd-mbackup.status; LOG=/tmp/sd-mbackup.log
-echo $$ > /tmp/sd-mbackup.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-mbackup.*.sha
+echo $$ > /tmp/sd-mbackup.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-mbackup.*.sha /tmp/sd-mbackup.*.bytes
 echo database > /tmp/sd-mbackup.phase
 OBJ="s3://$S3_BUCKET/$S3_PREFIX/$NAME"
-# the hash of exactly what was uploaded: the check compares the bucket's copy against it
-up() { tee >(sha256sum | cut -d' ' -f1 > /tmp/sd-mbackup.$1.sha) | s5cmd --endpoint-url "$S3_ENDPOINT" pipe --concurrency 2 --part-size 32 "$OBJ/$1.age" >>$LOG 2>&1; }
+# the hash and size of exactly what was uploaded: the check compares the
+# bucket's copy against the hash, the dialog shows the size
+up() { tee >(sha256sum | cut -d' ' -f1 > /tmp/sd-mbackup.$1.sha) >(wc -c > /tmp/sd-mbackup.$1.bytes) | s5cmd --endpoint-url "$S3_ENDPOINT" pipe --concurrency 2 --part-size 32 "$OBJ/$1.age" >>$LOG 2>&1; }
 # the database first: media uploaded meanwhile lands in the tar, so no row
 # points at a file the backup lacks
 ${PG}pg_dump ${PG_ARGS} -Fc "\${DB_NAME:-mastodon}" 2>>$LOG | age -r "$AGE_RECIPIENT" | up db.dump
@@ -347,8 +351,19 @@ export async function uploadMastodonBackup(
     }
     return undefined;
   };
+  const bytes = async (obj: string) => {
+    const v = Number((await exec(`cat /tmp/sd-mbackup.${obj}.bytes 2>/dev/null || true`)).trim());
+    return v > 0 ? v : undefined;
+  };
   const [dbSha256, mediaSha256] = [await sha("db.dump"), await sha("media.tar")];
-  record = { ...record, ...(dbSha256 ? { dbSha256 } : {}), ...(mediaSha256 ? { mediaSha256 } : {}) };
+  const [dbBytes, mediaBytes] = [await bytes("db.dump"), await bytes("media.tar")];
+  record = {
+    ...record,
+    ...(dbSha256 ? { dbSha256 } : {}),
+    ...(mediaSha256 ? { mediaSha256 } : {}),
+    ...(dbBytes ? { dbBytes } : {}),
+    ...(mediaBytes ? { mediaBytes } : {}),
+  };
   ctx.db.setSetting(pendingKey(ctx.launchId), JSON.stringify(record));
   return record;
 }

@@ -491,7 +491,8 @@ export interface FleetSummary {
       schedule: "off" | "daily" | "weekly";
       autoRestore: boolean;
       /** verified: read back and decrypted after the upload */
-      backups: Array<{ name: string; takenAt: string; verified: boolean }>;
+      /** dbBytes/mediaBytes: as uploaded (encrypted); absent on backups before 2026-10-15 */
+      backups: Array<{ name: string; takenAt: string; verified: boolean; dbBytes?: number; mediaBytes?: number }>;
     };
     /** Which components recover on their own (off unless turned on). */
     autoRecover: AutoRecoverPolicy;
@@ -1224,6 +1225,9 @@ export interface NodeDisk {
   freeBytes: number;
   percentUsed: number;
   checkedAt: string;
+  /** Components with several volumes (Mastodon: media, database): each one;
+   *  the fields above are the fullest. */
+  volumes?: Array<{ name: string; totalBytes: number; usedBytes: number; freeBytes: number; percentUsed: number }>;
 }
 
 /** A node's resources as the conductor deploys them (launch-spec RoleResources). */

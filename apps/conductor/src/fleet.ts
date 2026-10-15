@@ -233,6 +233,7 @@ import {
   type DataRestoreParams,
   type DataBackupRecord,
 } from "./data-backup.js";
+import { MEDIA as MASTODON_MEDIA } from "./steps/mastodon-migrate.js";
 import {
   MASTODON_S3_SECRET_FILE,
   abandonMastodonBackupCmd,
@@ -540,6 +541,21 @@ export interface NodeDisk {
   /** 0-100, as df reports it (used of used + available). */
   percentUsed: number;
   checkedAt: string;
+  /** A component with several volumes (Mastodon: media, database): each
+   *  one read, and the fields above are the fullest of them. */
+  volumes?: Array<{ name: string } & Omit<NodeDisk, "checkedAt" | "volumes">>;
+}
+
+/** The persistent volumes a component's disk read covers: service, mount, label. */
+function diskVolumes(key: string): Array<{ service: string; path: string; name: string }> {
+  if (/^(val|sentry)-/.test(key)) return [{ service: "sparkdreamd", path: NODE_HOME, name: "chain data" }];
+  if (key === "mastodon") {
+    return [
+      { service: "mastodon", path: MASTODON_MEDIA, name: "media" },
+      { service: "db", path: "/var/lib/postgresql/data", name: "database" },
+    ];
+  }
+  return [];
 }
 
 /**
@@ -766,21 +782,32 @@ export class FleetService {
    * forwarded port is dead). Cached for a minute per deployment.
    */
   async componentDisk(launch: LaunchRow, component: FleetComponentRow): Promise<NodeDisk | null> {
-    if (!/^(val|sentry)-/.test(component.key)) return null;
+    const volumes = diskVolumes(component.key);
+    if (volumes.length === 0) return null;
     const cached = this.diskCache.get(component.dseq);
     if (cached?.probe) return cached.probe;
     if (cached && Date.now() - cached.at < 60_000) return cached.disk;
-    const probe = this.services.provider
-      .shellExec(this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, "sparkdreamd", [
-        "sh",
-        "-c",
-        `df -Pk ${NODE_HOME} 2>/dev/null`,
-      ])
-      .then((r) => {
-        const df = parseDf(r.stdout);
-        return df ? { ...df, checkedAt: new Date().toISOString() } : null;
+    const read = (v: (typeof volumes)[number]) =>
+      this.services.provider
+        .shellExec(this.mtlsCreds(launch), component.host_uri, component.dseq, 1, 1, v.service, [
+          "sh",
+          "-c",
+          `df -Pk ${v.path} 2>/dev/null`,
+        ])
+        .then((r) => {
+          const df = parseDf(r.stdout);
+          return df ? { name: v.name, ...df } : null;
+        })
+        // one volume's container not answering (Mastodon's web pod down)
+        // leaves the others' reads standing
+        .catch(() => null);
+    const probe = Promise.all(volumes.map(read))
+      .then((reads): NodeDisk | null => {
+        const ok = reads.filter((r) => r !== null);
+        if (ok.length === 0) return null;
+        const { name: _, ...fullest } = ok.reduce((a, b) => (b.percentUsed > a.percentUsed ? b : a));
+        return { ...fullest, checkedAt: new Date().toISOString(), ...(volumes.length > 1 ? { volumes: ok } : {}) };
       })
-      .catch(() => null)
       .then((disk) => {
         this.diskCache.set(component.dseq, { disk, at: Date.now() });
         return disk;
@@ -1045,7 +1072,13 @@ export class FleetService {
                 })(),
                 schedule: this.mastodonBackupSchedule(launch.id),
                 autoRestore: mastodonAutoRestore(this.db, launch.id),
-                backups: mastodonBackups(this.db, launch.id).map((b) => ({ name: b.name, takenAt: b.takenAt, verified: b.verified === true })),
+                backups: mastodonBackups(this.db, launch.id).map((b) => ({
+                  name: b.name,
+                  takenAt: b.takenAt,
+                  verified: b.verified === true,
+                  ...(b.dbBytes !== undefined ? { dbBytes: b.dbBytes } : {}),
+                  ...(b.mediaBytes !== undefined ? { mediaBytes: b.mediaBytes } : {}),
+                })),
               },
             }
           : {}),

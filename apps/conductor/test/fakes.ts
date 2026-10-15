@@ -450,6 +450,10 @@ export class FakeProviderGateway {
       const data = this.mastodonBucket.get(object("/tmp/sd-mbackup.env", `${m[1]}.age`));
       return ok(data && this.mastodonScripts.get(`${dseq}|sd-mbackup`) === "done" ? sha(data) : "");
     }
+    if ((m = /^cat \/tmp\/sd-mbackup\.(db\.dump|media\.tar)\.bytes/.exec(script))) {
+      const data = this.mastodonBucket.get(object("/tmp/sd-mbackup.env", `${m[1]}.age`));
+      return ok(data && this.mastodonScripts.get(`${dseq}|sd-mbackup`) === "done" ? `${data.length}\n` : "");
+    }
     if ((m = /^cat \/tmp\/sd-mverify\.(db\.dump|media\.tar)\.readback/.exec(script))) {
       const key = object("/tmp/sd-mverify.env", `${m[1]}.age`);
       const data = this.mastodonBucket.get(key);

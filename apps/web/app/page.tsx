@@ -319,6 +319,13 @@ function gib(bytes: number): string {
   return `${g < 10 ? g.toFixed(1) : Math.round(g)} GiB`;
 }
 
+/** A size in the unit that reads best: "820 KB", "4.7 MB", "1.3 GB". */
+function bytesText(bytes: number): string {
+  if (bytes < 1024 ** 2) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
 /** "3h 12m" / "12m" / "45s" — coarse on purpose, these are estimates. */
 const duration = (seconds: number): string => {
   const s = Math.max(0, Math.round(seconds));
@@ -1484,15 +1491,25 @@ export default function Page() {
     };
   }, [heightTargets]);
 
-  // how full each node's data volume is: it fills over days, so once a
-  // minute is plenty (the conductor caches the read for as long)
+  // how full each node's data volume is (and Mastodon's media and database
+  // volumes): they fill over days, so once a minute is plenty (the
+  // conductor caches the read for as long)
+  const diskTargets = useMemo(
+    () =>
+      (fleet?.fleets ?? []).flatMap((f) =>
+        f.components
+          .filter((c) => (/^(val|sentry)-/.test(c.key) || c.key === "mastodon") && c.state === "active")
+          .map((c) => ({ launchId: f.launchId, dseq: c.dseq })),
+      ),
+    [fleet],
+  );
   useEffect(() => {
-    if (heightTargets.length === 0) return;
+    if (diskTargets.length === 0) return;
     let stop = false;
     const tick = async () => {
       const { getComponentDisk } = await import("../lib/api");
       await Promise.all(
-        heightTargets.map(async ({ launchId, dseq }) => {
+        diskTargets.map(async ({ launchId, dseq }) => {
           const d = await getComponentDisk(launchId, dseq).catch(() => null);
           if (d && !stop) setNodeDisks((m) => ({ ...m, [dseq]: d }));
         }),
@@ -1504,7 +1521,7 @@ export default function Page() {
       stop = true;
       clearInterval(t);
     };
-  }, [heightTargets]);
+  }, [diskTargets]);
 
   // compute-network balances + BME mint state (console-air's mint & burn
   // flow, §mint): deployments on mainnet are paid in uact, acquired by
@@ -4094,9 +4111,19 @@ export default function Page() {
                           <div
                             key={b.name}
                             title={b.name}
-                            style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto auto auto", alignItems: "center", gap: 12, padding: "10px 13px", borderBottom: "1px solid rgba(255,255,255,.06)" }}
+                            style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto auto auto auto", alignItems: "center", gap: 12, padding: "10px 13px", borderBottom: "1px solid rgba(255,255,255,.06)" }}
                           >
                             <span style={{ fontSize: 12.5, color: b.name === latest ? "#ecedf2" : "#c9cad6" }}>{new Date(b.takenAt).toLocaleString()}</span>
+                            <span
+                              style={{ fontFamily: mono, fontSize: 12, color: "#9a9bab" }}
+                              title={
+                                b.dbBytes !== undefined || b.mediaBytes !== undefined
+                                  ? `database ${bytesText(b.dbBytes ?? 0)}, media ${bytesText(b.mediaBytes ?? 0)} (encrypted, as uploaded)`
+                                  : "taken before sizes were recorded"
+                              }
+                            >
+                              {b.dbBytes !== undefined || b.mediaBytes !== undefined ? bytesText((b.dbBytes ?? 0) + (b.mediaBytes ?? 0)) : "size —"}
+                            </span>
                             <span
                               style={{
                                 fontSize: 11,
@@ -6487,7 +6514,11 @@ export default function Page() {
                               {disk && c.state === "active" && (
                                 <span
                                   style={diskColor ? { color: diskColor } : undefined}
-                                  title={`chain data volume: ${gib(disk.freeBytes)} free of ${gib(disk.totalBytes)}`}
+                                  title={
+                                    disk.volumes
+                                      ? disk.volumes.map((v) => `${v.name} volume: ${gib(v.freeBytes)} free of ${gib(v.totalBytes)}`).join("\n")
+                                      : `chain data volume: ${gib(disk.freeBytes)} free of ${gib(disk.totalBytes)}`
+                                  }
                                 >
                                   {` · ${gib(disk.freeBytes)} free`}
                                 </span>
@@ -6553,15 +6584,19 @@ export default function Page() {
                                   Size <span className="v">{c.size}</span>
                                 </span>
                               )}
-                              {disk && (
-                                <span title={`read ${new Date(disk.checkedAt).toLocaleTimeString()}`}>
-                                  Chain data{" "}
-                                  <span className="v" style={diskColor ? { color: diskColor } : undefined}>
-                                    {gib(disk.freeBytes)} free of {gib(disk.totalBytes)} ({disk.percentUsed}% used)
-                                  </span>
-                                  {disk.percentUsed >= 80 && " · resize… to a larger size"}
-                                </span>
-                              )}
+                              {disk &&
+                                (disk.volumes ?? [{ name: "chain data", ...disk }]).map((v) => {
+                                  const color = v.percentUsed >= 90 ? "var(--red-text)" : v.percentUsed >= 80 ? "var(--amber-text)" : undefined;
+                                  return (
+                                    <span key={v.name} title={`read ${new Date(disk.checkedAt).toLocaleTimeString()}`}>
+                                      {v.name[0]!.toUpperCase() + v.name.slice(1)}{" "}
+                                      <span className="v" style={color ? { color } : undefined}>
+                                        {gib(v.freeBytes)} free of {gib(v.totalBytes)} ({v.percentUsed}% used)
+                                      </span>
+                                      {v.percentUsed >= 80 && " · resize… to a larger size"}
+                                    </span>
+                                  );
+                                })}
                               {c.tailnetIp && (
                                 <span className="f-mesh">
                                   Mesh IP{" "}
