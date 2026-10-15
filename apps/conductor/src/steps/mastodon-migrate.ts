@@ -32,7 +32,7 @@ const MAX_BYTES = 256 * 1024 * 1024;
  *  long request line. */
 const CHUNK = 48_000;
 const DB = "mastodon";
-const MEDIA = "/opt/mastodon/public/system";
+export const MEDIA = "/opt/mastodon/public/system";
 
 export interface MastodonBackup {
   /** The deployment the data came from. */
@@ -47,9 +47,9 @@ function backupDir(ctx: StepCtx, dseq: string): string {
   return path.join(ctx.dirs.secrets, "backups", `mastodon-${dseq}`);
 }
 
-type Lease = { hostUri: string; dseq: string; gseq: number; oseq: number };
+export type Lease = { hostUri: string; dseq: string; gseq: number; oseq: number };
 
-function shell(ctx: StepCtx, lease: Lease, service: string, script: string, timeoutMs = 60_000) {
+export function shell(ctx: StepCtx, lease: Lease, service: string, script: string, timeoutMs = 60_000) {
   return ctx.services.provider.shellExec(
     loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, service, ["sh", "-c", script], { timeoutMs },
   );
@@ -71,11 +71,32 @@ async function pull(ctx: StepCtx, lease: Lease, service: string, script: string)
  */
 export async function backupMastodon(ctx: StepCtx, stepName: string): Promise<MastodonBackup> {
   const lease = componentLease(ctx, "mastodon");
-  const measured = await shell(
-    ctx, lease, "mastodon",
-    // du's --exclude matches names (tar's below matches ./-relative paths)
-    `du -sb --exclude=cache --exclude=lost+found ${MEDIA} 2>/dev/null | cut -f1`,
-  ).then((r) => Number(r.stdout.trim()) || 0);
+  // the media lives on the web container's volume: a container that does
+  // not run (2026-10-14: a pod wedged on a bad image) leaves only the
+  // database to carry. That loses the media, so the move asks once, and
+  // resuming is the operator's go-ahead (0 below: no media to copy)
+  const withoutMedia = `mastodon-move-without-media:${ctx.launchId}:${stepName}`;
+  let measured = 0;
+  try {
+    measured = await shell(
+      ctx, lease, "mastodon",
+      // du's --exclude matches names (tar's below matches ./-relative paths)
+      `du -sb --exclude=cache --exclude=lost+found ${MEDIA} 2>/dev/null | cut -f1`,
+    ).then((r) => Number(r.stdout.trim()) || 0);
+    ctx.db.deleteSetting(withoutMedia);
+  } catch (e) {
+    if (ctx.db.getSetting(withoutMedia) === null) {
+      ctx.db.setSetting(withoutMedia, "asked");
+      throw new AwaitUser(
+        stepName,
+        `Mastodon's web container does not answer (${String(e instanceof Error ? e.message : e).slice(0, 160)}), ` +
+          "so its uploaded media (local avatars and attachments) cannot be copied; the database can. Nothing has " +
+          "been closed yet. Resume to move without the media: accounts, posts, follows, the owner and the bridge " +
+          "token come along, and remote media is fetched again. Or abort the op to keep the instance as it is.",
+      );
+    }
+    ctx.log("mastodon: the web container does not answer; moving the database only, as resumed");
+  }
   const dbSize = await shell(ctx, lease, "db", `psql -U postgres -tAc "select pg_database_size('${DB}')"`)
     .then((r) => Number(r.stdout.trim()) || 0);
   if (measured + dbSize > MAX_BYTES) {
@@ -83,7 +104,7 @@ export async function backupMastodon(ctx: StepCtx, stepName: string): Promise<Ma
       stepName,
       `this instance holds ${Math.round((measured + dbSize) / 1048576)} MiB (database and uploaded media), ` +
         `more than the ${MAX_BYTES / 1048576} MiB a resize carries over lease-shell. Abort the op; ` +
-        "a resize this size needs an object-storage backup the launcher does not do yet",
+        "set a backup bucket for Mastodon (backups… on its row) and resize again: the move then goes through the bucket",
     );
   }
 
@@ -143,7 +164,7 @@ async function push(ctx: StepCtx, lease: Lease, service: string, dest: string, d
 }
 
 /** Retry a command while the container is still coming up. */
-async function whenUp(ctx: StepCtx, lease: Lease, service: string, script: string, what: string): Promise<string> {
+export async function whenUp(ctx: StepCtx, lease: Lease, service: string, script: string, what: string): Promise<string> {
   let last = "";
   for (let i = 0; i < 40; i++) {
     try {
@@ -176,37 +197,17 @@ export async function restoreMastodon(
   const dump = readSecretBuffer(path.join(backup.dir, "db.dump"));
   if (sha256(dump) !== backup.db.sha256) throw new Error(`the backup in ${backup.dir} does not match its record`);
 
-  await whenUp(ctx, lease, "db", "pg_isready -U postgres -q && echo ok", "postgres");
+  await createScratchDb(ctx, lease);
   await push(ctx, lease, "db", "/tmp/restore.dump", dump);
-  const scratch = `${DB}_restore`;
-  await shell(
-    ctx, lease, "db",
-    `psql -U postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${scratch}" -c "CREATE DATABASE ${scratch}"`,
-  );
   // pg_restore reports harmless noise (extension comments owned by another
   // role) with a non-zero exit, so the check is the data itself
   await shell(
     ctx, lease, "db",
-    `pg_restore -U postgres --no-owner --role=postgres -d ${scratch} /tmp/restore.dump 2>&1 | tail -5; true`,
+    `pg_restore -U postgres --no-owner --role=postgres -d ${SCRATCH_DB} /tmp/restore.dump 2>&1 | tail -5; true`,
     15 * 60_000,
   );
-  const accounts = Number(
-    (await shell(ctx, lease, "db", `psql -U postgres -d ${scratch} -tAc "select count(*) from accounts"`)).stdout.trim(),
-  );
-  if (!Number.isFinite(accounts) || accounts < 1) {
-    throw new AwaitUser(
-      stepName,
-      `the restored database has no accounts (${accounts}); the backup is kept in ${backup.dir}. ` +
-        "The new instance still runs on its empty database. Inspect, then resume to retry the restore",
-    );
-  }
-  // swap: two statements in one session, a moment apart, so the instance's
-  // restart cannot prepare a new empty schema in between
-  await shell(
-    ctx, lease, "db",
-    `psql -U postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${DB} WITH (FORCE)" ` +
-      `-c "ALTER DATABASE ${scratch} RENAME TO ${DB}" && rm -f /tmp/restore.dump`,
-  );
+  const accounts = await swapInScratchDb(ctx, lease, stepName, `the backup is kept in ${backup.dir}`);
+  await shell(ctx, lease, "db", "rm -f /tmp/restore.dump").catch(() => undefined);
 
   if (backup.media) {
     const media = readSecretBuffer(path.join(backup.dir, "media.tgz"));
@@ -215,9 +216,56 @@ export async function restoreMastodon(
     await shell(ctx, lease, "mastodon", `tar -xzf /tmp/media.tgz -C ${MEDIA} && chown -R 991:991 ${MEDIA} && rm -f /tmp/media.tgz`, 15 * 60_000);
   }
 
-  // restart: rails db:prepare migrates the restored schema, and the
-  // processes reconnect to the database that replaced the one they held
-  await shell(ctx, lease, "mastodon", "kill 1").catch(() => undefined);
+  await restartMastodon(ctx, lease);
   ctx.log(`mastodon: restored ${accounts} accounts from deployment ${backup.dseq} into ${lease.dseq}`);
   return { dseq: lease.dseq, restoredFrom: backup.dseq, accounts };
+}
+
+/** The database a restore fills before it replaces the instance's own. */
+export const SCRATCH_DB = `${DB}_restore`;
+
+/** A fresh, empty scratch database (postgres must be up). */
+export async function createScratchDb(ctx: StepCtx, lease: Lease): Promise<void> {
+  await whenUp(ctx, lease, "db", "pg_isready -U postgres -q && echo ok", "postgres");
+  await shell(
+    ctx, lease, "db",
+    `psql -U postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${SCRATCH_DB}" -c "CREATE DATABASE ${SCRATCH_DB}"`,
+  );
+}
+
+/**
+ * Replace the instance's database with the restored scratch one, once it
+ * holds accounts (a restore that produced none pauses, `kept` saying where
+ * the backup still is). Returns the account count.
+ */
+export async function swapInScratchDb(ctx: StepCtx, lease: Lease, stepName: string, kept: string): Promise<number> {
+  const accounts = Number(
+    (await shell(ctx, lease, "db", `psql -U postgres -d ${SCRATCH_DB} -tAc "select count(*) from accounts"`)).stdout.trim(),
+  );
+  if (!Number.isFinite(accounts) || accounts < 1) {
+    throw new AwaitUser(
+      stepName,
+      `the restored database has no accounts (${accounts}); ${kept}. ` +
+        "The instance still runs on its own database. Inspect, then resume to retry the restore",
+    );
+  }
+  // swap: two statements in one session, a moment apart, so the instance's
+  // restart cannot prepare a new empty schema in between
+  await shell(
+    ctx, lease, "db",
+    `psql -U postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${DB} WITH (FORCE)" ` +
+      `-c "ALTER DATABASE ${SCRATCH_DB} RENAME TO ${DB}"`,
+  );
+  return accounts;
+}
+
+/** Restart web + sidekiq: rails db:prepare migrates the restored schema, and
+ *  the processes reconnect to the database that replaced the one they held.
+ *  Streaming too: the swap's forced drop cut its connection, and left to
+ *  crash it came back only after Kubernetes' restart back-off (2026-10-14:
+ *  ~7 minutes, past the move's health gate). Its node is PID 1 and exits
+ *  cleanly on SIGTERM. */
+export async function restartMastodon(ctx: StepCtx, lease: Lease): Promise<void> {
+  await shell(ctx, lease, "mastodon", "kill 1").catch(() => undefined);
+  await shell(ctx, lease, "streaming", "kill 1").catch(() => undefined);
 }

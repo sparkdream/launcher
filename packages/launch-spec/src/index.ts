@@ -25,6 +25,7 @@ export {
   unknownKeyIssues,
   WALLET_LOGIN_MIN_VERSION,
   imageBefore,
+  imageRefProblem,
   versionTag,
   type SpecCheck,
   type ValidationIssue,

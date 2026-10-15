@@ -9,6 +9,7 @@ import {
   SERVICES_FLEET_COMPONENTS,
   COMPONENT_KINDS,
   defaultLoginDomain,
+  imageRefProblem,
   isComponentKey,
   NODE_SIZES,
   type NodeSize,
@@ -968,6 +969,114 @@ export default function Page() {
       setError(String(e));
     }
   };
+  // Mastodon backups dialog (mastodon-backup / mastodon-restore ops), by
+  // launch id; `storage` is the bucket form while it is open
+  const [mastodonBackupsFor, setMastodonBackupsFor] = useState<string | null>(null);
+  const [mastodonStorageForm, setMastodonStorageForm] = useState<
+    (import("../lib/api").MeshBackupStorage & { secret: string; path: string; known: boolean }) | null
+  >(null);
+  const [mastodonBackupBusy, setMastodonBackupBusy] = useState(false);
+  const openMastodonBackups = async (launchId: string, hasStorage: boolean) => {
+    setError(null);
+    setMastodonBackupsFor(launchId);
+    setMastodonStorageForm(null);
+    // nowhere to back up yet: open the bucket form, prefilled from another fleet's
+    if (!hasStorage) await openMastodonStorageForm(launchId);
+  };
+  const openMastodonStorageForm = async (launchId: string) => {
+    let known: import("../lib/api").MeshBackupStorage | null = null;
+    try {
+      const { getMeshBackupStorage } = await import("../lib/api");
+      known = (await getMeshBackupStorage(launchId)).known;
+    } catch {
+      known = null;
+    }
+    setMastodonStorageForm({
+      endpoint: known?.endpoint ?? "",
+      bucket: known?.bucket ?? "",
+      region: known?.region ?? "us-west-2",
+      accessKeyId: known?.accessKeyId ?? "",
+      secret: "",
+      path: "",
+      known: known !== null,
+    });
+  };
+  const saveMastodonStorage = async (launchId: string, clear = false) => {
+    if (!clear && !mastodonStorageForm) return;
+    setMastodonBackupBusy(true);
+    setError(null);
+    try {
+      const { postMastodonBackupStorage, getFleet } = await import("../lib/api");
+      if (clear) await postMastodonBackupStorage(launchId, { clear: true });
+      else {
+        const { endpoint, bucket, region, accessKeyId, secret, path } = mastodonStorageForm!;
+        await postMastodonBackupStorage(launchId, {
+          endpoint,
+          bucket,
+          region,
+          accessKeyId,
+          ...(secret ? { secret } : {}),
+          ...(path ? { path } : {}),
+        });
+      }
+      setMastodonStorageForm(null);
+      if (wallet) setFleet(await getFleet(wallet.address));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMastodonBackupBusy(false);
+    }
+  };
+  const mastodonBackupAction = async (
+    launchId: string,
+    settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+  ) => {
+    setError(null);
+    try {
+      const { postMastodonBackup, getFleet } = await import("../lib/api");
+      const res = await postMastodonBackup(launchId, settings);
+      if (res.opId !== undefined) {
+        showToast("backing up Mastodon: follow it in the Launch panel");
+        setMastodonBackupsFor(null);
+        openLaunch(launchId);
+      } else if (wallet) {
+        setFleet(await getFleet(wallet.address));
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const removeMastodonBackup = async (launchId: string, b: { name: string; takenAt: string }) => {
+    const what = `the Mastodon backup of ${new Date(b.takenAt).toLocaleString()}`;
+    if (!window.confirm(`Delete ${what} from the bucket? It cannot be restored after.`)) return;
+    setError(null);
+    try {
+      const { deleteMastodonBackup, getFleet } = await import("../lib/api");
+      await deleteMastodonBackup(launchId, b.name);
+      showToast(`deleted ${what}`);
+      if (wallet) setFleet(await getFleet(wallet.address));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const restoreMastodon = async (launchId: string, b: { name: string; takenAt: string }) => {
+    const ok = window.confirm(
+      `Replace Mastodon's data with its backup of ${new Date(b.takenAt).toLocaleString()}?\n\n` +
+        "The database and uploaded media go back to that moment, and the instance restarts. Accounts, posts and " +
+        "follows made since are lost. Its deployment and domains stay as they are; no signature is needed.",
+    );
+    if (!ok) return;
+    setError(null);
+    try {
+      const { postMastodonRestore } = await import("../lib/api");
+      await postMastodonRestore(launchId, b.name);
+      showToast("restoring Mastodon: follow it in the Launch panel");
+      setMastodonBackupsFor(null);
+      openLaunch(launchId);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
   // headscale mesh backup form (mesh-backup op)
   // the fleet card's add… dialog (design 1a): what to add, and how it is placed
   const [addForm, setAddForm] = useState<{
@@ -1860,6 +1969,13 @@ export default function Page() {
     return "none";
   };
 
+  /** Refuse an image a provider could not pull, before anything is sent
+   *  (a malformed one wedges a StatefulSet until the provider deletes its pod). */
+  const badImage = (image: string): boolean => {
+    const problem = imageRefProblem(image);
+    if (problem) setError(`"${image}" is not a valid image: ${problem}`);
+    return problem !== null;
+  };
   const fleetAction = async (
     launchId: string,
     dseq: string,
@@ -3827,6 +3943,250 @@ export default function Page() {
           );
         })()}
 
+      {mastodonBackupsFor &&
+        (() => {
+          const f = fleet?.fleets.find((x) => x.launchId === mastodonBackupsFor);
+          const mb = f?.mastodonBackups;
+          if (!f || !mb) return null;
+          const close = () => {
+            setMastodonBackupsFor(null);
+            setMastodonStorageForm(null);
+          };
+          const running = f.ops.find((o) => (o.kind === "mastodon-backup" || o.kind === "mastodon-restore") && o.status === "active");
+          const moving = f.ops.some((o) => o.status === "active");
+          const latest = mb.backups.find((b) => b.verified)?.name;
+          const label = { fontSize: 12, fontWeight: 600, color: "#c9cad6" };
+          const mono = "'JetBrains Mono', monospace";
+          const field = {
+            padding: "8px 11px",
+            background: "#16161e",
+            border: "1px solid rgba(255,255,255,.12)",
+            borderRadius: 8,
+            color: "#ecedf2",
+            fontSize: 12.5,
+          } as const;
+          const sf = mastodonStorageForm;
+          const segment = (on: boolean, enabled: boolean) =>
+            ({ padding: "7px 0", borderRadius: 6, border: "none", background: on ? "rgba(109,106,248,.22)" : "transparent", color: on ? "#ecedf2" : "#9a9bab", fontSize: 12.5, fontWeight: 500, cursor: enabled && !on ? "pointer" : "default", textTransform: "capitalize" }) as const;
+          return (
+            <div className="modal-scrim" onClick={close}>
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{ width: 560, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)", overflowY: "auto", background: "#101016", border: "1px solid rgba(255,255,255,.1)", borderRadius: 14, boxShadow: "0 24px 64px rgba(0,0,0,.6)", color: "#ecedf2" }}
+              >
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, padding: "20px 22px 0" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 17 }}>Mastodon backups</span>
+                      <span style={{ fontFamily: mono, fontSize: 11.5, color: "#c9cad6", background: "rgba(255,255,255,.06)", padding: "2px 7px", borderRadius: 5 }}>{f.name}</span>
+                    </div>
+                    <div style={{ fontSize: 12.5, lineHeight: 1.5, color: "#9a9bab" }}>
+                      The database and uploaded media, encrypted with the fleet key and streamed from the instance to the bucket.
+                      The instance keeps running while it copies.
+                    </div>
+                  </div>
+                  <button aria-label="Close" onClick={close} className="dlg-x">✕</button>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: "18px 22px 20px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={label}>Bucket</span>
+                      {!sf && (
+                        <span style={{ display: "flex", gap: 12 }}>
+                          {mb.storage?.own && f.kind !== "services" && (
+                            <button className="dlg-link" disabled={mastodonBackupBusy || !!running} onClick={() => void saveMastodonStorage(f.launchId, true)}>
+                              use the mesh backup&apos;s
+                            </button>
+                          )}
+                          <button className="dlg-link" disabled={!!running} onClick={() => void openMastodonStorageForm(f.launchId)}>
+                            {mb.storage ? "change…" : "set…"}
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                    {!sf &&
+                      (mb.storage ? (
+                        <div style={{ fontSize: 12.5, color: "#c9cad6" }}>
+                          <span style={{ fontFamily: mono, fontSize: 12 }}>{mb.storage.bucket}/{mb.storage.path}</span>
+                          <span style={{ color: "#9a9bab" }}>{mb.storage.own ? " (Mastodon's own)" : " (the mesh backup's bucket)"}</span>
+                        </div>
+                      ) : (
+                        <div className="dlg-warn">
+                          <b>!</b>
+                          <span>
+                            {f.kind === "services"
+                              ? "A services fleet has no mesh backup bucket: give Mastodon a bucket of its own to back it up."
+                              : "No bucket yet: turn on the mesh backup (back up mesh… on headscale), or give Mastodon a bucket of its own."}
+                          </span>
+                        </div>
+                      ))}
+                    {sf && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {(["endpoint", "bucket", "region", "accessKeyId"] as const).map((k) => (
+                          <input
+                            key={k}
+                            style={field}
+                            placeholder={{ endpoint: "S3 endpoint (https://…)", bucket: "bucket", region: "region", accessKeyId: "access key id" }[k]}
+                            value={sf[k]}
+                            onChange={(e) => setMastodonStorageForm({ ...sf, [k]: e.target.value })}
+                          />
+                        ))}
+                        <input
+                          style={field}
+                          type="password"
+                          placeholder={sf.known || mb.storage?.own ? "secret key (blank: reuse the stored one)" : "secret key"}
+                          value={sf.secret}
+                          onChange={(e) => setMastodonStorageForm({ ...sf, secret: e.target.value })}
+                        />
+                        <input
+                          style={field}
+                          placeholder="key prefix (blank: sparkdream-launcher/<chain id>/mastodon)"
+                          value={sf.path}
+                          onChange={(e) => setMastodonStorageForm({ ...sf, path: e.target.value })}
+                        />
+                        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                          <button className="btn" disabled={mastodonBackupBusy} onClick={() => setMastodonStorageForm(null)}>
+                            Cancel
+                          </button>
+                          <button
+                            className="btn primary"
+                            disabled={mastodonBackupBusy || !sf.endpoint || !sf.bucket || !sf.accessKeyId}
+                            onClick={() => void saveMastodonStorage(f.launchId)}
+                          >
+                            {mastodonBackupBusy ? "Saving…" : "Save bucket"}
+                          </button>
+                        </div>
+                        <span style={{ fontSize: 11.5, lineHeight: 1.5, color: "#9a9bab" }}>
+                          Nothing in the deployment changes: each backup hands the instance these settings when it runs, and its check proves them.
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={label}>Kept backups</span>
+                      <span style={{ fontSize: 11.5, color: "#9a9bab" }}>last 2 are kept</span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", border: "1px solid rgba(255,255,255,.09)", borderRadius: 10, overflow: "hidden" }}>
+                      {running && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 7, padding: "10px 13px", background: "rgba(109,106,248,.07)", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <span style={{ width: 6, height: 6, borderRadius: 99, background: "#8f8dfa" }} />
+                            <span style={{ fontSize: 12.5 }}>
+                              {running.progress?.label ?? (running.kind === "mastodon-restore" ? "restoring Mastodon" : "backing up Mastodon")}
+                            </span>
+                            <span style={{ flex: 1 }} />
+                            {running.progress?.elapsedSeconds !== undefined && (
+                              <span style={{ fontFamily: mono, fontSize: 12, color: "#b3b1fb" }}>{Math.round(running.progress.elapsedSeconds / 60)} min</span>
+                            )}
+                          </div>
+                          <span className="bk-progress"><span /></span>
+                        </div>
+                      )}
+                      {mb.backups.length === 0 && !running && (
+                        <div style={{ padding: "10px 13px", fontSize: 12.5, color: "#9a9bab" }}>No backups yet.</div>
+                      )}
+                      {mb.backups.map((b) => {
+                        const tag = !b.verified ? "unverified" : b.name === latest ? "latest" : "usable";
+                        return (
+                          <div
+                            key={b.name}
+                            title={b.name}
+                            style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto auto auto", alignItems: "center", gap: 12, padding: "10px 13px", borderBottom: "1px solid rgba(255,255,255,.06)" }}
+                          >
+                            <span style={{ fontSize: 12.5, color: b.name === latest ? "#ecedf2" : "#c9cad6" }}>{new Date(b.takenAt).toLocaleString()}</span>
+                            <span
+                              style={{
+                                fontSize: 11,
+                                fontWeight: 600,
+                                padding: "2px 8px",
+                                borderRadius: 99,
+                                color: !b.verified ? "#fbbf24" : b.name === latest ? "#4ade80" : "#c9cad6",
+                                background: !b.verified ? "rgba(251,191,36,.1)" : b.name === latest ? "rgba(74,222,128,.1)" : "rgba(255,255,255,.07)",
+                              }}
+                            >
+                              {tag}
+                            </span>
+                            <button
+                              className="bk-delete"
+                              title="Replace the running instance's data with this backup"
+                              disabled={moving || !b.verified}
+                              onClick={() => void restoreMastodon(f.launchId, b)}
+                            >
+                              restore
+                            </button>
+                            <button
+                              className="bk-delete"
+                              title={`Delete ${b.name} from the bucket`}
+                              disabled={!!running}
+                              onClick={() => void removeMastodonBackup(f.launchId, b)}
+                            >
+                              delete
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <span style={label}>Schedule</span>
+                    <div
+                      style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 2, padding: 3, background: "#16161e", border: "1px solid rgba(255,255,255,.1)", borderRadius: 9, opacity: mb.storage ? 1 : 0.45 }}
+                    >
+                      {(["off", "daily", "weekly"] as const).map((v) => (
+                        <button
+                          key={v}
+                          disabled={!mb.storage || mb.schedule === v}
+                          onClick={() => void mastodonBackupAction(f.launchId, { schedule: v })}
+                          style={segment(mb.schedule === v, Boolean(mb.storage))}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    role="switch"
+                    aria-checked={mb.autoRestore}
+                    onClick={() => void mastodonBackupAction(f.launchId, { autoRestore: !mb.autoRestore })}
+                    style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "12px 14px", background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 10, color: "#ecedf2", cursor: "pointer", textAlign: "left" }}
+                  >
+                    <span style={{ flex: "none", width: 32, height: 18, borderRadius: 99, background: mb.autoRestore ? "#6d6af8" : "rgba(255,255,255,.18)", display: "flex", alignItems: "center", padding: 2, boxSizing: "border-box", justifyContent: mb.autoRestore ? "flex-end" : "flex-start", marginTop: 1 }}>
+                      <span style={{ width: 14, height: 14, borderRadius: 99, background: "#fff" }} />
+                    </span>
+                    <span style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>A relaunched instance starts from the latest backup</span>
+                      <span style={{ fontSize: 12, lineHeight: 1.5, color: "#9a9bab" }}>
+                        Off: a relaunch starts Mastodon empty, with a new owner account. A resize always carries the data, through the bucket when there is one.
+                      </span>
+                    </span>
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.02)", borderRadius: "0 0 14px 14px" }}>
+                  <button
+                    onClick={close}
+                    style={{ padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,.12)", background: "transparent", color: "#c9cad6", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+                  >
+                    Close
+                  </button>
+                  <button
+                    disabled={Boolean(running) || !mb.storage}
+                    onClick={() => void mastodonBackupAction(f.launchId)}
+                    style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: running || !mb.storage ? "#3d3c7a" : "#6d6af8", color: "#fff", fontSize: 13, fontWeight: 600, cursor: running || !mb.storage ? "default" : "pointer" }}
+                  >
+                    {running ? (running.kind === "mastodon-restore" ? "Restoring…" : "Backing up…") : "Back up now"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
       {addForm && (() => {
         const o = addForm.options;
         const isSentry = addForm.key === "sentry";
@@ -5363,7 +5723,8 @@ export default function Page() {
                                       const image = window.prompt(
                                         `New sparkdreamd image for validators + sentries:${feeNote}`,
                                         node?.image ?? undefined,
-                                      );
+                                      )?.trim();
+                                      if (image && badImage(image)) return;
                                       // skip only when the whole node fleet already runs the
                                       // image — after an aborted mid-upgrade the fleet is mixed
                                       // and re-running with the same tag is the retry path
@@ -5396,7 +5757,8 @@ export default function Page() {
                                       const image = window.prompt(
                                         `New image for a coordinated (consensus-breaking) upgrade:${feeNote}`,
                                         nodes[0]?.image ?? undefined,
-                                      );
+                                      )?.trim();
+                                      if (image && badImage(image)) return;
                                       // an unedited prefill on a fleet already running it
                                       // would halt consensus to install what is installed;
                                       // a mixed fleet is the aborted-upgrade retry path
@@ -6516,7 +6878,8 @@ export default function Page() {
                                         const image = window.prompt(
                                           `Upgrade ${c.key}:${sideNote}${feeNote}`,
                                           c.image ?? undefined,
-                                        );
+                                        )?.trim();
+                                        if (image && badImage(image)) return;
                                         if (image && image !== c.image)
                                           fleetAction(f.launchId, c.dseq, "upgrade", {
                                             image,
@@ -6709,7 +7072,9 @@ export default function Page() {
                                         }
                                         const ok = window.confirm(
                                           `Resize Mastodon to "${size}"?\n\n` +
-                                            "1. Its database and uploaded media are backed up to the launcher (encrypted).\n" +
+                                            (f.mastodonBackups?.storage
+                                              ? "1. Its database and uploaded media are backed up to its bucket (encrypted) and checked.\n"
+                                              : "1. Its database and uploaded media are backed up to the launcher (encrypted).\n") +
                                             "2. The current deployment is closed (one signature): the instance goes down.\n" +
                                             "3. A new deployment at the new size is created and leased (signatures), on the same provider if it bids.\n" +
                                             "4. The data is restored and Mastodon restarts; the bridge is re-linked.\n\n" +
@@ -6720,6 +7085,15 @@ export default function Page() {
                                       }}
                                     >
                                       resize…
+                                    </button>
+                                  )}
+                                  {c.key === "mastodon" && f.mastodonBackups && (
+                                    <button
+                                      className="btn"
+                                      title="Back up the instance's database and media to a bucket, on a schedule or now; restore one in place, and choose whether a relaunch starts from the latest."
+                                      onClick={() => void openMastodonBackups(f.launchId, Boolean(f.mastodonBackups?.storage))}
+                                    >
+                                      backups…
                                     </button>
                                   )}
                                   {c.key === "mastodon" && (

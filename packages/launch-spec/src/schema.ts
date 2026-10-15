@@ -437,6 +437,13 @@ const mastodonComponent = z.object({
    * standalone `bridge` component of its own.
    */
   bridge: bridgeLink.optional(),
+  /**
+   * Where the instance's backups go (the database and uploaded media,
+   * encrypted to the fleet's age key). Defaults to the fleet's mesh backup
+   * bucket; a services fleet has no mesh, so it needs this to back up.
+   * `path` defaults to sparkdream-launcher/<chain-id>/mastodon.
+   */
+  backup: z.object({ s3: s3Backup }).optional(),
 });
 
 /**

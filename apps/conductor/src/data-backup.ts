@@ -217,13 +217,13 @@ export function backupSource(rows: FleetComponentRow[]): FleetComponentRow | und
 }
 
 /** A shell file of exported variables, values single-quoted. */
-function envFile(vars: Record<string, string>): string {
+export function envFile(vars: Record<string, string>): string {
   return Object.entries(vars)
     .map(([k, v]) => `export ${k}='${v.replace(/'/g, `'\\''`)}'`)
     .join("\n") + "\n";
 }
 
-function s3Env(storage: DataBackupStorage): Record<string, string> {
+export function s3Env(storage: DataBackupStorage): Record<string, string> {
   return {
     AWS_ACCESS_KEY_ID: storage.accessKeyId,
     AWS_SECRET_ACCESS_KEY: storage.secret,
@@ -262,7 +262,7 @@ fi
  * restore. curl signs the requests itself (--aws-sigv4, curl 7.75+). Path
  * style, as s5cmd uses with a custom endpoint.
  */
-const S3GET_FN = `# s3get KEY: stream s3://$S3_BUCKET/KEY to stdout in checked ranges (s5cmd
+export const S3GET_FN = `# s3get KEY: stream s3://$S3_BUCKET/KEY to stdout in checked ranges (s5cmd
 # cat ends early without an error on 4everland). Needs AWS_* and S3_ENDPOINT.
 s3get() {
   local url="\${S3_ENDPOINT%/}/$S3_BUCKET/$1" size off=0 end n tries chunk=67108864 part=/tmp/.s3get.$$
@@ -391,7 +391,7 @@ const TOOLS_PROBE =
   `grep -q launcher-hold /usr/local/bin/entrypoint_ssh.sh 2>/dev/null || echo "missing hold"`;
 
 /** How long a copy may run before it is given up (a stuck upload keeps the node held). */
-const MAX_COPY_SECS = 12 * 3600;
+export const MAX_COPY_SECS = 12 * 3600;
 /** A restore whose data stopped growing this long is given up. */
 const RESTORE_STALL_SECS = 20 * 60;
 /** Consecutive failed polls (15s apart) before the launcher stops waiting on a node. */
@@ -402,7 +402,7 @@ const MAX_POLL_ERRORS = 20;
  * uploader hung on a part, holding up the pipe) while the script stayed
  * alive, which the watch would have waited on for 12 hours.
  */
-const UPLOAD_STALL_SECS = 10 * 60;
+export const UPLOAD_STALL_SECS = 10 * 60;
 
 /**
  * "<MB read> <seconds running>" for the tar a launcher script runs as a
@@ -490,7 +490,15 @@ export const scriptStateCmd = (name: string) =>
   `a=dead; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && a=alive; echo "\${s:-none} $a"`;
 
 async function scriptState(ctx: StepCtx, target: SshTarget, name: string): Promise<{ status: string; alive: boolean }> {
-  const [status = "none", alive] = (await ctx.services.ssh.exec(target, scriptStateCmd(name))).stdout.trim().split(/\s+/);
+  return scriptStateVia(async (cmd) => (await ctx.services.ssh.exec(target, cmd)).stdout, name);
+}
+
+/** scriptState through any way into the container (SSH, lease-shell). */
+export async function scriptStateVia(
+  exec: (cmd: string) => Promise<string>,
+  name: string,
+): Promise<{ status: string; alive: boolean }> {
+  const [status = "none", alive] = (await exec(scriptStateCmd(name))).trim().split(/\s+/);
   return { status, alive: alive === "alive" };
 }
 
@@ -526,7 +534,24 @@ async function watchScript(
   ctx: StepCtx,
   target: () => SshTarget,
   name: string,
-  opts: { maxSecs: number; progressMb?: () => Promise<number | null>; stallSecs?: number; tick?: (secs: number, mb: number) => Promise<void> | void },
+  opts: WatchOpts,
+): Promise<string | null> {
+  return watchScriptVia(ctx, async (cmd) => (await ctx.services.ssh.exec(target(), cmd)).stdout, name, opts);
+}
+
+interface WatchOpts {
+  maxSecs: number;
+  progressMb?: () => Promise<number | null>;
+  stallSecs?: number;
+  tick?: (secs: number, mb: number) => Promise<void> | void;
+}
+
+/** watchScript through any way into the container (SSH, lease-shell). */
+export async function watchScriptVia(
+  ctx: StepCtx,
+  exec: (cmd: string) => Promise<string>,
+  name: string,
+  opts: WatchOpts,
 ): Promise<string | null> {
   const started = Date.now();
   let errors = 0;
@@ -536,11 +561,11 @@ async function watchScript(
     await ctx.services.sleep(15_000);
     const secs = Math.round((Date.now() - started) / 1000);
     try {
-      const { status, alive } = await scriptState(ctx, target(), name);
+      const { status, alive } = await scriptStateVia(exec, name);
       errors = 0;
       if (status === "done") return null;
       if (status === "failed") {
-        const log = (await ctx.services.ssh.exec(target(), `tail -n 15 /tmp/${name}.log 2>/dev/null || true`)).stdout.trim();
+        const log = (await exec(`tail -n 15 /tmp/${name}.log 2>/dev/null || true`)).trim();
         return log || `${name} failed`;
       }
       if (!alive) return "the copy stopped without finishing (its container restarted?)";

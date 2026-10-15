@@ -483,6 +483,16 @@ export interface FleetSummary {
       /** age in days of the latest usable backup */
       latestAgeDays?: number;
     };
+    /** Fleets running Mastodon: where its backups go (null: nowhere yet),
+     *  recorded backups (newest first) and their settings. */
+    mastodonBackups?: {
+      /** own: Mastodon's own bucket; else the mesh backup's */
+      storage: { bucket: string; path: string; own: boolean } | null;
+      schedule: "off" | "daily" | "weekly";
+      autoRestore: boolean;
+      /** verified: read back and decrypted after the upload */
+      backups: Array<{ name: string; takenAt: string; verified: boolean }>;
+    };
     /** Which components recover on their own (off unless turned on). */
     autoRecover: AutoRecoverPolicy;
     /** Confirmed outages: open ones first, then the latest resolved. */
@@ -968,6 +978,48 @@ export async function postDataRestore(launchId: string, key: string, name: strin
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ key, name }),
+    }),
+  );
+}
+
+/** Back up Mastodon now (no body), or change its schedule / automatic restore. */
+export async function postMastodonBackup(
+  launchId: string,
+  settings: { schedule?: "off" | "daily" | "weekly"; autoRestore?: boolean } = {},
+): Promise<{ status?: string; opId?: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/mastodon-backup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
+  );
+}
+/** Set Mastodon's own backup bucket (a blank secret reuses one the launcher
+ *  holds for the access key), or clear it ({ clear: true }). */
+export async function postMastodonBackupStorage(
+  launchId: string,
+  storage: (MeshBackupStorage & { secret?: string; path?: string }) | { clear: true },
+): Promise<{ status: string }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/mastodon-backup/storage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(storage),
+    }),
+  );
+}
+/** Delete a recorded Mastodon backup from the bucket and the fleet's list. */
+export async function deleteMastodonBackup(launchId: string, name: string): Promise<{ status: string }> {
+  return json(await afetch(`/api/fleet/${launchId}/mastodon-backups/${encodeURIComponent(name)}`, { method: "DELETE" }));
+}
+/** Replace the running instance's data with a recorded backup, in place. */
+export async function postMastodonRestore(launchId: string, name: string): Promise<{ opId: number }> {
+  return json(
+    await afetch(`/api/fleet/${launchId}/mastodon-restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
     }),
   );
 }

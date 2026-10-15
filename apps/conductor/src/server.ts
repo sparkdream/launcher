@@ -16,6 +16,7 @@ import {
   type LaunchSpec,
   type LaunchSpecInput,
   type RelayerPath,
+  imageRefProblem,
 } from "@sparkdream/launch-spec";
 import {
   bakedSatisfies,
@@ -80,6 +81,7 @@ import { estimateLaunchCost } from "./estimate.js";
 import { feeConfig } from "./fee.js";
 import type { Services } from "./services.js";
 import { autoRestoreEnabled } from "./data-backup.js";
+import { mastodonAutoRestore } from "./mastodon-backup.js";
 import { publicAlertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
 import { setUnattendedSettings, UNATTENDED_FEE_DENOM } from "./unattended.js";
 import { CloudflareDns, cloudflareToken, setCloudflareToken } from "./dns.js";
@@ -279,6 +281,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
               drive(launch.id, JSON.parse(launch.spec_json));
             } catch {
               // not possible right now (no second sentry, an op started): next pass
+            }
+          }
+          // scheduled Mastodon backup (off unless the fleet turned it on)
+          if (!running.has(launch.id) && fleet.mastodonBackupDue(launch.id)) {
+            try {
+              fleet.requestMastodonBackup(launch, { auto: true });
+              drive(launch.id, JSON.parse(launch.spec_json));
+            } catch {
+              // not possible right now (an op started): next pass
             }
           }
           // no usable chain-data backup (or only an old one): a moved node
@@ -1010,6 +1021,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
       case "upgrade": {
         if (!body.image) return reply.status(400).send({ error: "image required" });
+        const badImage = imageRefProblem(body.image);
+        if (badImage) return reply.status(400).send({ error: `"${body.image}" is not a valid image: ${badImage}` });
         // rolling scope: given components or the whole node fleet (§5).
         // Defaulting to nodes only — the image is a sparkdreamd tag;
         // explorer/frontend upgrades name their component explicitly.
@@ -1027,6 +1040,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (!body.image || !body.haltHeight) {
           return reply.status(400).send({ error: "image and haltHeight required" });
         }
+        const badHaltImage = imageRefProblem(body.image);
+        if (badHaltImage) return reply.status(400).send({ error: `"${body.image}" is not a valid image: ${badHaltImage}` });
         const opId = fleet.requestHaltUpgrade(launch, body.image, body.haltHeight);
         drive(launchId, spec);
         return { status: "halt-upgrade-started", opId };
@@ -1712,6 +1727,96 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       const opId = fleet.requestDataRestore(launch, component, name);
       drive(launchId, JSON.parse(launch.spec_json));
       return { status: "data-restore-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+
+  // Mastodon backups (mastodon-backup.ts): back up now, schedule, bucket,
+  // restore in place
+  app.post("/api/fleet/:launchId/mastodon-backup", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const { schedule, autoRestore } = (req.body ?? {}) as { schedule?: string; autoRestore?: boolean };
+    if (schedule !== undefined && schedule !== "off" && schedule !== "daily" && schedule !== "weekly") {
+      return reply.status(400).send({ error: 'schedule must be "off", "daily" or "weekly"' });
+    }
+    if (autoRestore !== undefined && typeof autoRestore !== "boolean") {
+      return reply.status(400).send({ error: "autoRestore must be true or false" });
+    }
+    try {
+      if (schedule !== undefined || autoRestore !== undefined) {
+        if (schedule !== undefined) fleet.setMastodonBackupSchedule(launch, schedule);
+        if (autoRestore !== undefined) fleet.setMastodonAutoRestore(launch, autoRestore);
+        return { schedule: fleet.mastodonBackupSchedule(launchId), autoRestore: mastodonAutoRestore(deps.db, launchId) };
+      }
+      const opId = fleet.requestMastodonBackup(launch);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "mastodon-backup-started", opId };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  // where the backups go: the S3 settings (a blank secret reuses one the
+  // launcher holds for the access key), or { clear: true } for the default
+  app.post("/api/fleet/:launchId/mastodon-backup/storage", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const body = (req.body ?? {}) as {
+      clear?: boolean;
+      endpoint?: string;
+      bucket?: string;
+      region?: string;
+      accessKeyId?: string;
+      secret?: string;
+      path?: string;
+    };
+    try {
+      fleet.setMastodonBackupStorage(
+        launch,
+        body.clear
+          ? null
+          : {
+              endpoint: body.endpoint ?? "",
+              bucket: body.bucket ?? "",
+              accessKeyId: body.accessKeyId ?? "",
+              ...(body.region ? { region: body.region } : {}),
+              ...(body.secret ? { secret: body.secret } : {}),
+              ...(body.path ? { path: body.path } : {}),
+            },
+      );
+      return { status: "saved" };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.delete("/api/fleet/:launchId/mastodon-backups/:name", async (req, reply) => {
+    const { launchId, name } = req.params as { launchId: string; name: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    try {
+      await fleet.deleteMastodonBackup(launch, name);
+      return { status: "deleted", name };
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
+  });
+  app.post("/api/fleet/:launchId/mastodon-restore", async (req, reply) => {
+    const { launchId } = req.params as { launchId: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const { name } = (req.body ?? {}) as { name?: string };
+    if (!name) return reply.status(400).send({ error: "name required" });
+    try {
+      const opId = fleet.requestMastodonRestore(launch, name);
+      drive(launchId, JSON.parse(launch.spec_json));
+      return { status: "mastodon-restore-started", opId };
     } catch (e) {
       return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
     }

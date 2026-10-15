@@ -299,7 +299,7 @@ export class FakeProviderGateway {
   }
 
   /** Lease-shell exec — the headscale image has no sshd (mirrors FakeSsh). */
-  shellLog: Array<{ dseq: string; script: string }> = [];
+  shellLog: Array<{ dseq: string; script: string; service?: string }> = [];
   /** Session keys delivered to daemons, keyed "<dseq>/<service>". */
   sessionKeys = new Map<string, string>();
   /** Session-key deliveries that fail before one succeeds (the container
@@ -355,6 +355,10 @@ export class FakeProviderGateway {
     throw new Error(`lease shell: exit 2: mastodon-bootstrap ${action}`);
   }
 
+  /** "<dseq>/<service>" whose container does not run (a pod wedged on a bad
+   *  image): lease-shell into it fails, the deployment's other services answer. */
+  downServices = new Set<string>();
+
   /** Deployments whose provider's API is down (status and lease-shell both
    *  fail) while the workload keeps running. */
   apiDownDseqs = new Set<string>();
@@ -385,6 +389,109 @@ export class FakeProviderGateway {
   private shellFiles = new Map<string, Buffer>();
   /** The restore's scratch database, by dseq. */
   private scratchDb = new Map<string, { accounts: string[]; token?: string } | null>();
+
+  /** The Mastodon image carries the backup tools (pg_dump, age, s5cmd...). */
+  mastodonBackupTools = true;
+  /** Mastodon backup objects in the bucket, "bucket/prefix/name/object" -> contents. */
+  mastodonBucket = new Map<string, Buffer>();
+  /** The next Mastodon backup uploads fail. */
+  mastodonUploadFails = false;
+  /** Objects the bucket returns altered (so they fail their check). */
+  mastodonCorrupt = new Set<string>();
+  /** The launcher's Mastodon scripts by "<dseq>|<name>": their status file. */
+  mastodonScripts = new Map<string, string>();
+  /** Scripts the launcher stopped, "<dseq>|<name>". */
+  mastodonStopped: string[] = [];
+
+  private shellEnv(dseq: string, path: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const m of (this.shellFiles.get(`${dseq}:${path}`)?.toString() ?? "").matchAll(/^export (\w+)='(.*)'$/gm)) out[m[1]!] = m[2]!;
+    return out;
+  }
+
+  /**
+   * The Mastodon backup scripts (mastodon-backup.ts), run in memory: a
+   * backup's database object is the instance's accounts and token as JSON
+   * (as a resize's dump is), its media object the media; a restore fills the
+   * scratch database from it, which the swap then renames in.
+   */
+  private mastodonBackupScripts(dseq: string, script: string): { stdout: string; stderr: string } | undefined {
+    const ok = (stdout = "") => ({ stdout, stderr: "" });
+    const sha = (b: Buffer) => crypto.createHash("sha256").update(b).digest("hex");
+    let m: RegExpExecArray | null;
+    if (script.startsWith("for t in pg_dump pg_restore")) return ok(this.mastodonBackupTools ? "" : "pg_dump\ns5cmd\n");
+    if ((m = /^umask 077; printf '%s' '([A-Za-z0-9+/=]*)' \| base64 -d > (\S+)$/.exec(script))) {
+      this.shellFiles.set(`${dseq}:${m[2]!}`, Buffer.from(m[1]!, "base64"));
+      return ok();
+    }
+    const name = /\/tmp\/(sd-mbackup|sd-mverify|sd-mrestore)\.pid/.exec(script)?.[1];
+    if (name && script.includes("kill -TERM --")) {
+      this.mastodonStopped.push(`${dseq}|${name}`);
+      this.mastodonScripts.set(`${dseq}|${name}`, "failed");
+      return ok("stopped");
+    }
+    if (name && script.includes("kill -0")) {
+      const status = this.mastodonScripts.get(`${dseq}|${name}`);
+      return ok(`${status || "none"} ${status === "running" ? "alive" : "dead"}`);
+    }
+    if (script.startsWith("p=$(cat /tmp/sd-mbackup.pid")) return ok("");
+    if ((m = /^rm -f ((?:\/tmp\/sd-m\w+\.\w+ ?)+)$/.exec(script))) {
+      for (const f of m[1]!.trim().split(" ")) {
+        const st = /\/tmp\/(sd-m\w+)\.status/.exec(f)?.[1];
+        if (st) this.mastodonScripts.delete(`${dseq}|${st}`);
+      }
+      return ok();
+    }
+    const object = (envPath: string, obj: string) => {
+      const env = this.shellEnv(dseq, envPath);
+      return `${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}/${obj}`;
+    };
+    if ((m = /^cat \/tmp\/sd-mbackup\.(db\.dump|media\.tar)\.sha/.exec(script))) {
+      const data = this.mastodonBucket.get(object("/tmp/sd-mbackup.env", `${m[1]}.age`));
+      return ok(data && this.mastodonScripts.get(`${dseq}|sd-mbackup`) === "done" ? sha(data) : "");
+    }
+    if ((m = /^cat \/tmp\/sd-mverify\.(db\.dump|media\.tar)\.readback/.exec(script))) {
+      const key = object("/tmp/sd-mverify.env", `${m[1]}.age`);
+      const data = this.mastodonBucket.get(key);
+      return ok(!data ? "" : this.mastodonCorrupt.has(key) ? "b".repeat(64) : sha(data));
+    }
+    if (script.includes("bash /tmp/sd-mbackup.sh")) {
+      if (this.mastodonUploadFails) this.mastodonScripts.set(`${dseq}|sd-mbackup`, "failed");
+      else {
+        const inst = this.mastodon.get(dseq);
+        const dump = JSON.stringify({ accounts: [...(inst?.accounts ?? [])], token: inst?.token });
+        this.mastodonBucket.set(object("/tmp/sd-mbackup.env", "db.dump.age"), Buffer.from(dump));
+        this.mastodonBucket.set(object("/tmp/sd-mbackup.env", "media.tar.age"), this.mastodonMedia.get(dseq) ?? Buffer.alloc(0));
+        this.mastodonScripts.set(`${dseq}|sd-mbackup`, "done");
+      }
+      return ok();
+    }
+    if (script.includes("bash /tmp/sd-mverify.sh")) {
+      const keys = ["db.dump.age", "media.tar.age"].map((o) => object("/tmp/sd-mverify.env", o));
+      const good = keys.every((k) => this.mastodonBucket.has(k) && !this.mastodonCorrupt.has(k));
+      this.mastodonScripts.set(`${dseq}|sd-mverify`, good ? "done" : "failed");
+      return ok();
+    }
+    if (script.includes("bash /tmp/sd-mrestore.sh")) {
+      const dump = this.mastodonBucket.get(object("/tmp/sd-mrestore.env", "db.dump.age"));
+      const media = this.mastodonBucket.get(object("/tmp/sd-mrestore.env", "media.tar.age"));
+      if (!dump || !media) this.mastodonScripts.set(`${dseq}|sd-mrestore`, "failed");
+      else {
+        this.scratchDb.set(dseq, JSON.parse(dump.toString()));
+        this.mastodonMedia.set(dseq, media);
+        this.mastodonScripts.set(`${dseq}|sd-mrestore`, "done");
+      }
+      return ok();
+    }
+    if (script.includes(". /tmp/sd-mrm.env")) {
+      const env = this.shellEnv(dseq, "/tmp/sd-mrm.env");
+      for (const k of [...this.mastodonBucket.keys()]) {
+        if (k.startsWith(`${env.S3_BUCKET}/${env.S3_PREFIX}/${env.NAME}/`)) this.mastodonBucket.delete(k);
+      }
+      return ok("removed");
+    }
+    return undefined;
+  }
 
   /**
    * Mastodon's data as the resize moves it (steps/mastodon-migrate.ts): a
@@ -458,8 +565,9 @@ export class FakeProviderGateway {
     cmd: string[],
   ): Promise<{ stdout: string; stderr: string }> {
     const script = cmd[cmd.length - 1] ?? "";
-    this.shellLog.push({ dseq, script });
+    this.shellLog.push({ dseq, script, service: _service });
     if (this.apiDownDseqs.has(dseq)) throw new Error("lease shell: provider reported a failure (pod restarting?)");
+    if (this.downServices.has(`${dseq}/${_service}`)) throw new Error("lease shell: no active replicas for service");
     if (cmd[0] === "mastodon-bootstrap") return this.mastodonBootstrap(dseq, cmd.slice(1));
     if (script.includes("127.0.0.1:8080/health")) return { stdout: `${this.headscaleSelf}\n`, stderr: "" };
     // a node's data volume: 20 GiB, a quarter used unless a test says otherwise
@@ -473,6 +581,8 @@ export class FakeProviderGateway {
         stderr: "",
       };
     }
+    const backup = this.mastodonBackupScripts(dseq, script);
+    if (backup) return backup;
     const data = this.mastodonData(dseq, script);
     if (data) return data;
     // printing env vars (the bridge's delivered-env check): what the

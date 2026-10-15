@@ -31,6 +31,7 @@ import {
   type NodeSize,
   type RoleResources,
   type RelayerPath,
+  imageRefProblem,
 } from "@sparkdream/launch-spec";
 import { descriptorFor } from "./components/index.js";
 import { peerProgress, type PeerSetup } from "./peering.js";
@@ -232,6 +233,19 @@ import {
   type DataRestoreParams,
   type DataBackupRecord,
 } from "./data-backup.js";
+import {
+  MASTODON_S3_SECRET_FILE,
+  abandonMastodonBackupCmd,
+  dropPendingMastodonBackup,
+  forgetMastodonBackup,
+  latestMastodonBackup,
+  mastodonAutoRestore,
+  mastodonBackupStorage,
+  mastodonBackups,
+  removeMastodonBackup,
+  type MastodonBackupParams,
+  type MastodonRestoreParams,
+} from "./mastodon-backup.js";
 import { HANDOVER_STEPS, UNRETIRE_CMD, type NodeResizeParams } from "./node-resize.js";
 import { estimateComponent, estimateNode, sizeToBytes } from "./estimate.js";
 import { cloudflareToken } from "./dns.js";
@@ -1021,6 +1035,20 @@ export class FleetService {
                 ...(await this.backupStanding(launch).catch(() => ({}))),
               },
             }),
+        ...(spec.topology.components.mastodon?.enabled
+          ? {
+              mastodonBackups: {
+                // the bucket's place (never its secret): Mastodon's own, or the mesh backup's
+                storage: (() => {
+                  const st = mastodonBackupStorage(spec, launchDirs(this.workRoot, launch.id).secrets);
+                  return st ? { bucket: st.bucket, path: st.prefix, own: Boolean(spec.topology.components.mastodon.backup) } : null;
+                })(),
+                schedule: this.mastodonBackupSchedule(launch.id),
+                autoRestore: mastodonAutoRestore(this.db, launch.id),
+                backups: mastodonBackups(this.db, launch.id).map((b) => ({ name: b.name, takenAt: b.takenAt, verified: b.verified === true })),
+              },
+            }
+          : {}),
         autoRecover: this.autoRecoverPolicy(launch.id),
         incidents: this.db.listIncidents(launch.id, 5).map((i) => ({
           id: i.id,
@@ -1359,11 +1387,18 @@ export class FleetService {
               "signs nothing between the DNS flip and the signer repoint.",
       );
     } else if (component.key === "mastodon") {
+      const latest = latestMastodonBackup(this.db, launch.id);
+      const bucket = mastodonBackupStorage(spec, launchDirs(this.workRoot, launch.id).secrets);
       warnings.push(
-        "relaunching Mastodon starts it on EMPTY volumes on another provider: its accounts, posts " +
-          "and uploaded media stay behind with the closed deployment, and the launcher creates a new " +
-          "owner account. To move the instance with its data (to change its size, or to leave a " +
-          "provider), use resize instead.",
+        latest && bucket && mastodonAutoRestore(this.db, launch.id)
+          ? `relaunching Mastodon starts it on another provider from its backup of ${latest.takenAt}: ` +
+              "posts, accounts and media added since stay behind with the closed deployment. To carry " +
+              "everything up to now, take a backup first (backups…), or use resize, which copies the data at the moment it moves."
+          : "relaunching Mastodon starts it on EMPTY volumes on another provider: its accounts, posts " +
+              "and uploaded media stay behind with the closed deployment, and the launcher creates a new " +
+              "owner account. To move the instance with its data (to change its size, or to leave a " +
+              "provider), use resize instead" +
+              (bucket ? ", or take a backup first (backups…), which the relaunch then restores." : "."),
       );
     } else if (component.key.startsWith("val-")) {
       warnings.push(
@@ -2886,6 +2921,8 @@ export class FleetService {
       .listFleetOps(launch.id, "active")
       .some((o) => o.kind === "mastodon-resize" || (o.kind === "relaunch" && JSON.parse(o.params_json).key === "mastodon"));
     if (busy) throw new Error("Mastodon is already being moved: finish or abort that op first");
+    const backup = this.mastodonBackupBusy(launch.id);
+    if (backup) throw new Error(`a Mastodon ${backup.kind.slice("mastodon-".length)} is running (op #${backup.id}): finish or abort it first`);
   }
 
   private queueMastodonMove(
@@ -3633,10 +3670,11 @@ export class FleetService {
   private knownS3Secret(owner: string, accessKeyId: string, exceptLaunch: string): string | undefined {
     for (const other of this.db.listLaunches()) {
       if (other.id === exceptLaunch || other.owner !== owner) continue;
-      const backup = withDefaults(JSON.parse(other.spec_json)).topology.headscale.backup;
-      if (backup?.s3.accessKeyId !== accessKeyId) continue;
-      const secret = resolveS3Secret(backup, launchDirs(this.workRoot, other.id).secrets);
-      if (secret) return secret;
+      for (const backup of backupsOf(withDefaults(JSON.parse(other.spec_json)))) {
+        if (backup.s3.accessKeyId !== accessKeyId) continue;
+        const secret = resolveS3Secret(backup, launchDirs(this.workRoot, other.id).secrets);
+        if (secret) return secret;
+      }
     }
     return undefined;
   }
@@ -3645,13 +3683,171 @@ export class FleetService {
   knownBackupStorage(owner: string): { endpoint: string; bucket: string; region: string; accessKeyId: string } | null {
     for (const other of this.db.listLaunches()) {
       if (other.owner !== owner) continue;
-      const backup = withDefaults(JSON.parse(other.spec_json)).topology.headscale.backup;
+      const backup = backupsOf(withDefaults(JSON.parse(other.spec_json)))[0];
       if (backup) {
         const { endpoint, bucket, region, accessKeyId } = backup.s3;
         return { endpoint, bucket, region, accessKeyId };
       }
     }
     return null;
+  }
+
+  /**
+   * Set where Mastodon's backups go (mastodon.backup in the spec, the secret
+   * in the launch's secrets as secret:s3-mastodon-backup). Nothing in the
+   * deployment changes: a backup hands the container its settings when it
+   * runs, and its check proves them. A blank secret reuses the one another
+   * fleet of this wallet holds for the same access key; null clears the
+   * setting (back to the mesh backup's bucket, where the fleet has one).
+   */
+  setMastodonBackupStorage(
+    launch: LaunchRow,
+    s3: { endpoint: string; bucket: string; region?: string; accessKeyId: string; secret?: string; path?: string } | null,
+  ): void {
+    const spec = this.spec(launch);
+    if (!spec.topology.components.mastodon?.enabled) throw new Error("this fleet runs no Mastodon");
+    if (this.mastodonBackupBusy(launch.id)) throw new Error("a Mastodon backup or restore is running: change the bucket once it is done");
+    const dirs = launchDirs(this.workRoot, launch.id);
+    const stored = JSON.parse(launch.spec_json);
+    if (s3 === null) {
+      delete stored.topology.components.mastodon.backup;
+      fs.rmSync(path.join(dirs.secrets, MASTODON_S3_SECRET_FILE), { force: true });
+      this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+      return;
+    }
+    const endpoint = s3.endpoint.trim();
+    const bucket = s3.bucket.trim();
+    const accessKeyId = s3.accessKeyId.trim();
+    if (!/^https:\/\/[^\s/]+/.test(endpoint)) throw new Error("the S3 endpoint must be an https:// URL");
+    if (!bucket || !accessKeyId) throw new Error("bucket and access key are required");
+    let secret = s3.secret?.trim();
+    if (!secret) secret = this.knownS3Secret(launch.owner, accessKeyId, launch.id);
+    if (!secret && spec.topology.components.mastodon.backup?.s3.accessKeyId === accessKeyId) {
+      secret = resolveS3Secret(spec.topology.components.mastodon.backup, dirs.secrets);
+    }
+    if (!secret) throw new Error("the S3 secret key is required (no fleet here holds one for this access key)");
+    stored.topology.components.mastodon.backup = {
+      s3: {
+        endpoint,
+        bucket,
+        region: s3.region?.trim() || "us-west-2",
+        accessKeyId,
+        secretRef: `secret:${MASTODON_S3_SECRET_FILE}`,
+        ...(s3.path?.trim() ? { path: s3.path.trim() } : {}),
+      },
+    };
+    const { errors } = validateSpec(withDefaults(stored));
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    writeSecretFile(path.join(dirs.secrets, MASTODON_S3_SECRET_FILE), secret);
+    this.db.setLaunchSpec(launch.id, JSON.stringify(stored));
+  }
+
+  private mastodonBackupBusy(launchId: string) {
+    return this.db
+      .listFleetOps(launchId, "active")
+      .find((o) => o.kind === "mastodon-backup" || o.kind === "mastodon-restore" || o.kind === "mastodon-resize");
+  }
+
+  /** The running Mastodon row, or an error saying why there is none. */
+  private runningMastodon(launch: LaunchRow): FleetComponentRow {
+    const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === "mastodon");
+    if (!row || row.state !== "active") throw new Error("this fleet has no running Mastodon");
+    return row;
+  }
+
+  /**
+   * Back up the Mastodon instance to its bucket ("mastodon-backup" op). The
+   * instance keeps running: pg_dump reads one consistent snapshot.
+   */
+  requestMastodonBackup(launch: LaunchRow, opts: { auto?: boolean } = {}): number {
+    const spec = this.spec(launch);
+    this.runningMastodon(launch);
+    if (!mastodonBackupStorage(spec, launchDirs(this.workRoot, launch.id).secrets)) {
+      throw new Error("Mastodon has no backup bucket: set one first");
+    }
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: back up once it is done");
+    }
+    return this.db.createFleetOp(launch.id, "mastodon-backup", (opts.auto ? { auto: true } : {}) satisfies MastodonBackupParams);
+  }
+
+  /** Replace the running instance's data with a recorded backup ("mastodon-restore" op). */
+  requestMastodonRestore(launch: LaunchRow, name: string): number {
+    this.runningMastodon(launch);
+    const record = mastodonBackups(this.db, launch.id).find((r) => r.name === name);
+    if (!record) throw new Error(`no Mastodon backup named ${name} is recorded for this fleet`);
+    if (!record.verified) throw new Error(`${name} never passed its check, so it may not restore: delete it and take a new one`);
+    if (this.db.listFleetOps(launch.id, "active").length > 0) {
+      throw new Error("another operation is in progress: restore once it is done");
+    }
+    return this.db.createFleetOp(launch.id, "mastodon-restore", { name } satisfies MastodonRestoreParams);
+  }
+
+  /** Delete a recorded Mastodon backup from the bucket (through the running instance) and the fleet's list. */
+  async deleteMastodonBackup(launch: LaunchRow, name: string): Promise<void> {
+    if (!mastodonBackups(this.db, launch.id).some((r) => r.name === name)) {
+      throw new Error(`no Mastodon backup named ${name} is recorded for this fleet`);
+    }
+    const running = this.db
+      .listFleetOps(launch.id, "active")
+      .find((o) => o.kind === "mastodon-restore" && o.params_json.includes(name));
+    if (running) throw new Error(`op ${running.id} is using ${name}: delete it once that is done`);
+    const storage = mastodonBackupStorage(this.spec(launch), launchDirs(this.workRoot, launch.id).secrets);
+    if (!storage) throw new Error("Mastodon has no backup bucket");
+    await removeMastodonBackup(this.mastodonShell(launch, this.runningMastodon(launch)), storage, name);
+    forgetMastodonBackup(this.db, launch.id, name);
+  }
+
+  private mastodonShell(launch: LaunchRow, row: FleetComponentRow) {
+    return async (service: string, script: string, timeoutMs = 60_000) =>
+      (
+        await this.services.provider.shellExec(this.mtlsCreds(launch), row.host_uri, row.dseq, 1, 1, service, ["sh", "-c", script], {
+          timeoutMs,
+        })
+      ).stdout;
+  }
+
+  setMastodonAutoRestore(launch: LaunchRow, on: boolean): void {
+    this.db.setSetting(`mastodon-restore-auto:${launch.id}`, on ? "on" : "off");
+  }
+
+  /** How often scheduled Mastodon backups run: "off" (default), "daily" or "weekly". */
+  mastodonBackupSchedule(launchId: string): "off" | "daily" | "weekly" {
+    const v = this.db.getSetting(`mastodon-backup-schedule:${launchId}`);
+    return v === "daily" || v === "weekly" ? v : "off";
+  }
+
+  setMastodonBackupSchedule(launch: LaunchRow, schedule: string): void {
+    if (schedule !== "off" && schedule !== "daily" && schedule !== "weekly") {
+      throw new Error('schedule must be "off", "daily" or "weekly"');
+    }
+    if (schedule !== "off" && !mastodonBackupStorage(this.spec(launch), launchDirs(this.workRoot, launch.id).secrets)) {
+      throw new Error("Mastodon has no backup bucket: set one first");
+    }
+    this.db.setSetting(`mastodon-backup-schedule:${launch.id}`, schedule);
+  }
+
+  /**
+   * A scheduled Mastodon backup is due: on schedule, past its interval since
+   * the last checked backup or attempt, nothing else running, Mastodon up.
+   */
+  mastodonBackupDue(launchId: string, now = Date.now()): boolean {
+    const schedule = this.mastodonBackupSchedule(launchId);
+    if (schedule === "off") return false;
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "completed") return false;
+    if (this.db.listFleetOps(launchId, "active").length > 0) return false;
+    const row = this.db.listFleetComponents(launchId).find((c) => c.key === "mastodon");
+    if (!row || row.state !== "active") return false;
+    const last = latestMastodonBackup(this.db, launchId);
+    // a failed attempt waits a full interval too, rather than retrying every minute
+    const lastAttempt = this.db
+      .listFleetOps(launchId)
+      .filter((o) => o.kind === "mastodon-backup")
+      .map((o) => Date.parse(o.created_at))
+      .sort((a, b) => b - a)[0];
+    const since = Math.max(last ? Date.parse(last.takenAt) : 0, lastAttempt ?? 0);
+    return now - since >= (schedule === "daily" ? 86_400_000 : 7 * 86_400_000);
   }
 
   requestGasPrice(launch: LaunchRow, minGasPrice: string): number {
@@ -4259,6 +4455,20 @@ export class FleetService {
         warning = warning ? `${warning}; ${note}` : note;
       }
     }
+    // nor a Mastodon backup or restore running in the container (the
+    // instance itself never stopped)
+    if (op.kind === "mastodon-backup" || op.kind === "mastodon-restore" || op.kind === "mastodon-resize") {
+      this.db.setFleetOpProgress(opId, null);
+      dropPendingMastodonBackup(this.db, launch.id);
+      const row = this.db.listFleetComponents(launch.id).find((c) => c.key === "mastodon" && c.state === "active");
+      if (row) {
+        await this.mastodonShell(launch, row as FleetComponentRow)("mastodon", abandonMastodonBackupCmd()).catch((e) => {
+          if (op.kind === "mastodon-resize") return;
+          const note = `Mastodon could not be reached to stop the ${op.kind.slice("mastodon-".length)} (${e instanceof Error ? e.message : String(e)})`;
+          warning = warning ? `${warning}; ${note}` : note;
+        });
+      }
+    }
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error
     const deploy = this.db.stepOutput<{ dseq: string }>(launch.id, `op${opId}:deploy`);
@@ -4332,6 +4542,7 @@ export class FleetService {
   }
 
   requestUpgrade(launch: LaunchRow, components: string[], image: string): number {
+    assertImageRef(image);
     const before = this.imagesBefore(launch, (key) => components.includes(key));
     this.recordSpecImage(launch, components, image);
     const params: UpgradeParams = { components, image, ...before };
@@ -4464,6 +4675,7 @@ export class FleetService {
   /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */
   requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number): number {
     if (isServicesFleet(this.spec(launch))) throw new Error("a services fleet runs no chain to upgrade");
+    assertImageRef(image);
     const before = this.imagesBefore(launch, (key) => /^(val|sentry)-/.test(key));
     this.recordSpecImage(launch, ["val-0"], image); // halt-upgrade swaps every node
     const params: HaltUpgradeParams = { image, haltHeight, ...before };
@@ -4791,4 +5003,15 @@ export class FleetService {
     }
     return { launchId };
   }
+}
+
+/** Every S3 backup setting a spec holds: the mesh backup's, then Mastodon's own. */
+function backupsOf(spec: LaunchSpec): { s3: { endpoint: string; bucket: string; region: string; accessKeyId: string; secretRef: string } }[] {
+  return [spec.topology.headscale?.backup, spec.topology.components.mastodon?.backup].filter((b) => b !== undefined);
+}
+
+/** Refuse an image a provider could not pull (imageRefProblem), before anything is signed. */
+function assertImageRef(image: string): void {
+  const problem = imageRefProblem(image);
+  if (problem) throw new Error(`"${image}" is not a valid image: ${problem}`);
 }

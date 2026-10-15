@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  imageRefProblem,
   chainId,
   checkSpec,
   grpcRequired,
@@ -1264,3 +1265,30 @@ describe("services fleet sharing", () => {
   });
 });
 
+describe("image references", () => {
+  const digest = "338edff6bae78293d76b39c79f942af9dbcfc16da68f1f9851c0159b00815138";
+  it("accepts tags, digests, both, and registries with ports", () => {
+    for (const image of [
+      "sparkdreamnft/mastodon:v1.0.54",
+      "sparkdreamnft/mastodon:v1.0.54a",
+      `sparkdreamnft/mastodon:v1.0.54@sha256:${digest}`,
+      `sparkdreamnft/mastodon@sha256:${digest}`,
+      "ghcr.io/mastodon/mastodon-streaming:v4.7.2",
+      "postgres:14-alpine",
+      "localhost:5000/foo/bar:dev",
+    ]) {
+      expect(imageRefProblem(image), image).toBeNull();
+    }
+  });
+
+  it("refuses what a provider cannot pull, saying why", () => {
+    // 2026-10-14: the digest's prefix pasted twice wedged Mastodon's StatefulSet
+    expect(imageRefProblem(`sparkdreamnft/mastodon:v1.0.54@sha256:sha256:${digest}`)).toMatch(/repeats its "sha256:" prefix/);
+    expect(imageRefProblem(`sparkdreamnft/mastodon@sha256:${digest.slice(0, 60)}`)).toMatch(/64 hex digits, this one 60/);
+    expect(imageRefProblem("SparkDreamNFT/mastodon:v1")).toMatch(/lowercase/);
+    expect(imageRefProblem("sparkdreamnft/mastodon: v1")).toMatch(/spaces/);
+    expect(imageRefProblem("sparkdreamnft/mastodon:")).toMatch(/not an image reference/);
+    expect(imageRefProblem("sparkdreamnft//mastodon")).toMatch(/not an image reference/);
+    expect(imageRefProblem("")).toMatch(/empty/);
+  });
+});

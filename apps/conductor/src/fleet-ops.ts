@@ -20,6 +20,17 @@ import {
 } from "@sparkdream/launch-spec";
 import type { ConductorDb, FleetComponentRow, FleetOpRow } from "./db.js";
 import { backupMastodon, restoreMastodon, type MastodonBackup } from "./steps/mastodon-migrate.js";
+import {
+  bucketBackupReady,
+  mastodonBackupSteps,
+  mastodonRestoreSteps,
+  relaunchRestoreStep,
+  restoreMastodonBackup,
+  uploadMastodonBackup,
+  verifyMastodonBackup,
+  type MastodonBackupRecord,
+  type MastodonRestoreParams,
+} from "./mastodon-backup.js";
 import { AwaitUser, launchDirs, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
@@ -43,7 +54,7 @@ import { descriptorFor, setServiceEnv } from "./components/index.js";
 import { applyMinGasPrices, nodeMinGasPrices, patchNodeAppToml, patchSentryAppToml, readMinGasPrices, sentryServe } from "./sentry-serve.js";
 import { fleetPeer, peerRow, relayedBy, sisterChainApis } from "./relayer.js";
 import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
-import { reconcileSessions, type SessionRole } from "./sessions.js";
+import { componentLease, reconcileSessions, type SessionRole } from "./sessions.js";
 import { claimPayments } from "./pay-claims.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { ensureScannerOperatorKey } from "./steps/scanner.js";
@@ -1347,8 +1358,35 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
   const relaunch = relaunchSteps(opId, params, sized);
   const at = relaunch.findIndex((s) => s.name === p("manifest"));
   if (at < 0) throw new Error("relaunch steps have no manifest step");
+  const progress = (ctx: StepCtx) => (label: string, secs: number) =>
+    ctx.db.setFleetOpProgress(opId, { label, elapsedSeconds: secs, updatedAt: new Date().toISOString() });
   return [
-    { name: p("backup"), run: (ctx) => backupMastodon(ctx, p("backup")) },
+    {
+      // through the bucket when Mastodon has one and its image the tools
+      // (no size limit, and the copy stays as a backup); else over
+      // lease-shell into the launcher, up to 256 MiB
+      name: p("backup"),
+      async run(ctx): Promise<MastodonBackup | { bucket: MastodonBackupRecord }> {
+        if (!(await bucketBackupReady(ctx, spec))) return backupMastodon(ctx, p("backup"));
+        const record = await uploadMastodonBackup(ctx, spec, p("backup"), { progress: progress(ctx) }).finally(() =>
+          ctx.db.setFleetOpProgress(opId, null),
+        );
+        return { bucket: record };
+      },
+    },
+    {
+      name: p("backup-check"),
+      async run(ctx) {
+        const out = ctx.output<MastodonBackup | { bucket: MastodonBackupRecord }>(p("backup"))!;
+        if (!("bucket" in out)) return { bucket: false };
+        const record = await verifyMastodonBackup(ctx, spec, p("backup-check"), {
+          retake: [p("backup")],
+          attemptsKey: `mastodon-backup-verify-failures:${opId}`,
+          progress: progress(ctx),
+        }).finally(() => ctx.db.setFleetOpProgress(opId, null));
+        return { bucket: record };
+      },
+    },
     {
       name: p("render"),
       async run(ctx) {
@@ -1375,7 +1413,16 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
     {
       name: p("restore"),
       async run(ctx) {
-        const out = await restoreMastodon(ctx, p("restore"), ctx.output<MastodonBackup>(p("backup"))!);
+        const checked = ctx.output<{ bucket: MastodonBackupRecord | false }>(p("backup-check"))?.bucket;
+        const out = checked
+          ? {
+              dseq: componentLease(ctx, key).dseq,
+              restoredFrom: checked.name,
+              accounts: await restoreMastodonBackup(ctx, sized, p("restore"), checked, { progress: progress(ctx) }).finally(() =>
+                ctx.db.setFleetOpProgress(opId, null),
+              ),
+            }
+          : await restoreMastodon(ctx, p("restore"), ctx.output<MastodonBackup>(p("backup"))!);
         // the new deployment holds the data at the new size (and sign-in
         // setting): from here on the spec renders it that way (upgrades, a
         // later relaunch, the chain sync configure runs next)
@@ -1388,6 +1435,19 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
     },
     ...relaunch.slice(at + 1),
   ];
+}
+
+/**
+ * A Mastodon relaunch: the instance starts from its latest checked backup
+ * (restored after the manifest, before anything configures it) when it has
+ * one and automatic restore is on; otherwise empty, as before.
+ */
+export function mastodonRelaunchSteps(opId: number, params: RelaunchParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const relaunch = relaunchSteps(opId, params, spec);
+  const at = relaunch.findIndex((s) => s.name === p("manifest"));
+  if (at < 0) throw new Error("relaunch steps have no manifest step");
+  return [...relaunch.slice(0, at + 1), relaunchRestoreStep(p("restore-data"), spec), ...relaunch.slice(at + 1)];
 }
 
 /** Params of a "reconfigure" op: the components whose chain setup to redo. */
@@ -6259,7 +6319,9 @@ function buildSteps(
       steps.push(
         ...(params.key === "headscale"
           ? headscaleRelaunchSteps(op.id, params, spec)
-          : relaunchSteps(op.id, params, spec)),
+          : params.key === "mastodon"
+            ? mastodonRelaunchSteps(op.id, params, spec)
+            : relaunchSteps(op.id, params, spec)),
       );
     }
     if (op.kind === "add-component") steps.push(...addComponentSteps(op.id, params, spec));
@@ -6275,6 +6337,8 @@ function buildSteps(
     if (op.kind === "claims") steps.push(...claimsSteps(op.id, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
     if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));
+    if (op.kind === "mastodon-backup") steps.push(...mastodonBackupSteps(op.id, spec));
+    if (op.kind === "mastodon-restore") steps.push(...mastodonRestoreSteps(op.id, params as MastodonRestoreParams, spec));
     if (op.kind === "node-resize") steps.push(...nodeResizeSteps(op.id, params, spec));
     if (op.kind === "upgrade") steps.push(...upgradeSteps(op.id, params, spec));
     if (op.kind === "halt-upgrade") steps.push(...haltUpgradeSteps(op.id, params, spec));

@@ -1065,6 +1065,46 @@ export function versionTag(image: string): [number, number, number] | undefined 
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : undefined;
 }
 
+// The image reference grammar (distribution/reference): [domain/]path[:tag][@digest]
+const REF_DOMAIN = "(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*(?::[0-9]+)?";
+const REF_COMPONENT = "[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*";
+const IMAGE_REF = new RegExp(
+  `^((?:${REF_DOMAIN}/)?${REF_COMPONENT}(?:/${REF_COMPONENT})*)` +
+    "(?::([\\w][\\w.-]{0,127}))?" +
+    "(?:@([A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*):([0-9a-fA-F]{32,}))?$",
+);
+
+/**
+ * Why `image` is not a reference a provider can pull, or null when it is.
+ * A malformed one (2026-10-14: "…@sha256:sha256:<hex>", the digest's prefix
+ * pasted twice) is accepted by Akash and never starts: the pod fails with
+ * InvalidImageName, and a StatefulSet (any service with a persistent volume)
+ * keeps that pod even after the template is fixed, until the provider
+ * deletes it. So upgrades refuse it before anything is signed.
+ */
+export function imageRefProblem(image: string): string | null {
+  if (image !== image.trim() || /\s/.test(image)) return "it contains spaces";
+  if (!image) return "it is empty";
+  if (/@sha256:sha256:/i.test(image)) return 'the digest repeats its "sha256:" prefix: write @sha256:<64 hex digits>';
+  const m = IMAGE_REF.exec(image);
+  if (!m) {
+    if (/[A-Z]/.test(image.split(/[:@]/)[0]!.split("/").slice(-1)[0]!)) return "the repository name has capital letters (they must be lowercase)";
+    return "it is not an image reference ([registry/]repository[:tag][@sha256:digest])";
+  }
+  // the first part names a registry only when it looks like a host (a dot,
+  // a port, localhost); otherwise it is part of the repository, lowercase
+  const first = m[1]!.split("/")[0]!;
+  const registry = m[1]!.includes("/") && (/[.:]/.test(first) || first === "localhost");
+  if (!registry && !new RegExp(`^${REF_COMPONENT}$`).test(first)) {
+    return "the repository name has capital letters (they must be lowercase)";
+  }
+  if (m[1]!.length > 255) return "the repository name is longer than 255 characters";
+  if (m[3]?.toLowerCase() === "sha256" && m[4]!.length !== 64) {
+    return `a sha256 digest has 64 hex digits, this one ${m[4]!.length}`;
+  }
+  return null;
+}
+
 /** Whether `image` carries a version tag older than `version` (vX.Y.Z).
  *  Images tagged otherwise (dev, latest, a digest) cannot be told apart:
  *  false. */

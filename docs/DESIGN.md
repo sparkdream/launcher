@@ -1563,12 +1563,15 @@ hash, and a provider refuses a manifest whose resources differ from the
 lease), so a new size is a new deployment, and its volumes start empty.
 The op carries the data across:
 
-1. `backup`: over lease-shell from the running deployment, `pg_dump -Fc`
-   of the database and a tar of `public/system` without the remote-media
-   cache, each streamed as base64. Kept encrypted with the secrets
+1. `backup`: when Mastodon has a backup bucket and its image the backup
+   tools (below), a Mastodon backup to the bucket, read back and checked
+   (`backup-check`), which stays as one of the kept backups. Otherwise,
+   over lease-shell from the running deployment, `pg_dump -Fc` of the
+   database and a tar of `public/system` without the remote-media cache,
+   each streamed as base64, kept encrypted with the secrets
    (`secrets/backups/mastodon-<dseq>/`): the dump holds every account's
-   ActivityPub key and password hash. More than 256 MiB pauses: pushing
-   it back in chunks would take hours.
+   ActivityPub key and password hash. That path pauses over 256 MiB, since
+   pushing it back in chunks would take hours, and says to set a bucket.
 2. `render`: the SDL at the new size.
 3. The relaunch steps (close, deploy, lease, manifest), preferring the
    current provider rather than avoiding it, since staying keeps the
@@ -1578,8 +1581,9 @@ The op carries the data across:
    them after a provider change, and only the sign-in domain when a move turns
    sign-in on and stays on the provider.
 4. `restore`, before anything configures the instance (which would
-   otherwise create a second owner and a new bridge token): lease-shell
-   has no usable stdin, so the dump goes up as base64 chunks appended
+   otherwise create a second owner and a new bridge token): from the bucket
+   as a Mastodon restore does (below), or, for a lease-shell backup:
+   lease-shell has no usable stdin, so the dump goes up as base64 chunks appended
    through the command (halved on a request-line refusal) and is checked
    by digest; it restores into a scratch database, which replaces the
    empty one in two back-to-back statements; the media is unpacked; then
@@ -1591,7 +1595,65 @@ The op carries the data across:
 The instance is down from the close to the restart, and posts made
 between the backup and the close are not carried. Redis and the bridge's
 state file start over; both are caches. A plain relaunch of Mastodon
-warns that it leaves the data behind and points at resize.
+starts from the latest Mastodon backup when there is one (below);
+otherwise it warns that it leaves the data behind and points at resize.
+
+**Backups** (fleet row "backups…", `mastodon-backup.ts`; ops
+`mastodon-backup` and `mastodon-restore`). The database and the uploaded
+media go to object storage, as chain data does, so an instance survives
+its provider.
+
+- **Bucket.** `mastodon.backup.s3` (the mesh backup's shape; the secret in
+  `secrets/s3-mastodon-backup` through `secret:s3-mastodon-backup`), else
+  the fleet's mesh backup bucket. A services fleet has no mesh, so it
+  needs its own. Prefix `mastodon.backup.s3.path`, default
+  `sparkdream-launcher/<chain-id>/mastodon` (never the mesh backup's own
+  path). The dialog sets or clears it; a blank secret reuses one another
+  fleet of the wallet holds for that access key. Nothing in the deployment
+  changes: each script gets the settings when it runs.
+- **Layout.** A backup is a folder `mastodon-<UTC time>/` holding
+  `db.dump.age` (`pg_dump -Fc`) and `media.tar.age` (`public/system`
+  without `cache/`), each encrypted to the fleet's age recipient. A rolling
+  pair is kept: the launcher deletes the folder that falls off once a new
+  backup passes its check. Records live in `mastodon-backups:<launch>`.
+- **Upload** (`upload`). From inside the web container, which reaches
+  postgres over the deployment's network with its own `DB_*` env:
+  `pg_dump | age | s5cmd pipe`, then `tar | age | s5cmd pipe`, a `tee`
+  hashing each stream. The database goes first, so media uploaded meanwhile
+  is in the tar and no restored row points at a file the backup lacks. The
+  instance keeps running: `pg_dump` reads one consistent snapshot, and tar's
+  "file changed as we read it" (exit 1) is accepted. Progress reads the
+  current reader's bytes from `/proc`; 10 minutes without any fails the step.
+- **Lease-shell.** The images have no sshd and lease-shell has no usable
+  stdin, so scripts, settings and the age identity go in as base64 through
+  the command (`umask 077`), and a failed write reports without the command,
+  since a timeout's error would quote the bucket's secret. Scripts run
+  detached under `setsid` with pid and status in `/tmp`, polled like the
+  chain-data ones (`watchScriptVia`); an aborted op stops them.
+- **Check** (`verify`). Reads both objects back through `s3get` and
+  decrypts them to nowhere: every age chunk is authenticated, the dump must
+  open as one (`PGDMP`), the media must list as a tar. One that fails is
+  deleted and taken again once; a second failure pauses with what the
+  hashes say (different bytes than uploaded, or the same bytes undecryptable).
+- **Restore** (`restoreMastodonBackup`). The dump is restored into the
+  scratch database (`pg_restore` over the network, its harmless noise
+  ignored; a failed download or decryption fails the step), the media
+  unpacked over the volume and handed back to uid 991, then the same
+  account check, swap and restart as the resize's. In place ("restore" on a
+  kept backup: the instance's posts since the backup are lost), as part of
+  a resize, and in a relaunch: `restore-data` after the manifest restores
+  the latest checked backup when automatic restore is on (default; the
+  dialog's switch). A relaunch without a bucket or backup starts empty as
+  before; a restore that fails pauses, and turning automatic restore off
+  then resuming starts the instance empty instead.
+- **Schedule.** Off, daily or weekly (`mastodon-backup-schedule:<launch>`),
+  run by the monitor when nothing else is active; a failed attempt also
+  waits a full interval.
+- **Image.** The chain repo's `Dockerfile-mastodon` adds
+  `postgresql-client-14` (PGDG; the major of the launcher's `postgres:14`),
+  `age` and `s5cmd`. On an older image the backup pauses naming what is
+  missing and pointing at "upgrade…"; a resize then falls back to the
+  lease-shell path.
 
 **Settings** (fleet row "settings…", action `mastodon-settings`:
 `registrations`, and `walletLogin` merged into the current one). The new
