@@ -672,6 +672,7 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     }
   }
   const pub = spec.topology.publicEndpoints;
+  validateBattleWeb3(spec, err);
   if (comps.frontend.enabled && !(pub?.api && pub?.rpc)) {
     err(
       "topology.publicEndpoints",
@@ -1220,6 +1221,36 @@ function validateServicesFleet(
   if (spec.topology.components.battle?.enabled) {
     if (!spec.topology.components.battle.domain) err("topology.components.battle.domain", "domain is required when enabled");
     if (!spec.images.battle) err("images.battle", "image is required when enabled");
+    if (spec.topology.components.battle.web3 && !spec.topology.components.battle.web3.target) {
+      err("topology.components.battle.web3.target", "a services fleet has no chain: name the fleet whose chain the game writes to");
+    }
+  }
+}
+
+/**
+ * The battle game's web3 relayer, when it writes to this fleet's chain: the
+ * checks this spec can answer. A fleet target is resolved, and its account
+ * checked against that fleet's spec, by the conductor.
+ */
+function validateBattleWeb3(spec: LaunchSpec, err: (path: string, message: string) => void): void {
+  const battle = spec.topology.components.battle;
+  if (!battle?.enabled || !battle.web3 || battle.web3.target) return;
+  const web3 = battle.web3;
+  if (web3.wallet && !web3.wallet.startsWith(`${spec.network.bech32Prefix}1`)) {
+    err("topology.components.battle.web3.wallet", `"${web3.wallet}" is not a ${spec.network.bech32Prefix} address`);
+  }
+  if (web3.account) {
+    const acct = spec.accounts.initial.find((a) => a.name === web3.account);
+    const trust = acct && typeof acct.member === "object" ? acct.member.trustLevel : acct?.member === true ? "core" : undefined;
+    if (!acct?.generate) {
+      err("topology.components.battle.web3.account", `"${web3.account}" must be a generated account in accounts.initial (the launcher signs as it)`);
+    } else if (!trust || trust === "new") {
+      err("topology.components.battle.web3.account", `"${web3.account}" must be a member with trustLevel provisional or above (x/artifact class creation)`);
+    }
+  }
+  const pub = spec.topology.publicEndpoints;
+  if (!(pub?.api && pub?.rpc)) {
+    err("topology.publicEndpoints", "the battle game's web3 mode queries through the public api domain and broadcasts through the public rpc domain");
   }
 }
 

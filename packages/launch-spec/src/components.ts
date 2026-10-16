@@ -158,9 +158,10 @@ export const COMPONENT_KINDS: Readonly<Record<ComponentKey, ComponentKind>> = {
   battle: {
     key: "battle",
     label: "Battle royale",
-    summary: "Browser battle royale game, with bots and a leaderboard",
-    // a game server (the battle-royale repo's image): reads nothing from any
-    // chain, so it runs the same beside a chain or in a services fleet
+    summary: "Browser battle royale game, with bots, a leaderboard and optional onchain records",
+    // a game server (the battle-royale repo's image): runs the same beside a
+    // chain or in a services fleet; with battle.web3 it writes results to a
+    // chain through its public api and rpc domains, never through the mesh
     mesh: false,
     ssh: false,
     domain: true,

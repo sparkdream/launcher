@@ -81,6 +81,96 @@ function editRecord(secrets: string, role: string, patch: Partial<SessionRecord>
   writeSecretFile(path.join(secrets, "sessions.json"), JSON.stringify(all));
 }
 
+describe("the battle game's session key", () => {
+  const battle = { enabled: true, domain: "battle.phoenix.example" };
+
+  it("with a launcher-generated account: creates the four classes with its key, then grants mints and updates only", async () => {
+    const chain = chainStub();
+    const { db, services, secrets } = await launched({ battle: { ...battle, web3: { account: "vera" } } }, chain);
+    const accounts = db.stepOutput<any>("fl", "generate-keys")!.accounts;
+    const vera = accounts["acct-vera"];
+    const classes = Object.values(chain.state().chains).flatMap((c) => c.classes ?? []);
+    expect(classes.map((c) => c.symbol)).toEqual(["BRCAREER", "BRBADGE", "BRMAP", "BRMATCH"]);
+    expect(classes.every((c) => c.owner === vera && c.signer === "acct-vera")).toBe(true);
+    const session = readSessions(secrets).battle!;
+    expect(session.granter).toBe(vera);
+    const grant = grants(chain).find((g) => g.grantee === session.grantee)!;
+    expect(grant).toMatchObject({
+      signer: "acct-vera",
+      allowed_msg_types: ["/sparkdream.artifact.v1.MsgMint", "/sparkdream.artifact.v1.MsgUpdateToken"],
+    });
+    const dseq = db.listFleetComponents("fl").find((c) => c.key === "battle")!.dseq;
+    expect(services.provider.sessionKeys.get(`${dseq}/battle`)).toBe(session.mnemonic);
+    // delivered where the game reads it, handed to the game's user
+    const delivery = services.provider.shellLog.find((l) => l.dseq === dseq && l.script.includes("session-key"))!;
+    expect(delivery.script).toContain("/app/data/session-key");
+    expect(delivery.script).toContain("chown node");
+    db.close();
+  }, 180_000);
+
+  it("with a wallet member: pauses for the class creation, then for the grant, and never signs as the member", async () => {
+    const chain = chainStub();
+    const [acct] = await (await Secp256k1HdWallet.generate(12, { prefix: "sprkdrm" })).getAccounts();
+    const member = acct!.address;
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec({ battle: { ...battle, web3: { wallet: member } } });
+    chain.edit((st) => {
+      st.defaultBalances = { [s.token.baseDenom]: "2000000000" };
+      st.members = { [member]: { trust_level: "TRUST_LEVEL_PROVISIONAL", dream_balance: "0", staked_dream: "0" } };
+    });
+    db.createLaunch("fl", JSON.stringify(s), "akash1owner");
+    const run = () => withStub(chain, () => runWithSigner(db, "fl", s, work, allSteps(), services, new FakeSigner()));
+    const waiting = () => {
+      const step = db.listSteps("fl").find((x) => x.status === "waiting");
+      return step?.wallet_json ? JSON.parse(step.wallet_json) : undefined;
+    };
+    const sign = () => {
+      const req = waiting();
+      expect(req.signer).toBe(member);
+      const node = chain.state().log.at(-1)!.node;
+      const doc = path.join(tmp(), "tx.json");
+      fs.writeFileSync(doc, JSON.stringify({ body: { messages: req.msgs }, __from: member }));
+      execFileSync(chain.bin, ["tx", "broadcast", doc, "--node", node]);
+    };
+
+    // 1. the classes: four MsgCreateClass for the member to sign (CLI commands included)
+    expect((await run()).status).toBe("awaiting-user");
+    const classReq = waiting();
+    expect(classReq.msgs.map((m: any) => [m["@type"].split(".").pop(), m.symbol, m.creator])).toEqual([
+      ["MsgCreateClass", "BRCAREER", member],
+      ["MsgCreateClass", "BRBADGE", member],
+      ["MsgCreateClass", "BRMAP", member],
+      ["MsgCreateClass", "BRMATCH", member],
+    ]);
+    expect(classReq.cli).toContain("sparkdreamd tx sign");
+    sign();
+
+    // 2. the session grant, scoped to the game's two message types
+    expect((await run()).status).toBe("awaiting-user");
+    const pending = readSessions(launchDirs(work, "fl").secrets).battle!;
+    expect(pending).toMatchObject({ granter: member, pending: true });
+    expect(waiting().msgs.map((m: any) => m["@type"].split(".").pop())).toEqual(["MsgSend", "MsgCreateSession"]);
+    expect(waiting().msgs[1]).toMatchObject({
+      granter: member,
+      grantee: pending.grantee,
+      allowed_msg_types: ["/sparkdream.artifact.v1.MsgMint", "/sparkdream.artifact.v1.MsgUpdateToken"],
+    });
+    sign();
+
+    // 3. signed: delivered, and the launch finishes; the classes exist once and are not asked for again
+    expect((await run()).status).toBe("completed");
+    const classes = Object.values(chain.state().chains).flatMap((c) => c.classes ?? []);
+    expect(classes).toHaveLength(4);
+    new FleetService(db, services, work).materialize("fl");
+    const dseq = db.listFleetComponents("fl").find((c) => c.key === "battle")!.dseq;
+    expect(services.provider.sessionKeys.get(`${dseq}/battle`)).toBe(readSessions(launchDirs(work, "fl").secrets).battle!.mnemonic);
+    expect(chain.state().log.filter((l) => l.from === member)).toHaveLength(2);
+    db.close();
+  }, 240_000);
+});
+
 describe("session keys at launch", () => {
   it("grants each daemon a scoped, budgeted session from its own account and delivers the key", async () => {
     const chain = chainStub();

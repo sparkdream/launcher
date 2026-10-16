@@ -88,7 +88,7 @@ const HUB_IMAGE = "sparkdreamnft/hub:v1.0.2";
 const NTFY_IMAGE = "binwiederhier/ntfy:v2.28.0";
 // the battle royale game (the battle-royale repo's Dockerfile: game server
 // and its client on one port); versioned on its own, by the repo's git tags
-const BATTLE_IMAGE = "sparkdreamnft/battle-royale:v1.0.0";
+const BATTLE_IMAGE = "sparkdreamnft/battle-royale:v1.0.1";
 
 export type NodeSize = "small" | "standard" | "large";
 

@@ -12,6 +12,7 @@ import { readSecretFile, writeSecretFile } from "./secrets.js";
 import { loadCert, type Assignments, type DeploymentPlan } from "./steps/phase-bcd.js";
 import { queryJson } from "./steps/phase-g.js";
 import { verifierMember, verifierTargetId } from "./verifier.js";
+import { battleRelayer, battleTargetId } from "./battle.js";
 
 /**
  * Session keys for the unattended daemons (§5 session keys). sdapverify,
@@ -21,7 +22,7 @@ import { verifierMember, verifierTargetId } from "./verifier.js";
  * SESSION_KEY grant from that account:
  *
  *   scope     one message type (MsgVerifyContent / MsgSubmitFederatedContent /
- *             MsgSubmitCheckpoint)
+ *             MsgSubmitCheckpoint), or the game's two (MsgMint, MsgUpdateToken)
  *   budget    spend_limit: the account pays the daemon's fees, up to this
  *   lifetime  the component's session.days, capped by the chain's
  *             max_expiration
@@ -48,22 +49,32 @@ import { verifierMember, verifierTargetId } from "./verifier.js";
  * on chain and delivers that same key rather than minting another.
  */
 
-export type SessionRole = "verifier" | "bridge" | "scanner";
+export type SessionRole = "verifier" | "bridge" | "scanner" | "battle";
 
-/** Where the key file lives in each daemon's container. Both are on a
- *  persistent volume, so a container restart keeps the key. */
+/** Where the key file lives in the sdap daemons' containers, on a persistent
+ *  volume, so a container restart keeps the key. */
 export const SESSION_KEY_FILE = "/data/session-key";
+
+/** The key file's path in a role's container, and the user the daemon runs
+ *  as (lease-shell runs as the image's root; the file is handed over). */
+export function sessionKeyFile(role: SessionRole): string {
+  return role === "battle" ? "/app/data/session-key" : SESSION_KEY_FILE;
+}
+const DAEMON_USER: Record<SessionRole, string> = { verifier: "sdap", bridge: "sdap", scanner: "sdap", battle: "node" };
 
 const MSG_TYPES: Record<SessionRole, string[]> = {
   verifier: ["/sparkdream.federation.v1.MsgVerifyContent"],
   bridge: ["/sparkdream.federation.v1.MsgSubmitFederatedContent"],
   scanner: ["/sparkdream.service.v1.MsgSubmitCheckpoint"],
+  // the game mints and edits its tokens; class creation (a burn) stays with the account's own key
+  battle: ["/sparkdream.artifact.v1.MsgMint", "/sparkdream.artifact.v1.MsgUpdateToken"],
 };
 
 /** The component a role's daemon runs in, and the SDL service inside it. */
 function HOST_OF(spec: LaunchSpec, role: SessionRole): { component: string; service: string } {
   if (role === "verifier") return { component: "verifier", service: "verifier" };
   if (role === "scanner") return { component: "scanner", service: "scanner" };
+  if (role === "battle") return { component: "battle", service: "battle" };
   // a fleet's bridge is its Mastodon's sidecar, or a standalone component
   return fleetBridge(spec)?.kind === "standalone"
     ? { component: "bridge", service: "bridge" }
@@ -116,6 +127,7 @@ export function sessionRoles(spec: LaunchSpec): SessionRole[] {
     ...(c.verifier?.enabled ? (["verifier"] as const) : []),
     ...(fleetBridge(spec) ? (["bridge"] as const) : []),
     ...(c.scanner?.enabled ? (["scanner"] as const) : []),
+    ...(c.battle?.enabled && c.battle.web3 ? (["battle"] as const) : []),
   ];
 }
 
@@ -126,7 +138,9 @@ function settings(spec: LaunchSpec, role: SessionRole): { days: number; spendLim
       ? spec.topology.components.verifier?.session
       : role === "scanner"
         ? spec.topology.components.scanner?.session
-        : fleetBridge(spec)?.link.session;
+        : role === "battle"
+          ? spec.topology.components.battle?.web3?.session
+          : fleetBridge(spec)?.link.session;
   return { days: sessionDays(spec, s), spendLimit: s?.spendLimit ?? "25000000" };
 }
 
@@ -187,10 +201,14 @@ export function componentLease(
  * has none and pauses for the wallet instead.
  */
 async function granterActor(ctx: StepCtx, spec: LaunchSpec, role: SessionRole): Promise<{ chain: ChainActor; granter: string }> {
-  if (role === "verifier") {
-    const targetId = verifierTargetId(spec, ctx.launchId);
+  if (role === "verifier" || role === "battle") {
+    // a member of the target chain: launcher-generated (signs here) or wallet-held (pauses)
+    const targetId = sessionChainLaunch(spec, ctx.launchId, role);
     const chain = await fleetActor(ctx, targetId, targetId === ctx.launchId ? "this fleet" : `fleet ${targetId}`);
-    const member = verifierMember(spec, ctx.launchId, ctx.db, ctx.workRoot);
+    const member =
+      role === "verifier"
+        ? verifierMember(spec, ctx.launchId, ctx.db, ctx.workRoot)
+        : battleRelayer(spec, ctx.launchId, ctx.db, ctx.workRoot);
     const { signer: _none, ...unsigned } = chain;
     return member.key
       ? { chain: { ...chain, signer: { ...member.key, address: member.address } }, granter: member.address }
@@ -223,7 +241,9 @@ export async function grantHolds(rpc: string, record: SessionRecord): Promise<bo
 
 /** The launch whose chain holds a role's grant. */
 export function sessionChainLaunch(spec: LaunchSpec, launchId: string, role: SessionRole): string {
-  return role === "verifier" ? verifierTargetId(spec, launchId) : launchId;
+  if (role === "verifier") return verifierTargetId(spec, launchId);
+  if (role === "battle") return battleTargetId(spec, launchId);
+  return launchId;
 }
 
 /** Why a live grant should be replaced before it runs out, if it should. */
@@ -258,7 +278,8 @@ async function deliverKey(ctx: StepCtx, role: SessionRole, mnemonic: string): Pr
   const lease = componentLease(ctx, host.component);
   // BIP39 words are lowercase ASCII: safe inside single quotes
   if (!/^[a-z ]+$/.test(mnemonic)) throw new Error("session mnemonic has unexpected characters");
-  const tmp = `${SESSION_KEY_FILE}.new`;
+  const file = sessionKeyFile(role);
+  const tmp = `${file}.new`;
   let lastError = "";
   // the container is often restarting right now: the bridge's token lands
   // through a deployment update just before this, and lease-shell answers
@@ -268,12 +289,13 @@ async function deliverKey(ctx: StepCtx, role: SessionRole, mnemonic: string): Pr
     try {
       await ctx.services.provider.shellExec(
         loadCert(ctx), lease.hostUri, lease.dseq, lease.gseq, lease.oseq, host.service,
-        // lease-shell runs as the image's user (root, for the sdap image, whose
-        // entrypoint drops the daemon to "sdap"): hand the file to the daemon
+        // lease-shell runs as the image's user (root, for the sdap and game
+        // images, whose entrypoints drop the daemon to its own user): hand the
+        // file to the daemon
         [
           "sh", "-c",
           `umask 077 && printf '%s\\n' '${mnemonic}' > ${tmp} && ` +
-            `(chown sdap ${tmp} 2>/dev/null || true) && mv ${tmp} ${SESSION_KEY_FILE}`,
+            `(chown ${DAEMON_USER[role]} ${tmp} 2>/dev/null || true) && mv ${tmp} ${file}`,
         ],
       );
       return;
@@ -493,7 +515,7 @@ export async function ensureSession(
       ctx,
       `session-${role}`,
       chain,
-      `fund ${{ bridge: "the bridge operator", scanner: "the scanner operator", verifier: "the verifier account" }[role]} ${granter} with ${topUp} ${chain.gasDenom} ` +
+      `fund ${{ bridge: "the bridge operator", scanner: "the scanner operator", verifier: "the verifier account", battle: "the game management account" }[role]} ${granter} with ${topUp} ${chain.gasDenom} ` +
         `so it can grant its daemon's session key (it has ${have} spendable)`,
       [{ "@type": "/cosmos.bank.v1beta1.MsgSend", from_address: WALLET_SIGNER, to_address: granter, amount: [{ denom: chain.gasDenom, amount: topUp.toString() }] }],
       { signerRole: `an account holding ${chain.gasDenom}` },

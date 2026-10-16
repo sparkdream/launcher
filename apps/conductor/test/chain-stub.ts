@@ -26,6 +26,8 @@ export interface StubChain {
   roles?: Record<string, { current_bond: string; signer?: string }>;
   /** x/session grants, keyed "<granter>/<grantee>". */
   sessions?: Record<string, Record<string, any>>;
+  /** x/artifact classes, in creation order (the game's). */
+  classes?: Array<{ id: string; owner: string; symbol: string; name: string; signer?: string }>;
   peers: Record<string, Record<string, unknown>>;
   policies: Record<string, Record<string, unknown>>;
   proposals: Record<string, { status: string; messages: any[]; policy_address?: string; execution_time?: number }>;
@@ -101,6 +103,9 @@ if (a0 === "query" && a1 === "rep" && a2 === "get-member") {
   const m = (st.members || {})[a3]; if (!m) fail("rpc error: code = NotFound desc = member not found"); out({ member: { address: a3, ...m } });
 }
 if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: { service_type: a3, min_bond_amount: "1000000000" } });
+if (a0 === "query" && a1 === "artifact" && a2 === "classes-by-owner") {
+  out({ classes: (chain.classes || []).filter((c) => c.owner === a3).map((c) => ({ class: c })) });
+}
 if (a0 === "query" && a1 === "session" && a2 === "grants-by-grantee") {
   out({ grants: Object.values(chain.grants || {}).filter((g) => g.grantee === a3) });
 }
@@ -173,6 +178,10 @@ if (a0 === "tx" && a1 === "broadcast") {
       chain.roles ||= {};
       const prev = chain.roles[role + "/" + m.creator];
       chain.roles[role + "/" + m.creator] = { current_bond: String(BigInt(prev ? prev.current_bond : "0") + BigInt(m.amount)), signer: doc.__from };
+    } else if (t === "MsgCreateClass") {
+      chain.classes ||= [];
+      if (chain.classes.some((c) => c.owner === m.creator && c.symbol === m.symbol)) throw new Error("class symbol already used by this owner");
+      chain.classes.push({ id: String(chain.classes.length + 1), owner: m.creator, symbol: m.symbol, name: m.name, signer: doc.__from });
     } else if (t === "MsgSend") {
       st.balances ||= {};
       const to = (st.balances[m.to_address] ||= {});

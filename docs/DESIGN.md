@@ -1481,6 +1481,19 @@ relay nor sign-ups, and `registrations: none` stays right.
   which also ends open sessions, and re-enables it once they are again. It
   never re-enables an account an admin disabled, and it changes nothing when
   a chain cannot be reached.
+- **Signing in from another key.** A member can give another address an
+  x/session SIGN_IN grant naming the instance's host (sparkdream-ui
+  Permissions, "Sign-in grant"; chain upgrade `sign-in-grants`). When that
+  address connects on the login page, it is offered the member's account
+  and signs a challenge that names it; `sdaplogin` checks the grant and the
+  member's standing and signs it in as the member, with `sparkdream_delegate`
+  / `_grant` / `_chain` claims. The image records the session against the
+  grant, and a 10-minute sidekiq job asks
+  `https://<login domain>/sign-in-grant/<chain>/<id>` and ends the session
+  once the grant is revoked, declined or expired. Tokens of apps authorized
+  from such a session stay until revoked in the account's settings. Needs an
+  sdap and a Mastodon image from the release carrying the chain upgrade; the
+  launcher renders nothing new for it.
 - **Turning it on later.** For a running instance, use the "settings…"
   action (below). It moves the instance, as a resize does.
 - **Images.** Both halves must be new enough: an sdap image that ships
@@ -2847,11 +2860,52 @@ The **battle royale component** (`battle`, `components/battle.ts`,
 `sparkdreamnft/battle-royale`, versioned by that repo's git tags) is a
 browser game for a chain or services fleet: one Node process serving the
 game page and its WebSocket server on port 2567, exposed as 80 on its
-domain. It reads no chain and carries no env; the client connects to the
-origin that served the page. Its leaderboard is a JSON file on a 1 Gi
-persistent volume at `/app/data` (the image starts as root only to take
-ownership of the volume), so it survives updates but not a relaunch on
-another provider.
+domain. Plain, it reads no chain and carries no env; the client connects to
+the origin that served the page. Its guest profiles and leaderboard are a
+SQLite database on a 1 Gi persistent volume at `/app/data` (the image starts
+as root only to take ownership of the volume), so they survive updates but
+not a relaunch on another provider.
+
+With `battle.web3` (`apps/conductor/src/battle.ts`), players connect Keplr
+and the game writes their results to a chain through x/artifact: a soulbound
+career token per address, achievement badges, a map token for each winner
+and a match token (held by the game management account) anchoring every
+match's full result by hash. The chain is this fleet's or, via
+`web3.target`, another fleet's on the launcher (a services fleet must name
+one), reached through its `publicEndpoints.api` and `.rpc`, never the mesh.
+The game management account is a member of the target chain at PROVISIONAL
+or above, exactly as the verifier's member: `web3.account` (a generated
+account the launcher signs as) or `web3.wallet` (a key that stays in the
+user's wallet; the launcher pauses for its signature, with CLI commands for
+a key on another computer). It needs funding for the class burns (10 SPARK
+each), the token deposits (0.1 SPARK each, refundable on burn) and the
+session's fee budget.
+
+The game never holds that account's key. Its configure steps
+(`steps/battle.ts`, after every placement) first have the account create
+the four `BR*` classes — `MsgCreateClass` burns SPARK and is not delegable,
+so this is signed by the launcher-held key or by the wallet, once, and
+skipped when the classes exist — then grant the game server an x/session
+key through `ensureSession` with the `battle` role: `MsgMint` and
+`MsgUpdateToken` only, the spec's `session` budget and lifetime, renewed
+and rotated like the verifier's, delivered by lease-shell into the game's
+data volume at `/app/data/session-key` (handed to the image's `node`
+user). The game wraps its mints and updates in `MsgExecSession`, re-reading
+the key file before every transaction, and the chain executes them as the
+granter and takes the fees from the grant's spend limit. A stolen key can
+therefore only mint into the game's classes or edit their tokens, up to the
+granter's balance, until the grant is revoked or expires. The chain side of
+this is the allowlist in x/session's params, which must list the two
+artifact messages (a chain upgrade; `MsgCreateClass` deliberately stays
+out).
+
+The SDL env carries the chain identity, `CHAIN_GRANTER` (the account),
+`CHAIN_SESSION_KEY_FILE`, `CHAIN_EXPLORER` when the target runs an
+explorer, and `PUBLIC_URL` (the game's domain, the base of match token
+uris; a domain retarget rewrites it), and nothing secret, so upgrades and
+chain resets re-render it. The add dialog takes the account's address, or
+the whole `web3` block from the spec editor; `requestAddComponent` resolves
+the target fleet and checks the account the way it does the verifier's.
 
 ### Fleet bundle (management portability & DR)
 

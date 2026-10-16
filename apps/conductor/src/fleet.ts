@@ -132,6 +132,7 @@ const RELAYER_FUNDS_EVERY_MS = 15 * 60_000;
 /** How often a settled fleet's mesh is swept for leftover nodes. */
 const MESH_STRAY_EVERY_MS = 10 * 60_000;
 import { checkVerifierAccount, resolveVerifierTarget } from "./verifier.js";
+import { checkBattleAccount, resolveBattleTarget } from "./battle.js";
 import { bridgeDependents, mayUseFleet, resolveBridgeTarget } from "./bridge-target.js";
 import { resolveSmtpPasswordSource } from "./services-spec.js";
 import { replaceRerunSteps } from "./services-steps.js";
@@ -4088,6 +4089,15 @@ export class FleetService {
         verifier.target.fleet = resolveVerifierTarget(this.db, spec, launch.owner, verifier.target.fleet, launch.id);
       } else {
         checkVerifierAccount(spec, spec);
+      }
+    }
+    // the battle game's web3 mode: its chain fleet resolved and its relayer account checked
+    const battle = spec.topology.components.battle;
+    if (key === "battle" && battle?.enabled && battle.web3) {
+      if (battle.web3.target) {
+        battle.web3.target.fleet = resolveBattleTarget(this.db, spec, launch.owner, battle.web3.target.fleet, launch.id);
+      } else {
+        checkBattleAccount(spec, spec);
       }
     }
     // a standalone bridge: its Mastodon fleet resolved, and the domain taken

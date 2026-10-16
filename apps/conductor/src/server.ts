@@ -1996,8 +1996,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
     const body = (req.body ?? {}) as { role?: unknown };
-    if (body.role !== undefined && body.role !== "verifier" && body.role !== "bridge" && body.role !== "scanner") {
-      return reply.status(400).send({ error: "role must be verifier, bridge or scanner" });
+    if (body.role !== undefined && !["verifier", "bridge", "scanner", "battle"].includes(String(body.role))) {
+      return reply.status(400).send({ error: "role must be verifier, bridge, scanner or battle" });
     }
     try {
       const roles = body.role

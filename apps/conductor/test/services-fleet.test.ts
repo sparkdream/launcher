@@ -167,6 +167,9 @@ describe("landing page hub", () => {
   }, 120_000);
 });
 
+/** A well-formed sprkdrm address: the game management account's. */
+const KING = "sprkdrm1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9";
+
 describe("battle royale game", () => {
   it("renders the game server on its domain, with its leaderboard on a persistent volume", () => {
     const s = servicesSpec();
@@ -186,6 +189,76 @@ describe("battle royale game", () => {
     expect(out.battle.resources.storage[1]).toMatchObject({ name: "data", attributes: { persistent: true } });
     (s.topology.components as any).battle = { enabled: true };
     expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.battle.domain");
+  });
+
+  it("with web3 on a chain fleet, carries the chain, the game management account and its own url in env, never a key", () => {
+    const s = chainSpec();
+    (s.topology.components as any).battle = { enabled: true, domain: "battle.phoenix.example", web3: { account: "vera" } };
+    (s.topology.components as any).explorer = { enabled: true, domain: "explorer.phoenix.example" };
+    const spec = withDefaults(s as any);
+    expect(validateSpec(spec).errors).toEqual([]);
+    const render = (spec: LaunchSpec, accounts: Record<string, string>) =>
+      descriptorFor("battle")!.render({
+        spec,
+        component: { key: "battle", image: spec.images.battle, domain: "battle.phoenix.example" },
+        launchId: "chain",
+        resolveFleet: (id: string) => (id === "chain" ? { spec, secretsDir: tmp(), launchId: id, accounts } : undefined),
+      } as any) as any;
+    const out = render(spec, { "acct-vera": "sprkdrm1vera" });
+    expect(out.battle.service.env).toEqual([
+      "CHAIN_ENABLED=1",
+      expect.stringMatching(/^CHAIN_ID=phoenix/),
+      "CHAIN_NAME=phoenix",
+      "CHAIN_RPC=https://rpc.phoenix.example",
+      "CHAIN_LCD=https://api.phoenix.example",
+      `CHAIN_DENOM=${spec.token.baseDenom}`,
+      `CHAIN_DISPLAY_DENOM=${spec.token.displayDenom}`,
+      "CHAIN_PREFIX=sprkdrm",
+      `CHAIN_GAS_PRICE=${spec.token.minGasPrice}${spec.token.baseDenom}`,
+      "CHAIN_EXPLORER=https://explorer.phoenix.example/phoenix",
+      "CHAIN_GRANTER=sprkdrm1vera",
+      "CHAIN_SESSION_KEY_FILE=/app/data/session-key",
+      "PUBLIC_URL=https://battle.phoenix.example",
+    ]);
+    expect(JSON.stringify(out)).not.toMatch(/MNEMONIC/);
+    // a domain retarget moves the match token uris with it
+    expect(descriptorFor("battle")!.retargetEnv!(spec)).toEqual({ PUBLIC_URL: "https://battle.phoenix.example" });
+    // configured after placement: classes by the account's own key, then its session key
+    expect(descriptorFor("battle")!.configureSteps!((s) => s, spec).map((st) => st.name)).toEqual(["battle-classes", "session-battle"]);
+    expect(descriptorFor("battle")!.configureSteps!((s) => s, withDefaults(chainSpec() as any))).toEqual([]);
+
+    // a wallet member: its address is the granter, straight from the spec
+    (s.topology.components as any).battle.web3 = { wallet: KING };
+    const byWallet = render(withDefaults(s as any), {});
+    expect(byWallet.battle.service.env).toContain(`CHAIN_GRANTER=${KING}`);
+
+    // exactly one of account and wallet; a generated member account; a chain with public endpoints
+    (s.topology.components as any).battle.web3 = { account: "vera", wallet: KING };
+    expect(() => withDefaults(s as any)).toThrow(/exactly one/);
+    (s.topology.components as any).battle.web3 = { wallet: KING.replace("sprkdrm1", "cosmos1") };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.battle.web3.wallet");
+    (s.topology.components as any).battle.web3 = { account: "nobody" };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.battle.web3.account");
+    delete (s.topology as any).publicEndpoints;
+    (s.topology.components as any).battle.web3 = { account: "vera" };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.publicEndpoints");
+  });
+
+  it("with web3 in a services fleet, needs a chain fleet to write to", () => {
+    const s = servicesSpec();
+    (s.topology.components as any).battle = { enabled: true, domain: "battle.zenith.example", web3: { account: "vera" } };
+    expect(validateSpec(withDefaults(s as any)).errors.map((e) => e.path)).toContain("topology.components.battle.web3.target");
+    (s.topology.components as any).battle.web3 = { wallet: KING, target: { fleet: "phoenix" } };
+    expect(validateSpec(withDefaults(s as any)).errors).toEqual([]);
+    // rendering without the target resolved is refused rather than rendering a chainless game
+    expect(() =>
+      descriptorFor("battle")!.render({
+        spec: withDefaults(s as any),
+        component: { key: "battle", image: "sparkdreamnft/battle-royale:v1.0.1", domain: "battle.zenith.example" },
+        launchId: "svc",
+        resolveFleet: () => undefined,
+      } as any),
+    ).toThrow(/target fleet phoenix/);
   });
 
   it("is added to a running services fleet", async () => {

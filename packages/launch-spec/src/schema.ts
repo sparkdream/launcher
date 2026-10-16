@@ -496,6 +496,47 @@ const verifierComponent = z.object({
 });
 
 /**
+ * The battle royale game (sparkdreamnft/battle-royale). Plain, it needs only
+ * a domain. With `web3`, players can connect Keplr and have their results
+ * written to a chain through x/artifact (career, badge, map and match
+ * tokens) by the game management account: the launcher has that account
+ * create the game's four classes once (a burn of 10 SPARK each), then grants
+ * the game server an x/session key scoped to MsgMint and MsgUpdateToken,
+ * renewed like the verifier's. The account's own key never reaches the
+ * game's provider.
+ */
+const battleComponent = componentToggle.extend({
+  web3: z
+    .object({
+      /** The chain to write to: another fleet on this launcher (launch id or
+       *  network name); this fleet when omitted. A services fleet has no
+       *  chain, so there it is required. Its publicEndpoints.api and .rpc are
+       *  where the game server queries and broadcasts. */
+      target: z.object({ fleet: z.string().min(1) }).strict().optional(),
+      /** The game management account, exactly one of `account` or `wallet`:
+       *  an x/rep member of the target chain at PROVISIONAL or above (class
+       *  creation), funded for the class burns, token deposits (0.1 SPARK
+       *  each, refundable) and the session's fee budget.
+       *
+       *  account  an accounts.initial name the launcher generated: it creates
+       *           the classes and grants the session key with that key itself.
+       *  wallet   the address of a member whose key stays in your wallet: the
+       *           launcher pauses for your signature to create the classes
+       *           and to grant (and renew) the session key, with CLI
+       *           commands for a key kept on another computer. */
+      account: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/).optional(),
+      wallet: z.string().regex(/^[a-z]+1[02-9ac-hj-np-z]{38,58}$/).optional(),
+      /** The game server signs through this session key. */
+      session: sessionKey.default({}),
+    })
+    .strict()
+    .refine((w) => Boolean(w.account) !== Boolean(w.wallet), {
+      message: "set exactly one of account (a launcher-generated member) or wallet (a member address whose key stays in your wallet)",
+    })
+    .optional(),
+});
+
+/**
  * A content scanner (contentscan, the sdap image): follows this chain over
  * its public api, judges media-labelled content and the URLs inside it, and
  * publishes signed verdicts in a static feed it serves on `domain`
@@ -731,7 +772,7 @@ export const launchSpecSchema = z.object({
       bridge: bridgeComponent.optional(),
       scanner: scannerComponent.optional(),
       ntfy: ntfyComponent.optional(),
-      battle: componentToggle.optional(),
+      battle: battleComponent.optional(),
     }),
     /**
      * Public chain endpoints, served by sentry-0 via accept-domain ingress

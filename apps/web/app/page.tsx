@@ -242,6 +242,26 @@ topology:
     #   # controller: Commons Operations Committee
     #   # classifierUrl: https://classifier.example.com/score
     #   # session: { days: 90, spendLimit: "25000000" }
+    # Battle royale game (sparkdreamnft/battle-royale) on its domain. With
+    # web3, players connect Keplr and their results are minted through
+    # x/artifact (career, badge, map and match tokens) for the game
+    # management account, a member (PROVISIONAL or above) of the target chain
+    # — this fleet, or target names another fleet (required in a services
+    # fleet). The launcher has that account create the game's four classes
+    # once (10 SPARK burned each) and grant the game server a session key
+    # scoped to MsgMint and MsgUpdateToken, renewed like the verifier's:
+    # account names a generated member (the launcher signs as it), or wallet
+    # gives a member address whose key stays in your wallet (the launcher
+    # pauses for your signature, with CLI commands for a key kept on another
+    # computer). Fund it for the burns, the token deposits (0.1 SPARK each,
+    # refundable) and the session's fee budget.
+    # battle:
+    #   enabled: true
+    #   domain: battle.example.com
+    #   # web3:
+    #   #   wallet: <your member address>   # or: account: arcade
+    #   #   # session: { days: 90, spendLimit: "25000000" }
+    #   #   # target: { fleet: <launch id or network name> }
   # required when frontend is enabled — sentry-0 serves these domains:
   # publicEndpoints:
   #   api: api.example.com
@@ -1101,6 +1121,7 @@ export default function Page() {
     domain: string;
     bridgeTarget: string;
     verifierWallet: string;
+    battleWallet: string;
   } | null>(null);
   const [addBusy, setAddBusy] = useState(false);
   /** Open the add dialog for a fleet, reading what it can add; `prefer` preselects a choice (the backups dialog's "add a second sentry"). */
@@ -1117,6 +1138,7 @@ export default function Page() {
       domain: "",
       bridgeTarget: "",
       verifierWallet: "",
+      battleWallet: "",
     });
     void import("../lib/api")
       .then(({ getAddOptions }) => getAddOptions(launchId))
@@ -1167,6 +1189,15 @@ export default function Page() {
                   : `add topology.components.${key} in the spec editor first (see the example spec), then add the ${COMPONENT_KINDS[key].label}`,
             );
           }
+        }
+        // the battle game: web3 from the spec editor, or just the game
+        // management account's address; without either the game runs with
+        // guest profiles alone
+        if (key === "battle") {
+          const edited = yaml.load(specText) as any;
+          const fromSpec = edited?.topology?.components?.battle;
+          if (fromSpec && typeof fromSpec === "object" && fromSpec.web3) settings = { enabled: true, web3: fromSpec.web3 };
+          else if (addForm.battleWallet.trim()) settings = { enabled: true, web3: { wallet: addForm.battleWallet.trim() } };
         }
         // the scanner's settings all have defaults: the spec editor's if it
         // has some, else just the domain below
@@ -4372,6 +4403,26 @@ export default function Page() {
                     <div style={{ fontSize: 12, color: "#9a9bab" }}>
                       Its settings come from topology.components.{addForm.key} in the spec editor.
                     </div>
+                  )}
+                  {addForm.key === "battle" && (
+                    <>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                        <div style={label}>Game management account</div>
+                        <input
+                          placeholder="member address, PROVISIONAL or above (blank: no onchain records, or the spec editor's web3)"
+                          value={addForm.battleWallet}
+                          onChange={(e) => setAddForm({ ...addForm, battleWallet: e.target.value })}
+                          style={field}
+                        />
+                      </div>
+                      <div style={{ fontSize: 12, color: "#9a9bab" }}>
+                        With an account, players can connect Keplr and have their results minted on this chain: you
+                        sign once to create the game's four classes (10 SPARK burned each) and once per renewal to
+                        grant the game a session key limited to minting and editing its tokens; the key itself
+                        never leaves your wallet. In a services fleet, or for a launcher-generated account, set
+                        topology.components.battle.web3 in the spec editor instead.
+                      </div>
+                    </>
                   )}
                   {addForm.key === "scanner" && (
                     <div style={{ fontSize: 12, color: "#9a9bab" }}>
