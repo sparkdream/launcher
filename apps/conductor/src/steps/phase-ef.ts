@@ -9,6 +9,7 @@ import { TypeUrl } from "@sparkdream/akash-tx";
 import { updateDeploymentMsgs } from "../akash/update.js";
 import { linkPeersStep, linkRelayerStep } from "./relayer-link.js";
 import { configureMastodonStep, linkStandaloneBridge } from "./mastodon.js";
+import { configureBattleStep } from "./battle.js";
 import { configureScannerStep } from "./scanner.js";
 import { configureVerifierStep } from "./verifier.js";
 import { descriptorFor } from "../components/index.js";
@@ -1127,6 +1128,8 @@ export function phaseEFSteps(): StepDef[] {
     // verifier (no-op without one): its federation-verifier bond
     configureVerifierStep,
     configureScannerStep,
+    // the battle game's web3 mode (no-op without it): its classes, then its session key
+    configureBattleStep,
     // the alerts server (no-op without one): the launcher's alerts go to it
     configureNtfyStep,
     finalizeStep,

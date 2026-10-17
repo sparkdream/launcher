@@ -920,7 +920,9 @@
       }
     },
     "name": {
+      "contest_stakes": [],
       "dispute_map": [],
+      "dispute_stakes": [],
       "name_records": [],
       "owner_infos": [],
       "params": {
@@ -1296,6 +1298,7 @@
         "initiative_creation_fee_apprentice": "1000000",
         "initiative_creation_fee_standard": "3000000",
         "interim_deadline_epochs": "6",
+        "invitation_acceptance_epochs": "30",
         "invitation_accountability_epochs": "30",
         "invitation_cost_multiplier": "1.100000000000000000",
         "invitation_stake_burn_rate": "0.100000000000000000",
@@ -1436,7 +1439,13 @@
       "project_count": "1",
       "project_list": [],
       "project_stake_info_list": [],
-      "reserved_tag_map": [],
+      "reserved_tag_map": [
+        {
+          "authority": "service",
+          "members_can_use": false,
+          "name": "service-operator"
+        }
+      ],
       "review_bounty_list": [],
       "role_activity_list": [],
       "role_reward_day_funding_list": [],
@@ -1983,14 +1992,14 @@
           "/sparkdream.season.v1.MsgStartQuest",
           "/sparkdream.season.v1.MsgAbandonQuest",
           "/sparkdream.season.v1.MsgClaimQuestReward",
-          "/sparkdream.service.v1.MsgUnbondOperator",
-          "/sparkdream.service.v1.MsgTopUpBond",
           "/sparkdream.service.v1.MsgUpdateMetadata",
           "/sparkdream.service.v1.MsgClaimUnbondedBond",
           "/sparkdream.service.v1.MsgSubmitCheckpoint",
           "/sparkdream.federation.v1.MsgSubmitFederatedContent",
           "/sparkdream.federation.v1.MsgAttestOutbound",
-          "/sparkdream.federation.v1.MsgVerifyContent"
+          "/sparkdream.federation.v1.MsgVerifyContent",
+          "/sparkdream.artifact.v1.MsgMint",
+          "/sparkdream.artifact.v1.MsgUpdateToken"
         ],
         "authorized_grant_creators": [
           "sprkdrm1m0a2t448gsfxq5nr6el96jmm6svj43sym0derq"
@@ -2050,14 +2059,14 @@
           "/sparkdream.season.v1.MsgStartQuest",
           "/sparkdream.season.v1.MsgAbandonQuest",
           "/sparkdream.season.v1.MsgClaimQuestReward",
-          "/sparkdream.service.v1.MsgUnbondOperator",
-          "/sparkdream.service.v1.MsgTopUpBond",
           "/sparkdream.service.v1.MsgUpdateMetadata",
           "/sparkdream.service.v1.MsgClaimUnbondedBond",
           "/sparkdream.service.v1.MsgSubmitCheckpoint",
           "/sparkdream.federation.v1.MsgSubmitFederatedContent",
           "/sparkdream.federation.v1.MsgAttestOutbound",
-          "/sparkdream.federation.v1.MsgVerifyContent"
+          "/sparkdream.federation.v1.MsgVerifyContent",
+          "/sparkdream.artifact.v1.MsgMint",
+          "/sparkdream.artifact.v1.MsgUpdateToken"
         ],
         "max_endblocker_dispatches_per_pass": 100,
         "max_exec_count": "10000",
@@ -2085,14 +2094,19 @@
     },
     "shield": {
       "day_fundings": [],
+      "decryption_demands": [],
       "decryption_keys": [],
       "decryption_shares": [],
+      "dkg_complaints": [],
       "dkg_contributions": [],
       "dkg_registrations": [],
       "dkg_state": {
+        "complaint_deadline": "0",
         "contribution_deadline": "0",
         "contributions_received": "0",
+        "disqualified_dealers": [],
         "expected_validators": [],
+        "justification_deadline": "0",
         "open_at_height": "0",
         "phase": "DKG_PHASE_INACTIVE",
         "registration_deadline": "0",
@@ -2104,6 +2118,7 @@
       "next_pending_op_id": "0",
       "params": {
         "dkg_window_blocks": "100",
+        "enable_batch_after_dkg": false,
         "enabled": true,
         "encrypted_batch_enabled": false,
         "max_encrypted_payload_size": 16384,
@@ -2387,6 +2402,7 @@
       "tle_key_set": {
         "created_at_height": "0",
         "master_public_key": null,
+        "master_public_key_g2": null,
         "threshold_denominator": "0",
         "threshold_numerator": "0",
         "validator_shares": []
@@ -2452,7 +2468,7 @@
   "consensus": {
     "params": {
       "abci": {
-        "vote_extensions_enable_height": "0"
+        "vote_extensions_enable_height": "1"
       },
       "block": {
         "max_bytes": "22020096",

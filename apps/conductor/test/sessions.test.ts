@@ -129,7 +129,8 @@ describe("the battle game's session key", () => {
     const sign = () => {
       const req = waiting();
       expect(req.signer).toBe(member);
-      const node = chain.state().log.at(-1)!.node;
+      // the class creation pauses before anything is broadcast: the one chain the step queried
+      const node = chain.state().log.at(-1)?.node ?? Object.keys(chain.state().chains)[0]!;
       const doc = path.join(tmp(), "tx.json");
       fs.writeFileSync(doc, JSON.stringify({ body: { messages: req.msgs }, __from: member }));
       execFileSync(chain.bin, ["tx", "broadcast", doc, "--node", node]);

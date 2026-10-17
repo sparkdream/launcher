@@ -20,6 +20,21 @@ export interface ChainRelease {
 
 export const CHAIN_RELEASES: ChainRelease[] = [
   {
+    "version": "v1.0.55",
+    "commit": "1d9d3dbc1b77dcf1b38ec8a1b408e93a32acba05",
+    "images": [
+      {
+        "image": "sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.55"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-mainnet-ssh:v1.0.55"
+      },
+      {
+        "image": "sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.55"
+      }
+    ]
+  },
+  {
     "version": "v1.0.54",
     "commit": "d6847916b36961c961f762e5a480cf63ade3a413",
     "images": [

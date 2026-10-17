@@ -1,7 +1,8 @@
 import { withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { battleRelayer, battleTargetId } from "../battle.js";
-import { AwaitUser, type StepCtx } from "../engine.js";
+import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { fleetActor, sendTx, walletPause, type ChainActor } from "../peering.js";
+import { ensureSession } from "../sessions.js";
 import { queryJson } from "./phase-g.js";
 
 /**
@@ -120,3 +121,17 @@ export async function ensureBattleClasses(
   ctx.log(`battle: ${relayer.label} created ${missing.map((c) => c.symbol).join(", ")} on ${chain.chainId}`);
   return { address: relayer.address, created: missing.map((c) => c.symbol) };
 }
+
+/**
+ * The game's web3 setup at launch (no-op without battle.web3): the same two
+ * steps an add or reconfigure runs, its classes and then its session key.
+ */
+export const configureBattleStep: StepDef = {
+  name: "configure-battle",
+  async run(ctx) {
+    const battle = ctx.spec.topology.components.battle;
+    if (!battle?.enabled || !battle.web3) return { skipped: true };
+    const classes = await ensureBattleClasses(ctx, "configure-battle", ctx.spec);
+    return { ...classes, session: await ensureSession(ctx, ctx.spec, "battle") };
+  },
+};
