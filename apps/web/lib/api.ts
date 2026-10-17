@@ -239,6 +239,10 @@ export interface WalletRequest {
   gas?: number;
   minFee?: { denom: string; amount: string };
   cli?: string;
+  /** The same transaction prefilled in the chain's frontend. */
+  frontendLink?: string;
+  /** A session grant the launcher resumes by itself on seeing. */
+  awaitsSession?: { granter: string; grantee: string };
 }
 
 export interface LaunchView {

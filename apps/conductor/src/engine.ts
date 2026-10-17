@@ -107,6 +107,12 @@ export interface WalletRequest {
   minFee?: { denom: string; amount: string };
   /** Equivalent CLI commands, for a key kept outside a browser wallet. */
   cli?: string;
+  /** The same transaction prefilled in the chain's frontend (sparkdream-ui),
+   *  for a wallet on another computer that has no sparkdreamd there. */
+  frontendLink?: string;
+  /** A session grant the monitor watches for on chain (chain.rest), so a
+   *  grant signed elsewhere resumes the launch without a click here. */
+  awaitsSession?: { granter: string; grantee: string };
 }
 
 /** Placeholder for the signing wallet's address in WalletRequest.msgs. */

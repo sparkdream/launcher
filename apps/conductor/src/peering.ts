@@ -223,6 +223,8 @@ export async function walletPause(
     gas?: number;
     minFee?: { denom: string; amount: bigint };
     peerSetup?: PeerSetup;
+    frontendLink?: string;
+    awaitsSession?: WalletRequest["awaitsSession"];
   } = {},
 ): Promise<AwaitUser> {
   const signerRole = opts.signerRole ?? "an Operations Committee member";
@@ -268,6 +270,8 @@ export async function walletPause(
       gas,
       ...(opts.minFee ? { minFee: { denom: opts.minFee.denom, amount: opts.minFee.amount.toString() } } : {}),
       cli,
+      ...(opts.frontendLink ? { frontendLink: opts.frontendLink } : {}),
+      ...(opts.awaitsSession ? { awaitsSession: opts.awaitsSession } : {}),
     },
     undefined,
     opts.peerSetup,

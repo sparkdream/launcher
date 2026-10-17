@@ -12,7 +12,7 @@ import { allSteps } from "../src/index.js";
 import { FleetService } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { writeSecretFile } from "../src/secrets.js";
-import { durationMs, readSessions, renewAt, type SessionRecord } from "../src/sessions.js";
+import { durationMs, grantLink, readSessions, renewAt, type SessionRecord } from "../src/sessions.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 import { chainStub, withStub, type ChainStub } from "./chain-stub.js";
 
@@ -342,6 +342,29 @@ describe("durationMs", () => {
   });
 });
 
+describe("grantLink", () => {
+  it("prefills the frontend's permissions page with the grant the wallet pause asks for", () => {
+    const record = {
+      grantee: "sprkdrm1grantee",
+      expiresAt: "2026-10-24T12:00:00.123Z",
+      spendLimit: "5000000",
+      maxExecCount: 1000,
+    } as SessionRecord;
+    const url = new URL(grantLink("https://app.example.org/", "verifier", "sprkdrm1granter", record, ["sprkdrm1old"]));
+    expect(`${url.origin}${url.pathname}`).toBe("https://app.example.org/permissions");
+    const q = url.searchParams;
+    expect(q.get("session_request")).toBe("verifier");
+    expect(q.get("granter")).toBe("sprkdrm1granter");
+    expect(q.get("grantee")).toBe("sprkdrm1grantee");
+    expect(q.get("spend")).toBe("5000000");
+    expect(q.get("expires")).toBe("2026-10-24T12:00:00Z");
+    expect(q.get("execs")).toBe("1000");
+    expect(q.get("fund")).toBe("1");
+    expect(q.getAll("type").length).toBeGreaterThan(0);
+    expect(q.getAll("revoke")).toEqual(["sprkdrm1old"]);
+  });
+});
+
 describe("a verifier acting as a wallet member", () => {
   /** A launch whose verifier is `wallet`, a member the launcher holds no key for. */
   async function walletLaunch(chain: ChainStub, trust = "TRUST_LEVEL_ESTABLISHED") {
@@ -391,6 +414,8 @@ describe("a verifier acting as a wallet member", () => {
     expect(pending).toMatchObject({ granter: member, pending: true });
     expect(waiting().msgs.map((m: any) => m["@type"].split(".").pop())).toEqual(["MsgSend", "MsgCreateSession"]);
     expect(waiting().msgs[1]).toMatchObject({ granter: member, grantee: pending.grantee });
+    // the monitor watches for that grant, so one signed elsewhere resumes by itself
+    expect(waiting().awaitsSession).toEqual({ granter: member, grantee: pending.grantee });
 
     // an unsigned resume asks again for the same key, not a new one
     expect((await run()).status).toBe("awaiting-user");

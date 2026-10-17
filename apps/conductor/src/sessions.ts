@@ -400,6 +400,32 @@ function grantMsgs(
 }
 
 /**
+ * The grant prefilled on the chain's frontend (sparkdream-ui's permissions
+ * page, from v1.0.89), for a member whose wallet is on another computer: it
+ * signs the same messages as grantMsgs plus the revocations.
+ */
+export function grantLink(
+  frontend: string,
+  role: SessionRole,
+  granter: string,
+  next: SessionRecord,
+  revoke: string[],
+): string {
+  const q = new URLSearchParams({
+    session_request: role,
+    granter,
+    grantee: next.grantee,
+    spend: next.spendLimit,
+    expires: new Date(next.expiresAt).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    execs: String(next.maxExecCount),
+    fund: "1",
+  });
+  for (const t of MSG_TYPES[role]) q.append("type", t);
+  for (const r of revoke) q.append("revoke", r);
+  return `${frontend.replace(/\/+$/, "")}/permissions?${q}`;
+}
+
+/**
  * A grant only the granter's wallet can sign. The key is minted and recorded
  * (pending) before the pause, and the pause re-asks for that same key until
  * it is signed or grows too old to be worth granting; the resume, finding
@@ -456,6 +482,8 @@ async function walletGrant(
   const pause = await walletPause(ctx, `session-${role}`, chain, `grant the ${role}'s session key`, msgs, {
     signerRole: `the ${role} member`,
     signer: granter,
+    ...(chain.frontend ? { frontendLink: grantLink(chain.frontend, role, granter, next, revoke) } : {}),
+    awaitsSession: { granter, grantee: next.grantee },
   });
   ctx.log(`session: ${role} needs a new key (${reason}); waiting for ${granter} to sign the grant of ${next.grantee}`);
   // the daemon's fees come out of the member's own balance, up to the limit

@@ -3230,6 +3230,40 @@ export default function Page() {
               >
                 {waitingStep.peerSetup ? "Sign the next step with Keplr" : "Sign with Keplr"}
               </button>
+              {waitingStep.wallet.frontendLink && (
+                // the member's wallet is on another computer: the chain's frontend signs the same tx
+                <details>
+                  <summary className="dim-note">
+                    Wallet on another computer? Sign it in {waitingStep.wallet.chain.chainName}&apos;s frontend
+                  </summary>
+                  <div className="dim-note" style={{ margin: "6px 0" }}>
+                    Open this link where {waitingStep.wallet.signerRole}&apos;s wallet is, connect it, and grant the key
+                    (needs a frontend from v1.0.89).
+                    {waitingStep.wallet.awaitsSession
+                      ? " The launcher sees the grant on chain and carries on by itself."
+                      : " Then resume here."}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <button
+                      className="btn small"
+                      onClick={() => {
+                        try {
+                          void navigator.clipboard.writeText(waitingStep.wallet!.frontendLink!);
+                          showToast("copied the link");
+                        } catch {
+                          showToast("select the link and copy it by hand");
+                        }
+                      }}
+                    >
+                      Copy link
+                    </button>
+                    <a href={waitingStep.wallet.frontendLink} target="_blank" rel="noreferrer">
+                      Open here
+                    </a>
+                  </div>
+                  <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{waitingStep.wallet.frontendLink}</pre>
+                </details>
+              )}
               {waitingStep.wallet.cli && !waitingStep.peerSetup && (
                 <details>
                   <summary className="dim-note">Key not in a browser wallet? Show the CLI commands</summary>

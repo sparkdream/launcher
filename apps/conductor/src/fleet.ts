@@ -191,7 +191,7 @@ import {
   type SessionRole,
 } from "./sessions.js";
 import type { ConductorDb, FleetComponentRow, FleetOpProgress, FleetOpRow, IncidentRow, LaunchRow } from "./db.js";
-import { launchDirs } from "./engine.js";
+import { launchDirs, type WalletRequest } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { accountDepositMsg, closeDeploymentMsg } from "./akash/messages.js";
 import type { OfferedBid } from "./akash/policy.js";
@@ -4006,6 +4006,38 @@ export class FleetService {
     if (!setup.rest) return false;
     const now = await peerProgress(this.services.rpc, setup.rest, setup.peerId);
     return now !== undefined && now !== setup.progress;
+  }
+
+  /**
+   * A launch paused on a session grant only the member's wallet can sign
+   * (sessions.ts walletGrant) whose grant is now on chain: signed through the
+   * chain's frontend or the CLI on another computer. The monitor then resumes
+   * it, as peerSetupReady does for a peer's setup.
+   */
+  async walletSessionReady(launchId: string): Promise<boolean> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "paused") return false;
+    const step = this.db.listSteps(launchId).find((st) => st.status === "waiting" && st.wallet_json);
+    if (!step) return false;
+    let req: WalletRequest | undefined;
+    try {
+      req = JSON.parse(step.wallet_json!) as WalletRequest;
+    } catch {
+      return false;
+    }
+    const want = req?.awaitsSession;
+    const rest = req?.chain?.rest;
+    if (!want || !rest) return false;
+    try {
+      const body = JSON.parse(
+        await this.services.rpc.getText(
+          `${rest.replace(/\/+$/, "")}/sparkdream/session/v1/session/${want.granter}/${want.grantee}`,
+        ),
+      );
+      return !!body?.session;
+    } catch {
+      return false;
+    }
   }
 
   queueStaleRelayLink(launchId: string): boolean {

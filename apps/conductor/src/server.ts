@@ -240,13 +240,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       // launches are independent — sweep them concurrently so one hung
       // provider can't delay every other fleet's health refresh
       // a launch paused on a federation peer's setup elsewhere resumes by
-      // itself once that chain shows the work done (peerSetupReady)
+      // itself once that chain shows the work done (peerSetupReady), and one
+      // paused on a member's session grant once the grant is on chain
       await Promise.all(
         deps.db
           .listLaunches()
           .filter((l) => l.status === "paused" && !running.has(l.id))
           .map(async (launch) => {
-            if (await fleet.peerSetupReady(launch.id).catch(() => false)) {
+            if (
+              (await fleet.peerSetupReady(launch.id).catch(() => false)) ||
+              (await fleet.walletSessionReady(launch.id).catch(() => false))
+            ) {
               drive(launch.id, JSON.parse(launch.spec_json));
             } else if (
               await fleet
