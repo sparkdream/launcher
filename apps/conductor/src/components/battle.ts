@@ -53,7 +53,8 @@ export function battleWeb3Env(input: RenderInput): string[] {
     `CHAIN_DISPLAY_DENOM=${t.token.displayDenom}`,
     `CHAIN_PREFIX=${t.network.bech32Prefix}`,
     `CHAIN_GAS_PRICE=${t.token.minGasPrice}${t.token.baseDenom}`,
-    ...(explorer ? [`CHAIN_EXPLORER=${explorer}`] : []),
+    // empty turns the HUD's tx links off; unset, the game would link to its built-in devnet explorer
+    `CHAIN_EXPLORER=${explorer ?? ""}`,
     `CHAIN_GRANTER=${granter}`,
     `CHAIN_SESSION_KEY_FILE=${sessionKeyFile("battle")}`,
     `PUBLIC_URL=https://${component.domain!}`,

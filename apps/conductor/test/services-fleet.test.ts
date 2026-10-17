@@ -232,6 +232,12 @@ describe("battle royale game", () => {
     const byWallet = render(withDefaults(s as any), {});
     expect(byWallet.battle.service.env).toContain(`CHAIN_GRANTER=${KING}`);
 
+    // a chain without an explorer: an empty CHAIN_EXPLORER, so the game shows no tx links
+    // (unset, it would fall back to its built-in devnet explorer)
+    (s.topology.components as any).explorer = { enabled: false };
+    expect(render(withDefaults(s as any), {}).battle.service.env).toContain("CHAIN_EXPLORER=");
+    (s.topology.components as any).explorer = { enabled: true, domain: "explorer.phoenix.example" };
+
     // exactly one of account and wallet; a generated member account; a chain with public endpoints
     (s.topology.components as any).battle.web3 = { account: "vera", wallet: KING };
     expect(() => withDefaults(s as any)).toThrow(/exactly one/);
@@ -254,7 +260,7 @@ describe("battle royale game", () => {
     expect(() =>
       descriptorFor("battle")!.render({
         spec: withDefaults(s as any),
-        component: { key: "battle", image: "sparkdreamnft/battle-royale:v1.0.1", domain: "battle.zenith.example" },
+        component: { key: "battle", image: "sparkdreamnft/battle-royale:v1.0.2", domain: "battle.zenith.example" },
         launchId: "svc",
         resolveFleet: () => undefined,
       } as any),
