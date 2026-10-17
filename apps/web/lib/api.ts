@@ -487,6 +487,9 @@ export interface FleetSummary {
       /** age in days of the latest usable backup */
       latestAgeDays?: number;
     };
+    /** The battle game's onchain records, while they are on: the chain
+     *  fleet's network name (absent: this fleet's chain) and the account. */
+    battleWeb3?: { target?: string; wallet?: string; account?: string };
     /** Fleets running Mastodon: where its backups go (null: nowhere yet),
      *  recorded backups (newest first) and their settings. */
     mastodonBackups?: {
@@ -612,6 +615,9 @@ export type FleetAction =
   | "mastodon-settings"
   /** Mastodon: the other servers its bridge anchors for as their own peers. */
   | "bridge-peers"
+  /** The battle game: turn its onchain records on, change or off, on its
+   *  existing deployment (updated in place). */
+  | "battle-web3"
   /** A closed service component: drop it from the fleet and the spec. */
   | "remove";
 
@@ -633,6 +639,7 @@ export async function postFleetAction(
     peers?: string[];
     registrations?: "open" | "approved" | "none";
     walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
+    web3?: Record<string, unknown> | null;
   } = {},
 ): Promise<{ status?: string; note?: string; warnings?: string[]; confirmPrompt?: string; backupFirst?: boolean; error?: string }> {
   const res = await afetch(`/api/fleet/${launchId}/${dseq}/actions`, {
@@ -1254,6 +1261,54 @@ export interface ResizeOptions {
 }
 export async function getResizeOptions(launchId: string, dseq: string): Promise<ResizeOptions> {
   return json(await afetch(`/api/fleet/${launchId}/${dseq}/resize-options`));
+}
+
+/** A chain fleet the battle game could write to (battle-options.ts). */
+export interface BattleWeb3Target {
+  id: string;
+  name: string;
+  chainId: string;
+  self: boolean;
+  unusable: string | null;
+  /** Another wallet's fleet (shared with this one): member addresses only. */
+  foreign: boolean;
+  /** Another wallet's fleet not shared with this one. */
+  notShared: boolean;
+  accounts: string[];
+  bech32Prefix: string;
+  baseDenom: string;
+  displayDenom: string;
+  exponent: number;
+}
+
+/** The picked account as the picked chain sees it. Amounts in the base denom. */
+export interface BattleWeb3Check {
+  address: string;
+  trustLevel: string | null;
+  canCreateClasses: boolean;
+  balance: string | null;
+  classesReady: boolean;
+  classCost: string | null;
+  tokenDeposit: string | null;
+  sessionMax: { days: number; spendLimit: string } | null;
+  error?: string;
+}
+
+export interface BattleWeb3Options {
+  domain?: string;
+  current: { enabled: boolean; target?: string; wallet?: string; account?: string; session: { days?: number; spendLimit: string } };
+  defaultDays: number;
+  targets: BattleWeb3Target[];
+  check?: BattleWeb3Check;
+}
+
+export async function getBattleWeb3Options(
+  launchId: string,
+  dseq: string,
+  query: { target?: string; account?: string } = {},
+): Promise<BattleWeb3Options> {
+  const q = new URLSearchParams(Object.entries(query).filter((e): e is [string, string] => Boolean(e[1])));
+  return json(await afetch(`/api/fleet/${launchId}/${dseq}/battle-web3${q.size > 0 ? `?${q}` : ""}`));
 }
 
 export async function getComponentDisk(launchId: string, dseq: string): Promise<NodeDisk> {

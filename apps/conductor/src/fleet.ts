@@ -291,7 +291,7 @@ import {
 } from "./local-signer.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 
-import type { AddComponentParams, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
+import type { AddComponentParams, BattleWeb3Params, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -455,6 +455,10 @@ export interface FleetView {
   bidPicks: Array<{ key: string; dseq: string; bids: OfferedBid[] }>;
   /** The daemons' session keys (§5 session keys): grants, never the keys. */
   sessions: ReturnType<typeof sessionSummary>;
+  /** The battle game's onchain records, while they are on: the chain fleet
+   *  it writes to (its network name; absent: this fleet's chain) and the
+   *  game management account. The card offers to turn them off. */
+  battleWeb3?: { target?: string; wallet?: string; account?: string };
 }
 
 export interface FleetSummary {
@@ -1081,6 +1085,21 @@ export class FleetService {
                   ...(b.mediaBytes !== undefined ? { mediaBytes: b.mediaBytes } : {}),
                 })),
               },
+            }
+          : {}),
+        ...(spec.topology.components.battle?.enabled && spec.topology.components.battle.web3
+          ? {
+              battleWeb3: (() => {
+                const w = spec.topology.components.battle.web3;
+                const ref = w.target?.fleet;
+                // stored as a launch id once resolved: show its network name
+                const target = ref ? this.db.getLaunch(ref) : undefined;
+                return {
+                  ...(ref ? { target: target ? this.spec(target).network.name : ref } : {}),
+                  ...(w.wallet ? { wallet: w.wallet } : {}),
+                  ...(w.account ? { account: w.account } : {}),
+                };
+              })(),
             }
           : {}),
         autoRecover: this.autoRecoverPolicy(launch.id),
@@ -3098,6 +3117,48 @@ export class FleetService {
   }
 
   /**
+   * Turn the running battle game's onchain records on (or change their
+   * chain or account, or turn them off with null) without moving it: the
+   * spec takes the new battle.web3, checked as an add checks it, and a
+   * "battle-web3" op updates the deployment in place, then creates the
+   * classes and grants the session key. The lease, the domain and the
+   * profile database stay.
+   */
+  requestBattleWeb3(launch: LaunchRow, component: FleetComponentRow, web3: Record<string, unknown> | null): number {
+    if (component.key !== "battle") throw new Error("only the battle game has onchain records to configure");
+    if (component.state !== "active") throw new Error(`battle is ${component.state}, not active`);
+    if (this.db.getStep(launch.id, "finalize")?.status !== "done") throw new Error("the launch has not finished");
+    const busy = this.db.listFleetOps(launch.id, "active").find((o) => {
+      if (o.kind === "battle-web3") return true;
+      try {
+        const p = JSON.parse(o.params_json);
+        return p.key === "battle" || (Array.isArray(p.keys) && p.keys.includes("battle")) || (Array.isArray(p.components) && p.components.includes("battle"));
+      } catch {
+        return false;
+      }
+    });
+    if (busy) throw new Error(`an op on battle is still running (#${busy.id} ${busy.kind}): finish or abort it first`);
+    const spec = this.spec(launch);
+    const battle = spec.topology.components.battle as Record<string, unknown> | undefined;
+    if (!battle?.enabled) throw new Error("battle is not enabled in the spec");
+    if (!web3 && !battle.web3) throw new Error("the game's onchain records are already off");
+    const previous = (battle.web3 as Record<string, unknown> | undefined) ?? null;
+    if (web3) battle.web3 = web3;
+    else delete battle.web3;
+    Object.assign(spec, withDefaults(spec as unknown as LaunchSpecInput));
+    const parsed = spec.topology.components.battle!;
+    if (parsed.web3?.target) {
+      parsed.web3.target.fleet = resolveBattleTarget(this.db, spec, launch.owner, parsed.web3.target.fleet, launch.id);
+    } else {
+      checkBattleAccount(spec, spec);
+    }
+    const { errors } = validateSpec(spec);
+    if (errors.length > 0) throw new Error(errors.map((e) => `${e.path}: ${e.message}`).join("; "));
+    this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+    return this.db.createFleetOp(launch.id, "battle-web3", { web3: Boolean(parsed.web3), previous } satisfies BattleWeb3Params);
+  }
+
+  /**
    * Take a closed service component out of the fleet: the spec stops
    * enabling it (its settings stay, so adding it back later starts from
    * them) and its row and health go. What it set up elsewhere stays where it
@@ -4544,6 +4605,26 @@ export class FleetService {
         });
       }
     }
+    // an abandoned battle-web3 puts the game's settings back as they were;
+    // once its update has landed, the running game carries the new chain
+    // env, so a follow-up op updates the deployment back from them (read
+    // before the op's steps go)
+    let battleRevert: BattleWeb3Params | undefined;
+    if (op.kind === "battle-web3") {
+      const params = JSON.parse(op.params_json) as BattleWeb3Params;
+      const previous = params.previous ?? null;
+      const spec = JSON.parse(launch.spec_json) as Record<string, any>;
+      const battle = spec.topology?.components?.battle as Record<string, unknown> | undefined;
+      if (battle) {
+        const current = (battle.web3 as Record<string, unknown> | undefined) ?? null;
+        if (previous) battle.web3 = previous;
+        else delete battle.web3;
+        this.db.setLaunchSpec(launch.id, JSON.stringify(spec));
+        if (this.db.getStep(launch.id, `op${opId}:update`)?.status === "done") {
+          battleRevert = { web3: Boolean(previous), previous: current };
+        }
+      }
+    }
     // read the op's deployment BEFORE deleting its steps, then erase the
     // step rows so the abandoned op stops surfacing as the launch's error
     const deploy = this.db.stepOutput<{ dseq: string }>(launch.id, `op${opId}:deploy`);
@@ -4551,6 +4632,15 @@ export class FleetService {
     // and its unsigned txs: the signing queue serves oldest-first, so an
     // abandoned op's dead lease request would shadow the close below forever
     this.db.deleteUnsignedPendingTxsLike(launch.id, `op${opId}:%`);
+    let revertStep: string | undefined;
+    if (battleRevert) {
+      const revertId = this.db.createFleetOp(launch.id, "battle-web3", battleRevert);
+      revertStep = `op${revertId}:update`;
+      const note =
+        `the game was already updated for the new settings, so op #${revertId} updates it back ` +
+        `(${battleRevert.web3 ? "its previous chain" : "onchain records off"}): sign its update`;
+      warning = warning ? `${warning}; ${note}` : note;
+    }
     let closeDseq = deploy?.dseq;
     if (op.kind === "node-resize") {
       this.db.setFleetOpProgress(opId, null);
@@ -4595,7 +4685,7 @@ export class FleetService {
         return { step, ...(warning ? { warning } : {}) };
       }
     }
-    return warning ? { warning } : {};
+    return { ...(revertStep ? { step: revertStep } : {}), ...(warning ? { warning } : {}) };
   }
 
   /** Add/remove a provider on a wallet's global avoid/prefer list (§6). */

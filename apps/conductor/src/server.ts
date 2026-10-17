@@ -85,6 +85,7 @@ import { mastodonAutoRestore } from "./mastodon-backup.js";
 import { publicAlertSettings, setAlertSettings, type AlertSettings } from "./incidents.js";
 import { setUnattendedSettings, UNATTENDED_FEE_DENOM } from "./unattended.js";
 import { CloudflareDns, cloudflareToken, setCloudflareToken } from "./dns.js";
+import { battleWeb3Options } from "./battle-options.js";
 
 export interface ServerDeps {
   db: ConductorDb;
@@ -797,8 +798,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "resize"
         | "mastodon-settings"
         | "bridge-peers"
+        | "battle-web3"
         | "remove";
       confirm?: boolean;
+      /** battle-web3: the game's battle.web3 settings (target, account or
+       *  wallet, session), or null to turn its onchain records off. */
+      web3?: Record<string, unknown> | null;
       /** mastodon-settings: who may sign up, and wallet sign-in (merged into
        *  the current settings). */
       registrations?: "open" | "approved" | "none";
@@ -1019,6 +1024,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           // the op's steps are built from the spec just written
           drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
           return { status: move ? "mastodon-move-started" : "mastodon-settings-started", opId, move };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "battle-web3": {
+        if (body.web3 === undefined || (body.web3 !== null && typeof body.web3 !== "object")) {
+          return reply.status(400).send({ error: "web3 must be the battle.web3 settings, or null to turn onchain records off" });
+        }
+        try {
+          const opId = fleet.requestBattleWeb3(launch, component, body.web3);
+          // the op's steps are built from the spec just written
+          drive(launchId, JSON.parse(deps.db.getLaunch(launchId)!.spec_json));
+          return { status: "battle-web3-started", opId };
         } catch (e) {
           return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
         }
@@ -1262,6 +1280,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const component = deps.db.getFleetComponentByDseq(launchId, dseq);
     if (!component || !/^(val|sentry)-\d+$/.test(component.key)) return reply.status(404).send({ error: "no chain node at that dseq" });
     return fleet.resizeOptions(launch, component);
+  });
+
+  // what the battle game's onchain dialog starts from: its stored settings,
+  // the chain fleets it could write to, and (with ?target=&account=) that
+  // account as the picked chain sees it
+  app.get("/api/fleet/:launchId/:dseq/battle-web3", async (req, reply) => {
+    const { launchId, dseq } = req.params as { launchId: string; dseq: string };
+    const launch = deps.db.getLaunch(launchId);
+    if (!launch) return reply.status(404).send({ error: "launch not found" });
+    if (denyForeign(req, reply, launch)) return;
+    const component = deps.db.getFleetComponentByDseq(launchId, dseq);
+    if (component?.key !== "battle") return reply.status(404).send({ error: "no battle game at that dseq" });
+    const q = req.query as { target?: string; account?: string };
+    try {
+      return await battleWeb3Options(deps.db, deps.services.rpc, launch, q);
+    } catch (e) {
+      return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+    }
   });
 
   // the chain's genesis.json (identical for every node)

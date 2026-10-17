@@ -1,4 +1,4 @@
-import { withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { imageBefore, versionTag, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { battleRelayer, battleTargetId } from "../battle.js";
 import { AwaitUser, type StepCtx, type StepDef } from "../engine.js";
 import { fleetActor, sendTx, walletPause, type ChainActor } from "../peering.js";
@@ -12,7 +12,16 @@ import { queryJson } from "./phase-g.js";
  * account itself: MsgCreateClass burns SPARK and is not delegable to a
  * session key, so the game server never holds the authority to do it.
  */
-export const BATTLE_CLASSES: readonly { symbol: string; name: string; description: string; transferable: boolean }[] = [
+export interface BattleClass {
+  symbol: string;
+  name: string;
+  description: string;
+  transferable: boolean;
+}
+
+// What battle-royale v1.0.2 and earlier need at boot (all four, BRMAP
+// included); v1.0.3 and later publish their own list, and v1.0.4 dropped BRMAP.
+export const BATTLE_CLASSES: readonly BattleClass[] = [
   {
     symbol: "BRCAREER",
     name: "Battle Royale Career",
@@ -39,10 +48,70 @@ export const BATTLE_CLASSES: readonly { symbol: string; name: string; descriptio
   },
 ];
 
-/** Gas for four class creations in one tx. */
-const CREATE_CLASSES_GAS = 1_200_000;
+/** The first battle-royale release that lists its classes at /chain-status. */
+const CLASS_LIST_SINCE = "v1.0.3";
 
-function createClassMsg(creator: string, spec: (typeof BATTLE_CLASSES)[number], denom: string): unknown {
+/** How long a game that should list its classes gets to answer: an update
+ *  restarts it just before the class step reads the list. */
+const CLASS_LIST_TRIES = 12;
+const CLASS_LIST_RETRY_MS = 10_000;
+
+/**
+ * The classes the game needs, as the deployed game says (its /chain-status
+ * lists them since battle-royale v1.0.3), so a new class needs a game
+ * release, not a launcher one. A game tagged before v1.0.3 gets the
+ * built-in BATTLE_CLASSES; so does one tagged otherwise (dev, a digest)
+ * that answers without a list. A game that should list them and does not
+ * answer is waited for (`wait`, between tries) and then refused, never
+ * replaced by the built-in list: on 2026-10-17 the class step read it while
+ * the update was restarting v1.0.4, fell back, and asked for BRMAP, a class
+ * that release had dropped. A malformed list is refused too.
+ */
+export async function battleClassList(
+  rpc: { getText(url: string): Promise<string> },
+  spec: LaunchSpec,
+  wait?: (ms: number) => Promise<void>,
+): Promise<readonly BattleClass[]> {
+  const domain = spec.topology.components.battle?.domain;
+  const image = spec.images?.battle;
+  if (!domain || (image && imageBefore(image, CLASS_LIST_SINCE))) return BATTLE_CLASSES;
+  let status: { classes?: unknown } | undefined;
+  let lastError = "";
+  for (let attempt = 0; attempt < (wait ? CLASS_LIST_TRIES : 1) && !status; attempt++) {
+    if (attempt > 0) await wait!(CLASS_LIST_RETRY_MS);
+    try {
+      status = JSON.parse(await rpc.getText(`https://${domain}/chain-status`)) as { classes?: unknown };
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  if (!status) {
+    throw new Error(`the battle game at ${domain} did not answer /chain-status with the classes it needs (${lastError}): retry once it is up`);
+  }
+  if (!Array.isArray(status.classes)) {
+    if (image && versionTag(image)) {
+      throw new Error(`the battle game at ${domain} (${image}) lists no classes at /chain-status`);
+    }
+    return BATTLE_CLASSES;
+  }
+  const list = status.classes as unknown[];
+  const valid = list.filter(
+    (c): c is BattleClass =>
+      !!c && typeof c === "object" &&
+      typeof (c as BattleClass).symbol === "string" && /^[A-Z0-9]{1,16}$/.test((c as BattleClass).symbol) &&
+      typeof (c as BattleClass).name === "string" && typeof (c as BattleClass).description === "string" &&
+      typeof (c as BattleClass).transferable === "boolean",
+  );
+  if (valid.length === 0 || valid.length !== list.length) {
+    throw new Error(`the battle game at ${domain} lists classes the launcher cannot read at /chain-status`);
+  }
+  return valid;
+}
+
+/** Gas per class creation (four in one tx took 1.2M). */
+const CREATE_CLASS_GAS = 300_000;
+
+function createClassMsg(creator: string, spec: BattleClass, denom: string): unknown {
   return {
     "@type": "/sparkdream.artifact.v1.MsgCreateClass",
     creator,
@@ -87,7 +156,7 @@ export async function ensureBattleClasses(
   const chain = await fleetActor(ctx, targetId, targetId === ctx.launchId ? "this fleet" : `fleet ${target.network.name}`);
 
   const owned = await ownedSymbols(chain, relayer.address);
-  const missing = BATTLE_CLASSES.filter((c) => !owned.has(c.symbol));
+  const missing = (await battleClassList(ctx.services.rpc, spec, (ms) => ctx.services.sleep(ms))).filter((c) => !owned.has(c.symbol));
   if (missing.length === 0) return { address: relayer.address, created: [] };
   const msgs = missing.map((c) => createClassMsg(relayer.address, c, chain.gasDenom));
 
@@ -112,12 +181,12 @@ export async function ensureBattleClasses(
       chain,
       `create the game's ${missing.map((c) => c.symbol).join(", ")} classes`,
       msgs,
-      { signerRole: "the game management account", signer: relayer.address, gas: CREATE_CLASSES_GAS },
+      { signerRole: "the game management account", signer: relayer.address, gas: CREATE_CLASS_GAS * msgs.length },
     );
   }
 
   const signer: ChainActor = { ...chain, signer: { ...relayer.key, address: relayer.address } };
-  await sendTx(ctx, signer, `${chain.chainId}-battle-classes`, msgs, { gas: CREATE_CLASSES_GAS });
+  await sendTx(ctx, signer, `${chain.chainId}-battle-classes`, msgs, { gas: CREATE_CLASS_GAS * msgs.length });
   ctx.log(`battle: ${relayer.label} created ${missing.map((c) => c.symbol).join(", ")} on ${chain.chainId}`);
   return { address: relayer.address, created: missing.map((c) => c.symbol) };
 }

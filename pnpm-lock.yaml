@@ -44,8 +44,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/launch-spec
       '@sparkdreamnft/sparkdreamjs':
-        specifier: ^0.0.43
-        version: 0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
+        specifier: ^0.0.45
+        version: 0.0.45(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
       bcryptjs:
         specifier: ^3.0.3
         version: 3.0.3
@@ -157,8 +157,8 @@ importers:
         specifier: ^0.39.0
         version: 0.39.0
       '@sparkdreamnft/sparkdreamjs':
-        specifier: ^0.0.43
-        version: 0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
+        specifier: ^0.0.45
+        version: 0.0.45(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)
       cosmjs-types:
         specifier: ^0.11.0
         version: 0.11.0
@@ -1758,8 +1758,8 @@ packages:
   '@sinclair/typebox@0.24.51':
     resolution: {integrity: sha512-1P1OROm/rdubP5aFDSZQILU0vrLCJ4fvHt6EoqHEM+2D/G5MK3bIaymUKLit8Js9gbns5UyJnkP/TZROLw4tUA==}
 
-  '@sparkdreamnft/sparkdreamjs@0.0.43':
-    resolution: {integrity: sha512-QN6KfNLPUZU41Dk5t7NoE9GGuENFmG5SxrIr2Ffyc6dgFgnJlycX0mCHTKyUmRnxdkcq3UwR2aFF21MloFkayQ==}
+  '@sparkdreamnft/sparkdreamjs@0.0.45':
+    resolution: {integrity: sha512-7++4Hg6GWrtO8o+2ChMnfEE32bTrBBuXhoaB711V0pS1G9BTDE8HDW9RPxwYPEk9I+gpvQbsrAlGJqdFf2oaLQ==}
 
   '@swc/helpers@0.5.15':
     resolution: {integrity: sha512-JQ5TuMi45Owi4/BIMAJBoSQoOJu12oOk/gADqlcUL9JEdHB8vyjUSsxqeNXnmXHjYKMi2WcYtezGEEhqUI/E2g==}
@@ -5546,7 +5546,7 @@ snapshots:
 
   '@sinclair/typebox@0.24.51': {}
 
-  '@sparkdreamnft/sparkdreamjs@0.0.43(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)':
+  '@sparkdreamnft/sparkdreamjs@0.0.45(@chain-registry/v2-types@0.53.146)(@chain-registry/v2@1.71.237)':
     dependencies:
       '@cosmjs/proto-signing': 0.39.0
       '@cosmjs/stargate': 0.39.0

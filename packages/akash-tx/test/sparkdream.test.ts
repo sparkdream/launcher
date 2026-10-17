@@ -75,6 +75,17 @@ describe("wallet-signed Spark Dream messages", () => {
     expect(fillSigner({ at: expiration }, ME).at).toBe(expiration);
   });
 
+  it("signs the battle game's x/artifact messages (class creation, minting)", () => {
+    // sparkdreamjs before 0.0.45 had no x/artifact: the class-creation pause failed with "cannot sign"
+    const { registry, aminoTypes } = sparkdreamSigning();
+    const typeUrl = "/sparkdream.artifact.v1.MsgCreateClass";
+    const value = registry.encode({ typeUrl, value: { creator: WALLET_SIGNER, name: "Battle Royale Career", symbol: "BRCAREER" } });
+    const [eo] = encodedToEncodeObjects([{ typeUrl, value: toBase64(value) }], ME);
+    expect(eo!.value).toMatchObject({ creator: ME, symbol: "BRCAREER" });
+    expect(aminoTypes.toAmino(eo!).type).toBe("sparkdream/x/artifact/MsgCreateClass");
+    for (const t of ["/sparkdream.artifact.v1.MsgMint", "/sparkdream.artifact.v1.MsgUpdateToken"]) expect(registry.lookupType(t)).toBeTruthy();
+  });
+
   it("refuses a message type it does not know", () => {
     expect(() => encodedToEncodeObjects([{ typeUrl: "/nope.v1.MsgNothing", value: "" }], ME)).toThrow(/cannot sign/);
   });

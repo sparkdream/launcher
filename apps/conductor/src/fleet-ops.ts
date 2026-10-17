@@ -1477,6 +1477,64 @@ export function reconfigureSteps(opId: number, params: ReconfigureParams, spec: 
   ];
 }
 
+/** Params of a "battle-web3" op: whether the game writes to a chain after it. */
+export interface BattleWeb3Params {
+  web3: boolean;
+  /** battle.web3 as stored before this op (null: off), which an abort puts
+   *  back. Absent on ops queued before it was recorded: read as off. */
+  previous?: Record<string, unknown> | null;
+}
+
+/**
+ * Turn the battle game's onchain records on, change them, or turn them off,
+ * on its existing deployment: requestBattleWeb3 has already written
+ * battle.web3 into the stored spec. The SDL is rendered again from it (the
+ * game's env holds nothing the spec doesn't) and the deployment updated in
+ * place, one signature, so the lease, the domain and the profile database
+ * stay. With web3, the kind's configure steps follow: the classes, then the
+ * session key, delivered into the restarted container (delivery retries
+ * while it comes up). Turned off, the game simply stops writing; a grant
+ * left behind lapses at its expiry.
+ */
+export function battleWeb3Steps(opId: number, params: BattleWeb3Params, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  return [
+    {
+      name: p("update"),
+      async run(ctx) {
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const row = componentRow(ctx, "battle");
+        const sdlPath = sdlPathFor(ctx, "battle");
+        rerenderComponentSdl(ctx, spec, "battle", sdlPath);
+        const artifacts = sdlArtifacts(loadSdl(sdlPath));
+        fs.writeFileSync(path.join(ctx.dirs.sdl, "battle.manifest.json"), artifacts.manifestJson);
+        // convergent, as retarget: an update that already landed would be
+        // rejected as "nothing to change", so only the manifest goes again
+        const wantHash = Buffer.from(artifacts.hash).toString("base64");
+        const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+        if (onChain?.hash === wantHash) {
+          ctx.log("battle: on-chain version already matches — skipping update tx");
+          ctx.db.deletePendingTx(ctx.launchId, p("update"));
+        } else {
+          await ctx.requireTx(p("update"), [
+            { typeUrl: TypeUrl.UpdateDeployment, value: { id: { owner, dseq: row.dseq }, hash: wantHash } },
+          ]);
+        }
+        await ctx.services.provider.sendManifest(loadCert(ctx), row.host_uri, row.dseq, artifacts.manifestJson);
+        return { dseq: row.dseq, web3: params.web3 };
+      },
+    },
+    ...(params.web3 ? (descriptorFor("battle")?.configureSteps?.(p, spec) ?? []) : []),
+    {
+      name: p("battle-web3"),
+      async run(ctx) {
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { web3: params.web3 };
+      },
+    },
+  ];
+}
+
 /**
  * Claim the recurring payments councils make to the fleet's launcher-held
  * operators (pay-claims.ts). Local signing only, so the monitor starts it
@@ -6336,6 +6394,7 @@ function buildSteps(
     if (op.kind === "sessions") steps.push(...sessionsSteps(op.id, params, spec));
     if (op.kind === "claims") steps.push(...claimsSteps(op.id, spec));
     if (op.kind === "reconfigure") steps.push(...reconfigureSteps(op.id, params, spec));
+    if (op.kind === "battle-web3") steps.push(...battleWeb3Steps(op.id, params, spec));
     if (op.kind === "mastodon-resize") steps.push(...mastodonResizeSteps(op.id, params, spec));
     if (op.kind === "mastodon-backup") steps.push(...mastodonBackupSteps(op.id, spec));
     if (op.kind === "mastodon-restore") steps.push(...mastodonRestoreSteps(op.id, params as MastodonRestoreParams, spec));

@@ -53,6 +53,7 @@ import {
 } from "../lib/api";
 import { FundingRows } from "./relayer-funds";
 import { RelayerSettingsModal } from "./relayer-settings";
+import { BattleWeb3Dialog } from "./battle-web3";
 import { PeerSetupRoutes } from "./peer-setup";
 import {
   connectKeplr,
@@ -244,7 +245,7 @@ topology:
     #   # session: { days: 90, spendLimit: "25000000" }
     # Battle royale game (sparkdreamnft/battle-royale) on its domain. With
     # web3, players connect Keplr and their results are minted through
-    # x/artifact (career, badge, map and match tokens) for the game
+    # x/artifact (career, badge and match tokens) for the game
     # management account, a member (PROVISIONAL or above) of the target chain
     # — this fleet, or target names another fleet (required in a services
     # fleet). The launcher has that account create the game's four classes
@@ -905,6 +906,8 @@ export default function Page() {
   // encrypted export and the merge-import
   // chain-data backups dialog (data-backup / data-restore ops), by launch id
   const [chainBackupsFor, setChainBackupsFor] = useState<string | null>(null);
+  // the battle game's onchain records dialog
+  const [battleWeb3For, setBattleWeb3For] = useState<{ launchId: string; dseq: string; chainFleet: boolean } | null>(null);
   // design 4a: the resize dialog (sizes from GET resize-options)
   const [resizeFor, setResizeFor] = useState<{
     launchId: string;
@@ -2043,6 +2046,7 @@ export default function Page() {
       | "resize"
       | "mastodon-settings"
       | "bridge-peers"
+      | "battle-web3"
       | "remove",
     extra: {
       image?: string;
@@ -2056,6 +2060,7 @@ export default function Page() {
       peers?: string[];
       registrations?: "open" | "approved" | "none";
       walletLogin?: { enabled: boolean; minTrustLevel?: string; domain?: string };
+      web3?: Record<string, unknown> | null;
     } = {},
   ) => {
     setError(null);
@@ -3506,6 +3511,20 @@ export default function Page() {
         </section>
       )}
 
+      {battleWeb3For && (
+        <BattleWeb3Dialog
+          launchId={battleWeb3For.launchId}
+          dseq={battleWeb3For.dseq}
+          chainFleet={battleWeb3For.chainFleet}
+          onClose={() => setBattleWeb3For(null)}
+          onApply={(web3) => {
+            const { launchId, dseq } = battleWeb3For;
+            setBattleWeb3For(null);
+            // the dialog is the confirmation: the conductor still refuses what cannot go ahead
+            void fleetAction(launchId, dseq, "battle-web3", { web3 });
+          }}
+        />
+      )}
       {relayerSettingsFor && (
         <RelayerSettingsModal
           launchId={relayerSettingsFor}
@@ -6048,7 +6067,7 @@ export default function Page() {
                                 className="btn"
                                 title={
                                   chainFleet
-                                    ? "Other Akash wallets on this launcher whose relayers may relay to this chain (your devnet and testnet wallets, say): content federation and transfers between sister chains. This fleet's own wallet always may. Removing a wallet stops new links; relayers already linked keep running."
+                                    ? "Other Akash wallets on this launcher whose relayers may relay to this chain (your devnet and testnet wallets, say): content federation and transfers between sister chains. Their battle games may also record matches on it, with a member address from the wallet. This fleet's own wallet always may. Removing a wallet stops new links; relayers already linked keep running."
                                     : "Other Akash wallets on this launcher whose chain fleets may link a standalone bridge to this fleet's Mastodon (your devnet and testnet wallets, say). This fleet's own wallet always may. Removing a wallet stops new links; bridges already linked keep running."
                                 }
                                 onClick={async () => {
@@ -7275,6 +7294,15 @@ export default function Page() {
                                       }}
                                     >
                                       settings…
+                                    </button>
+                                  )}
+                                  {c.key === "battle" && (
+                                    <button
+                                      className="btn"
+                                      title="Onchain records: players connect Keplr and their results are minted through x/artifact for the game management account. Turn them on or off, or change the chain, the account or the session grant; the running deployment is updated in place, so the lease, the domain and the leaderboard stay."
+                                      onClick={() => setBattleWeb3For({ launchId: f.launchId, dseq: c.dseq, chainFleet })}
+                                    >
+                                      onchain{f.battleWeb3 ? " ✓" : ""}…
                                     </button>
                                   )}
                                   <button

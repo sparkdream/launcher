@@ -1,6 +1,7 @@
 import { withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { ConductorDb, LaunchRow } from "./db.js";
 import { launchDirs } from "./engine.js";
+import { mayUseFleet } from "./bridge-target.js";
 
 /**
  * The battle royale component's web3 mode: which chain the game server
@@ -94,11 +95,20 @@ export function resolveBattleTarget(db: ConductorDb, spec: LaunchSpec, owner: st
   }
   if (!target) throw new Error(`battle web3 target "${ref}": no such fleet on this launcher`);
   if (target.status === "aborted") throw new Error(`battle web3 target "${ref}": that fleet was shut down`);
-  // a battle.account signs with the target's generated key: only the wallet
-  // that owns the target may lend it (and a wallet member's fleet must still
-  // be one this wallet runs, to be reachable from here)
-  if ((target.owner ?? "") !== (owner ?? "")) {
-    throw new Error(`battle web3 target "${ref}": that fleet belongs to a different wallet`);
+  // another wallet's fleet only when it shares itself with this one, and
+  // then with a wallet member: a battle.account signs with the target's
+  // generated key, which only the wallet that owns the target may lend
+  if (!mayUseFleet(target, owner)) {
+    throw new Error(
+      `battle web3 target "${ref}": that fleet belongs to a different wallet that does not share it with this one ` +
+        "(its owner can add this wallet to its sharing list)",
+    );
+  }
+  if ((target.owner ?? "") !== (owner ?? "") && spec.topology.components.battle?.web3?.account) {
+    throw new Error(
+      `battle web3 target "${ref}": that fleet belongs to a different wallet, so its generated accounts stay with it: ` +
+        "use a member address whose key is in your wallet",
+    );
   }
   if (db.getStep(target.id, "finalize")?.status !== "done") {
     throw new Error(`battle web3 target "${ref}": that fleet has not finished launching`);

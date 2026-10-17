@@ -17,7 +17,7 @@
     "@cosmjs/encoding": "^0.39.0",
     "@cosmjs/proto-signing": "^0.39.0",
     "@cosmjs/stargate": "^0.39.0",
-    "@sparkdreamnft/sparkdreamjs": "^0.0.43",
+    "@sparkdreamnft/sparkdreamjs": "^0.0.45",
     "cosmjs-types": "^0.11.0"
   },
   "devDependencies": {

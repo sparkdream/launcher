@@ -498,9 +498,9 @@ const verifierComponent = z.object({
 /**
  * The battle royale game (sparkdreamnft/battle-royale). Plain, it needs only
  * a domain. With `web3`, players can connect Keplr and have their results
- * written to a chain through x/artifact (career, badge, map and match
- * tokens) by the game management account: the launcher has that account
- * create the game's four classes once (a burn of 10 SPARK each), then grants
+ * written to a chain through x/artifact (career, badge and match tokens)
+ * by the game management account: the launcher has that account create
+ * the classes the game lists once (a burn of 10 SPARK each), then grants
  * the game server an x/session key scoped to MsgMint and MsgUpdateToken,
  * renewed like the verifier's. The account's own key never reaches the
  * game's provider.
@@ -656,7 +656,9 @@ export const launchSpecSchema = z.object({
    * (and copy its stored SMTP password into a fleet of their own). For a
    * chain fleet, their relayers may relay to its chain: federation and
    * transfers between sister chains, with this fleet's founder key signing
-   * its end of a federation peer. The fleet's own wallet always may. For one
+   * its end of a federation peer, and their battle games may record matches
+   * on its chain with a member address from their wallet (never this
+   * fleet's generated accounts). The fleet's own wallet always may. For one
    * person's several wallets (a devnet one and a testnet one); the list is
    * the owner's explicit opt-in, since the linking fleet's setup reaches
    * into this fleet's deployment with this fleet's certificate and keys.

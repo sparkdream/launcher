@@ -2868,8 +2868,8 @@ not a relaunch on another provider.
 
 With `battle.web3` (`apps/conductor/src/battle.ts`), players connect Keplr
 and the game writes their results to a chain through x/artifact: a soulbound
-career token per address, achievement badges, a map token for each winner
-and a match token (held by the game management account) anchoring every
+career token per address, achievement badges for x/rep members (map tokens
+are paused from battle-royale v1.0.4 until maps are redesigned) and a match token (held by the game management account) anchoring every
 match's full result by hash. The chain is this fleet's or, via
 `web3.target`, another fleet's on the launcher (a services fleet must name
 one), reached through its `publicEndpoints.api` and `.rpc`, never the mesh.
@@ -2883,7 +2883,7 @@ session's fee budget.
 
 The game never holds that account's key. Its configure steps
 (`steps/battle.ts`, after every placement) first have the account create
-the four `BR*` classes — `MsgCreateClass` burns SPARK and is not delegable,
+the game's classes (the list its `/chain-status` publishes, falling back to the four `BR*` ones for an older image; `battleClassList`) — `MsgCreateClass` burns SPARK and is not delegable,
 so this is signed by the launcher-held key or by the wallet, once, and
 skipped when the classes exist — then grant the game server an x/session
 key through `ensureSession` with the `battle` role: `MsgMint` and
@@ -2906,6 +2906,24 @@ uris; a domain retarget rewrites it), and nothing secret, so upgrades and
 chain resets re-render it. The add dialog takes the account's address, or
 the whole `web3` block from the spec editor; `requestAddComponent` resolves
 the target fleet and checks the account the way it does the verifier's.
+A game already running plain (or on another chain or account) is switched
+in place by its **onchain…** dialog (`battle-web3.tsx`, in the resize
+dialog's design): a switch turns the records on or off, and on it takes the
+chain fleet, the account and the session's lifetime and fee budget.
+`GET /api/fleet/:id/:dseq/battle-web3` (`battle-options.ts`) fills it: the
+stored settings, the launcher's finished chain fleets with their generated
+members (another wallet's fleet is offered once its `sharing.wallets` lists
+this one, and then only for a member address from the wallet: its generated
+keys stay with its owner; one not shared is listed greyed out), and with `?target=&account=` that account read from the target's
+public api (trust level, balance, whether it owns the game's classes yet,
+the class fee and token deposit, the chain's session caps), so the dialog
+says what will be signed and refuses what the chain would. Applying stores
+the new `web3` block (`requestBattleWeb3`, checked as an add checks it, or
+`null` for off) and queues a `battle-web3` op that re-renders the SDL,
+updates the deployment (one signature, same lease, domain and profile
+database), then runs the same classes and session steps; the class step
+pauses for the wallet only when classes are missing. A grant left behind
+when the records go off lapses at its expiry.
 
 ### Fleet bundle (management portability & DR)
 
