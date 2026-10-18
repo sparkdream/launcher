@@ -59,7 +59,7 @@ import { claimPayments } from "./pay-claims.js";
 import { ensureBridgeOperatorKey } from "./steps/mastodon.js";
 import { ensureScannerOperatorKey } from "./steps/scanner.js";
 import { fleetResolver } from "./verifier.js";
-import { deploymentInfoWithRetry, forwardedVerdict, ingressHost, ingressVerdict, pushManifest, wireValidatorPeers } from "./steps/phase-ef.js";
+import { deploymentInfoWithRetry, forwardedVerdict, ingressHost, ingressVerdict, pushManifest, serviceIngressHost, wireValidatorPeers } from "./steps/phase-ef.js";
 import { resolveStateSyncTrust } from "./steps/join.js";
 import { accountCoordinates, awaitTxIncluded, queryJson } from "./steps/phase-g.js";
 import {
@@ -617,6 +617,32 @@ export async function refreshSshEndpoints(
 
 /** Times a placement moves off a provider whose ingress served nothing, before it pauses. */
 const MAX_INGRESS_REPLACEMENTS = 2;
+
+/**
+ * Point `domains` at a new lease's own ingress hostnames through the
+ * launcher's DNS token, before anything probes them: the domains it set (or
+ * found set), none without a token. A domain the lease status names no
+ * generated hostname for yet is skipped (the provider's bare hostname is no
+ * target to guess here); the verify's dark-domain path still covers it.
+ */
+async function pointAtLease(
+  ctx: StepCtx,
+  deploy: { dseq: string },
+  lease: { hostUri: string; gseq: number; oseq: number },
+  domains: string[],
+): Promise<string[]> {
+  if (!ctx.services.dns) return [];
+  const status = await ctx.services.provider
+    .leaseStatus(loadCert(ctx), lease.hostUri, deploy.dseq, lease.gseq, lease.oseq)
+    .catch(() => undefined);
+  if (!status) return [];
+  const records: { domain: string; target: string }[] = [];
+  for (const domain of domains) {
+    const target = serviceIngressHost(status, domain);
+    if (target) records.push({ domain, target });
+  }
+  return pointDns(ctx, records);
+}
 
 /** Whether a placement's provider is at fault (ingressVerdict, forwardedVerdict). */
 export interface PlacementVerdict {
@@ -2332,6 +2358,13 @@ export function relaunchSteps(
         // on) that no DNS record points at yet, while the main domain still
         // answers from the same provider
         const probes = descriptorFor(key)?.ingress?.(spec) ?? [{ domain, healthUrl: url }];
+        // a move leaves each record on the old provider's ingress, and a
+        // domain that answers does not prove otherwise: a provider can keep
+        // serving a closed lease (2026-10-17: the testnet explorer's UI still
+        // loaded from cpu.dal after op 414 moved it to zencloud, its /api
+        // dead, and this step passed on that). So point every domain at this
+        // lease first, with the token; a record already there is left alone
+        const pointed = placed && leased ? await pointAtLease(ctx, placed, leased, probes.map((d) => d.domain)) : [];
         let dark = probes;
         for (let i = 0; i < 36; i++) {
           const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.healthUrl)));
@@ -2339,7 +2372,7 @@ export function relaunchSteps(
           if (dark.length === 0) {
             ctx.db.setComponentState(ctx.launchId, key, "active");
             if (finishAtGate) ctx.db.setFleetOpStatus(opId, "done");
-            return { healthy: true, url };
+            return { healthy: true, url, ...(pointed.length > 0 ? { dnsPointed: pointed } : {}) };
           }
           await ctx.services.sleep(5000);
         }
@@ -2788,6 +2821,20 @@ export function relaunchSteps(
             await replaceOffBrokenIngress(ctx, placed, leased, async () => ({ broken: true, detail: "" }), p("public-dns"));
           }
         }
+        // a move leaves the records on the old provider, where a node that
+        // outlived its closed lease can still answer (2026-10-08's zombie
+        // sentry-1): point them at this lease first, with the token
+        let pointed: string[] = [];
+        {
+          const placed = ctx.output<{ dseq: string }>(p("deploy"));
+          const leased = ctx.output<{ hostUri: string; gseq: number; oseq: number }>(p("lease"));
+          if (placed && leased) {
+            const status = await ctx.services.provider
+              .leaseStatus(loadCert(ctx), leased.hostUri, placed.dseq, leased.gseq, leased.oseq)
+              .catch(() => undefined);
+            if (status) pointed = await pointOrigins(ctx, publicEndpointRecords(status, publicDomains));
+          }
+        }
         // the node is serving again (persist booted it); a domain still
         // dark after a few minutes points at the old provider's ingress
         let dark = publicDomains;
@@ -2839,7 +2886,7 @@ export function relaunchSteps(
           );
         }
         ctx.db.setFleetOpStatus(opId, "done");
-        return { answering: publicDomains.map((d) => d.domain) };
+        return { answering: publicDomains.map((d) => d.domain), ...(pointed.length > 0 ? { dnsPointed: pointed } : {}) };
       },
     });
   }

@@ -438,6 +438,38 @@ describe("alerts server (ntfy)", () => {
     w.db.close();
   }, 240_000);
 
+  it("a relaunch points the domain at its new lease even while the old provider still answers", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const signer = new FakeSigner();
+    const s = servicesSpec();
+    (s.topology.components as any).hub = { enabled: true, domain: "zenith.example" };
+    db.createLaunch("svc", JSON.stringify(s), "akash1owner");
+    expect((await runWithSigner(db, "svc", s, work, allSteps(s), services, signer)).status).toBe("completed");
+    const fleet = new FleetService(db, services, work);
+    fleet.materialize("svc");
+    // the domain never goes dark: the old provider keeps serving the closed
+    // lease's page, so only pointing the record moves the traffic
+    const pointed: { name: string; target: string }[] = [];
+    services.dns = {
+      async pointCname(name, target) {
+        pointed.push({ name, target });
+        return true;
+      },
+    };
+    const before = db.listFleetComponents("svc").find((c) => c.key === "hub")!;
+    await fleet.requestRelaunch(db.getLaunch("svc")!, before);
+    const stored = JSON.parse(db.getLaunch("svc")!.spec_json) as LaunchSpec;
+    const done = await runWithSigner(db, "svc", stored, work, [...buildPreLaunchOpSteps(db, "svc"), ...allSteps(stored), ...buildOpSteps(db, "svc")], services, signer);
+    expect(done.reason ?? "").toBe("");
+    expect(done.status).toBe("completed");
+    const after = db.listFleetComponents("svc").find((c) => c.key === "hub")!;
+    expect(after.dseq).not.toBe(before.dseq);
+    expect(pointed).toEqual([{ name: "zenith.example", target: expect.stringContaining(new URL(after.host_uri).hostname) }]);
+    db.close();
+  }, 240_000);
+
   it("a launch re-places a component whose provider's ingress serves nothing", async () => {
     const launch = async (broken?: string) => {
       const work = tmp();
