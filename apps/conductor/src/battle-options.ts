@@ -185,12 +185,14 @@ export async function battleAccountCheck(
     getJson(rpc, `${base}/cosmos/bank/v1beta1/balances/${address}/by_denom?denom=${encodeURIComponent(target.baseDenom)}`)
       .then((r) => String(r.balance?.amount ?? "0"))
       .catch(() => null),
+    // unread is not "none": the dialog would say every class is still to create
     getJson(rpc, `${base}/sparkdream/artifact/v1/classes_by_owner/${address}`)
       .then((r) => (r.classes ?? []) as Array<{ symbol?: string; class?: { symbol?: string } }>)
-      .catch(() => []),
+      .catch((e: unknown) => (e instanceof Error ? e : new Error(String(e)))),
     getJson(rpc, `${base}/sparkdream/session/v1/params`).then((r) => r.params).catch(() => null),
   ]);
   const trustLevel = member ? String(member.trust_level ?? "TRUST_LEVEL_NEW").replace(/^TRUST_LEVEL_/, "").toLowerCase() : null;
+  if (classes instanceof Error) return { ...blank, error: `the classes ${address} owns on ${target.name} could not be read at ${api}: ${classes.message}` };
   const owned = new Set(classes.map((c) => String(c.class?.symbol ?? c.symbol ?? "")));
   const missing = needed.filter((c) => !owned.has(c.symbol)).length;
   const fee = params?.class_creation_fee ? BigInt(params.class_creation_fee) : null;

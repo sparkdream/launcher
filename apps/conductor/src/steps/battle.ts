@@ -132,9 +132,36 @@ function createClassMsg(creator: string, spec: BattleClass, denom: string): unkn
   };
 }
 
-/** Symbols of the classes `owner` has on the chain. */
-async function ownedSymbols(chain: ChainActor, owner: string): Promise<Set<string>> {
-  const out = await queryJson(["query", "artifact", "classes-by-owner", owner], chain.rpc).catch(() => ({ classes: [] }));
+/**
+ * Symbols of the classes `owner` has on the chain: by the CLI, else by the
+ * chain's public API (`rest`). The CLI cannot always print the answer (on
+ * 2026-10-21 sparkdreamd v1.0.55 failed to marshal a class with no expiry),
+ * and a query that fails must never read as "owns none": the step then asked
+ * for every class again, and each signature created another full set.
+ */
+async function ownedSymbols(
+  rpc: { getText(url: string): Promise<string> },
+  chain: ChainActor,
+  owner: string,
+  rest?: string,
+): Promise<Set<string>> {
+  let out: { classes?: unknown[] };
+  try {
+    out = await queryJson(["query", "artifact", "classes-by-owner", owner], chain.rpc);
+  } catch (e) {
+    // what the CLI said, on one line (the message starts with the command line)
+    const msg = e instanceof Error ? e.message : String(e);
+    const cli = (/stderr\(tail\):([\s\S]*)$/.exec(msg)?.[1] ?? msg).replace(/\s+/g, " ").trim().slice(-200);
+    if (!rest) throw new Error(`could not read the classes ${owner} owns on ${chain.chainId} (${cli}): retry once it can be read`);
+    try {
+      out = JSON.parse(await rpc.getText(`${rest.replace(/\/+$/, "")}/sparkdream/artifact/v1/classes_by_owner/${owner}`));
+    } catch (e2) {
+      throw new Error(
+        `could not read the classes ${owner} owns on ${chain.chainId}, by the CLI (${cli}) nor at ${rest} ` +
+          `(${e2 instanceof Error ? e2.message : String(e2)}): retry once it can be read`,
+      );
+    }
+  }
   const classes = (out.classes ?? []) as Array<{ symbol?: string; class?: { symbol?: string } }>;
   return new Set(classes.map((c) => String(c.class?.symbol ?? c.symbol ?? "")));
 }
@@ -155,7 +182,8 @@ export async function ensureBattleClasses(
   const relayer = battleRelayer(spec, ctx.launchId, ctx.db, ctx.workRoot);
   const chain = await fleetActor(ctx, targetId, targetId === ctx.launchId ? "this fleet" : `fleet ${target.network.name}`);
 
-  const owned = await ownedSymbols(chain, relayer.address);
+  const api = target.topology.publicEndpoints?.api;
+  const owned = await ownedSymbols(ctx.services.rpc, chain, relayer.address, api ? `https://${api}` : undefined);
   const missing = (await battleClassList(ctx.services.rpc, spec, (ms) => ctx.services.sleep(ms))).filter((c) => !owned.has(c.symbol));
   if (missing.length === 0) return { address: relayer.address, created: [] };
   const msgs = missing.map((c) => createClassMsg(relayer.address, c, chain.gasDenom));

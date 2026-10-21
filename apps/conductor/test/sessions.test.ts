@@ -255,6 +255,33 @@ describe("the battle game's onchain records on a running game", () => {
     db.close();
   }, 240_000);
 
+  it("never read a class query the CLI cannot print as owning none", async () => {
+    // 2026-10-21: the CLI failed on every read, so each signature created all the classes again
+    const chain = chainStub();
+    const { db, services, fleet, runOps } = await launched({ battle }, chain);
+    const row = () => db.listFleetComponents("fl").find((c) => c.key === "battle")!;
+    const created = () => Object.values(chain.state().chains).flatMap((c) => c.classes ?? []).map((c) => c.symbol);
+    chain.edit((st) => (st.classesUnprintable = true));
+
+    // nothing to read it at: the step stops instead of creating
+    fleet.requestBattleWeb3(db.getLaunch("fl")!, row(), { account: "vera" });
+    const stopped = await runOps();
+    const opId = db.listFleetOps("fl").find((o) => o.kind === "battle-web3")!.id;
+    expect(stopped).toMatchObject({ status: "paused", failedStep: `op${opId}:battle-classes` });
+    expect(db.getStep("fl", `op${opId}:battle-classes`)!.error).toMatch(/could not read the classes .* expiry\) nor at https:\/\/api\.phoenix\.example/);
+    expect(created()).toEqual([]);
+
+    // the chain's public API answers instead: what it lists is not created again
+    const vera = db.stepOutput<any>("fl", "generate-keys")!.accounts["acct-vera"];
+    const lcd = "https://api.phoenix.example";
+    services.rpc.texts.set(`${lcd}/sparkdream/artifact/v1/classes_by_owner/${vera}`, JSON.stringify({ classes: [{ class: { symbol: "BRCAREER" } }] }));
+    const resumed = await runOps();
+    expect(resumed.reason ?? "").toBe("");
+    expect(resumed.status).toBe("completed");
+    expect(created()).toEqual(["BRBADGE", "BRMATCH"]);
+    db.close();
+  }, 240_000);
+
   it("are put back as they were when the op is aborted at the wallet's signature", async () => {
     const chain = chainStub();
     const { db, fleet, runOps, work } = await launched({ battle }, chain);

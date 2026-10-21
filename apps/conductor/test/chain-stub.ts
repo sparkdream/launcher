@@ -52,6 +52,9 @@ export interface StubState {
   members?: Record<string, { trust_level?: string; dream_balance?: string; staked_dream?: string }>;
   /** x/session max_expiration as the CLI prints it (default 90 days). */
   sessionMaxExpiration?: string;
+  /** `query artifact classes-by-owner` fails as sparkdreamd v1.0.55 did:
+   *  the chain answers, the CLI cannot print it. */
+  classesUnprintable?: boolean;
 }
 
 const SCRIPT = String.raw`#!/usr/bin/env node
@@ -104,6 +107,7 @@ if (a0 === "query" && a1 === "rep" && a2 === "get-member") {
 }
 if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: { service_type: a3, min_bond_amount: "1000000000" } });
 if (a0 === "query" && a1 === "artifact" && a2 === "classes-by-owner") {
+  if (st.classesUnprintable) fail("cannot marshal response classes:{...}: not supported: dont_omit_empty=true on invalid (nil?) message field: expiry");
   out({ classes: (chain.classes || []).filter((c) => c.owner === a3).map((c) => ({ class: c })) });
 }
 if (a0 === "query" && a1 === "session" && a2 === "grants-by-grantee") {
