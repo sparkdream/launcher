@@ -123,4 +123,8 @@ export interface ComponentDescriptor {
    *  SDL after the accept lists and retargetEnv: the domains of side
    *  services (Mastodon's login) and the env that names them. */
   retargetDoc?(doc: any, spec: LaunchSpec): void;
+  /** An image upgrade's catch-up for the deployed SDL, applied alongside the
+   *  image swap: settings render() has gained since the deployment was made
+   *  (Mastodon's upload body size), since an upgrade never re-renders. */
+  upgradeDoc?(doc: any): void;
 }

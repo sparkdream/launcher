@@ -247,7 +247,7 @@ function render(input: RenderInput) {
     mastodon: {
       service: {
         image: component.image,
-        expose: [{ port: 3000, as: 80, accept: [component.domain!], to: [{ global: true }] }],
+        expose: [{ port: 3000, as: 80, accept: [component.domain!], to: [{ global: true }], http_options: WEB_HTTP_OPTIONS }],
         env: [
           ...env,
           ...MASTODON_TUNING[sizeOf(spec)],
@@ -304,6 +304,10 @@ function render(input: RenderInput) {
   return services;
 }
 
+/** Media uploads (videos up to 99 MB) need more than the ingress's 1 MiB
+ *  default; 100 MiB is the most Akash allows. */
+const WEB_HTTP_OPTIONS = { max_body_size: 104857600 };
+
 export const mastodon: ComponentDescriptor = {
   key: "mastodon",
   render,
@@ -338,6 +342,13 @@ export const mastodon: ComponentDescriptor = {
     for (const e of doc.services.login.expose ?? []) if (e.accept) e.accept = [login];
     setServiceEnv(doc, ["login"], { LOGIN_ISSUER: `https://${login}` });
     setServiceEnv(doc, ["mastodon"], { OIDC_ISSUER: `https://${login}`, SPARKDREAM_LOGIN_URL: `https://${login}` });
+  },
+  // deployments made before the web service carried WEB_HTTP_OPTIONS get it
+  // on their next image upgrade
+  upgradeDoc: (doc) => {
+    for (const e of doc.services?.mastodon?.expose ?? []) {
+      if (e.port === 3000) e.http_options = { ...e.http_options, ...WEB_HTTP_OPTIONS };
+    }
   },
   configureSteps: (name, spec) => [
     { name: name("configure-mastodon"), run: (ctx) => configureMastodon(ctx, name("configure-mastodon"), spec) },

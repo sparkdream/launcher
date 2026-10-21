@@ -794,10 +794,19 @@ describe("upgrading a Mastodon deployment's side images", () => {
     expect(images.sdap).toBe("sparkdreamnft/sdap:v9.9.9");
     expect(images.mastodon).toBe(before.mastodon.image);
 
-    // the web image itself still upgrades the main service
+    // the web image itself still upgrades the main service, and brings a
+    // deployment made before the upload body size was set up to it
+    const sdlPath = path.join(work, "launches", "fl", "sdl", "mastodon.yaml");
+    const old = sdl("mastodon.yaml");
+    expect(old.services.mastodon.expose[0].http_options).toEqual({ max_body_size: 104857600 });
+    delete old.services.mastodon.expose[0].http_options;
+    fs.writeFileSync(sdlPath, yaml.dump(old));
     fleet.requestUpgrade(db.getLaunch("fl")!, ["mastodon"], "sparkdreamnft/mastodon:v9.9.9");
     expect((await runOps()).status).toBe("completed");
     expect(sdl("mastodon.yaml").services.mastodon.image).toBe("sparkdreamnft/mastodon:v9.9.9");
+    expect(sdl("mastodon.yaml").services.mastodon.expose[0].http_options).toEqual({ max_body_size: 104857600 });
+    const manifest = fs.readFileSync(path.join(work, "launches", "fl", "sdl", "mastodon.manifest.json"), "utf8");
+    expect(manifest).toContain('"maxBodySize":104857600');
     expect(sdl("mastodon.yaml").services.bridge.image).toBe("sparkdreamnft/sdap:v9.9.9");
     expect(row().image).toBe("sparkdreamnft/mastodon:v9.9.9");
     db.close();
