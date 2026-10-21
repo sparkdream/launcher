@@ -2030,6 +2030,16 @@ export function relaunchSteps(
             // blocks on the mesh); a service like the explorer holds no chain
             // state, and some providers (cpu.dal.aes) keep closed leases up
             ctx.log(`${key}: the old container still answers after the close; not a chain node, continuing`);
+          } else if (
+            probe.stdout.includes("zombie-probe") &&
+            (await disableAbandonedNode(ctx, rowTarget(ctx, row), key))
+          ) {
+            // the lease was closed before this op could disable the node (an
+            // aborted relaunch's cleanup closes its new lease, and cpu.dal.aes
+            // keeps closed leases running: 2026-10-21 sentry-0), but it still
+            // takes commands, so it is made inert now instead of waiting on a
+            // teardown that may never come
+            ctx.log(`${key}: the old container still answers after the close; its node is disabled now`);
           } else if (probe.stdout.includes("zombie-probe")) {
             throw new AwaitUser(
               p("close"),
