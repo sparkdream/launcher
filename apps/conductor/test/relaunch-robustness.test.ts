@@ -248,6 +248,60 @@ describe("sentries take several mesh peers (all arrive from 127.0.0.1)", () => {
   }, 240_000);
 });
 
+describe("mesh join key headscale lost", () => {
+  it("repair gives the component a fresh key and pushes it, once", async () => {
+    const w = await launched(spec1x1("tmkms"));
+    // headscale restored from a backup older than sentry-0's join key: the
+    // next restart would leave it logged out ("auth-key not found")
+    const sdl = path.join(w.work, "launches", "fl", "sdl", "sentry-0.yaml");
+    const joinKey = () => /TS_AUTHKEY=([^\s"']+)/.exec(fs.readFileSync(sdl, "utf8"))![1]!;
+    const lost = joinKey();
+    w.services.provider.hsKeysLost.add(lost);
+    w.fleet.requestRepair(w.db.getLaunch("fl")!, row(w, "sentry-0"));
+    expect((await driveOps(w)).status).toBe("completed");
+    const op = w.db.listFleetOps("fl").find((o) => o.kind === "repair")!;
+    const out = JSON.parse(w.db.getStep("fl", `op${op.id}:mesh-env`)!.output_json!);
+    expect(out.rekeyed).toEqual(["sentry-0"]);
+    expect(joinKey()).not.toBe(lost);
+    expect(w.services.provider.hsKeys).toContain(joinKey());
+
+    // nothing lost any more: a second repair mints nothing
+    const minted = w.services.provider.hsKeys.length;
+    w.fleet.requestRepair(w.db.getLaunch("fl")!, row(w, "sentry-0"));
+    expect((await driveOps(w)).status).toBe("completed");
+    const op2 = w.db.listFleetOps("fl").filter((o) => o.kind === "repair").at(-1)!;
+    expect(w.db.getStep("fl", `op${op2.id}:mesh-env`)!.output_json).not.toContain("rekeyed");
+    expect(w.services.provider.hsKeys.length).toBe(minted);
+  }, 240_000);
+});
+
+describe("repair with one provider down", () => {
+  it("still sends the re-keyed component its manifest when another component's provider is unreachable", async () => {
+    const w = await launched(spec1x1("tmkms"));
+    const sdl = path.join(w.work, "launches", "fl", "sdl", "sentry-0.yaml");
+    const lost = /TS_AUTHKEY=([^\s"']+)/.exec(fs.readFileSync(sdl, "utf8"))![1]!;
+    w.services.provider.hsKeysLost.add(lost);
+    const val = row(w, "val-0");
+    expect(val.host_uri).not.toBe(row(w, "sentry-0").host_uri);
+    // the validator's provider resets every connection (the 2026-10-24
+    // explorer on zencloud): its push fails, the sentry's must still go out
+    const send = w.services.provider.sendManifest.bind(w.services.provider);
+    const sent: string[] = [];
+    w.services.provider.sendManifest = async (creds, hostUri, dseq, json) => {
+      if (hostUri === val.host_uri) throw new Error("read ECONNRESET");
+      sent.push(dseq);
+      return send(creds, hostUri, dseq, json);
+    };
+    w.fleet.requestRepair(w.db.getLaunch("fl")!, row(w, "sentry-0"));
+    expect((await driveOps(w)).status).toBe("completed");
+    const op = w.db.listFleetOps("fl").find((o) => o.kind === "repair")!;
+    const out = JSON.parse(w.db.getStep("fl", `op${op.id}:mesh-env`)!.output_json!);
+    expect(out.rekeyed).toEqual(["sentry-0"]);
+    expect(out.unpushed).toEqual(["val-0"]);
+    expect(sent).toContain(row(w, "sentry-0").dseq);
+  }, 240_000);
+});
+
 describe("sentry relaunch", () => {
   it("finishes when its validator cannot be reached, leaving that link to the validator's own recovery", async () => {
     const w = await launched(spec1x1("tmkms"));

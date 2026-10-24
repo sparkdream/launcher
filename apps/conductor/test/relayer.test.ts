@@ -618,6 +618,34 @@ describe("relayer that cannot reach a chain", () => {
   }, 120_000);
 });
 
+describe("relayer off the mesh", () => {
+  it("names the logged-out mesh instead of asking again for gas the key holds (fundcheck without reachable)", async () => {
+    const work = tmp();
+    const db = new ConductorDb(path.join(work, "state.db"));
+    const services = fakeServices();
+    const s = spec("sparkdream", { domain: "hs.example" }, [osmosis]);
+    // 2026-10-21: headscale restored from a backup older than the relayer's
+    // join key; the relayer restarted logged out and every tunnel went dead
+    services.ssh.unreachableChains.add(chainId(s));
+    services.ssh.relayerFundcheckNoReachable = true;
+    services.ssh.relayerMeshState =
+      "NoState: You are logged out. The last login error was: handling register with auth key: auth-key not found";
+    const chain = chainStub();
+    db.createLaunch("fl", JSON.stringify(s), "akash1owner");
+    const result = await withStub(chain, () =>
+      runWithSigner(db, "fl", s, work, allSteps(), services, new FakeSigner()),
+    );
+    expect(result.status).not.toBe("completed");
+    expect(db.listSteps("fl").some((x) => x.status === "waiting")).toBe(false);
+    const failed = db.listSteps("fl").find((x) => x.status === "error")!;
+    expect(failed.error).toContain(`the relayer cannot query ${chainId(s)}`);
+    expect(failed.error).toContain("the relayer is off the mesh");
+    expect(failed.error).toContain("auth-key not found");
+    expect(chain.state().log.filter((l) => l.types.includes("/cosmos.bank.v1beta1.MsgSend"))).toHaveLength(0);
+    db.close();
+  }, 120_000);
+});
+
 describe("relayer path waiting for funds", () => {
   it("leaves an unfunded openWhenFunded path unopened without pausing, then opens it on a relink once funded", async () => {
     const work = tmp();

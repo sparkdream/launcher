@@ -289,11 +289,15 @@ export async function createNamedAccounts(ctx: StepCtx): Promise<Record<string, 
   }
   // a chain reset rebuilds every account but the bridge and scanner
   // operators': the running daemons carry their addresses (SDA_GRANTER,
-  // CS_GRANTER, and the scanner's feed), so they keep their keys
+  // CS_GRANTER, and the scanner's feed), so they keep their keys. The
+  // relayer keeps its key too: the same mnemonic holds its gas on the other
+  // chains it relays to, which a reset of this one does not touch (a new
+  // one stranded those balances and asked for gas there again)
   const mnemonicsFile = path.join(dirs.secrets, "mnemonics.json");
   const previous: Record<string, string> = fs.existsSync(mnemonicsFile) ? JSON.parse(readSecretFile(mnemonicsFile)) : {};
   if (previous[BRIDGE_OPERATOR]) mnemonics[BRIDGE_OPERATOR] = previous[BRIDGE_OPERATOR];
   if (previous[SCANNER_OPERATOR]) mnemonics[SCANNER_OPERATOR] = previous[SCANNER_OPERATOR];
+  if (previous[RELAYER_ACCOUNT]) mnemonics[RELAYER_ACCOUNT] = previous[RELAYER_ACCOUNT];
   // Plaintext on local disk for M1; M6 moves this into encrypted db columns.
   writeSecretFile(mnemonicsFile, JSON.stringify(mnemonics, null, 2));
   // the relayer's key (cosmjs-derived: other chains need other prefixes, so

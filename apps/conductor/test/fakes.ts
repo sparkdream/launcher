@@ -15,7 +15,7 @@ import type { Signer } from "../src/engine.js";
 import { templatePath } from "../src/vendor.js";
 import type { LocalSignerHost, MeshCli, TmkmsProcess } from "../src/local-signer.js";
 import type { AllowanceInfo, GrantInfo, UnattendedChain } from "../src/unattended.js";
-import { loggedBringup, RELAYER_DEAD_RPCS, RELAYER_FUNDCHECK } from "../src/steps/relayer-link.js";
+import { loggedBringup, RELAYER_DEAD_RPCS, RELAYER_FUNDCHECK, RELAYER_MESH_STATE } from "../src/steps/relayer-link.js";
 
 /** Six providers so a 2×2 fleet + headscale can satisfy strict anti-affinity. */
 export function fakeProviders(): Map<string, ProviderInfo> {
@@ -308,6 +308,10 @@ export class FakeProviderGateway {
   /** headscale users created via lease-shell ("sparkdream" pre-seeded for
    *  tests that mint keys without running configure-headscale first). */
   private hsUsers: string[] = ["sparkdream"];
+  /** Preauth keys minted so far, in mint order (ids are 1-based). */
+  hsKeys: string[] = [];
+  /** Minted keys headscale no longer has (a restore from an older backup). */
+  hsKeysLost = new Set<string>();
   /** Objects the headscale backup scripts wrote: bucket/key. */
   s3Objects = new Set<string>();
   /** The bucket refuses the credentials (uploads and litestream both fail). */
@@ -643,7 +647,21 @@ export class FakeProviderGateway {
       if (!/--user \d+/.test(script)) {
         throw new Error('lease shell: exit 1: invalid argument for "-u, --user" flag: strconv.ParseUint');
       }
-      return { stdout: JSON.stringify({ key: `hskey-${this.shellLog.length}` }), stderr: "" };
+      // real-shaped: "hskey-auth-<prefix>-<secret>", listed as its prefix
+      const key = `hskey-auth-${this.shellLog.length}-secret`;
+      this.hsKeys.push(key);
+      return { stdout: JSON.stringify({ key }), stderr: "" };
+    }
+    if (script.includes("preauthkeys list")) {
+      // headscale 0.28 lists each key masked to its prefix
+      return {
+        stdout: JSON.stringify(
+          this.hsKeys
+            .filter((k) => !this.hsKeysLost.has(k))
+            .map((k, i) => ({ id: i + 1, key: k.replace(/-secret$/, "-***"), expiration: { seconds: 0 } })),
+        ),
+        stderr: "",
+      };
     }
     if (script.includes("SELECT count(*) FROM users")) return { stdout: "1", stderr: "" };
     if (script.includes("127.0.0.1:26657/status")) {
@@ -723,6 +741,11 @@ export class FakeSsh {
   unfundedChains = new Set<string>();
   /** Relayer: chain ids the relayer cannot reach (its balance query and RPC go unanswered). */
   unreachableChains = new Set<string>();
+  /** Relayer on an image whose fundcheck predates `reachable`: an unanswered
+   *  balance query prints balance 0 with no denom, for a key it does have. */
+  relayerFundcheckNoReachable = false;
+  /** Relayer: what RELAYER_MESH_STATE prints ("" when it is not asked). */
+  relayerMeshState = "Running";
   /** Relayer: containers holding the ready marker (hermes running). */
   relayerReady = new Set<string>();
   /** Relayer: container restarts so far, per target (PID 1's start time). */
@@ -1033,11 +1056,15 @@ export class FakeSsh {
           manifest().chains.map((c) => {
             const reachable = !this.unreachableChains.has(c.id);
             const funded = reachable && !this.unfundedChains.has(c.id);
+            if (this.relayerFundcheckNoReachable) {
+              return { chain: c.id, address: "relayer1addr", balance: funded ? "1000000" : "0", denom: reachable ? "ugas" : "", account: true, ready: funded };
+            }
             return { chain: c.id, address: "", balance: funded ? "1000000" : "0", denom: "", account: null, reachable, ready: funded };
           }),
         ),
       );
     }
+    if (command === RELAYER_MESH_STATE) return ok(this.relayerMeshState);
     if (command === RELAYER_DEAD_RPCS) {
       return ok([...this.unreachableChains].map((c) => `${c} http://127.0.0.1:26657`).join("\n"));
     }

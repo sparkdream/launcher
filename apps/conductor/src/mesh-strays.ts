@@ -71,6 +71,27 @@ export function parseMeshKeys(stdout: string): MeshKey[] {
   }));
 }
 
+/**
+ * Whether a full preauth key is the listed one. headscale 0.27+ lists a key
+ * masked ("hskey-auth-<prefix>-***"); the prefix is unique per key, so it
+ * identifies it. An older headscale lists the key itself.
+ */
+export function sameMeshKey(full: string, listed: string): boolean {
+  return listed.endsWith("-***") ? full.startsWith(listed.slice(0, -3)) : full === listed;
+}
+
+/**
+ * What headscale would say to a client joining with `full`: "missing" when
+ * no key on the list is it (seen 2026-10-21: a headscale restored from a
+ * backup older than the relayer's key answered "auth-key not found" and left
+ * it off the mesh at its next restart), "expired" past its expiry.
+ */
+export function meshKeyState(full: string, keys: MeshKey[], now = Math.floor(Date.now() / 1000)): "ok" | "missing" | "expired" {
+  const k = keys.find((x) => sameMeshKey(full, x.key));
+  if (!k) return "missing";
+  return k.expiresAt !== 0 && k.expiresAt <= now ? "expired" : "ok";
+}
+
 /** Every key a node of this fleet may join the mesh under: the spec's nodes
  *  and mesh components, plus any component the fleet has ever placed (a
  *  removed one's leftovers are strays too). */
@@ -123,7 +144,7 @@ export function planStrays(opts: {
     (k) =>
       strayKeyIds.has(k.id) &&
       !stillUsed.has(k.id) &&
-      !(opts.protectedKeys?.has(k.key) ?? false) &&
+      ![...(opts.protectedKeys ?? [])].some((p) => sameMeshKey(p, k.key)) &&
       (k.expiresAt === 0 || k.expiresAt > now),
   );
   return { strays, unsure: [...unsure].sort(), expire };

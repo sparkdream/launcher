@@ -72,7 +72,7 @@ import {
 import { NODE_HOME, NODE_LOG, restartNode, rpcUrl, socatTunnelCmd, STALLED_BEHIND_BLOCKS, START_NODE_CMD, VAL_PEER_TUNNEL_PORT, WITNESS_RPC_PORT } from "./node-ops.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 import { nodeResizeSteps } from "./node-resize.js";
-import { disableNodeCmd, pinnedOpKeys, sweepMeshStrays, type StraySweepDeps } from "./mesh-strays.js";
+import { disableNodeCmd, meshKeyState, parseMeshKeys, pinnedOpKeys, sweepMeshStrays, type StraySweepDeps } from "./mesh-strays.js";
 import { meshBackupSteps } from "./mesh-backup.js";
 import { addSentrySteps, type AddSentryParams } from "./add-sentry.js";
 import {
@@ -6091,14 +6091,56 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
         const msgs: Msg[] = [];
         const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
+        // A component joins the mesh with the preauth key in its env at every
+        // boot, so a key headscale no longer has (a restore from an older
+        // backup) or let expire strands it at its next restart, logged out
+        // with "auth-key not found". It gets a fresh key here, and the push
+        // below restarts it onto the mesh.
+        const hsKeys = await meshStrayDeps(ctx)
+          .headscale("headscale preauthkeys list --output json")
+          .then(parseMeshKeys)
+          // a fleet always has the keys its components joined with: an empty
+          // listing is a query that went wrong, not a mesh to re-key whole
+          .then((keys) => (keys.length > 0 ? keys : undefined))
+          .catch((e: unknown) => {
+            ctx.log(`could not list headscale's preauth keys, so no join key is checked (${e instanceof Error ? e.message : String(e)})`);
+            return undefined;
+          });
+        const rekeyed: string[] = [];
         for (const key of meshKeys) {
-          if (tunnelPeers(spec, key).size === 0) continue;
           const row = rows.find((c) => c.key === key);
           if (!row || row.state !== "active") continue;
           const sdlPath = sdlPathFor(ctx, key);
           if (!fs.existsSync(sdlPath)) continue;
           let text = fs.readFileSync(sdlPath, "utf8");
+          const joinKey = /TS_AUTHKEY=([^\s"']+)/.exec(text)?.[1];
+          const keyState = hsKeys && joinKey && !joinKey.startsWith("{{") ? meshKeyState(joinKey, hsKeys) : "ok";
+          // on the re-run after the signature the SDL already holds the new
+          // key, which then reads as ok: the pin is what says it still needs
+          // its push
+          const rekeying = keyState !== "ok" || fs.existsSync(path.join(ctx.dirs.root, `op${opId}-authkey-${key}.pin`));
+          if (tunnelPeers(spec, key).size === 0 && !rekeying) continue;
           const added: string[] = [];
+          if (rekeying) {
+            // pinned: the update's signature pauses this step, and a key
+            // minted again on the re-run would drift from the signed hash
+            const fresh = await pinnedValue(ctx, `op${opId}-authkey-${key}`, async () => {
+              const hs = headscaleRef(ctx);
+              const userId = await headscaleUserId(ctx, hs, spec.network.name);
+              const out = await meshStrayDeps(ctx).headscale(
+                `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
+              );
+              const parsed = JSON.parse(out.trim());
+              const k: string = typeof parsed === "string" ? parsed : parsed.key;
+              if (!k) throw new Error(`no preauth key in mint output for ${key}`);
+              return k;
+            });
+            text = text.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${fresh}`);
+            if (keyState !== "ok") {
+              added.push(`mesh join key ${keyState === "missing" ? "unknown to headscale" : "expired"}, replaced`);
+            }
+            rekeyed.push(key);
+          }
           if (key.startsWith("val-")) {
             // validators placed before the dial-out tunnel existed have no
             // TS_TUNNEL_PEER: give them one, so the peers pass below can
@@ -6155,10 +6197,66 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         if (msgs.length > 0) await ctx.requireTx(p("mesh-env"), msgs);
         else ctx.db.deletePendingTx(ctx.launchId, p("mesh-env"));
         const cert = loadCert(ctx);
+        // one provider down must not hold back the rest (seen live: the
+        // explorer's provider reset every connection, and the relayer's new
+        // join key, already signed, never reached its provider). A re-keyed
+        // component that missed its push fails the step, since that is what
+        // this run is for; any other is left to the next repair, which pushes
+        // unconditionally, or to its own relaunch
+        const unpushed: string[] = [];
         for (const { row, json } of pushes) {
-          await pushManifest(ctx, cert, row.key, row.host_uri, row.dseq, json);
+          try {
+            await pushManifest(ctx, cert, row.key, row.host_uri, row.dseq, json);
+          } catch (e) {
+            unpushed.push(row.key);
+            ctx.log(`${row.key}: could not send its manifest (${e instanceof Error ? e.message : String(e)})`);
+          }
         }
-        return { repointed: pushes.map((x) => x.row.key) };
+        const missed = rekeyed.filter((k) => unpushed.includes(k));
+        if (missed.length > 0) {
+          throw new Error(
+            `${missed.join(", ")}: the new mesh join key is on chain but the provider did not take the manifest; ` +
+              "retry once the provider answers, or relaunch the component",
+          );
+        }
+        if (unpushed.length > 0) {
+          ctx.log(
+            `${unpushed.join(", ")}: provider unreachable, manifest not sent; the next repair sends it, or relaunch them`,
+          );
+        }
+        // a re-keyed component registers as a new node, possibly at a new
+        // address: record it so the peers pass below and later ops use it
+        // (a tunnel elsewhere that dials it is re-aimed by the next repair)
+        const rejoined: Record<string, string> = {};
+        for (const key of rekeyed) {
+          const row = rows.find((c) => c.key === key)!;
+          let ip = "";
+          for (let i = 0; i < 36 && !/^100\./.test(ip); i++) {
+            if (i > 0) await ctx.services.sleep(5000);
+            const res = await ctx.services.ssh
+              .exec(rowTarget(ctx, row), `tailscale --socket=${meshSocket(ctx, key)} ip -4 2>/dev/null || true`, {
+                quick: true,
+              })
+              .catch(() => ({ stdout: "" }));
+            ip = res.stdout.trim().split("\n")[0] ?? "";
+          }
+          if (!/^100\./.test(ip)) {
+            ctx.log(`${key}: has its new join key but did not report a mesh address within 3 minutes; check its tailscaled log`);
+            continue;
+          }
+          rejoined[key] = ip;
+          if (ip !== row.tailnet_ip) {
+            ctx.log(`${key}: back on the mesh at ${ip} (was ${row.tailnet_ip ?? "unset"}); re-run repair if another component tunnels to it`);
+            ctx.db.updateComponentRuntime(ctx.launchId, key, { tailnet_ip: ip });
+          } else {
+            ctx.log(`${key}: back on the mesh at ${ip}`);
+          }
+        }
+        return {
+          repointed: pushes.map((x) => x.row.key).filter((k) => !unpushed.includes(k)),
+          ...(unpushed.length > 0 ? { unpushed } : {}),
+          ...(rekeyed.length > 0 ? { rekeyed, rejoined } : {}),
+        };
       },
     },
     {

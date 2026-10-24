@@ -55,6 +55,13 @@ export const RELAYER_DEAD_RPCS =
   `awk -F"'" '/^id = /{id=$2} /^rpc_addr = /{print id, $2}' ${RELAYER_DIR}/config.toml 2>/dev/null | ` +
   'while read id url; do curl -s -m 5 -o /dev/null "$url/status" || echo "$id $url"; done';
 
+/** The relayer's tailscale state and health, e.g. "NeedsLogin: You are logged
+ *  out. ..."; empty when it runs no tailscale (no mesh tunnels). */
+export const RELAYER_MESH_STATE =
+  'sock="${TS_STATE_DIR:-/data/tailscale}/tailscaled.sock"; [ -S "$sock" ] && ' +
+  'tailscale --socket="$sock" status --json 2>/dev/null | ' +
+  "jq -r '.BackendState + (if (.Health // []) | length > 0 then \": \" + ((.Health // []) | join(\"; \")) else \"\" end)' || true";
+
 /** What linking produced: the relayer's address on each chain and the
  *  channels it opened. Also saved to <launch>/relayer/state.json for the
  *  fleet panel, since the step that last linked may be a launch step or any
@@ -370,6 +377,18 @@ async function linkRelayerStages(
   // error says what to fix instead of asking for gas (seen live: a mesh tunnel
   // aimed at a resized sentry-0's old address)
   const unreachable = async (what: string): Promise<Error> => {
+    // a relayer off the mesh reaches no tunnelled chain at all: say that
+    // rather than blame the chains (seen live: headscale restored from a
+    // backup older than the relayer's join key, "auth-key not found")
+    const mesh = (await ctx.services.ssh.exec(target, RELAYER_MESH_STATE, { quick: true }).catch(() => ({ stdout: "" })))
+      .stdout.trim();
+    if (mesh && !mesh.startsWith("Running")) {
+      return new Error(
+        `${what}; the relayer is off the mesh (tailscale: ${mesh}), so its tunnels to fleet sentries answer nothing. ` +
+          "Run repair fleet: it gives a component whose join key headscale no longer has (or that expired) a fresh " +
+          "one and restarts it onto the mesh. Then relink",
+      );
+    }
     const dead = (await ctx.services.ssh.exec(target, RELAYER_DEAD_RPCS, { timeoutMs: 120_000 })).stdout
       .trim()
       .split("\n")
@@ -393,7 +412,12 @@ async function linkRelayerStages(
       await ctx.services.ssh.exec(target, RELAYER_FUNDCHECK, { timeoutMs: 180_000 })
     ).stdout;
     try {
-      return JSON.parse(out) as FundCheck;
+      // images before `reachable` print a failed balance query as balance 0
+      // with no denom (a query that answers always names one): reading it as
+      // unfunded asked for gas the key already held, on every resume
+      return (JSON.parse(out) as FundCheck).map((s) =>
+        s.reachable === undefined && s.address && !s.denom ? { ...s, reachable: false } : s,
+      );
     } catch {
       throw await unreachable("relayer-fundcheck did not answer within 150s");
     }

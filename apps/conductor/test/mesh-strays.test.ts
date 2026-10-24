@@ -3,10 +3,12 @@ import { testnetSpec } from "@sparkdream/launch-spec";
 import type { FleetComponentRow } from "../src/db.js";
 import {
   disableNodeCmd,
+  meshKeyState,
   meshSocketFromSdl,
   parseMeshNodes,
   pinnedOpKeys,
   planStrays,
+  sameMeshKey,
   sweepMeshStrays,
   type MeshKey,
   type MeshNode,
@@ -187,6 +189,36 @@ describe("helpers", () => {
   it("collects the pins of active ops", () => {
     const pins: Record<number, string> = { 3: "k3\n" };
     expect([...pinnedOpKeys((id) => pins[id], [3, 4])]).toEqual(["k3"]);
+  });
+
+  it("matches a full preauth key against headscale's masked listing", () => {
+    const full = "hskey-auth-abcdef123456-" + "s".repeat(64);
+    expect(sameMeshKey(full, "hskey-auth-abcdef123456-***")).toBe(true);
+    expect(sameMeshKey(full, "hskey-auth-abcdef123457-***")).toBe(false);
+    // older headscale lists the key itself
+    expect(sameMeshKey("legacykey", "legacykey")).toBe(true);
+    const listed: MeshKey[] = [
+      { id: 1, key: "hskey-auth-abcdef123456-***", expiresAt: 2000 },
+      { id: 2, key: "hskey-auth-old000000000-***", expiresAt: 500 },
+    ];
+    expect(meshKeyState(full, listed, 1000)).toBe("ok");
+    expect(meshKeyState("hskey-auth-old000000000-" + "s".repeat(64), listed, 1000)).toBe("expired");
+    expect(meshKeyState("hskey-auth-gone00000000-" + "s".repeat(64), listed, 1000)).toBe("missing");
+  });
+
+  it("protects a pinned key that headscale lists masked", () => {
+    const full = "hskey-auth-pinned000000-" + "s".repeat(64);
+    const plan = planStrays({
+      nodes: [node(1, "sentry-0", "100.64.0.1", 7)],
+      keys: [{ id: 7, key: "hskey-auth-pinned000000-***", expiresAt: 0 }],
+      user: USER,
+      fleetKeys: new Set(["sentry-0"]),
+      live: {},
+      unreadable: new Set(),
+      protectedKeys: new Set([full]),
+    });
+    expect(plan.strays.map((n) => n.id)).toEqual([1]);
+    expect(plan.expire).toEqual([]);
   });
 
   it("disables by moving, never deleting", () => {
