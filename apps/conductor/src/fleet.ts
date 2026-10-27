@@ -2009,6 +2009,8 @@ export class FleetService {
 
   /** Components whose incident opened while an op was active, per launch. */
   private readonly deferredRecoveries = new Map<string, Set<string>>();
+  /** "launchId/component" auto-recoveries held while Akash is down (alerted once). */
+  private readonly heldForAkash = new Set<string>();
 
   /** Automatic restarts of `key` in the last 24 hours (restarts are no op, so ops do not count them). */
   private recentAutoRestarts(launchId: string, key: string, record = false): number {
@@ -2075,6 +2077,31 @@ export class FleetService {
       if (!deferred) this.deferredRecoveries.set(launch.id, (deferred = new Set()));
       deferred.add(key);
       return;
+    }
+    // Akash's own API down: whatever reads down now may be the outage, not
+    // the component, and a move would also need that API. Held, retried
+    // with the deferred ones once it answers (the incident still open)
+    if (action !== "restart") {
+      const outage = await this.services.akashOutage?.().catch(() => null);
+      const heldKey = `${launch.id}/${key}`;
+      if (outage) {
+        if (!opts.escalate) {
+          let deferred = this.deferredRecoveries.get(launch.id);
+          if (!deferred) this.deferredRecoveries.set(launch.id, (deferred = new Set()));
+          deferred.add(key);
+        }
+        if (!this.heldForAkash.has(heldKey)) {
+          this.heldForAkash.add(heldKey);
+          await this.notify(
+            launch,
+            key,
+            `${key} not moved: Akash is down`,
+            `${incident.cause}, but Akash's own API is down too (${outage}), so the ${action} of ${key} waits until it answers again.`,
+          );
+        }
+        return;
+      }
+      this.heldForAkash.delete(heldKey);
     }
     const spec = this.spec(launch);
     const recent =

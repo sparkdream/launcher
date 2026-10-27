@@ -3,6 +3,7 @@ import path from "node:path";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { calculateFee, GasPrice, SigningStargateClient } from "@cosmjs/stargate";
 import { launcherRegistry, toEncodeObject, TypeUrl, UNATTENDED_MSG_TYPES, type Msg } from "@sparkdream/akash-tx";
+import { failoverFetch } from "./akash/rest.js";
 import type { ConductorDb } from "./db.js";
 import { readSecretFile, writeSecretFile } from "./secrets.js";
 
@@ -51,13 +52,25 @@ export interface UnattendedChain {
 
 export class AkashUnattendedChain implements UnattendedChain {
   constructor(
-    private readonly opts: { lcd: string; rpc: string; gasPrice: string },
+    /** lcds and rpcs are tried in order: one provider down must not hide
+     *  the grant or stop a recovery (2026-10-27: api.akashnet.net and
+     *  rpc.akashnet.net both answered 521) */
+    private readonly opts: { lcds: string[]; rpcs: string[]; gasPrice: string },
     private readonly fetchImpl: typeof fetch = (...a) => fetch(...a),
   ) {}
 
+  /** The LCD that answered last: tried first next time. */
+  private preferred = 0;
+
+  private async lcdFetch(pathAndQuery: string): Promise<Response> {
+    const { res, index } = await failoverFetch(this.opts.lcds, pathAndQuery, this.preferred, this.fetchImpl);
+    if (res.status < 500) this.preferred = index;
+    return res;
+  }
+
   async grants(granter: string, grantee: string): Promise<GrantInfo[]> {
-    const res = await this.fetchImpl(
-      `${this.opts.lcd}/cosmos/authz/v1beta1/grants?granter=${granter}&grantee=${grantee}&pagination.limit=100`,
+    const res = await this.lcdFetch(
+      `/cosmos/authz/v1beta1/grants?granter=${granter}&grantee=${grantee}&pagination.limit=100`,
     );
     if (!res.ok) throw new Error(`authz grants query: HTTP ${res.status}`);
     const body = (await res.json()) as {
@@ -69,7 +82,7 @@ export class AkashUnattendedChain implements UnattendedChain {
   }
 
   async allowance(granter: string, grantee: string): Promise<AllowanceInfo | null> {
-    const res = await this.fetchImpl(`${this.opts.lcd}/cosmos/feegrant/v1beta1/allowance/${granter}/${grantee}`);
+    const res = await this.lcdFetch(`/cosmos/feegrant/v1beta1/allowance/${granter}/${grantee}`);
     if (res.status === 404 || res.status === 500) return null; // "fee-grant not found"
     if (!res.ok) throw new Error(`fee allowance query: HTTP ${res.status}`);
     const body = (await res.json()) as {
@@ -83,13 +96,26 @@ export class AkashUnattendedChain implements UnattendedChain {
     const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "akash" });
     const [account] = await wallet.getAccounts();
     const grantee = account!.address;
-    const client = await SigningStargateClient.connectWithSigner(this.opts.rpc, wallet, { registry: launcherRegistry() });
+    const client = await this.connect(wallet);
     const exec = toEncodeObject({ typeUrl: TypeUrl.Exec, value: { grantee, msgs } });
     const gas = Math.ceil((await client.simulate(grantee, [exec], "")) * 1.4);
     const fee = { ...calculateFee(gas, GasPrice.fromString(this.opts.gasPrice)), granter };
     const result = await client.signAndBroadcast(grantee, [exec], fee, "SparkDream launcher: unattended recovery");
     if (result.code !== 0) throw new Error(`tx failed (code ${result.code}): ${result.rawLog ?? ""}`);
     return result.transactionHash;
+  }
+
+  /** A signing client on the first RPC that answers. */
+  private async connect(wallet: DirectSecp256k1HdWallet): Promise<SigningStargateClient> {
+    let lastError: unknown;
+    for (const rpc of this.opts.rpcs) {
+      try {
+        return await SigningStargateClient.connectWithSigner(rpc, wallet, { registry: launcherRegistry() });
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 }
 

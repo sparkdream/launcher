@@ -1,7 +1,7 @@
 "use client";
 
 import { Children, Fragment, isValidElement, useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
-import { GasPrice, SigningStargateClient } from "@cosmjs/stargate";
+import { GasPrice } from "@cosmjs/stargate";
 import { launcherRegistry, mintActMsg, toEncodeObject } from "@sparkdream/akash-tx";
 import {
   checkSpec,
@@ -17,6 +17,7 @@ import {
   type SpecCheck,
 } from "@sparkdream/launch-spec";
 import yaml from "js-yaml";
+import { connectSigning, endpointsOf } from "../lib/akash-endpoints";
 import { EDITOR, openLaunchFor } from "../lib/open-launch";
 import { resetSource } from "../lib/reset-spec";
 import { specPathLine } from "../lib/spec-lines";
@@ -1563,15 +1564,15 @@ export default function Page() {
   useEffect(() => {
     if (!wallet) return;
     let stop = false;
-    fetchBmeInfo(chain.rest)
+    fetchBmeInfo(endpointsOf(chain, "rest"))
       .then((b) => !stop && setBme(b))
       .catch(() => {});
     const tick = async () => {
       try {
-        const b = await fetchBalances(chain.rest, wallet.address);
+        const b = await fetchBalances(endpointsOf(chain, "rest"), wallet.address);
         if (stop) return;
         setBalances(b);
-        setLedger(await fetchBmeLedger(chain.rest, wallet.address).catch(() => null));
+        setLedger(await fetchBmeLedger(endpointsOf(chain, "rest"), wallet.address).catch(() => null));
       } catch {
         // LCD hiccups are non-fatal; keep the last known balances
       }
@@ -1588,7 +1589,7 @@ export default function Page() {
       clearInterval(t);
       clearInterval(pt);
     };
-  }, [wallet, chain.rest]);
+  }, [wallet, chain.rest, chain.chainId]);
 
   // the wallet grants (or revokes) unattended recovery: plain Keplr signing
   // of the msgs the conductor builds for the launcher's key
@@ -1599,7 +1600,7 @@ export default function Page() {
     try {
       const { getUnattendedMsgs } = await import("../lib/api");
       const { msgs } = await getUnattendedMsgs(wallet.address, kind, 30);
-      const client = await SigningStargateClient.connectWithSigner(chain.rpc, wallet.signer, {
+      const client = await connectSigning(chain, wallet.signer, {
         registry: launcherRegistry(),
         gasPrice: GasPrice.fromString(`${chain.gasPrice}${chain.denom}`),
       });
@@ -1626,7 +1627,7 @@ export default function Page() {
     setBusy("minting ACT in Keplr…");
     setError(null);
     try {
-      const client = await SigningStargateClient.connectWithSigner(chain.rpc, wallet.signer, {
+      const client = await connectSigning(chain, wallet.signer, {
         registry: launcherRegistry(),
         gasPrice: GasPrice.fromString(`${chain.gasPrice}${chain.denom}`),
       });
@@ -2215,7 +2216,7 @@ export default function Page() {
     setBusy(`signing ${pending.step} in Keplr…`);
     setError(null);
     try {
-      const client = await SigningStargateClient.connectWithSigner(chain.rpc, wallet.signer, {
+      const client = await connectSigning(chain, wallet.signer, {
         registry: launcherRegistry(),
         gasPrice: GasPrice.fromString(`${chain.gasPrice}${chain.denom}`),
       });

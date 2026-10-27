@@ -13,14 +13,26 @@ export interface Coin {
   amount: string;
 }
 
-async function getJson(rest: string, path: string): Promise<any> {
-  const res = await fetch(`${rest.replace(/\/$/, "")}${path}`);
-  if (!res.ok) throw new Error(`LCD ${path} → ${res.status}`);
-  return res.json();
+/** `rest`: one LCD, or several tried in order (a 5xx or a network error moves on). */
+async function getJson(rest: string | string[], path: string): Promise<any> {
+  let lastError: unknown;
+  for (const base of typeof rest === "string" ? [rest] : rest) {
+    let res: Response;
+    try {
+      res = await fetch(`${base.replace(/\/$/, "")}${path}`);
+    } catch (e) {
+      lastError = e;
+      continue;
+    }
+    if (res.ok) return res.json();
+    lastError = new Error(`LCD ${path} → ${res.status}`);
+    if (res.status < 500) break;
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /** All spendable balances for `address` (uakt, uact, …). */
-export async function fetchBalances(rest: string, address: string): Promise<Coin[]> {
+export async function fetchBalances(rest: string | string[], address: string): Promise<Coin[]> {
   const body = await getJson(rest, `/cosmos/bank/v1beta1/balances/${address}`);
   return body.balances ?? [];
 }
@@ -38,7 +50,7 @@ export interface BmeInfo {
  * BME module params + circuit-breaker status. Returns null when the network
  * has no BME module (e.g. the Akash sandbox, where deployments pay uakt).
  */
-export async function fetchBmeInfo(rest: string): Promise<BmeInfo | null> {
+export async function fetchBmeInfo(rest: string | string[]): Promise<BmeInfo | null> {
   let params: any;
   try {
     params = (await getJson(rest, "/akash/bme/v1/params")).params;
@@ -85,7 +97,7 @@ export interface BmeLedgerSummary {
 }
 
 /** This wallet's mint/burn ledger records, condensed for the UI. */
-export async function fetchBmeLedger(rest: string, address: string): Promise<BmeLedgerSummary> {
+export async function fetchBmeLedger(rest: string | string[], address: string): Promise<BmeLedgerSummary> {
   // status is filtered client-side, matching console-air — the LCD filter
   // expects the raw enum encoding
   const body = await getJson(

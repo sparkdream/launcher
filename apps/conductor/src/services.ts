@@ -147,4 +147,8 @@ export interface Services {
   unattended?: UnattendedChain;
   /** DNS updates after a move (dns.ts); absent or unconfigured = the operator does them. */
   dns?: DnsUpdater;
+  /** Why Akash's own API or RPC is down, or null when both answer (akash/rest.ts
+   *  akashOutageProbe). Auto-recovery moves nothing while it is down. Absent:
+   *  never checked. */
+  akashOutage?: () => Promise<string | null>;
 }

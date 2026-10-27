@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseLcds, RestAkashApi } from "../src/akash/rest.js";
+import { akashOutageProbe, failoverFetch, parseLcds, RestAkashApi } from "../src/akash/rest.js";
 
 const api = (lcd: string) => new RestAkashApi({ lcd, consoleApi: "https://console.invalid" });
 
@@ -47,5 +47,35 @@ describe("LCD failover", () => {
   it("keeps the single-LCD reading of an all-5xx deployment lookup", async () => {
     stubFetch(() => new Response("", { status: 503 }));
     expect(await api("https://a,https://b").deploymentInfo("o", "1")).toBeUndefined();
+  });
+});
+
+describe("failoverFetch", () => {
+  it("starts at the given base and wraps around", async () => {
+    const calls = stubFetch((u) => (u.startsWith("https://b") ? new Response("", { status: 521 }) : confirmed()));
+    const { index } = await failoverFetch(["https://a", "https://b"], TX, 1);
+    expect(index).toBe(0);
+    expect(calls).toEqual([`https://b${TX}`, `https://a${TX}`]);
+  });
+});
+
+describe("akashOutageProbe", () => {
+  it("names each endpoint that is down, and caches the answer for a minute", async () => {
+    let t = 0;
+    let down = true;
+    const calls: string[] = [];
+    const fake = (async (url: string) => {
+      calls.push(url);
+      if (down && url.startsWith("https://api")) return new Response("", { status: 521 });
+      if (down) throw new TypeError("fetch failed");
+      return new Response("{}");
+    }) as unknown as typeof fetch;
+    const probe = akashOutageProbe("https://api.akash", "https://rpc.akash:443/", fake, () => t);
+    expect(await probe()).toBe("api.akash answers HTTP 521; rpc.akash does not answer (fetch failed)");
+    expect(calls).toContain("https://rpc.akash:443/status");
+    down = false;
+    expect(await probe()).not.toBeNull();
+    t = 60_000;
+    expect(await probe()).toBeNull();
   });
 });

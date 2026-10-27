@@ -6,7 +6,7 @@ import { ConductorDb } from "./db.js";
 import { buildServer } from "./server.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
-import { DEFAULT_AKASH_LCDS, parseLcds } from "./akash/rest.js";
+import { akashOutageProbe, DEFAULT_AKASH_LCDS, DEFAULT_AKASH_RPCS, parseLcds } from "./akash/rest.js";
 import { SshSignerHost, SystemdSignerHost } from "./local-signer.js";
 import { AkashUnattendedChain, UNATTENDED_FEE_DENOM } from "./unattended.js";
 import { CloudflareDns, cloudflareToken } from "./dns.js";
@@ -29,17 +29,24 @@ const services = productionServices({
 });
 
 /**
- * AKASH_RPC        CometBFT RPC the launcher signs unattended-recovery txs
- *                  through (default https://rpc.akashnet.net:443)
+ * AKASH_RPC        CometBFT RPC(s) the launcher signs unattended-recovery
+ *                  txs through, comma-separated: tried in order (default
+ *                  DEFAULT_AKASH_RPCS)
  * AKASH_GAS_PRICE  their gas price (default 0.025uakt: Akash nodes take fees
  *                  in uakt only, and refused every uact fee as "insufficient")
  */
 services.unattended = new AkashUnattendedChain({
-  // it reads grants from one LCD: the first of the list
-  lcd: parseLcds(process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS)[0]!,
-  rpc: process.env.AKASH_RPC ?? "https://rpc.akashnet.net:443",
+  lcds: parseLcds(process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS),
+  rpcs: parseLcds(process.env.AKASH_RPC ?? DEFAULT_AKASH_RPCS),
   gasPrice: process.env.AKASH_GAS_PRICE ?? `0.025${UNATTENDED_FEE_DENOM}`,
 });
+
+// Akash's own API and RPC (the first of each list): auto-recovery moves no
+// component while either is down
+services.akashOutage = akashOutageProbe(
+  parseLcds(process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS)[0]!,
+  parseLcds(process.env.AKASH_RPC ?? DEFAULT_AKASH_RPCS)[0]!,
+);
 
 // a tmkms signer on another machine (ssh_config alias, key auth), e.g. a Pi
 services.remoteSigner = (remote) => new SshSignerHost(services.ssh, remote);

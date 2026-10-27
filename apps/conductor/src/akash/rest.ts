@@ -37,11 +37,84 @@ const TX_LOOKUP_DELAYS_MS = [2000, 4000, 8000, 16000];
 export const DEFAULT_AKASH_LCDS =
   "https://api.akashnet.net,https://akash-api.polkachu.com,https://rest.cosmos.directory/akash";
 
-/** AKASH_LCD may name several LCDs, comma-separated. */
+/** The default CometBFT RPCs, tried in order (2026-10-27: rpc.akashnet.net
+ *  answered 521 alongside api.akashnet.net). */
+export const DEFAULT_AKASH_RPCS =
+  "https://rpc.akashnet.net:443,https://akash-rpc.polkachu.com,https://rpc.cosmos.directory/akash";
+
+/** AKASH_LCD (or AKASH_RPC) may name several endpoints, comma-separated. */
 export function parseLcds(value: string): string[] {
   const list = value.split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
-  if (list.length === 0) throw new Error("AKASH_LCD names no endpoint");
+  if (list.length === 0) throw new Error("no endpoint named");
   return list;
+}
+
+/**
+ * GET a path from the first of `bases` that answers, starting at `start`: a
+ * 5xx or a network error moves on to the next, any other answer (404
+ * included) is the answer. When every base fails, the last 5xx response is
+ * returned (a caller reading !res.ok behaves as with one base), or the last
+ * network error thrown. `index` is the base that gave `res`.
+ */
+export async function failoverFetch(
+  bases: string[],
+  pathAndQuery: string,
+  start = 0,
+  fetchImpl: typeof fetch = (...a) => fetch(...a),
+): Promise<{ res: Response; index: number }> {
+  let last: { res: Response; index: number } | undefined;
+  let lastError: unknown;
+  for (let i = 0; i < bases.length; i++) {
+    const index = (start + i) % bases.length;
+    let res: Response;
+    try {
+      res = await fetchImpl(`${bases[index]}${pathAndQuery}`, { headers: { accept: "application/json" } });
+    } catch (e) {
+      lastError = e;
+      continue;
+    }
+    if (res.status >= 500) {
+      last = { res, index };
+      continue;
+    }
+    return { res, index };
+  }
+  if (last) return last;
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Why `lcd` or `rpc` does not answer, or null when both do; cached for a
+ * minute. Akash's own endpoints and providers can go down together
+ * (2026-10-27: api.akashnet.net and rpc.akashnet.net answered 521 while
+ * cpu.dal's provider API reset every connection), and a component read down
+ * then is no reason to move it.
+ */
+export function akashOutageProbe(
+  lcd: string,
+  rpc: string,
+  fetchImpl: typeof fetch = (...a) => fetch(...a),
+  now: () => number = Date.now,
+): () => Promise<string | null> {
+  let cached: { at: number; outage: string | null } | undefined;
+  const check = async (url: string): Promise<string | null> => {
+    try {
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
+      return res.status >= 500 ? `${new URL(url).host} answers HTTP ${res.status}` : null;
+    } catch (e) {
+      return `${new URL(url).host} does not answer (${e instanceof Error ? e.message : String(e)})`;
+    }
+  };
+  return async () => {
+    if (cached && now() - cached.at < 60_000) return cached.outage;
+    const [a, b] = await Promise.all([
+      check(`${lcd}/cosmos/base/tendermint/v1beta1/blocks/latest`),
+      check(`${rpc.replace(/\/+$/, "")}/status`),
+    ]);
+    const outage = [a, b].filter(Boolean).join("; ") || null;
+    cached = { at: now(), outage };
+    return outage;
+  };
 }
 
 /** Real chain-facing adapter. Field names mirror the LCD (snake_case). */
@@ -54,34 +127,11 @@ export class RestAkashApi implements AkashApi {
     this.lcds = parseLcds(endpoints.lcd);
   }
 
-  /**
-   * GET an LCD path, failing over across the configured LCDs: a 5xx or a
-   * network error moves on to the next, any other answer (404 included) is
-   * the answer. When every LCD fails, the last 5xx response is returned (a
-   * caller reading !res.ok behaves as with one LCD), or the last network
-   * error thrown.
-   */
+  /** GET an LCD path across the configured LCDs (failoverFetch). */
   private async lcdFetch(pathAndQuery: string): Promise<Response> {
-    let lastRes: Response | undefined;
-    let lastError: unknown;
-    for (let i = 0; i < this.lcds.length; i++) {
-      const idx = (this.preferred + i) % this.lcds.length;
-      let res: Response;
-      try {
-        res = await fetch(`${this.lcds[idx]}${pathAndQuery}`, { headers: { accept: "application/json" } });
-      } catch (e) {
-        lastError = e;
-        continue;
-      }
-      if (res.status >= 500) {
-        lastRes = res;
-        continue;
-      }
-      this.preferred = idx;
-      return res;
-    }
-    if (lastRes) return lastRes;
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    const { res, index } = await failoverFetch(this.lcds, pathAndQuery, this.preferred);
+    if (res.status < 500) this.preferred = index;
+    return res;
   }
 
   /** JSON from an LCD path, with getJson's retries across failover rounds. */

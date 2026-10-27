@@ -155,6 +155,26 @@ describe("automatic recovery", () => {
     expect(w.alerts).toContain("sparkdream: recovering sentry-1 automatically");
   }, 240_000);
 
+  it("moves nothing while Akash's own API is down, then recovers once it answers (2026-10-27)", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    let outage: string | null = "api.akashnet.net answers HTTP 521";
+    w.services.akashOutage = async () => outage;
+    await sentryDies(w);
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+    expect(w.alerts).toContain("sparkdream: sentry-1 not moved: Akash is down");
+    // alerted once, however many passes it is held
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    expect(w.alerts.filter((a) => a.includes("not moved"))).toHaveLength(1);
+
+    outage = null;
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    const op = w.db.listFleetOps("fl", "active")[0]!;
+    expect(JSON.parse(op.params_json)).toMatchObject({ key: "sentry-1", auto: true });
+  }, 240_000);
+
   it("waits for Keplr, and says so, when the wallet has not granted", async () => {
     const w = await launched();
     setUnattendedSettings(w.db, OWNER, { enabled: true });
