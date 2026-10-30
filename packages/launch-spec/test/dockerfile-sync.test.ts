@@ -19,6 +19,13 @@ describe("chain version sync", () => {
     expect(m![1]).toBe(profiles.testnet.images.sparkdreamd);
   });
 
+  it("Dockerfile SPARKDREAMD_DEVNET_IMAGE matches the devnet profile default", () => {
+    const dockerfile = readFileSync(join(repoRoot, "Dockerfile"), "utf8");
+    const m = /^ARG SPARKDREAMD_DEVNET_IMAGE=(\S+)$/m.exec(dockerfile);
+    expect(m, "ARG SPARKDREAMD_DEVNET_IMAGE not found in Dockerfile").not.toBeNull();
+    expect(m![1]).toBe(profiles.devnet.images.sparkdreamd);
+  });
+
   it("vendor-info.ts matches the vendored reference SDL (rerun sync-vendor if not)", () => {
     const sdl = readFileSync(
       join(repoRoot, "vendor/sparkdream-deploy/network/testnet/validator.sdl.yaml"),

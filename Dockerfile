@@ -1,11 +1,16 @@
 # SparkDream Chain Launcher — single container: conductor + static web UI +
 # sparkdreamd binary (§2 dual-mode: same image locally and on Akash).
 #
-# The sparkdreamd binary is copied from the chain image; keep the tag in sync
-# with the launch-spec profiles (packages/launch-spec/src/profiles.ts).
-ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.55
+# The sparkdreamd binaries are copied from the chain images; keep the tags in
+# sync with the launch-spec profiles (packages/launch-spec/src/profiles.ts).
+# One per network: since v1.0.56 the chain's parameter floors are build-tagged,
+# so the testnet build refuses a devnet genesis. Mainnet comes through fetch
+# mode or a seeded cache.
+ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.56
+ARG SPARKDREAMD_DEVNET_IMAGE=sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.56
 
 FROM ${SPARKDREAMD_IMAGE} AS chainbin
+FROM ${SPARKDREAMD_DEVNET_IMAGE} AS chainbin-devnet
 
 FROM node:22-alpine AS build
 # python3/make/g++: compile better-sqlite3's native addon (no musl prebuilt)
@@ -26,6 +31,8 @@ RUN apk add --no-cache openssl age tar openssh-client git \
      | tar xz -C /usr/local/bin litestream || echo "litestream download failed (offline build?) — replication disabled"
 
 COPY --from=chainbin /usr/local/bin/sparkdreamd /usr/local/bin/sparkdreamd
+COPY --from=chainbin-devnet /usr/local/bin/sparkdreamd /usr/local/bin/sparkdreamd-devnet
+ENV SPARKDREAMD_BIN_DEVNET=/usr/local/bin/sparkdreamd-devnet
 
 WORKDIR /app
 COPY --from=build /src/node_modules ./node_modules

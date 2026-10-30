@@ -38,7 +38,21 @@ afterEach(() => {
   process.env.CHAIN_ASSET_MODE = savedEnv.CHAIN_ASSET_MODE;
   if (savedEnv.SPARKDREAM_CHAIN_REPO === undefined) delete process.env.SPARKDREAM_CHAIN_REPO;
   if (savedEnv.CHAIN_ASSET_MODE === undefined) delete process.env.CHAIN_ASSET_MODE;
+  for (const name of ["SPARKDREAMD_BIN", "SPARKDREAMD_BIN_DEVNET", "SPARKDREAMD_BIN_TESTNET"]) {
+    if (savedEnv[name] === undefined) delete process.env[name];
+    else process.env[name] = savedEnv[name];
+  }
 });
+
+let fakeBins = 0;
+/** A stand-in sparkdreamd whose `version --long` reports `tags` (none: says nothing). */
+function fakeBinary(tags?: string): string {
+  const bin = path.join(tmp, `sparkdreamd-fake-${++fakeBins}`);
+  const report = tags === undefined ? "version: v0" : `build_tags: ${tags}\nversion: v0`;
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '${report}\\n'\n`);
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
 
 /** A minimal chain-repo lookalike: deploy/config + mesh, one tag. */
 beforeAll(async () => {
@@ -169,10 +183,39 @@ describe("asset resolution", () => {
   };
 
   it("baked build satisfies the vendored version", () => {
+    process.env.SPARKDREAMD_BIN = fakeBinary("testnet");
     const image = `sparkdreamnft/sparkdreamd-testnet-ssh:${VENDORED_CHAIN_VERSION}`;
     expect(bakedSatisfies(image)).toBe(true);
     const assets = resolveChainAssets(spec(image), tmp);
     expect(assets?.source).toBe("baked");
+  });
+
+  it("serves each network's image with that network's build (v1.0.56 floors)", () => {
+    delete process.env.SPARKDREAMD_BIN;
+    const testnet = fakeBinary("testnet");
+    const devnet = fakeBinary("devnet");
+    process.env.SPARKDREAMD_BIN_TESTNET = testnet;
+    process.env.SPARKDREAMD_BIN_DEVNET = devnet;
+    const image = (network: string) => `sparkdreamnft/sparkdreamd-${network}-ssh:${VENDORED_CHAIN_VERSION}`;
+    expect(resolveChainAssets(spec(image("testnet")), tmp)?.bin).toBe(testnet);
+    expect(resolveChainAssets(spec(image("devnet")), tmp)?.bin).toBe(devnet);
+    // the devnet slot holding another network's build is not used for it
+    process.env.SPARKDREAMD_BIN_DEVNET = fakeBinary("testnet");
+    expect(bakedSatisfies(image("devnet"))).toBe(false);
+    expect(resolveChainAssets(spec(image("devnet")), fs.mkdtempSync(path.join(tmp, "resolve-")))).toBeNull();
+    const message = bakedModeError(image("devnet")).message;
+    expect(message).toContain("needs the devnet build");
+    expect(message).toContain("is the testnet build");
+    expect(message).toContain("SPARKDREAMD_BIN_DEVNET");
+    expect(message).toContain("CHAIN_ASSET_MODE=fetch");
+  });
+
+  it("never takes the test build for a network, and takes a binary that does not say on its version", () => {
+    const image = `sparkdreamnft/sparkdreamd-testnet-ssh:${VENDORED_CHAIN_VERSION}`;
+    process.env.SPARKDREAMD_BIN = fakeBinary("testparams");
+    expect(bakedSatisfies(image)).toBe(false);
+    process.env.SPARKDREAMD_BIN = fakeBinary();
+    expect(bakedSatisfies(image)).toBe(true);
   });
 
   it("falls back to a complete cache entry and touches its recency", () => {

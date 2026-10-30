@@ -1,4 +1,5 @@
-import { chainId, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, sessionDays, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
+import { sessionCeiling } from "./sessions.js";
 import type { ConductorDb, LaunchRow } from "./db.js";
 import { mayUseFleet } from "./bridge-target.js";
 import type { RpcProber } from "./services.js";
@@ -205,7 +206,7 @@ export async function battleAccountCheck(
     classCost: fee === null ? null : String(fee * BigInt(missing)),
     tokenDeposit: params?.token_deposit ? String(params.token_deposit) : null,
     sessionMax: session
-      ? { days: Math.floor(Number(String(session.max_expiration ?? "0").replace(/s$/, "")) / 86_400), spendLimit: String(session.max_spend_limit_amount ?? "0") }
+      ? { days: Math.floor(Number(sessionCeiling(session).replace(/s$/, "")) / 86_400), spendLimit: String(session.max_spend_limit_amount ?? "0") }
       : null,
   };
 }
@@ -231,7 +232,7 @@ export async function battleWeb3Options(
       ...(web3?.account ? { account: web3.account } : {}),
       session: { ...(web3?.session.days ? { days: web3.session.days } : {}), spendLimit: web3?.session.spendLimit ?? "25000000" },
     },
-    defaultDays: spec.network.type === "mainnet" ? 30 : 90,
+    defaultDays: sessionDays(spec, undefined),
     targets,
   };
   const account = query.account?.trim();

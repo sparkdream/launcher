@@ -1,6 +1,6 @@
 import { sha256 } from "@cosmjs/crypto";
 import { toBech32 } from "@cosmjs/encoding";
-import { deriveDreamDenom, sessionMaxDays, type LaunchSpec } from "@sparkdream/launch-spec";
+import { deriveDreamDenom, type LaunchSpec } from "@sparkdream/launch-spec";
 
 /**
  * Cosmos SDK decimal string: 18 fractional digits. Pads the number's exact
@@ -487,10 +487,20 @@ export function applyChainParams(genesis: Json, spec: LaunchSpec): Json {
       slashing.slash_fraction_double_sign = dec(s.slashFractionDoubleSign);
   }
 
-  // The daemons' session keys are renewed within this ceiling; the code
-  // default (7 days) would mean a re-grant every few days.
+  // The reference's session ceilings stand (v1.0.56: 7 days for broad keys,
+  // 30 for the narrow ones the daemons use) unless the spec sets its own
   const session = app.session?.params as Json | undefined;
-  if (session) session.max_expiration = `${sessionMaxDays(spec) * 86_400}s`;
+  const maxDays = spec.chainParams.session?.maxExpirationDays;
+  if (session && maxDays) {
+    const maxSecs = maxDays * 86_400;
+    session.max_expiration = `${maxSecs}s`;
+    // the chain refuses a narrow ceiling below max_expiration; older
+    // binaries have no such field
+    const narrow = session.narrow_session_max_expiration;
+    if (typeof narrow === "string" && Number(narrow.replace(/s$/, "")) < maxSecs) {
+      session.narrow_session_max_expiration = `${maxSecs}s`;
+    }
+  }
 
   // Legacy module some chains still carry; keep its denom consistent if present.
   const crisis = app.crisis as Json | undefined;

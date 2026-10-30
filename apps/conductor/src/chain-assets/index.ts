@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import type { LaunchSpec } from "@sparkdream/launch-spec";
@@ -70,13 +71,54 @@ export function setChainAssetMode(db: SettingsStore, mode: string): ChainAssetMo
   return parsed;
 }
 
-function bakedBin(): string {
-  return process.env.SPARKDREAMD_BIN ?? "sparkdreamd";
+/** The network a chain image is built for, from its name (sparkdreamd-<network>-ssh). */
+export function imageNetwork(image: string): string | undefined {
+  return /sparkdreamd-(devnet|testnet|mainnet)\b/.exec(image)?.[1];
 }
 
-/** True when the baked launcher build already serves this image's version. */
+/**
+ * The baked binary for a network: SPARKDREAMD_BIN (an override for every
+ * network: tests, local dev), else SPARKDREAMD_BIN_<NETWORK>, else PATH.
+ */
+function bakedBin(network?: string): string {
+  return process.env.SPARKDREAMD_BIN || (network && process.env[`SPARKDREAMD_BIN_${network.toUpperCase()}`]) || "sparkdreamd";
+}
+
+const builds = new Map<string, string[] | null>();
+
+/**
+ * The build tags a binary reports (`version --long`), or null when it does
+ * not say (a stand-in script, or a build without the tag stamped in).
+ */
+function binaryBuild(bin: string): string[] | null {
+  let cached = builds.get(bin);
+  if (cached === undefined) {
+    try {
+      const out = execFileSync(bin, ["version", "--long"], { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] });
+      const tags = /^build_tags:[ \t]*(\S*)/m.exec(out)?.[1];
+      cached = tags ? tags.split(",") : null;
+    } catch {
+      cached = null;
+    }
+    builds.set(bin, cached);
+  }
+  return cached;
+}
+
+/**
+ * True when the baked launcher build serves this image: the same version
+ * and, for a network image, that network's build. Since v1.0.56 the chain's
+ * parameter floors are build-tagged, so one network's binary refuses another
+ * network's reference genesis (the testnet build rejects the devnet's 12h
+ * attestation_ttl; the test build rejects every network's). A binary that
+ * does not report its build is taken on its version alone.
+ */
 export function bakedSatisfies(image: string): boolean {
-  return imageSemver(image) === VENDORED_CHAIN_VERSION;
+  if (imageSemver(image) !== VENDORED_CHAIN_VERSION) return false;
+  const network = imageNetwork(image);
+  if (!network) return true;
+  const build = binaryBuild(bakedBin(network));
+  return !build || build.includes(network);
 }
 
 /**
@@ -87,7 +129,7 @@ export function bakedSatisfies(image: string): boolean {
 export function resolveChainAssets(spec: LaunchSpec, workRoot: string): ChainAssets | null {
   const image = spec.images.sparkdreamd;
   if (bakedSatisfies(image)) {
-    return { bin: bakedBin(), vendorDir: vendorDir(), source: "baked" };
+    return { bin: bakedBin(imageNetwork(image)), vendorDir: vendorDir(), source: "baked" };
   }
   const entry = cacheEntry(workRoot, image);
   if (entryComplete(entry)) {
@@ -167,6 +209,19 @@ export async function fetchChainAssets(
  *   build's manifest (sync-releases + rebuild, seed, pin, or go online).
  */
 export function bakedModeError(image: string): Error {
+  const network = imageNetwork(image);
+  if (network && imageSemver(image) === VENDORED_CHAIN_VERSION) {
+    const bin = bakedBin(network);
+    const build = binaryBuild(bin)?.join(",") ?? "another";
+    return new Error(
+      `${image} needs the ${network} build of sparkdreamd ${VENDORED_CHAIN_VERSION}, and the ` +
+        `launcher's binary for it (${bin}) is the ${build} build, whose parameter floors ` +
+        `refuse the ${network} genesis. Point SPARKDREAMD_BIN_${network.toUpperCase()} at a ` +
+        `${network} build (chain repo: go build -tags ${network}), seed the cache ` +
+        "(pnpm seed-chain-assets), or switch to online mode (CHAIN_ASSET_MODE=fetch), which " +
+        "takes the binary from the image.",
+    );
+  }
   const known = findChainRelease(image);
   if (known) {
     return new Error(

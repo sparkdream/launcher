@@ -884,9 +884,11 @@ export const launchSpecSchema = z.object({
         })
         .partial()
         .optional(),
-      /** x/session: maxExpirationDays is the longest a session key grant may
-       *  run (the daemons' keys are renewed within it). Defaults to 30 on
-       *  mainnet and 90 elsewhere; the code default is 7. */
+      /** x/session: maxExpirationDays overrides the chain's max_expiration,
+       *  the longest a broad session key may run (7 days in the reference
+       *  genesis; raises narrow_session_max_expiration with it when above).
+       *  Unset, the reference's ceilings stand. The daemons' keys are narrow
+       *  and run to narrow_session_max_expiration (30 days). */
       session: z.object({ maxExpirationDays: z.number().int().min(1).max(365) }).partial().optional(),
     })
     .default({}),

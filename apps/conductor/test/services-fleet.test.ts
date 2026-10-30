@@ -631,7 +631,7 @@ describe("standalone bridge", () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
-    const chain = chainStub();
+    const chain = chainStub("devnet");
     const svc = servicesSpec();
     db.createLaunch("svc", JSON.stringify(svc), "akash1owner");
     expect((await runWithSigner(db, "svc", svc, work, allSteps(svc), services, new FakeSigner())).status).toBe("completed");
@@ -704,7 +704,7 @@ describe("wallet sign-in on a services fleet", () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
-    const chain = chainStub();
+    const chain = chainStub("devnet");
     const svc = withDefaults({
       ...JSON.parse(JSON.stringify(servicesSpec())),
       images: { ...servicesSpec().images, ...LOGIN_IMAGES },
@@ -793,7 +793,7 @@ describe("a second Mastodon on an existing instance's domain", () => {
     const work = tmp();
     const db = new ConductorDb(path.join(work, "state.db"));
     const services = fakeServices();
-    const chain = chainStub();
+    const chain = chainStub("devnet");
     const svc = servicesSpec();
     db.createLaunch("svc", JSON.stringify(svc), "akash1owner");
     expect((await runWithSigner(db, "svc", svc, work, allSteps(svc), services, new FakeSigner())).status).toBe("completed");
@@ -921,7 +921,7 @@ describe("sharing a services fleet with other wallets", () => {
     updateMastodonSecrets(launchDirs(work, "svc").secrets, { smtpPassword: "relay-secret" });
     const c = chainSpec();
     db.createLaunch("fl", JSON.stringify(c), DEVNET);
-    expect((await withStub(chainStub(), () => runWithSigner(db, "fl", c, work, allSteps(c), services, new FakeSigner()))).status).toBe("completed");
+    expect((await withStub(chainStub("devnet"), () => runWithSigner(db, "fl", c, work, allSteps(c), services, new FakeSigner()))).status).toBe("completed");
     const fleet = new FleetService(db, services, work);
     fleet.materialize("svc");
     fleet.materialize("fl");

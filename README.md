@@ -56,8 +56,8 @@ sparkdream-ui):
 
 ```bash
 # Build (bundles conductor, static web UI, and the sparkdreamd binary).
-# SPARKDREAMD_IMAGE defaults to the tag matching packages/launch-spec profiles;
-# override with --build-arg SPARKDREAMD_IMAGE=... if needed.
+# SPARKDREAMD_IMAGE (testnet) and SPARKDREAMD_DEVNET_IMAGE default to the tags
+# matching packages/launch-spec profiles; override with --build-arg if needed.
 docker build -t sparkdreamnft/launcher:v1.0.0 .
 
 # Push to the registry
@@ -71,7 +71,9 @@ akash tx deployment create deploy.yaml --from <key> --chain-id akashnet-2 --node
 #### Building for a specific chain version
 
 The image bundles two version-coupled pieces: the `sparkdreamd` binary
-(pulled from the chain image named by the `SPARKDREAMD_IMAGE` build arg) and
+(pulled from the chain images named by the `SPARKDREAMD_IMAGE` and
+`SPARKDREAMD_DEVNET_IMAGE` build args: one per network, since each network's
+build refuses another's genesis) and
 the chain repo's deploy data in `vendor/` (reference genesis, config
 templates, SDLs). Both must agree on genesis format with the chain version
 you deploy. To build a launcher for a different chain version:
@@ -80,8 +82,17 @@ you deploy. To build a launcher for a different chain version:
 2. Run `pnpm sync-vendor`. This re-vendors the deploy data and regenerates
    `packages/launch-spec/src/vendor-info.ts`; profile image defaults and the
    spec validator's minimum-image check follow it automatically.
-3. Set the `SPARKDREAMD_IMAGE` default in the `Dockerfile` to the same
-   version (`pnpm test` fails if the two drift), then build and push.
+3. Set the `SPARKDREAMD_IMAGE` and `SPARKDREAMD_DEVNET_IMAGE` defaults in the
+   `Dockerfile` to the same version (`pnpm test` fails if they drift), then
+   build and push.
+
+Running the conductor outside the image (local dev, tests), point
+`SPARKDREAMD_BIN_DEVNET` / `SPARKDREAMD_BIN_TESTNET` / `SPARKDREAMD_BIN_MAINNET`
+at that network's build (chain repo: `go build -tags <network>`); `sparkdreamd`
+on PATH serves a network without one. `SPARKDREAMD_BIN` overrides all of them.
+A binary reporting another network's build (or the test build plain
+`make install` produces) is not used for that network: the launch stops
+offline with the remedies, or fetches the binary from the image online.
 
 Rebuilding is the zero-runtime-config path. The launcher can also serve
 other chain versions at runtime; see the next section.
@@ -148,6 +159,25 @@ In Akash mode set:
 
 Mainnet launches should use a **local** launcher with `tmkms` + external
 (hardware-wallet) operators — see [docs/DESIGN.md](docs/DESIGN.md) §2–3.
+
+## Testing
+
+```bash
+pnpm build-chain-bins   # once per chain version, needs Go and the chain repo
+pnpm test
+```
+
+The conductor tests build real genesis files, and since v1.0.56 the chain's
+parameter floors are build-tagged: each network's reference genesis
+validates only under that network's `sparkdreamd` build, and the test build
+a plain `make install` produces refuses all three. `pnpm build-chain-bins`
+builds the devnet, testnet and mainnet binaries at the vendored chain commit
+(`packages/launch-spec/src/vendor-info.ts`) into `.chain-bins/<version>/`
+(gitignored), taken from the chain repo (`SPARKDREAM_CHAIN_REPO`, default
+`~/cosmos/sparkdream/sparkdream`, or pass its path) without touching its
+checkout. The tests use them automatically and warn when they are missing.
+Set `SPARKDREAMD_BIN_DEVNET` / `_TESTNET` / `_MAINNET` to use other builds.
+Rerun it after `pnpm sync-vendor` moves to a new chain version.
 
 ## Status
 

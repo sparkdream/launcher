@@ -61,12 +61,13 @@ function serveGame(services: ReturnType<typeof fakeServices>): void {
   services.rpc.texts.set("battle.phoenix.example/chain-status", JSON.stringify({ enabled: false, classes: GAME_CLASSES }));
 }
 
-async function launched(components: Record<string, unknown>, chain: ChainStub) {
+async function launched(components: Record<string, unknown>, chain: ChainStub, chainParams?: Partial<LaunchSpec["chainParams"]>) {
   const work = tmp();
   const db = new ConductorDb(path.join(work, "state.db"));
   const services = fakeServices();
   serveGame(services);
   const s = spec(components);
+  if (chainParams) s.chainParams = { ...s.chainParams, ...chainParams };
   // the bridge operator's genesis funding, which the stub cannot see
   chain.edit((st) => (st.defaultBalances = { [s.token.baseDenom]: "2000000000" }));
   db.createLaunch("fl", JSON.stringify(s), "akash1owner");
@@ -425,10 +426,10 @@ describe("session keys at launch", () => {
     expect(services.provider.sessionKeys.get(`${dseq("verifier")}/verifier`)).toBe(sessions.verifier!.mnemonic);
     expect(services.provider.sessionKeys.get(`${dseq("mastodon")}/bridge`)).toBe(sessions.bridge!.mnemonic);
 
-    // 90 days on a testnet (inside the chain's ceiling), renewed at 60
+    // 30 days (inside the chain's ceiling), renewed at 20
     const lifetime = Date.parse(sessions.verifier!.expiresAt) - Date.parse(sessions.verifier!.createdAt);
-    expect(lifetime).toBeGreaterThan(89 * 86_400_000);
-    expect(lifetime).toBeLessThanOrEqual(90 * 86_400_000);
+    expect(lifetime).toBeGreaterThan(29 * 86_400_000);
+    expect(lifetime).toBeLessThanOrEqual(30 * 86_400_000);
     expect(renewAt(sessions.verifier!)).toBeCloseTo(Date.parse(sessions.verifier!.createdAt) + (2 * lifetime) / 3, -3);
     db.close();
   }, 180_000);
@@ -442,11 +443,21 @@ describe("session keys at launch", () => {
     db.close();
   }, 180_000);
 
-  it("writes the session ceiling into genesis: 90 days on a testnet", async () => {
+  it("keeps the reference's session ceilings in genesis: 7 days broad, 30 narrow", async () => {
     const chain = chainStub();
     const { work, db } = await launched({}, chain);
     const genesis = JSON.parse(fs.readFileSync(path.join(launchDirs(work, "fl").node("val-0"), "config", "genesis.json"), "utf8"));
-    expect(genesis.app_state.session.params.max_expiration).toBe(`${90 * 86_400}s`);
+    expect(genesis.app_state.session.params.max_expiration).toBe(`${7 * 86_400}s`);
+    expect(genesis.app_state.session.params.narrow_session_max_expiration).toBe(`${30 * 86_400}s`);
+    db.close();
+  }, 180_000);
+
+  it("a spec's longer session ceiling raises the narrow one with it", async () => {
+    const chain = chainStub();
+    const { work, db } = await launched({}, chain, { session: { maxExpirationDays: 60 } });
+    const genesis = JSON.parse(fs.readFileSync(path.join(launchDirs(work, "fl").node("val-0"), "config", "genesis.json"), "utf8"));
+    expect(genesis.app_state.session.params.max_expiration).toBe(`${60 * 86_400}s`);
+    expect(genesis.app_state.session.params.narrow_session_max_expiration).toBe(`${60 * 86_400}s`);
     db.close();
   }, 180_000);
 });

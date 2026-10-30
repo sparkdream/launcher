@@ -6,6 +6,9 @@ next-env.d.ts
 *.tsbuildinfo
 *.log
 
+# per-network sparkdreamd builds for the tests (pnpm build-chain-bins)
+.chain-bins/
+
 # launcher runtime state — never commit
 *.sqlite
 *.sqlite-*

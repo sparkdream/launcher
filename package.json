@@ -19,6 +19,7 @@
     "dev": "pnpm --parallel -r dev",
     "start": "pnpm -r build && DATA_DIR=${DATA_DIR:-apps/conductor/data} node apps/conductor/dist/main.js",
     "sync-vendor": "bash scripts/sync-vendor.sh",
+    "build-chain-bins": "bash scripts/build-chain-bins.sh",
     "seed-chain-assets": "pnpm --filter @sparkdream/conductor exec tsx src/chain-assets/seed.ts",
     "sync-releases": "pnpm --filter @sparkdream/conductor exec tsx src/chain-assets/sync-releases.ts"
   }

@@ -57,7 +57,6 @@ export {
   fleetBridge,
   isServicesFleet,
   SERVICES_FLEET_COMPONENTS,
-  sessionMaxDays,
   sessionDays,
   type Topology,
   type NodeRef,

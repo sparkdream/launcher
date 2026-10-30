@@ -16,6 +16,10 @@ import { execFileSync } from "node:child_process";
  */
 export interface ChainStub {
   bin: string;
+  /** The network whose real build (SPARKDREAMD_BIN_<NETWORK>) takes the
+   *  commands the stub does not model: since v1.0.56 another network's
+   *  build refuses this network's genesis. */
+  network: "devnet" | "testnet" | "mainnet";
   dir: string;
   state(): StubState;
   edit(fn: (s: StubState) => void): void;
@@ -50,7 +54,9 @@ export interface StubState {
   dreamShort?: boolean;
   /** x/rep members by address, for `query rep get-member` (NotFound otherwise). */
   members?: Record<string, { trust_level?: string; dream_balance?: string; staked_dream?: string }>;
-  /** x/session max_expiration as the CLI prints it (default 90 days). */
+  /** x/session narrow_session_max_expiration as the CLI prints it (default
+   *  30 days): the ceiling for the launcher's keys, which are all narrow.
+   *  max_expiration (broad keys) stays at 7 days. */
   sessionMaxExpiration?: string;
   /** `query artifact classes-by-owner` fails as sparkdreamd v1.0.55 did:
    *  the chain answers, the CLI cannot print it. */
@@ -120,7 +126,7 @@ if (a0 === "query" && a1 === "federation" && a2 === "get-bridge-binding") {
   const b = (chain.bindings || {})[a3 + "/" + args[4]]; if (!b) fail("rpc error: code = NotFound desc = binding not found"); out({ binding: b });
 }
 const sessionMaxMs = () => { let ms = 0;
-  for (const [, n, u] of (st.sessionMaxExpiration || "2160h0m0s").matchAll(/([0-9.]+)(h|m|s)/g)) ms += Number(n) * { h: 3600000, m: 60000, s: 1000 }[u];
+  for (const [, n, u] of (st.sessionMaxExpiration || "720h0m0s").matchAll(/([0-9.]+)(h|m|s)/g)) ms += Number(n) * { h: 3600000, m: 60000, s: 1000 }[u];
   return ms; };
 if (a0 === "query" && a1 === "session" && a2 === "session") {
   const g = (chain.sessions || {})[a3 + "/" + args[4]];
@@ -128,7 +134,7 @@ if (a0 === "query" && a1 === "session" && a2 === "session") {
   out({ session: g });
 }
 if (a0 === "query" && a1 === "session" && a2 === "params") {
-  out({ params: { max_expiration: st.sessionMaxExpiration || "2160h0m0s", max_spend_limit_amount: "100000000", max_exec_count: "10000" } });
+  out({ params: { max_expiration: "168h0m0s", narrow_session_max_expiration: st.sessionMaxExpiration || "720h0m0s", max_spend_limit_amount: "100000000", max_exec_count: "10000" } });
 }
 if (a0 === "tx" && a1 === "sign") {
   const doc = JSON.parse(fs.readFileSync(a2, "utf8"));
@@ -235,7 +241,7 @@ if (process.env.CHAIN_STUB_REAL) {
 out({});
 `;
 
-export function chainStub(): ChainStub {
+export function chainStub(network: ChainStub["network"] = "testnet"): ChainStub {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chain-stub-"));
   const bin = path.join(dir, "sparkdreamd");
   fs.writeFileSync(bin, SCRIPT, { mode: 0o755 });
@@ -245,6 +251,7 @@ export function chainStub(): ChainStub {
   const state = () => JSON.parse(fs.readFileSync(file, "utf8")) as StubState;
   return {
     bin,
+    network,
     dir,
     state,
     edit(fn) {
@@ -261,7 +268,9 @@ export async function withStub<T>(stub: ChainStub, fn: () => Promise<T>): Promis
   const prev = process.env.SPARKDREAMD_BIN;
   const prevReal = process.env.CHAIN_STUB_REAL;
   process.env.CHAIN_STUB_REAL =
-    prev ?? execFileSync("sh", ["-c", "command -v sparkdreamd || true"], { encoding: "utf8" }).trim();
+    prev ??
+    process.env[`SPARKDREAMD_BIN_${stub.network.toUpperCase()}`] ??
+    execFileSync("sh", ["-c", "command -v sparkdreamd || true"], { encoding: "utf8" }).trim();
   process.env.SPARKDREAMD_BIN = stub.bin;
   try {
     return await fn();

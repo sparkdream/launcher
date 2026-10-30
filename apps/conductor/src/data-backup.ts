@@ -31,6 +31,8 @@ import type { GenerateKeysOutput } from "./steps/phase-a.js";
 /** Backups kept in the bucket: a rolling pair, older ones deleted once a new one passes its check. */
 export const DATA_BACKUP_KEEP = 2;
 const HOLD_FILE = `${NODE_HOME}/.launcher-hold`;
+/** the height a node had when ensureHeld stopped it: a held node answers nothing */
+const HELD_HEIGHT_FILE = `${NODE_HOME}/.launcher-held-height`;
 /** A held node comes back by itself this long after the last refresh. */
 const HOLD_SECS = 30 * 60;
 
@@ -234,6 +236,24 @@ export function s3Env(storage: DataBackupStorage): Record<string, string> {
   };
 }
 
+/**
+ * `failed_stages "${PIPESTATUS[@]}" -- name...`: log which stages of the
+ * pipeline that just ran failed, and whether a signal killed one (a stage
+ * that dies to SIGKILL prints nothing of its own). Call it first thing after
+ * the pipeline, before anything else replaces PIPESTATUS.
+ */
+const FAILED_STAGES_FN = `failed_stages() {
+  local rc=() out="" i=0 c stage
+  while [ "$1" != -- ]; do rc+=("$1"); shift; done; shift
+  for stage in "$@"; do
+    c=\${rc[$i]:-?}; i=$((i + 1))
+    [ "$c" = 0 ] && continue
+    if [ "$c" -gt 128 ] 2>/dev/null; then c="$c (SIG$(kill -l $((c - 128))))"; fi
+    out="$out $stage=$c"
+  done
+  echo "failed stages:\${out:- none reported}" >> $LOG
+}`;
+
 /** Upload the backup: data dir → zstd → age → S3, then the manifest and pruning. Detached. */
 export const BACKUP_SCRIPT = `#!/bin/bash
 # sd-data-backup (launcher data-backup op)
@@ -241,14 +261,20 @@ set -o pipefail
 . /tmp/sd-backup.env && rm -f /tmp/sd-backup.env
 ST=/tmp/sd-backup.status; LOG=/tmp/sd-backup.log
 echo $$ > /tmp/sd-backup.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-backup.sha
+# every stage's errors go to the log: the script runs detached with stderr
+# on /dev/null, so a zstd, age or tee failure used to leave an empty log
+# (2026-10-30: sentry-1's upload failed as a bare "sd-backup failed")
+exec 2>>$LOG
+${FAILED_STAGES_FN}
 S5="s5cmd --endpoint-url $S3_ENDPOINT"
 # the hash of exactly what was uploaded: the verify step compares the
 # bucket's copy against it to tell a corrupted upload from a broken stream
-if tar -C ${NODE_HOME} -cf - data 2>>$LOG | zstd -q -T0 -3 | age -r "$AGE_RECIPIENT" \\
+if tar -C ${NODE_HOME} -cf - data | zstd -q -T0 -3 | age -r "$AGE_RECIPIENT" \\
      | tee >(sha256sum | cut -d' ' -f1 > /tmp/sd-backup.sha) \\
      | $S5 pipe --concurrency 2 --part-size 32 "s3://$S3_BUCKET/$S3_PREFIX/$NAME" >>$LOG 2>&1; then
   echo done > $ST
 else
+  failed_stages "\${PIPESTATUS[@]}" -- tar zstd age tee s5cmd
   echo failed > $ST
 fi
 `;
@@ -303,6 +329,7 @@ echo $$ > /tmp/sd-verify.pid; echo running > $ST; : > $LOG; rm -f /tmp/sd-verify
 S5="s5cmd --endpoint-url $S3_ENDPOINT"
 OBJ="s3://$S3_BUCKET/$S3_PREFIX/$NAME"
 ${S3GET_FN}
+${FAILED_STAGES_FN}
 if s3get "$S3_PREFIX/$NAME" 2>>$LOG | age -d -i $KEY 2>>$LOG | zstd -dq 2>>$LOG | tar -tf - >/dev/null 2>>$LOG; then
   rm -f $KEY
   printf '%s' "$MANIFEST" | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json" >>$LOG 2>&1
@@ -311,6 +338,7 @@ if s3get "$S3_PREFIX/$NAME" 2>>$LOG | age -d -i $KEY 2>>$LOG | zstd -dq 2>>$LOG 
     | while read -r old; do $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/$old" >>$LOG 2>&1; done
   echo done > $ST
 else
+  failed_stages "\${PIPESTATUS[@]}" -- s3get age zstd tar
   rm -f $KEY
   s3get "$S3_PREFIX/$NAME" 2>>$LOG | sha256sum | cut -d' ' -f1 > /tmp/sd-verify.readback
   echo failed > $ST
@@ -586,9 +614,12 @@ export async function watchScriptVia(
         return `the node stopped answering (${String(e instanceof Error ? e.message : e).slice(0, 160)})`;
       }
     }
-    if (secs > opts.maxSecs) return `still running after ${Math.round(opts.maxSecs / 3600)} hours`;
+    if (secs > opts.maxSecs) return `${STILL_RUNNING} ${Math.round(opts.maxSecs / 3600)} hours`;
   }
 }
+
+/** How watchScript's failure starts when the script ran past `maxSecs`. */
+const STILL_RUNNING = "still running after";
 
 /** Thrown when a restore had to be given up but its script could not be stopped. */
 export class RestoreStillRunning extends Error {}
@@ -642,10 +673,11 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
           // a resumed copy (the last one failed and let the node start) must
           // stop it again: never copy a data directory that is changing. The
           // node has moved on since prepare (2026-10-12: a resume hours later
-          // copied height 124488 under prepare's 96468), so read it again
-          // first; a node still held has not moved, and keeps prepare's.
-          height = (await nodeHeight(ctx, target(ctx))) || height;
+          // copied height 124488 under prepare's 96468; 2026-10-30: a retake
+          // after a failed check recorded prepare's 344998 for later data),
+          // so take the height the hold stopped it at.
           await ensureHeld(ctx, key);
+          height = (await heldHeight(ctx, target(ctx))) || height;
           const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
           name = `data-${stamp}-h${height}.tar.zst.age`;
           const genesisSha = fleetGenesisSha(ctx.dirs.node);
@@ -718,13 +750,15 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
         return { name };
       },
     },
-    releaseStep(p, key, opId, { finish: false }),
+    // the check keeps the node held and releases it itself (verifyStep)
     verifyStep(p, key, opId, spec),
   ];
 }
 
 /** Times a backup op takes the copy again after it failed its check, before it pauses. */
 const VERIFY_ATTEMPTS = 2;
+/** Times a check cut short is started again on the same copy, before the op pauses. */
+const VERIFY_INTERRUPTIONS = 3;
 
 /**
  * Read the uploaded backup back and unpack it end to end before recording
@@ -732,11 +766,23 @@ const VERIFY_ATTEMPTS = 2;
  * mid-file, and nothing had noticed. A backup that fails is deleted from the
  * bucket and taken again once; a second failure pauses the op with what the
  * hashes say went wrong.
+ *
+ * The node stays held through the check, as through the upload, and is
+ * released here. Unpacking the stream on the node's one CPU beside a running
+ * node got the container stopped by its provider (2026-10-30, sentry-1 on
+ * quanglong: SIGTERM from outside every few minutes under load, every check
+ * cut short) while the held upload of the same size went through.
+ *
+ * A check cut short (its container restarted, or the node stopped
+ * answering) says nothing about the copy, so it checks the same copy again
+ * instead: counted as failures, those cut-short checks deleted two good
+ * copies that day.
  */
 function verifyStep(p: (s: string) => string, key: string, opId: number, spec: LaunchSpec): StepDef {
   const pendingKey = (ctx: StepCtx) => `data-backup-pending:${ctx.launchId}`;
   const attemptsKey = `data-backup-verify-failures:${opId}`;
-  const retake = [p("hold"), p("upload"), p("release")];
+  const interruptsKey = `data-backup-verify-interruptions:${opId}`;
+  const retake = [p("hold"), p("upload")];
   return {
     name: p("verify"),
     async run(ctx) {
@@ -750,6 +796,9 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
       const record = JSON.parse(pending) as DataBackupRecord;
       const state = await scriptState(ctx, target(), "sd-verify");
       if (!(state.status === "done" || (state.status === "running" && state.alive))) {
+        // already held after the upload; a resumed check (the node started
+        // in between) stops it again
+        await ensureHeld(ctx, key);
         await uploadText(ctx, target(), "/tmp/sd-verify.age", `${identity}\n`);
         await uploadText(
           ctx,
@@ -773,10 +822,11 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
           : await watchScript(ctx, target, "sd-verify", {
               maxSecs: MAX_COPY_SECS,
               progressMb: () => meter.sample(),
-              tick: (secs, mb) => {
+              tick: async (secs, mb) => {
+                await refreshHoldOn(ctx, target()).catch(() => undefined);
                 ctx.db.setFleetOpProgress(opId, {
                   ...meter.fields(
-                    `reading the backup back from the bucket to check it (${key} keeps running)`,
+                    `reading the backup back from the bucket to check it (${key} stays stopped until then)`,
                     mb,
                     "waiting on the download",
                   ),
@@ -790,9 +840,30 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
         recordBackup(ctx.db, ctx.launchId, { ...record, verified: true });
         ctx.db.deleteSetting(pendingKey(ctx));
         ctx.db.deleteSetting(attemptsKey);
+        ctx.db.deleteSetting(interruptsKey);
+        await releaseNode(ctx, key);
         ctx.db.setFleetOpStatus(opId, "done");
         return { verified: true, name: record.name };
       }
+
+      if (!failure.startsWith(STILL_RUNNING) && (await checkCutShort(ctx, target()))) {
+        const interruptions = Number(ctx.db.getSetting(interruptsKey) ?? 0) + 1;
+        ctx.db.setSetting(interruptsKey, String(interruptions));
+        if (interruptions < VERIFY_INTERRUPTIONS) {
+          // a check still running out of reach is watched again, not restarted
+          throw new RerunFrom([], `the check of ${record.name} was cut short (${failure}); checking the same copy again`);
+        }
+        ctx.db.deleteSetting(interruptsKey);
+        await stopScript(ctx, target(), "sd-verify", "rm -f /tmp/sd-verify.age").catch(() => false);
+        await releaseNode(ctx, key).catch((e) => ctx.log(`${key}: ${e instanceof Error ? e.message : e}`));
+        throw new AwaitUser(
+          p("verify"),
+          `The check of ${record.name} from ${key} was cut short ${interruptions} times before it finished ` +
+            `(the last time, ${failure}). Nothing says the copy is bad, so it stays in the bucket, not yet ` +
+            "recorded: resume to check it again, or abandon.",
+        );
+      }
+      ctx.db.deleteSetting(interruptsKey);
 
       await stopScript(ctx, target(), "sd-verify", "rm -f /tmp/sd-verify.age");
       const readback = (await ctx.services.ssh.exec(target(), "cat /tmp/sd-verify.readback 2>/dev/null || true").catch(() => ({ stdout: "" }))).stdout.trim();
@@ -815,8 +886,11 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
       ctx.db.setSetting(attemptsKey, String(failures));
       ctx.log(`${record.name} failed its check (${why}); deleted from the bucket`);
       if (failures < VERIFY_ATTEMPTS) {
+        // still held: the retake copies straight away
         throw new RerunFrom(retake, `the backup failed its check (${why}); taking it again`);
       }
+      // never leave the node stopped while the op waits on the user
+      await releaseNode(ctx, key).catch((e) => ctx.log(`${key}: ${e instanceof Error ? e.message : e}`));
       throw new AwaitUser(
         p("verify"),
         `The chain-data backup from ${key} failed its check ${failures} times and was deleted from the bucket ` +
@@ -827,12 +901,29 @@ function verifyStep(p: (s: string) => string, key: string, opId: number, spec: L
   };
 }
 
+/**
+ * True when the check did not reach its end: the script is gone without
+ * reporting (its container restarted), the node cannot be reached, or the
+ * watch gave up on a node that stopped answering while the script ran on.
+ * Only a check that ran to a failure is a failed check.
+ */
+async function checkCutShort(ctx: StepCtx, target: SshTarget): Promise<boolean> {
+  const state = await scriptState(ctx, target, "sd-verify").catch(() => null);
+  return !state || (state.status !== "failed" && state.status !== "done");
+}
+
 /** The node's latest block height, or 0 when it is not running (held) or does not answer. */
 async function nodeHeight(ctx: StepCtx, target: SshTarget): Promise<number> {
   const status = await ctx.services.ssh
     .exec(target, "curl -s -m 5 localhost:26657/status")
     .catch(() => ({ stdout: "" }));
   return Number(/"latest_block_height":"(\d+)"/.exec(status.stdout)?.[1] ?? 0);
+}
+
+/** The height ensureHeld stopped the node at, or 0 when it did not record one. */
+async function heldHeight(ctx: StepCtx, target: SshTarget): Promise<number> {
+  const res = await ctx.services.ssh.exec(target, `cat ${HELD_HEIGHT_FILE} 2>/dev/null || true`).catch(() => ({ stdout: "" }));
+  return Number(res.stdout.trim()) || 0;
 }
 
 const nodeTarget = (ctx: StepCtx, key: string) => rowTarget(ctx, componentRow(ctx, key));
@@ -865,6 +956,8 @@ async function ensureHeld(ctx: StepCtx, key: string): Promise<void> {
           "cannot stop and restart it: relaunch or repair it first",
       );
     }
+    const height = await nodeHeight(ctx, target());
+    await ctx.services.ssh.exec(target(), height ? `echo ${height} > ${HELD_HEIGHT_FILE}` : `rm -f ${HELD_HEIGHT_FILE}`);
     await refreshHoldOn(ctx, target());
     await ctx.services.ssh.exec(target(), "(sleep 1; kill -TERM 1) >/dev/null 2>&1 &").catch(() => undefined);
   } else {
@@ -892,22 +985,28 @@ function holdStep(p: (s: string) => string, key: string): StepDef {
   };
 }
 
+/** Remove the hold and wait for the node: the entrypoint starts it within ~15s. */
+async function releaseNode(ctx: StepCtx, key: string): Promise<void> {
+  const target = () => nodeTarget(ctx, key);
+  await ctx.services.ssh.exec(target(), `rm -f ${HOLD_FILE}`);
+  for (let i = 0; i < 36; i++) {
+    if (await nodeRunning(ctx, target())) {
+      ctx.log(`${key}: running again`);
+      return;
+    }
+    await ctx.services.sleep(5000);
+  }
+  throw new Error(`${key} did not start after the hold was released: check its container log`);
+}
+
 /** Remove the hold; the entrypoint starts the node within ~15s. Closes the op. */
-function releaseStep(p: (s: string) => string, key: string, opId: number, opts: { finish?: boolean } = {}): StepDef {
+function releaseStep(p: (s: string) => string, key: string, opId: number): StepDef {
   return {
     name: p("release"),
     async run(ctx) {
-      const target = () => nodeTarget(ctx, key);
-      await ctx.services.ssh.exec(target(), `rm -f ${HOLD_FILE}`);
-      for (let i = 0; i < 36; i++) {
-        if (await nodeRunning(ctx, target())) {
-          ctx.log(`${key}: running again`);
-          if (opts.finish !== false) ctx.db.setFleetOpStatus(opId, "done");
-          return { running: true };
-        }
-        await ctx.services.sleep(5000);
-      }
-      throw new Error(`${key} did not start after the hold was released: check its container log`);
+      await releaseNode(ctx, key);
+      ctx.db.setFleetOpStatus(opId, "done");
+      return { running: true };
     },
   };
 }

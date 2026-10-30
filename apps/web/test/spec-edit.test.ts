@@ -40,7 +40,7 @@ describe("launch settings edits", () => {
   });
 
   it("reads hand-written resources as their tier, or custom", () => {
-    const standard = { cpu: 2, memory: "8Gi", storage: { root: "5Gi", data: "8Gi", persistent: true } };
+    const standard = { cpu: 2, memory: "8Gi", storage: { root: "5Gi", data: "20Gi", persistent: true } };
     expect(roleSizeOf({ infra: { resources: { sentry: standard } } }, "sentry")).toBe("standard");
     expect(roleSizeOf({ infra: { resources: { sentry: { ...standard, cpu: 3 } } } }, "sentry")).toBe("custom");
   });

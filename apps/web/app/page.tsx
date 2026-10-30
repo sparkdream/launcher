@@ -222,12 +222,12 @@ topology:
     # renew the session key). target: another fleet's chain (omit: this one);
     # peers default to the target's Mastodon domain. It signs through a
     # session key, renewed with a third of its lifetime left: session.days
-    # defaults to 90 (30 on mainnet), within the chain's
-    # chainParams.session.maxExpirationDays.
+    # defaults to 30, within the chain's ceiling for narrow session keys
+    # (30 days from v1.0.56).
     # verifier:
     #   enabled: true
     #   account: vera                  # or: wallet: <your member address>
-    #   # session: { days: 90, spendLimit: "25000000" }
+    #   # session: { days: 30, spendLimit: "25000000" }
     #   # target: { fleet: <launch id or network name> }
     #   # alarmWebhook: https://hooks.example.com/sdapverify
     # Content scanner (contentscan): judges media-labelled content and
@@ -243,7 +243,7 @@ topology:
     #   domain: scan.example.com
     #   # controller: Commons Operations Committee
     #   # classifierUrl: https://classifier.example.com/score
-    #   # session: { days: 90, spendLimit: "25000000" }
+    #   # session: { days: 30, spendLimit: "25000000" }
     # Battle royale game (sparkdreamnft/battle-royale) on its domain. With
     # web3, players connect Keplr and their results are minted through
     # x/artifact (career, badge and match tokens) for the game
@@ -262,7 +262,7 @@ topology:
     #   domain: battle.example.com
     #   # web3:
     #   #   wallet: <your member address>   # or: account: arcade
-    #   #   # session: { days: 90, spendLimit: "25000000" }
+    #   #   # session: { days: 30, spendLimit: "25000000" }
     #   #   # target: { fleet: <launch id or network name> }
   # required when frontend is enabled — sentry-0 serves these domains:
   # publicEndpoints:

@@ -20,6 +20,8 @@ import {
   withRedeployNonce,
 } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
+import { cacheEntry, writeMeta } from "../src/chain-assets/cache.js";
+import { launcherVendorDir } from "../src/vendor.js";
 import { syncPace, withNodeResources } from "../src/node-resize.js";
 import { fakeServices, FakeSigner, keplrSignAmino, type FakeWorld } from "./fakes.js";
 
@@ -1689,6 +1691,15 @@ describe("chain reset op", () => {
     // pinned tag would go stale on the next sync-vendor, which is how this
     // test started failing once the vendor moved to v1.0.31.
     const image = `sparkdreamnft/sparkdreamd-testnet-ssh:${nextChainVersion()}`;
+    // the new version's assets, as seed-chain-assets leaves them: offline,
+    // the genesis rebuild refuses a version it has no binary for
+    const entry = cacheEntry(w.work, image);
+    fs.mkdirSync(entry.dir, { recursive: true });
+    const real = process.env.SPARKDREAMD_BIN_TESTNET || execFileSync("sh", ["-c", "command -v sparkdreamd"], { encoding: "utf8" }).trim();
+    fs.symlinkSync(path.resolve(real), entry.bin);
+    fs.symlinkSync(launcherVendorDir(), entry.vendorDir);
+    const now = new Date().toISOString();
+    writeMeta(entry, { image, commit: "0".repeat(40), via: "seed", createdAt: now, lastUsedAt: now });
     const edited = JSON.parse(launch.spec_json);
     edited.images = { ...edited.images, sparkdreamd: image };
     w.fleet.requestChainReset(launch, edited);

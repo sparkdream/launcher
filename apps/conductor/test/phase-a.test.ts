@@ -111,10 +111,10 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     expect(genesis.app_state.identity.identity.chain_human_name).toBe("SparkdreamTest");
     expect(genesis.app_state.identity.identity.bond_denom).toBe("uspark.sparkdreamtest");
     expect(genesis.app_state.identity.identity.dream_denom).toBe("udream.sparkdreamtest");
-    expect(genesis.app_state.bank.denom_metadata.map((m: any) => m.base)).toEqual([
-      "uspark.sparkdreamtest",
-      "udream.sparkdreamtest",
-    ]);
+    // since v1.0.56 x/identity writes both tokens' bank metadata from this
+    // record at InitGenesis; the reference genesis carries none of its own
+    expect(genesis.app_state.bank.denom_metadata).toEqual([]);
+    expect(genesis.app_state.identity.identity.bond_display_decimals).toBe(6);
     expect(genesis.app_state.season.season.name).toBe("Genesis Season");
     // launcher-owned state survives the overlay: balances back the spec's
     // accounts, and the community pool stays empty (no module balance funds it)
@@ -178,10 +178,6 @@ describe("Phase A golden run — 2 validators × 2 sentries", () => {
     ]);
 
     // default token naming reproduces the reference exactly
-    const dreamMeta = genesis.app_state.bank.denom_metadata.find(
-      (m: any) => m.base === "udream.sparkdreamtest",
-    );
-    expect(dreamMeta.display).toBe("dream");
     expect(genesis.app_state.identity.identity.dream_display_symbol).toBe("DREAM");
     expect(genesis.app_state.identity.identity.dream_display_name).toBe("Sparkdream Test Dream");
     const val0 = fs.readFileSync(path.join(dirs.node("val-0"), "config", "config.toml"), "utf8");
@@ -265,15 +261,12 @@ describe("Phase A golden run — 1 validator × 1 sentry, tmkms", () => {
     expect(db.stepOutput<{ gentxCount: number }>("g11", "build-genesis")!.gentxCount).toBe(1);
 
     // dream token fully renamed via spec: base denom (custom prefix, no
-    // "udream."), metadata display, and identity symbol/name all follow
+    // "udream.") and the identity record x/identity derives its bank
+    // metadata from (symbol, name, decimals) all follow
     const genesis = JSON.parse(
       fs.readFileSync(path.join(dirs.node("val-0"), "config", "genesis.json"), "utf8"),
     );
-    const dreamMeta = genesis.app_state.bank.denom_metadata.find(
-      (m: any) => m.base === "uglow.sparkdreamtest",
-    );
-    expect(dreamMeta.display).toBe("glow");
-    expect(dreamMeta.denom_units[1]).toMatchObject({ denom: "glow", exponent: 6 });
+    expect(genesis.app_state.identity.identity.dream_display_decimals).toBe(6);
     expect(genesis.app_state.identity.identity.dream_denom).toBe("uglow.sparkdreamtest");
     expect(genesis.app_state.identity.identity.dream_display_symbol).toBe("GLOW");
     expect(genesis.app_state.identity.identity.dream_display_name).toBe("Glow");

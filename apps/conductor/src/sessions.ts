@@ -171,6 +171,16 @@ export function renewAt(record: SessionRecord): number {
 }
 
 /** Go durations as the CLI prints them ("168h0m0s") or as JSON ("604800s"). */
+/**
+ * The longest a launcher key may live. Every role's key is narrow (at most
+ * two message types, no allow_self_revoke), so from v1.0.56 the chain lets it
+ * run to narrow_session_max_expiration (30 days) instead of the broad
+ * max_expiration (7 days); older chains have only max_expiration.
+ */
+export function sessionCeiling(params: { max_expiration?: unknown; narrow_session_max_expiration?: unknown }): string {
+  return String(params.narrow_session_max_expiration ?? params.max_expiration ?? "168h");
+}
+
 export function durationMs(value: string): number {
   let ms = 0;
   for (const [, n, unit] of value.matchAll(/([0-9.]+)(h|ms|m|s)/g)) {
@@ -350,7 +360,7 @@ async function grantTerms(
   // the chain's ceilings bound what may be asked for
   const params = (await queryJson(["query", "session", "params"], chain.rpc)).params ?? {};
   const want = settings(spec, role);
-  const lifetimeMs = Math.min(want.days * 86_400_000, durationMs(String(params.max_expiration ?? "168h")));
+  const lifetimeMs = Math.min(want.days * 86_400_000, durationMs(sessionCeiling(params)));
   // block time trails the wall clock by a block or two, and create-session
   // rejects anything past block time + max_expiration: stay a little inside
   const expiresAt = new Date(Date.now() + lifetimeMs - 10 * 60_000);

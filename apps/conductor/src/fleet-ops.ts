@@ -31,6 +31,7 @@ import {
   type MastodonBackupRecord,
   type MastodonRestoreParams,
 } from "./mastodon-backup.js";
+import { runWithAssets } from "./chain-assets/index.js";
 import { AwaitUser, launchDirs, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
@@ -44,6 +45,7 @@ import { ageIdentityAt, clearPin, extractForwardedPort, headscaleUserId, loadCer
 import {
   buildGenesisFiles,
   createNamedAccounts,
+  ensureChainAssets,
   packageNodeDataStep,
   placeholder,
   type GenerateKeysOutput,
@@ -4543,10 +4545,15 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
       async run(ctx) {
         const keys = ctx.output<GenerateKeysOutput>("generate-keys");
         if (!keys) throw new Error("generate-keys output missing");
-        const result = await buildGenesisFiles(ctx, keys);
-        // bundles feed future relaunches — re-pack so they carry the new genesis
-        await packageNodeDataStep.run(ctx);
-        return result;
+        // the binary of the spec's network and version, fetched if need be:
+        // another network's build refuses this network's genesis (v1.0.56)
+        const assets = await ensureChainAssets(ctx);
+        return runWithAssets(assets, async () => {
+          const result = await buildGenesisFiles(ctx, keys);
+          // bundles feed future relaunches — re-pack so they carry the new genesis
+          await packageNodeDataStep.run(ctx);
+          return result;
+        });
       },
     },
   ];

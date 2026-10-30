@@ -1913,11 +1913,15 @@ pays its fees from the grant's budget (chain repo `internal/sdaptx`, env
   (`session.spendLimit`, 25 SPARK by default) and the chain's exec cap. A
   leaked key can send that one message until the budget, the cap or the
   expiry runs out, or until the grant is revoked.
-- **Lifetime.** `session.days` defaults to 90 (30 on mainnet) and is capped by
-  the chain's `session.max_expiration`. New launches write that ceiling into
-  genesis (`chainParams.session.maxExpirationDays`, same defaults; the code
-  default is 7 days). On a chain with a shorter ceiling the grant is shorter
-  and simply renews more often.
+- **Lifetime.** `session.days` defaults to 30 and is capped by the chain's
+  ceiling. Every launcher key is narrow (at most two message types, no
+  `allow_self_revoke`), so from v1.0.56 that is
+  `session.narrow_session_max_expiration` (30 days; broad keys keep the
+  7-day `max_expiration`), and `max_expiration` on older chains. Genesis keeps
+  the reference's ceilings unless the spec sets
+  `chainParams.session.maxExpirationDays`, which raises the narrow one with
+  it. On a chain with a shorter ceiling the grant is shorter and simply
+  renews more often.
 - **Grant** (`ensureSession`). A fresh 24-word key, then one tx signed
   locally by the account: a 1-unit `MsgSend` creates the grantee's auth
   account (`MsgCreateSession` does not, and a missing account cannot sign),

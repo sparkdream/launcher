@@ -52,6 +52,7 @@ import {
   fetchChainAssets,
   pruneCache,
   resolveChainAssets,
+  type ChainAssets,
 } from "../chain-assets/index.js";
 
 /**
@@ -136,15 +137,22 @@ export const validateSpecStep: StepDef = {
  */
 const KEEP_CACHED_VERSIONS = 3;
 
+/**
+ * The spec's chain assets: resolved (baked build or cache), else fetched in
+ * online mode; offline, a version with nothing local stops with the remedies.
+ */
+export async function ensureChainAssets(ctx: StepCtx): Promise<ChainAssets> {
+  const assets = resolveChainAssets(ctx.spec, ctx.workRoot);
+  if (assets) return assets;
+  if (chainAssetMode(ctx.db) === "baked") throw bakedModeError(ctx.spec.images.sparkdreamd);
+  return fetchChainAssets(ctx.spec, ctx.workRoot, ctx.log);
+}
+
 export const prepareChainAssetsStep: StepDef = {
   name: "prepare-chain-assets",
   async run(ctx) {
     const mode = chainAssetMode(ctx.db);
-    let assets = resolveChainAssets(ctx.spec, ctx.workRoot);
-    if (!assets) {
-      if (mode === "baked") throw bakedModeError(ctx.spec.images.sparkdreamd);
-      assets = await fetchChainAssets(ctx.spec, ctx.workRoot, ctx.log);
-    }
+    const assets = await ensureChainAssets(ctx);
     // prune AFTER materializing so the new entry counts as most recent;
     // versions referenced by any non-terminal launch are never evicted
     const active = new Set<string>();

@@ -104,8 +104,9 @@ describe("taking a chain-data backup", () => {
 
     const [record] = dataBackups(w.db, "fl");
     expect(record!.from).toBe("sentry-1");
-    // read once, while the node ran; the held node does not answer
-    expect(record!.height).toBe(w.db.stepOutput<{ height: number }>("fl", `op${opId}:prepare`)!.height);
+    // read as the hold stopped it (a held node does not answer), not prepare's earlier one
+    expect(record!.height).toBe(Number(w.services.ssh.heldHeights.get(id)));
+    expect(record!.height).toBeGreaterThan(w.db.stepOutput<{ height: number }>("fl", `op${opId}:prepare`)!.height);
     expect(record!.genesisSha).toMatch(/^[0-9a-f]{64}$/);
     // read back and unpacked before it was recorded, with the upload's hash
     expect(record!.verified).toBe(true);
@@ -335,12 +336,45 @@ describe("checking a backup after its upload", () => {
     const records = dataBackups(w.db, "fl");
     expect(records).toHaveLength(1);
     expect(records[0]!.verified).toBe(true);
-    // only the good copy is left in the bucket, and the node was held twice
+    // only the good copy is left in the bucket, and the node stayed held from the first copy through the retake's check
     expect([...w.services.ssh.s3Objects]).toEqual([`bk/sparkdream-launcher/sparkdream-1/chain-data/${records[0]!.name}`]);
     const id = sshId(w, "sentry-1");
-    expect(w.services.ssh.containerRestarts.get(id)).toBe(2);
+    expect(w.services.ssh.containerRestarts.get(id)).toBe(1);
     expect(w.services.ssh.started.has(id)).toBe(true);
   }, 240_000);
+
+  it("checks the same copy again when the check dies with its container, without deleting it", async () => {
+    const w = await launched();
+    w.services.ssh.verifiesDie = 1;
+    const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    expect((await driveOps(w)).status).toBe("completed");
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    const [record] = dataBackups(w.db, "fl");
+    expect(record!.verified).toBe(true);
+    // one copy, never deleted, and the node held only once
+    expect([...w.services.ssh.s3Objects]).toEqual([`bk/sparkdream-launcher/sparkdream-1/chain-data/${record!.name}`]);
+    expect(w.services.ssh.containerRestarts.get(sshId(w, "sentry-1"))).toBe(1);
+  }, 240_000);
+
+  it("pauses after checks cut short three times, keeping the copy for the resume", async () => {
+    const w = await launched();
+    w.services.ssh.verifiesDie = 3;
+    const { opId } = w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
+    const parked = await driveOps(w);
+    expect(parked.status).toBe("awaiting-user");
+    expect(parked.failedStep).toBe(`op${opId}:verify`);
+    expect(parked.reason).toContain("cut short 3 times");
+    expect(dataBackups(w.db, "fl")).toEqual([]);
+    expect(w.services.ssh.s3Objects.size).toBe(1);
+    const [object] = [...w.services.ssh.s3Objects];
+    expect(w.services.ssh.started.has(sshId(w, "sentry-1"))).toBe(true);
+
+    // resume checks that same copy, and records it
+    expect((await driveOps(w)).status).toBe("completed");
+    const [record] = dataBackups(w.db, "fl");
+    expect(record!.verified).toBe(true);
+    expect(object).toBe(`bk/sparkdream-launcher/sparkdream-1/chain-data/${record!.name}`);
+  }, 300_000);
 
   it("pauses after a second failure with what the hashes say, and records nothing", async () => {
     const w = await launched();

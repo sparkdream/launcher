@@ -788,6 +788,10 @@ export class FakeSsh {
   refusesDuplicateIp = new Set<string>();
   /** Backup/restore scripts die with their container on these nodes (/tmp emptied, no status). */
   scriptsDie = new Set<string>();
+  /** The next this-many checks die with their container on any node (/tmp emptied, no status). */
+  verifiesDie = 0;
+  /** host:port → the height the hold recorded when it stopped the node (on its volume). */
+  heldHeights = new Map<string, string>();
   /** Nodes whose container runs in wait mode (PID 1 is a tail). */
   waitMode = new Set<string>();
   /** Launcher scripts stopped, by `host:port|name`. */
@@ -919,6 +923,11 @@ export class FakeSsh {
       const read = this.verifyReads.get(id)?.shift();
       return ok(read === undefined ? "" : `${read[0]} ${read[1]}`);
     }
+    if (command.includes(".launcher-held-height")) {
+      if (command.startsWith("echo")) this.heldHeights.set(id, /^echo (\d+)/.exec(command)![1]!);
+      else if (command.startsWith("rm -f")) this.heldHeights.delete(id);
+      return ok(this.heldHeights.get(id) ?? "");
+    }
     if (command.includes(".launcher-hold")) {
       if (command.startsWith("test -f")) return ok(this.holds.has(id) ? "held" : "");
       if (command.startsWith("rm -f")) {
@@ -990,6 +999,10 @@ export class FakeSsh {
       const verdict = this.s3Objects.has(object) && !this.corruptObjects.has(object) ? "done" : "failed";
       this.verifyStatus.set(id, this.verifyReads.get(id)?.length ? "running" : verdict);
       this.verifyVerdict.set(id, verdict);
+      if (this.verifiesDie > 0) {
+        this.verifiesDie--;
+        this.verifyStatus.delete(id);
+      }
       return ok();
     }
     if (command.includes("bash /tmp/sd-backup.sh")) {

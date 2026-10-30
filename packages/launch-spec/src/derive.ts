@@ -241,14 +241,9 @@ export function lcdRequired(spec: LaunchSpec): boolean {
   );
 }
 
-/** Genesis session.max_expiration, in days (§5 session keys). */
-export function sessionMaxDays(spec: LaunchSpec): number {
-  return spec.chainParams.session?.maxExpirationDays ?? (spec.network.type === "mainnet" ? 30 : 90);
-}
-
 /** A daemon's session-key lifetime, before the chain's own cap applies. */
 export function sessionDays(spec: LaunchSpec, session: { days?: number | undefined } | undefined): number {
-  return session?.days ?? (spec.network.type === "mainnet" ? 30 : 90);
+  return session?.days ?? 30;
 }
 
 /**
