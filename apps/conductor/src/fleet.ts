@@ -2574,6 +2574,18 @@ export class FleetService {
     amount: string,
   ): Promise<{ step: string }> {
     const step = `fleet:topup:${component.dseq}`;
+    // the queue keeps one row per step and ignores a second enqueue, so a
+    // deployment's earlier top-up row would swallow every later one: the
+    // button looked like a no-op from the second top-up on. A settled row
+    // is history and an unsigned one is replaced by the new amount; one
+    // already signed has to settle first.
+    const previous = this.db.getPendingTx(launch.id, step);
+    if (previous?.status === "signed") {
+      throw new Error(
+        `${component.key}: the previous top-up is still confirming on-chain; try again in a minute`,
+      );
+    }
+    if (previous) this.db.deletePendingTx(launch.id, step);
     // the deposit must match the escrow's denom — same per-network mapping
     // the SDLs were rendered with
     const denom = PRICING_DENOM[this.spec(launch).infra.akashNetwork];

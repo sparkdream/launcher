@@ -1082,8 +1082,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
       case "topup": {
         if (!body.amount) return reply.status(400).send({ error: "amount required" });
-        const { step } = await fleet.requestTopUp(launch, component, body.amount);
-        return { status: "awaiting-signature", step };
+        try {
+          const { step } = await fleet.requestTopUp(launch, component, body.amount);
+          // the queue signs oldest-first: say so when something else is ahead
+          const head = deps.db.nextPendingTx(launchId);
+          const note =
+            head && head.step !== step
+              ? `top-up queued behind ${describePendingTx(deps.db, launchId, head.step).origin}: sign or dismiss that first`
+              : undefined;
+          return { status: "awaiting-signature", step, note };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
       }
       case "resume-signing": {
         try {

@@ -1532,6 +1532,27 @@ describe("top-up", () => {
     expect(msgs[1].value.to_address).toBe("akash1j7yznr6njvz0sjnw5dalngtck8teyr8y3euj3w");
     expect(msgs[1].value.amount).toEqual([{ denom: "uakt", amount: "25000" }]);
   }, 120_000);
+
+  it("queues a second top-up of the same deployment once the first settled", async () => {
+    const w = await launched();
+    const launch = w.db.getLaunch("fl")!;
+    const component = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const { step } = await w.fleet.requestTopUp(launch, component, "2500000");
+    // unsigned: the new amount replaces it
+    await w.fleet.requestTopUp(launch, component, "3000000");
+    const amountOf = () =>
+      toEncodeObject(JSON.parse(w.db.getPendingTx("fl", step)!.msgs_json)[0]).value.deposit.amount
+        .amount;
+    expect(amountOf()).toBe("3000000");
+    // signed but unsettled: refused rather than silently dropped
+    w.db.setPendingTxSigned("fl", step, "AB".repeat(32));
+    await expect(w.fleet.requestTopUp(launch, component, "1000000")).rejects.toThrow(/confirming/);
+    // settled: the next top-up is a fresh signature request
+    w.db.setPendingTxStatus("fl", step, "confirmed");
+    await w.fleet.requestTopUp(launch, component, "4000000");
+    expect(w.db.nextPendingTx("fl")?.step).toBe(step);
+    expect(amountOf()).toBe("4000000");
+  }, 120_000);
 });
 
 describe("pollSsh", () => {
