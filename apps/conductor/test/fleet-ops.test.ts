@@ -20,6 +20,7 @@ import {
   withRedeployNonce,
 } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
+import { extractForwardedPort } from "../src/steps/phase-bcd.js";
 import { cacheEntry, writeMeta } from "../src/chain-assets/cache.js";
 import { launcherVendorDir } from "../src/vendor.js";
 import { syncPace, withNodeResources } from "../src/node-resize.js";
@@ -338,6 +339,42 @@ describe("relaunch op", () => {
       fs.readFileSync(path.join(w.work, "launches", "fl", "sdl", "val-0.yaml"), "utf8"),
     ).toContain("WAIT_FOR_CONFIG=false");
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("relaunches a chain's only validator while its sentry sits stopped behind it", async () => {
+    // 2026-11-01 devnet: with its only validator down the chain stopped, the
+    // sentry reported catching up at 17032 forever, and persist waited on it
+    // reaching a head that only the validator it had not yet booted could make
+    const w = await launched(tmkms1x1());
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-0")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    const lease = await w.services.provider.leaseStatus({ certPem: "", keyPem: "" }, sentry.host_uri, sentry.dseq);
+    const rpcPort = extractForwardedPort(lease, 26657).port;
+    w.services.rpc.stoppedHeights.set(`:${rpcPort}`, { height: 17032, catchingUp: true });
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("completed");
+    expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
+  }, 120_000);
+
+  it("still waits for a stopped sentry when other validators keep the chain going", async () => {
+    const s = spec2x2();
+    const w = await launched({ ...s, security: { ...s.security, keyMode: "tmkms" } });
+    const before = w.db.listFleetComponents("fl").find((c) => c.key === "val-0")!;
+    await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, before);
+    w.services.api.leaseStates.set(before.dseq, "closed");
+    w.services.ssh.failHosts.add(`${before.ssh_host}:${before.ssh_port}`);
+    for (const s of w.db.listFleetComponents("fl").filter((c) => c.key.startsWith("sentry-"))) {
+      const lease = await w.services.provider.leaseStatus({ certPem: "", keyPem: "" }, s.host_uri, s.dseq);
+      w.services.rpc.stoppedHeights.set(`:${extractForwardedPort(lease, 26657).port}`, { height: 42, catchingUp: true });
+    }
+
+    const result = await driveOps(w);
+    expect(result.status).not.toBe("completed");
+    expect(w.db.getStep("fl", result.failedStep ?? "")?.error).toContain("not back at the head");
   }, 120_000);
 });
 

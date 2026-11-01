@@ -2617,16 +2617,38 @@ export function relaunchSteps(
           );
         }
       }
+      // A chain whose only validator is the one being relaunched stopped when
+      // it went down, and a sentry on a stopped chain reports catching up
+      // forever: nobody is ahead of it. Waiting for "at the head" there can
+      // never end (the chain moves again only once this validator boots),
+      // and a stopped chain streams no moving snapshot to interrupt, so a
+      // sentry holding still at its stored height counts as back. Seen live
+      // 2026-11-01: devnet val-0 redeploy failed persist at 17032.
+      const chainWaitsOnThis = isValidator && !spec.join && spec.topology.validators.count === 1;
+      const FLAT_SAMPLES = 6;
       for (const { row: r } of pushed) {
         let ok = false;
         let lastProblem = "unreachable";
+        let lastHeight = -1;
+        let flat = 0;
         for (let i = 0; i < 60 && !ok; i++) {
           if (i > 0) await ctx.services.sleep(5000);
           try {
             const url = await nodeRpcUrl(ctx, r.host_uri, r.dseq);
             const st = await ctx.services.rpc.status(url);
             if (!st.catchingUp && st.latestBlockHeight > 0) ok = true;
-            else lastProblem = `catching up at ${st.latestBlockHeight}`;
+            else {
+              lastProblem = `catching up at ${st.latestBlockHeight}`;
+              flat = st.latestBlockHeight > 0 && st.latestBlockHeight === lastHeight ? flat + 1 : 0;
+              lastHeight = st.latestBlockHeight;
+              if (chainWaitsOnThis && flat >= FLAT_SAMPLES) {
+                ctx.log(
+                  `${r.key}: holding at ${st.latestBlockHeight}, the chain is stopped until ${key} ` +
+                    "signs again; booting it",
+                );
+                ok = true;
+              }
+            }
           } catch (e) {
             lastProblem = String(e).slice(0, 80);
           }
