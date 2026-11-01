@@ -252,7 +252,7 @@ describe("mastodon launch", () => {
 });
 
 describe("mastodon bridge", () => {
-  it("added to a running fleet: peer activated, operator funded and bonded, token delivered", async () => {
+  it("added to a running fleet: peer activated, operator funded, joined x/rep and bonded, token delivered", async () => {
     const base = spec(undefined, publicEndpoints);
     const w = await launch(base);
     expect(w.result.status).toBe("completed");
@@ -286,6 +286,15 @@ describe("mastodon bridge", () => {
     const done = await drive();
     expect(done.reason ?? "").toBe("");
     expect(done.status).toBe("completed");
+
+    // the founder invited the operator into x/rep and it accepted with its
+    // own key, before bonding (a bridge operator must be a member)
+    const invitation = Object.values(chain.state().invitations ?? {}).find((i) => i.invitee_address === operator)!;
+    expect(invitation).toMatchObject({ status: "INVITATION_STATUS_ACCEPTED", staked_dream: "100000000" });
+    expect(invitation.signer).toMatch(/^acct-/);
+    expect(chain.state().members?.[operator!]).toBeTruthy();
+    const types = chain.state().log.filter((l) => l.from === "bridge-operator").map((l) => l.types[0]!.split(".").pop());
+    expect(types.slice(0, 2)).toEqual(["MsgAcceptInvitation", "MsgRegisterBridge"]);
 
     // bonded by the operator's own key, for the instance's peer
     const binding = Object.values(chain.state().chains)[0]!.bindings![`${operator}/${DOMAIN}`]!;

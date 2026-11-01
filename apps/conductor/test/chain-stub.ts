@@ -52,8 +52,11 @@ export interface StubState {
   defaultBalances?: Record<string, string>;
   /** MsgBondRole fails as if the member lacked the DREAM. */
   dreamShort?: boolean;
-  /** x/rep members by address, for `query rep get-member` (NotFound otherwise). */
-  members?: Record<string, { trust_level?: string; dream_balance?: string; staked_dream?: string }>;
+  /** x/rep members by address, for `query rep get-member` (NotFound otherwise).
+   *  MsgAcceptInvitation adds one; a bridge operator must be one (v1.0.56). */
+  members?: Record<string, { trust_level?: string; dream_balance?: string; staked_dream?: string; status?: string }>;
+  /** x/rep invitations, by id as the chain numbers them. */
+  invitations?: Record<string, { id: string; inviter: string; invitee_address: string; staked_dream: string; status?: string; signer?: string }>;
   /** x/session narrow_session_max_expiration as the CLI prints it (default
    *  30 days): the ceiling for the launcher's keys, which are all narrow.
    *  max_expiration (broad keys) stays at 7 days. */
@@ -111,6 +114,12 @@ if (a0 === "query" && a1 === "rep" && a2 === "bonded-role") {
 if (a0 === "query" && a1 === "rep" && a2 === "get-member") {
   const m = (st.members || {})[a3]; if (!m) fail("rpc error: code = NotFound desc = member not found"); out({ member: { address: a3, ...m } });
 }
+if (a0 === "query" && a1 === "rep" && a2 === "params") out({ params: { min_invitation_stake: "100000000" } });
+if (a0 === "query" && a1 === "rep" && a2 === "required-invitation-stake") out({ required_stake: "100000000", base_stake: "100000000" });
+if (a0 === "query" && a1 === "rep" && a2 === "list-invitation") {
+  // proto3 JSON drops the zero status (PENDING)
+  out({ invitation: Object.values(st.invitations || {}).reverse().map(({ signer, ...i }) => i) });
+}
 if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: { service_type: a3, min_bond_amount: "1000000000" } });
 if (a0 === "query" && a1 === "artifact" && a2 === "classes-by-owner") {
   if (st.classesUnprintable) fail("cannot marshal response classes:{...}: not supported: dont_omit_empty=true on invalid (nil?) message field: expiry");
@@ -157,6 +166,8 @@ if (a0 === "tx" && a1 === "broadcast") {
     } else if (t === "MsgRegisterBridge") {
       const p = chain.peers[m.peer_id];
       if (!p || p.status !== "PEER_STATUS_ACTIVE") throw new Error("peer not active");
+      const op = (st.members || {})[m.operator];
+      if (!op || (op.status && op.status !== "MEMBER_STATUS_ACTIVE")) throw new Error("bridge operator must be an active x/rep member");
       chain.bindings ||= {};
       chain.bindings[m.operator + "/" + m.peer_id] = { operator: m.operator, peer_id: m.peer_id, endpoint: m.endpoint, stake: m.stake_amount, signer: doc.__from };
     } else if (t === "MsgRegisterOperator") {
@@ -192,6 +203,19 @@ if (a0 === "tx" && a1 === "broadcast") {
       chain.classes ||= [];
       if (chain.classes.some((c) => c.owner === m.creator && c.symbol === m.symbol)) throw new Error("class symbol already used by this owner");
       chain.classes.push({ id: String(chain.classes.length + 1), owner: m.creator, symbol: m.symbol, name: m.name, signer: doc.__from });
+    } else if (t === "MsgInviteMember") {
+      if ((st.members || {})[m.invitee_address]) throw new Error("member already exists");
+      st.invitations ||= {};
+      if (Object.values(st.invitations).some((i) => i.invitee_address === m.invitee_address && !i.status)) throw new Error("invitation already exists");
+      const id = String(Object.keys(st.invitations).length + 1);
+      st.invitations[id] = { id, inviter: m.inviter, invitee_address: m.invitee_address, staked_dream: m.staked_dream, signer: doc.__from };
+    } else if (t === "MsgAcceptInvitation") {
+      const i = (st.invitations || {})[m.invitation_id];
+      if (!i || i.status || i.invitee_address !== m.invitee) throw new Error("invitation not found");
+      if (m.accepted_content_license !== "CC0-1.0") throw new Error("content license not accepted");
+      i.status = "INVITATION_STATUS_ACCEPTED";
+      st.members ||= {};
+      st.members[m.invitee] = { trust_level: "TRUST_LEVEL_NEW", dream_balance: "0", staked_dream: "0" };
     } else if (t === "MsgSend") {
       st.balances ||= {};
       const to = (st.balances[m.to_address] ||= {});

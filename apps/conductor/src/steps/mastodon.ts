@@ -20,7 +20,7 @@ import {
   writeBridgeOperatorAddress,
 } from "../components/mastodon-secrets.js";
 import type { FleetComponentRow } from "../db.js";
-import { launchDirs, WALLET_SIGNER, type StepCtx, type StepDef } from "../engine.js";
+import { AwaitUser, launchDirs, WALLET_SIGNER, type StepCtx, type StepDef } from "../engine.js";
 import { sparkdreamd } from "../exec.js";
 import { ensurePeerActive, walletPause, fleetActor, sendTx, walletChain, type ChainActor, type PeerStatus } from "../peering.js";
 import { bridgeDependents } from "../bridge-target.js";
@@ -255,6 +255,50 @@ async function bridgeBound(chain: ChainActor, operator: string, peerId: string):
   }
 }
 
+/** The operator's x/rep standing: "none" when it is not a member. */
+async function operatorMembership(chain: ChainActor, operator: string): Promise<"none" | "active" | "inactive" | "zeroed"> {
+  try {
+    const out = await queryJson(["query", "rep", "get-member", operator], chain.rpc);
+    // proto-JSON leaves the zero value (ACTIVE) out
+    const status = String(out.member?.status ?? "MEMBER_STATUS_ACTIVE");
+    return status === "MEMBER_STATUS_ZEROED" ? "zeroed" : status === "MEMBER_STATUS_INACTIVE" ? "inactive" : "active";
+  } catch (e) {
+    if (/not found|NotFound|code = 5/i.test(String(e))) return "none";
+    throw e;
+  }
+}
+
+/** The pending x/rep invitation for `invitee`, newest first (one is recent). */
+async function pendingInvitation(chain: ChainActor, invitee: string): Promise<{ id: string } | undefined> {
+  const out = await queryJson(["query", "rep", "list-invitation", "--page-reverse", "--page-limit", "1000"], chain.rpc);
+  return (out.invitation ?? []).find(
+    (i: { invitee_address?: string; status?: string }) =>
+      i.invitee_address === invitee && (i.status ?? "INVITATION_STATUS_PENDING") === "INVITATION_STATUS_PENDING",
+  );
+}
+
+/** The largest stake any of `inviters` needs for its next invitation (the
+ *  chain's base floor when none is given). */
+async function requiredInvitationStake(chain: ChainActor, inviters: string[]): Promise<string> {
+  let stake = BigInt((await queryJson(["query", "rep", "params"], chain.rpc)).params?.min_invitation_stake ?? "0");
+  for (const inviter of inviters) {
+    const out = await queryJson(["query", "rep", "required-invitation-stake", inviter], chain.rpc).catch(() => undefined);
+    const need = BigInt(out?.required_stake ?? "0");
+    if (need > stake) stake = need;
+  }
+  return stake.toString();
+}
+
+function inviteMsg(inviter: string, invitee: string, stake: string): unknown {
+  return {
+    "@type": "/sparkdream.rep.v1.MsgInviteMember",
+    inviter,
+    invitee_address: invitee,
+    staked_dream: stake,
+    vouched_tags: [],
+  };
+}
+
 /** Put the issued token and the peer list into the bridge service's env:
  *  one deployment update, after which the bridge leaves its idle loop for
  *  sdapbridge (or restarts with the peers it now watches). */
@@ -360,7 +404,37 @@ export async function linkBridge(
     ...chain,
     signer: { home: ctx.dirs.node("val-0"), key: BRIDGE_OPERATOR, address: operator },
   };
-  if (!(await bridgeBound(chain, operator, domain))) {
+  const unbound = !(await bridgeBound(chain, operator, domain));
+  // a bridge operator must be an active x/rep member (chain v1.0.56), so the
+  // self-dealing checks see the person behind the bridge: a member invites
+  // it and the operator accepts with its own key. An operator bonded on an
+  // older chain joins too: without membership its submissions are refused
+  const membership = await operatorMembership(chain, operator);
+  if (membership !== "none" && membership !== "active") {
+    throw new AwaitUser(
+      stepName,
+      `the bridge operator ${operator} is an ${membership} x/rep member on ${chain.chainId}: a bridge operator ` +
+        "must be active. Restore its membership on the chain, then resume",
+    );
+  }
+  const joining = membership === "none";
+  if (unbound || joining) {
+    const walletMsgs: unknown[] = [];
+    let inviteStake: string | undefined;
+    if (joining && !(await pendingInvitation(chain, operator))) {
+      if (chain.signer) {
+        // the launcher-held founder vouches for it
+        const stake = await requiredInvitationStake(chain, [chain.signer.address]);
+        await sendTx(ctx, chain, `${chain.chainId}-invite-bridge-operator`, [inviteMsg(chain.signer.address, operator, stake)]);
+        ctx.log(`mastodon: founder invited bridge operator ${operator} into x/rep (staked ${stake} micro-DREAM)`);
+      } else {
+        // the wallet member's floor is unknown until it signs: stake what the
+        // spec's members would each need (an escalated inviter needs more)
+        const members = spec.accounts.initial.filter((a) => a.member && a.address).map((a) => a.address!);
+        inviteStake = await requiredInvitationStake(chain, members);
+        walletMsgs.push(inviteMsg(WALLET_SIGNER, operator, inviteStake));
+      }
+    }
     const balances = await queryJson(["query", "bank", "balances", operator], chain.rpc);
     const have = BigInt(
       (balances.balances ?? []).find((b: { denom: string }) => b.denom === chain.gasDenom)?.amount ?? "0",
@@ -368,31 +442,54 @@ export async function linkBridge(
     // the bond + its tx fee, what granting the bridge's session key will
     // need spendable once the bond is locked, and a few whole tokens of
     // headroom so renewals do not come back asking for more (one ask, a round
-    // amount: 1005 rather than 1000.000001 on a zero-gas-price devnet)
+    // amount: 1005 rather than 1000.000001 on a zero-gas-price devnet), plus
+    // accepting its invitation's fee when it still has to join
     const headroom = 5n * 10n ** BigInt(spec.token.exponent ?? 6);
+    const txFee = BigInt(Math.ceil(chain.gasPrice * 400_000));
     const need =
-      BigInt(bond) +
-      BigInt(Math.ceil(chain.gasPrice * 400_000)) +
-      sessionReserve(chain.gasPrice, sessionSpendLimit(spec, "bridge")) +
-      headroom;
+      (unbound
+        ? BigInt(bond) + txFee + sessionReserve(chain.gasPrice, sessionSpendLimit(spec, "bridge")) + headroom
+        : 0n) + (joining ? txFee : 0n);
     if (have < need) {
-      // any funded account may top it up: a wallet send, or the CLI
-      throw await walletPause(
-        ctx,
-        stepName,
-        chain,
-        `fund the bridge operator ${operator} with ${need - have} ${chain.gasDenom} (bond ${bond}, gas and its session key's reserve; it holds ${have})`,
-        [
-          {
-            "@type": "/cosmos.bank.v1beta1.MsgSend",
-            from_address: WALLET_SIGNER,
-            to_address: operator,
-            amount: [{ denom: chain.gasDenom, amount: (need - have).toString() }],
-          },
-        ],
-        { signerRole: `an account holding ${chain.gasDenom}` },
-      );
+      walletMsgs.unshift({
+        "@type": "/cosmos.bank.v1beta1.MsgSend",
+        from_address: WALLET_SIGNER,
+        to_address: operator,
+        amount: [{ denom: chain.gasDenom, amount: (need - have).toString() }],
+      });
     }
+    if (walletMsgs.length > 0) {
+      // one signature for both asks: any funded account may top it up, only
+      // a member with an invitation credit may invite (or the CLI for either)
+      const asks = [
+        ...(have < need
+          ? [`fund the bridge operator ${operator} with ${need - have} ${chain.gasDenom} (bond ${bond}, gas and its session key's reserve; it holds ${have})`]
+          : []),
+        ...(inviteStake ? [`invite the bridge operator ${operator} into x/rep (staking ${inviteStake} micro-DREAM)`] : []),
+      ];
+      throw await walletPause(ctx, stepName, chain, asks.join(", and "), walletMsgs, {
+        signerRole: inviteStake
+          ? `an active x/rep member with an invitation credit and ${inviteStake} micro-DREAM unlocked${have < need ? `, holding ${chain.gasDenom}` : ""}`
+          : `an account holding ${chain.gasDenom}`,
+        gas: 400_000 * walletMsgs.length,
+      });
+    }
+  }
+  if (joining) {
+    const invitation = await pendingInvitation(chain, operator);
+    if (!invitation) throw new Error(`no pending x/rep invitation for the bridge operator ${operator} on ${chain.chainId}`);
+    await sendTx(ctx, operatorSigner, `${chain.chainId}-bridge-operator-join`, [
+      {
+        "@type": "/sparkdream.rep.v1.MsgAcceptInvitation",
+        invitee: operator,
+        invitation_id: String(invitation.id),
+        // joining dedicates what the member publishes to the public domain
+        accepted_content_license: "CC0-1.0",
+      },
+    ]);
+    ctx.log(`mastodon: bridge operator ${operator} joined x/rep (invitation ${invitation.id})`);
+  }
+  if (unbound) {
     await sendAsOperator(ctx, operatorSigner, [
       {
         "@type": "/sparkdream.federation.v1.MsgRegisterBridge",
