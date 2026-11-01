@@ -5857,11 +5857,20 @@ export default function Page() {
                                         node?.image ?? undefined,
                                       )?.trim();
                                       if (image && badImage(image)) return;
-                                      // skip only when the whole node fleet already runs the
-                                      // image — after an aborted mid-upgrade the fleet is mixed
-                                      // and re-running with the same tag is the retry path
-                                      if (image && node && nodes.some((c) => c.image !== image))
-                                        fleetAction(f.launchId, node.dseq, "upgrade", { image });
+                                      // after an aborted mid-upgrade the fleet is mixed and
+                                      // re-running with the same tag is the retry path; a fleet
+                                      // already all on the tag re-runs only when asked, which
+                                      // restarts each node onto the launcher's current node
+                                      // settings (env such as the MPTCP opt-out)
+                                      if (!image || !node) return;
+                                      if (
+                                        nodes.every((c) => c.image === image) &&
+                                        !window.confirm(
+                                          `Every node already runs ${image}. Re-apply it anyway? Each node restarts in turn (sentries first, validators last) and picks up the launcher's current node settings.`,
+                                        )
+                                      )
+                                        return;
+                                      fleetAction(f.launchId, node.dseq, "upgrade", { image });
                                     }}
                                   >
                                     rolling upgrade…

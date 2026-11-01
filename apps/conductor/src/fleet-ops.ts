@@ -36,7 +36,7 @@ import { AwaitUser, launchDirs, RerunFrom, type StepCtx, type StepDef } from "./
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
 import { feeCoin, feeConfig } from "./fee.js";
-import { PRICING_DENOM } from "./render-sdl.js";
+import { PRICING_DENOM, applyNodeEnv } from "./render-sdl.js";
 import { pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
@@ -4325,11 +4325,17 @@ export interface ResetChainParams {
  * way its kind asks (descriptor.envRefresh): "patch" sets chainEnv(spec) in
  * place, preserving the baked tunnel IPs and auth keys (same rationale as
  * retargetSdl); "rerender" renders the SDL again from the spec, for a kind
- * whose deployed SDL holds nothing the spec doesn't. No-op for chain nodes.
+ * whose deployed SDL holds nothing the spec doesn't. Chain nodes get
+ * NODE_ENV patched in (the MPTCP opt-out), everything else they carry kept.
  */
 function refreshComponentEnv(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPath: string): void {
   const d = descriptorFor(key);
-  if (!d || d.envRefresh === "none") return;
+  if (!d) {
+    const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
+    if (applyNodeEnv(doc)) fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
+    return;
+  }
+  if (d.envRefresh === "none") return;
   if (d.envRefresh === "rerender") {
     rerenderComponentSdl(ctx, spec, key, sdlPath);
     return;
