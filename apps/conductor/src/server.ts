@@ -148,12 +148,18 @@ function nameFleetUniquely(db: ConductorDb, spec: LaunchSpecInput): void {
 
 /** A waiting step's stored extras: a bare WalletRequest, or the funding
  *  rows (relayer keys to send to) with an optional request beside them. */
-function waitingExtras(stored: any): { wallet?: unknown; funding?: unknown[]; peerSetup?: unknown } {
-  if (stored && (Array.isArray(stored.funding) || stored.peerSetup)) {
+function waitingExtras(stored: any): {
+  wallet?: unknown;
+  funding?: unknown[];
+  peerSetup?: unknown;
+  override?: { token: string; label: string };
+} {
+  if (stored && (Array.isArray(stored.funding) || stored.peerSetup || stored.override)) {
     return {
       ...(stored.wallet ? { wallet: stored.wallet } : {}),
       ...(Array.isArray(stored.funding) ? { funding: stored.funding } : {}),
       ...(stored.peerSetup ? { peerSetup: stored.peerSetup } : {}),
+      ...(stored.override ? { override: stored.override } : {}),
     };
   }
   return { wallet: stored };
@@ -654,6 +660,23 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply
         .status(409)
         .send({ error: "launch aborted — its fleet was shut down; start a new launch" });
+    }
+    // the pause card's second button: the user takes the waiting step's own
+    // override instead of doing what it asked. Only a token the waiting step
+    // itself offered is pinned, so a stale or guessed token changes nothing.
+    const override = (req.body as { override?: unknown } | undefined)?.override;
+    if (typeof override === "string") {
+      const offered = deps.db
+        .listSteps(id)
+        .filter((s) => s.status === "waiting" && s.wallet_json)
+        .map((s) => waitingExtras(JSON.parse(s.wallet_json!)).override?.token)
+        .includes(override);
+      if (!offered || !/^[A-Za-z0-9:_-]{1,80}$/.test(override)) {
+        return reply.status(409).send({ error: "no waiting step offers that choice; reload and try again" });
+      }
+      const dirs = launchDirs(deps.workRoot, id);
+      fs.mkdirSync(dirs.root, { recursive: true });
+      fs.writeFileSync(path.join(dirs.root, `${override}.pin`), new Date().toISOString());
     }
     return { status: drive(id, JSON.parse(launch.spec_json)) };
   }

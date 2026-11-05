@@ -3296,6 +3296,17 @@ export default function Page() {
                   ? "Funded, resume"
                   : "I did it, resume"}
             </button>
+            {waitingStep.override && (
+              <button
+                className="btn"
+                onClick={() =>
+                  launchId &&
+                  resumeLaunch(launchId, waitingStep.override!.token).catch((e) => setError(String(e)))
+                }
+              >
+                {waitingStep.override.label}
+              </button>
+            )}
           </div>
         </div>
       )}

@@ -93,18 +93,38 @@ export const START_NODE_CMD =
  * the node is an ordinary child process, the original kill-then-start pair is
  * still what relaunches it.
  */
-export async function restartNode(ssh: Services["ssh"], target: SshTarget): Promise<void> {
-  const pid1 = await ssh
-    .exec(target, "cat /proc/1/comm 2>/dev/null || true")
+export async function restartNode(
+  ssh: Services["ssh"],
+  target: SshTarget,
+  opts: { timeoutMs?: number } = {},
+): Promise<void> {
+  // opts.timeoutMs bounds each command: a container whose SSH port still
+  // completes a handshake but answers nothing (a provider ingress left
+  // pointing at a torn-down pod) otherwise holds the caller forever
+  // Two container shapes end with the node's exit: sparkdreamd as PID 1
+  // (older images exec it), and sparkdreamd as the child of the entrypoint's
+  // own loop (remote-signer validators since 2026-11, so a node that exits
+  // for want of a signer is started again with the mesh still up). In both,
+  // the stop is enough and the container restart starts the node. A node
+  // whose parent is PID 1 under a wait-mode `tail` is the other shape: a
+  // child the launcher started over SSH, started again the same way.
+  const shape = await ssh
+    .exec(
+      target,
+      "c=$(cat /proc/1/comm 2>/dev/null); p=$(pgrep -xo sparkdreamd 2>/dev/null); pp=; " +
+        "[ -n \"$p\" ] && pp=$(cut -d' ' -f4 /proc/$p/stat 2>/dev/null); echo \"${c:-?} ${pp:-?}\"",
+      opts,
+    )
     .catch(() => ({ stdout: "" }));
-  if (pid1.stdout.trim() === "sparkdreamd") {
+  const [comm1 = "", parent = ""] = shape.stdout.trim().split(/\s+/);
+  if (comm1 === "sparkdreamd" || (parent === "1" && comm1 !== "tail" && comm1 !== "?" && comm1 !== "")) {
     await ssh
-      .exec(target, "(sleep 1; pkill -x sparkdreamd) >/dev/null 2>&1 &")
+      .exec(target, "(sleep 1; pkill -x sparkdreamd) >/dev/null 2>&1 &", opts)
       .catch(() => undefined);
     return;
   }
-  await ssh.exec(target, "pkill -x sparkdreamd || true");
-  await ssh.exec(target, `sleep 1 && ${START_NODE_CMD}`);
+  await ssh.exec(target, "pkill -x sparkdreamd || true", opts);
+  await ssh.exec(target, `sleep 1 && ${START_NODE_CMD}`, opts);
 }
 
 /** CometBFT RPC URL for a provider host URI (RPC is exposed on 26657). */

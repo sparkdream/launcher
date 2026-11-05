@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import yaml from "js-yaml";
 import { fromBech32 } from "@cosmjs/encoding";
@@ -535,6 +536,8 @@ export interface NodeHeight {
   catchingUp: boolean;
   source: "node" | "chain";
   signed?: boolean;
+  /** Chain view only: the commit's block time, to tell a live chain from a stopped one. */
+  time?: string;
   providerError?: string;
 }
 
@@ -909,7 +912,15 @@ export class FleetService {
       const signed = address
         ? signatures.some((sig) => sig.validator_address === address && Number(sig.block_id_flag) === 2)
         : undefined;
-      return { height, catchingUp: false, source: "chain", ...(signed === undefined ? {} : { signed }), providerError };
+      const time: string | undefined = header?.header?.time;
+      return {
+        height,
+        catchingUp: false,
+        source: "chain",
+        ...(signed === undefined ? {} : { signed }),
+        ...(time ? { time } : {}),
+        providerError,
+      };
     } catch {
       return null;
     }
@@ -1222,7 +1233,7 @@ export class FleetService {
     const chainRows = this.db
       .listFleetComponents(launchId)
       .filter((c) => c.state !== "closed" && /^(val|sentry)-/.test(c.key));
-    const heights = new Map<string, { height: number; catchingUp: boolean }>();
+    const heights = new Map<string, NodeHeight>();
     await Promise.all(
       chainRows.map(async (c) => {
         const h = await this.componentHeight(launch, c).catch(() => null);
@@ -1273,7 +1284,57 @@ export class FleetService {
             }
           } else if (c.key.startsWith("val-")) {
             const status = heights.get(c.key);
-            if (status && !status.catchingUp && stalled(status, head)) {
+            if (!status) {
+              this.db.setComponentHealth(
+                launchId,
+                c.key,
+                "unreachable",
+                details
+                  .concat("the node does not answer inside its container, and no sentry could show the chain's view of it")
+                  .join("; "),
+              );
+              return;
+            }
+            if (status.source === "chain") {
+              // The provider could not run the in-container probe, so the
+              // chain's view stands in for it, and only while that view shows
+              // the validator at work. A validator whose signature is missing
+              // from the latest commit, or whose chain has not committed
+              // anything for a while, is not "healthy" because its lease and
+              // escrow are: devnet's only validator read healthy for fifteen
+              // hours (2026-11-05) with its node dead in a pod the provider
+              // would not open, because the last commit of the halted chain
+              // did carry its signature.
+              const commitAge = status.time ? Date.now() - Date.parse(status.time) : 0;
+              const staleAfterMs = Math.max(120_000, 30 * (86_400_000 / perDay));
+              const idle =
+                status.signed === false
+                  ? `the chain's latest commit (${status.height}) carries no signature from it`
+                  : commitAge > staleAfterMs
+                    ? `the chain's latest commit (${status.height}) is ${Math.round(commitAge / 60_000)} minutes old`
+                    : null;
+              if (idle) {
+                if (await this.validatorJailed(launch, spec, c.key)) {
+                  this.db.setComponentHealth(
+                    launchId, c.key, "jailed",
+                    "downtime-jailed on chain — unjail re-enters the set once the node is synced",
+                  );
+                  return;
+                }
+                this.db.setComponentHealth(
+                  launchId,
+                  c.key,
+                  "unreachable",
+                  details
+                    .concat(
+                      `its provider could not reach into its container (${status.providerError ?? "no detail"}), and ${idle}`,
+                    )
+                    .join("; "),
+                );
+                return;
+              }
+            }
+            if (!status.catchingUp && stalled(status, head)) {
               this.db.setComponentHealth(
                 launchId, c.key, "stalled", stalledDetail(status, head, details),
               );
@@ -2394,6 +2455,29 @@ export class FleetService {
           });
           connected = probeSaysConnected(probe.stdout);
         } catch {
+          // The validator does not answer the launcher (its pod not ready,
+          // its provider's SSH port reset), which says nothing about the
+          // signer, except in one shape: tmkms is timing out on connects it
+          // began while the node was down, and the signer port answers now.
+          // Left alone, each attempt waits out its two minutes against a
+          // node that gives the signer seconds to arrive (devnet 2026-11-05:
+          // fifteen hours of that). A signer on this machine can be checked
+          // from here, so it is restarted to dial again at once.
+          if (!b.remote && Date.now() - w.lastRestart >= SIGNER_WATCH_COOLDOWN_MS) {
+            const stuck = await host
+              .unitLog(b.unit, 20, b.scope)
+              .then((l) => /Connection timed out|I\/O error/.test(l))
+              .catch(() => false);
+            if (stuck && (await tcpAnswers(row.tailnet_ip, Number(new URL(signerAddr(row.tailnet_ip)).port)))) {
+              await restartSigner(
+                deps,
+                row.key,
+                "watchdog: the validator's signer port answers again while tmkms was still timing out on it",
+              );
+              w.misses = 0;
+              w.lastRestart = Date.now();
+            }
+          }
           continue;
         }
         if (connected) {
@@ -5218,4 +5302,18 @@ function backupsOf(spec: LaunchSpec): { s3: { endpoint: string; bucket: string; 
 function assertImageRef(image: string): void {
   const problem = imageRefProblem(image);
   if (problem) throw new Error(`"${image}" is not a valid image: ${problem}`);
+}
+
+/** Whether a TCP connection to host:port completes within `ms` (from this machine). */
+function tcpAnswers(host: string, port: number, ms = 3000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (ok: boolean) => {
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(ms, () => done(false));
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
 }

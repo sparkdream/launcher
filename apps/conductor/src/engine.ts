@@ -131,9 +131,22 @@ export class AwaitUser extends Error {
      *  the chain's frontend) and what the monitor watches to resume by
      *  itself (peering.ts PeerSetup). */
     readonly peerSetup?: unknown,
+    /** A way past the pause the user may take on their own judgment instead
+     *  of doing what the reason asks: the pause card offers it as a second
+     *  button, and the resume writes `<token>.pin` in the launch's work dir
+     *  for the throwing step to honor on its re-run. */
+    readonly override?: StepOverride,
   ) {
     super(reason);
   }
+}
+
+export interface StepOverride {
+  /** Pin file name (without .pin) in the launch's work dir; op-scoped, so a
+   *  later op on the same component pauses afresh. */
+  token: string;
+  /** Button label on the pause card. */
+  label: string;
 }
 
 /**
@@ -372,11 +385,12 @@ export async function runLaunch(
             launchId,
             step.name,
             cause.reason,
-            cause.funding?.length || cause.peerSetup
+            cause.funding?.length || cause.peerSetup || cause.override
               ? {
                   wallet: cause.wallet,
                   ...(cause.funding?.length ? { funding: cause.funding } : {}),
                   ...(cause.peerSetup ? { peerSetup: cause.peerSetup } : {}),
+                  ...(cause.override ? { override: cause.override } : {}),
                 }
               : cause.wallet,
           );

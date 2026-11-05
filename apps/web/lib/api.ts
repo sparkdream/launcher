@@ -164,6 +164,9 @@ export interface StepView {
   /** A federation peer's remaining setup on a chain whose committee key the
    *  launcher does not hold: the ways to finish it elsewhere. */
   peerSetup?: PeerSetup;
+  /** A way past the pause the user may take on their own judgment (a second
+   *  button on the pause card); resumeLaunch(id, override.token) takes it. */
+  override?: { token: string; label: string };
 }
 
 /** How the launcher's Keplr can send to a relayer key: a launcher fleet's
@@ -377,8 +380,15 @@ export async function startLaunch(id: string): Promise<void> {
   await json(await afetch(`/api/launches/${id}/start`, { method: "POST" }));
 }
 
-export async function resumeLaunch(id: string): Promise<void> {
-  await json(await afetch(`/api/launches/${id}/resume`, { method: "POST" }));
+export async function resumeLaunch(id: string, override?: string): Promise<void> {
+  await json(
+    await afetch(`/api/launches/${id}/resume`, {
+      method: "POST",
+      ...(override
+        ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ override }) }
+        : {}),
+    }),
+  );
 }
 
 export async function getPendingTx(id: string): Promise<PendingTx | null> {

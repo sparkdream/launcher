@@ -2022,6 +2022,7 @@ export function relaunchSteps(
       // (observed on jjozzietech) answer lease-shell for an already-closed
       // lease with empty success, which read as "still alive" and wedged
       // the op behind a container that was long torn down.
+      const oldGone = `op${opId}-old-gone`;
       if (row.ssh_host && row.ssh_port) {
         try {
           const probe = await ctx.services.ssh.exec(rowTarget(ctx, row), "echo zombie-probe");
@@ -2042,10 +2043,19 @@ export function relaunchSteps(
             // takes commands, so it is made inert now instead of waiting on a
             // teardown that may never come
             ctx.log(`${key}: the old container still answers after the close; its node is disabled now`);
+          } else if (probe.stdout.includes("zombie-probe") && fs.existsSync(path.join(ctx.dirs.root, `${oldGone}.pin`))) {
+            // the user vouched for it: the lease is closed and the mesh sweep
+            // evicts a straggler, so the relaunch goes on without the teardown
+            ctx.log(`${key}: the old container still answers after the close; continuing on the user's say-so`);
           } else if (probe.stdout.includes("zombie-probe")) {
             throw new AwaitUser(
               p("close"),
-              `${key}'s old container still answers SSH after close: wait for the provider to tear it down, then resume`,
+              `${key}'s old container still answers SSH after close and could not be disabled: wait for the provider to tear it down, then resume. ` +
+                "If it is gone by every other sign (provider lease status, mesh), continue anyway: the mesh sweep evicts a straggler.",
+              undefined,
+              undefined,
+              undefined,
+              { token: oldGone, label: "The old node is gone, continue" },
             );
           }
         } catch (e) {
@@ -6295,6 +6305,89 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
       },
     },
     {
+      name: p("tunnels"),
+      async run(ctx) {
+        // mesh-env aims every tunnel from the rows as they stood when it
+        // began. A re-key in that same run registers the re-keyed nodes
+        // afresh, at addresses recorded only once they rejoin at its end, so
+        // the tunnels that dial them were aimed at the old ones and stayed so
+        // until the next repair (2026-11-05: val-0 at its old sentry, both
+        // sentries and the relayer at val-0's old address, for the rest of a
+        // fifteen-hour outage). The same pass again, against the rows as they
+        // are now; a run that moved nothing finds nothing to do.
+        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+        const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
+        const msgs: Msg[] = [];
+        const pushes: Array<{ row: FleetComponentRow; json: string; pin: string }> = [];
+        for (const key of meshKeys) {
+          const row = rows.find((c) => c.key === key);
+          if (!row || row.state !== "active" || tunnelPeers(spec, key).size === 0) continue;
+          const sdlPath = sdlPathFor(ctx, key);
+          if (!fs.existsSync(sdlPath)) continue;
+          const text = fs.readFileSync(sdlPath, "utf8");
+          const retarget = retargetTunnelEnv(ctx, spec, key, text);
+          // the signature pauses this step, and on the re-run the SDL already
+          // carries the new targets: the pin is what says it still needs its push
+          const pin = path.join(ctx.dirs.root, `op${opId}-tunnels-${key}.pin`);
+          if (retarget.changes.length === 0 && !fs.existsSync(pin)) continue;
+          if (retarget.changes.length > 0) {
+            for (const c of retarget.changes) ctx.log(`${key}: tunnel re-aimed at ${c}`);
+            fs.writeFileSync(sdlPath, retarget.text);
+            fs.writeFileSync(pin, new Date().toISOString());
+          }
+          const artifacts = sdlArtifacts(loadSdl(sdlPath));
+          const wantHash = Buffer.from(artifacts.hash).toString("base64");
+          fs.writeFileSync(path.join(ctx.dirs.sdl, `${key}.manifest.json`), artifacts.manifestJson);
+          pushes.push({ row, json: artifacts.manifestJson, pin });
+          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+          if (onChain?.hash === wantHash) continue;
+          msgs.push({
+            typeUrl: TypeUrl.UpdateDeployment,
+            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+          });
+        }
+        if (pushes.length === 0) {
+          ctx.log("every tunnel already dials its peer's current address");
+          ctx.db.deletePendingTx(ctx.launchId, p("tunnels"));
+          return { repointed: [] };
+        }
+        if (msgs.length > 0) await ctx.requireTx(p("tunnels"), msgs);
+        else ctx.db.deletePendingTx(ctx.launchId, p("tunnels"));
+        const cert = loadCert(ctx);
+        const unpushed: string[] = [];
+        for (const { row, json, pin } of pushes) {
+          try {
+            await pushManifest(ctx, cert, row.key, row.host_uri, row.dseq, json);
+            fs.rmSync(pin, { force: true });
+          } catch (e) {
+            unpushed.push(row.key);
+            ctx.log(`${row.key}: could not send its manifest (${e instanceof Error ? e.message : String(e)})`);
+          }
+        }
+        if (unpushed.length > 0) {
+          throw new Error(
+            `${unpushed.join(", ")}: the re-aimed tunnels are on chain but the provider did not take the manifest; ` +
+              "retry once the provider answers, or relaunch the component",
+          );
+        }
+        // a new manifest recreates the container: give the nodes a moment to
+        // come back before the peers pass below reads their config
+        const nodesPushed = pushes.map((x) => x.row).filter((r) => /^(val|sentry)-/.test(r.key) && r.ssh_host);
+        for (const row of nodesPushed) {
+          let back = false;
+          for (let i = 0; i < 36 && !back; i++) {
+            await ctx.services.sleep(5000);
+            back = await ctx.services.ssh
+              .exec(rowTarget(ctx, row), "true", { quick: true })
+              .then(() => true)
+              .catch(() => false);
+          }
+          ctx.log(back ? `${row.key}: back after its tunnel change` : `${row.key}: not back within 3 minutes of its tunnel change; the peers pass skips it if it still does not answer`);
+        }
+        return { repointed: pushes.map((x) => x.row.key) };
+      },
+    },
+    {
       name: p("peers"),
       async run(ctx) {
         const rows = ctx.db.listFleetComponents(ctx.launchId) as FleetComponentRow[];
@@ -6303,6 +6396,15 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
         // matched to a fleet member without parsing its address first
         const keyForId = new Map(Object.entries(nodeIds).map(([k, id]) => [id, k]));
         const repaired: string[] = [];
+        const unreachable: string[] = [];
+        // The reads are quick probes, but the writes and the restart that
+        // follow were open-ended, and a node whose SSH port completes the
+        // handshake and then says nothing (sentry-1 on a provider whose
+        // ingress outlived the pod, 2026-11-05) held this step for twelve
+        // hours. Bound them: a node that cannot take its rewrite inside the
+        // limit is reported and left for its relaunch, and the rest of the
+        // fleet still gets its peers fixed.
+        const WRITE_MS = 60_000;
         for (const key of nodes(spec).map((n) => n.key)) {
           const row = rows.find((c) => c.key === key);
           if (!row || row.state !== "active" || !row.ssh_host) continue;
@@ -6313,14 +6415,31 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             })
             .catch(() => ({ stdout: "" }));
           const line = /^persistent_peers\s*=\s*"(.*)"/m.exec(got.stdout);
-          if (!line) continue;
+          if (!line) {
+            if (!got.stdout) unreachable.push(key);
+            continue;
+          }
+          try {
+            await rewirePeers(key, row, target, line[1] ?? "");
+          } catch (e) {
+            unreachable.push(key);
+            ctx.log(
+              `${key}: could not rewrite its peers (${e instanceof Error ? e.message.split("\n")[0] : String(e)}); ` +
+                "its config is left as it was: relaunch it, or re-run repair once it answers",
+            );
+          }
+        }
+        if (repaired.length === 0) ctx.log("every peer entry already names its node's current address");
+        return { repaired, ...(unreachable.length > 0 ? { unreachable } : {}) };
+
+        async function rewirePeers(key: string, row: FleetComponentRow, target: SshTarget, current: string) {
           if (key.startsWith("val-")) {
             const publicP2p: Record<number, string | undefined> = {};
             for (const s of resolveTopology(spec).validatorSentries[Number(key.split("-")[1])] ?? []) {
               const ep = await sentryPublicP2p(ctx, s).catch(() => undefined);
               publicP2p[s] = ep ? `${ep.host}:${ep.port}` : undefined;
             }
-            const problem = validatorPeersProblem(spec, key, line[1] ?? "", nodeIds, publicP2p);
+            const problem = validatorPeersProblem(spec, key, current, nodeIds, publicP2p);
             if (problem) {
               // not an address to re-aim but a line to rebuild: write it the
               // way a fresh launch would (public endpoint first, else the
@@ -6334,13 +6453,13 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
                 (s) => sentryPublicP2p(ctx, s),
               );
               ctx.log(`${key}: persistent_peers = "${wired.peers}"`);
-              await restartNode(ctx.services.ssh, target);
+              await restartNode(ctx.services.ssh, target, { timeoutMs: WRITE_MS });
               repaired.push(key);
-              continue;
+              return;
             }
           }
           const changes: string[] = [];
-          const next = (line[1] ?? "")
+          const next = current
             .split(",")
             .filter(Boolean)
             .map((entry) => {
@@ -6359,7 +6478,7 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
               return `${id}@${ip}:${port}`;
             })
             .join(",");
-          if (changes.length === 0) continue;
+          if (changes.length === 0) return;
           for (const c of changes) ctx.log(`${key}: peer re-aimed at ${c}`);
           // Anchor on the assignment. `^persistent_peers.*` also matches
           // CometBFT's persistent_peers_max_dial_period, twenty lines further
@@ -6371,13 +6490,12 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             target,
             `sed -i 's|^persistent_peers[[:space:]]*=.*|persistent_peers = "${next}"|' ` +
               `${NODE_HOME}/config/config.toml`,
+            { timeoutMs: WRITE_MS },
           );
           // a peer change only takes effect on a restart of the process
-          await restartNode(ctx.services.ssh, target);
+          await restartNode(ctx.services.ssh, target, { timeoutMs: WRITE_MS });
           repaired.push(key);
         }
-        if (repaired.length === 0) ctx.log("every peer entry already names its node's current address");
-        return { repaired };
       },
     },
     {
