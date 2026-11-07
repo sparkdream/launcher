@@ -6,8 +6,8 @@
 # One per network: since v1.0.56 the chain's parameter floors are build-tagged,
 # so the testnet build refuses a devnet genesis. Mainnet comes through fetch
 # mode or a seeded cache.
-ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.56
-ARG SPARKDREAMD_DEVNET_IMAGE=sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.56
+ARG SPARKDREAMD_IMAGE=sparkdreamnft/sparkdreamd-testnet-ssh:v1.0.57
+ARG SPARKDREAMD_DEVNET_IMAGE=sparkdreamnft/sparkdreamd-devnet-ssh:v1.0.57
 
 FROM ${SPARKDREAMD_IMAGE} AS chainbin
 FROM ${SPARKDREAMD_DEVNET_IMAGE} AS chainbin-devnet
