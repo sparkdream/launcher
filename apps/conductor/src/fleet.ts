@@ -254,6 +254,8 @@ import { estimateComponent, estimateNode, sizeToBytes } from "./estimate.js";
 import { cloudflareToken } from "./dns.js";
 import {
   depositsOf,
+  adoptNextOpsKey,
+  nextOpsKey,
   opsKey,
   recordSpend,
   spentToday,
@@ -2257,7 +2259,7 @@ export class FleetService {
     if (!op || op.status !== "active" || !(JSON.parse(op.params_json) as { auto?: boolean }).auto) return false;
     const msgs = JSON.parse(pending.msgs_json) as Msg[];
     const settings = unattendedSettings(this.db, launch.owner);
-    const { mnemonic, address } = await opsKey(this.workRoot, launch.owner);
+    const { mnemonic, address } = await this.currentOpsKey(launch.owner);
     let cached = this.grantCache.get(launch.owner);
     if (!cached || Date.now() - cached.at > 60_000) {
       cached = {
@@ -2309,9 +2311,27 @@ export class FleetService {
     return true;
   }
 
+  /**
+   * The launcher's key for this wallet, after adopting the next key once the
+   * wallet's grant for it is on chain (every grant goes to a fresh key:
+   * nextOpsKey in unattended.ts says why).
+   */
+  private async currentOpsKey(owner: string): Promise<{ mnemonic: string; address: string }> {
+    const next = await nextOpsKey(this.workRoot, owner, false);
+    const chain = this.services.unattended;
+    if (next && chain) {
+      const grants = await chain.grants(owner, next.address).catch(() => null);
+      if (grants && UNATTENDED_MSG_TYPES.every((t) => grants.some((g) => g.msgType === t))) {
+        adoptNextOpsKey(this.workRoot, owner);
+        this.grantCache.delete(owner);
+      }
+    }
+    return opsKey(this.workRoot, owner);
+  }
+
   /** The wallet's unattended-recovery state: the launcher's key, the grant on chain, the settings. */
   async unattendedStatus(owner: string): Promise<UnattendedStatus> {
-    const { address } = await opsKey(this.workRoot, owner);
+    const { address } = await this.currentOpsKey(owner);
     const settings = unattendedSettings(this.db, owner);
     const chain = this.services.unattended;
     const grants = chain ? await chain.grants(owner, address).catch(() => null) : null;
@@ -2330,13 +2350,15 @@ export class FleetService {
     };
   }
 
-  /** What the wallet signs (Keplr) to grant or revoke unattended recovery. */
+  /**
+   * What the wallet signs (Keplr) to grant or revoke unattended recovery. A
+   * grant goes to a fresh key and withdraws what the current key holds, in
+   * one tx: the same pair is never granted twice (nextOpsKey says why).
+   */
   async unattendedMsgs(owner: string, kind: "grant" | "revoke", days = 30, feeLimit = { denom: UNATTENDED_FEE_DENOM, amount: "5000000" }): Promise<Msg[]> {
-    const { address } = await opsKey(this.workRoot, owner);
-    // what the chain holds now: a renewal must replace a live fee allowance
-    // (a second one is refused), and a revoke may only name what is there
-    // (one missing grant fails the whole tx). Unknown: assume a fresh grant
-    // and a full revoke, as before
+    const { address } = await this.currentOpsKey(owner);
+    // what the chain holds now: a revoke may only name what is there (one
+    // missing grant fails the whole tx). Unknown: assume a full revoke
     const chain = this.services.unattended;
     const grants = chain ? await chain.grants(owner, address).catch(() => null) : null;
     const allowance = chain ? await chain.allowance(owner, address).catch(() => undefined) : undefined;
@@ -2348,8 +2370,20 @@ export class FleetService {
     }
     if (!(days >= 1 && days <= 365)) throw new Error("a grant lasts 1 to 365 days");
     if (!/^\d+$/.test(feeLimit.amount)) throw new Error("the fee limit is a whole number of base units");
+    // the old key's withdrawal must name exactly what it holds, or the
+    // whole tx fails: no guessing when the chain cannot be read
+    if (!chain || grants === null || allowance === undefined) {
+      throw new Error("could not read the launcher key's current grant on Akash: try again in a minute");
+    }
+    const next = (await nextOpsKey(this.workRoot, owner, true))!;
+    // an earlier, unfinished grant to the next key (allowance only) is replaced
+    const nextAllowance = await chain.allowance(owner, next.address).catch(() => null);
+    const held = UNATTENDED_MSG_TYPES.filter((t) => grants.some((g) => g.msgType === t));
     const expiration = new Date(Date.now() + days * 86_400_000).toISOString().replace(/\.\d+Z$/, "Z");
-    return unattendedGrantMsgs(owner, address, expiration, feeLimit, { replaceAllowance: Boolean(allowance) });
+    return [
+      ...(held.length > 0 || allowance ? unattendedRevokeMsgs(owner, address, Boolean(allowance), held) : []),
+      ...unattendedGrantMsgs(owner, next.address, expiration, feeLimit, { replaceAllowance: Boolean(nextAllowance) }),
+    ];
   }
 
 

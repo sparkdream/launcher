@@ -4947,7 +4947,8 @@ export default function Page() {
                     Lets the launcher sign the transactions of the recoveries it starts on its own (a fleet&apos;s
                     auto-recovery), as this wallet: create, update and close deployments and create leases,
                     nothing else (no transfers). Your wallet grants that to the launcher&apos;s key below for 30
-                    days, plus a fee allowance; new deployments&apos; deposits are capped per day here.
+                    days, plus a fee allowance; new deployments&apos; deposits are capped per day here. Each grant goes to
+                    a new launcher key and withdraws the old key&apos;s grant in the same transaction.
                   </div>
                   <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
                     <div>

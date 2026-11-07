@@ -138,8 +138,51 @@ export async function opsKey(workRoot: string, owner: string): Promise<{ mnemoni
     mnemonic = (await DirectSecp256k1HdWallet.generate(24, { prefix: "akash" })).mnemonic;
     writeSecretFile(file, `${mnemonic}\n`);
   }
+  return { mnemonic, address: await addressOf(mnemonic) };
+}
+
+/**
+ * Every grant goes to a fresh key (the "next" key), adopted once the wallet's
+ * grant for it is on chain. Never re-granting the same granter/grantee pair
+ * sidesteps a feegrant bug: MsgRevokeAllowance deletes the allowance but not
+ * its expiry-queue entry (the keeper builds that key with granter and
+ * grantee swapped), and when the stale entry's date comes the end-blocker
+ * deletes whatever allowance the pair holds then. A renewal (revoke, then
+ * grant to the same key) so lost its allowance 30 days after each earlier
+ * grant: "no fee allowance" every few days in November 2026.
+ */
+const nextKeyFile = (workRoot: string, owner: string) => keyFile(workRoot, owner).replace(/\.mnemonic$/, ".next.mnemonic");
+
+async function addressOf(mnemonic: string): Promise<string> {
   const [account] = await (await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, { prefix: "akash" })).getAccounts();
-  return { mnemonic, address: account!.address };
+  return account!.address;
+}
+
+/** The key the next grant goes to: made on first ask, kept until adopted (an abandoned Keplr prompt reuses it). */
+export async function nextOpsKey(workRoot: string, owner: string, create: boolean): Promise<{ mnemonic: string; address: string } | null> {
+  const file = nextKeyFile(workRoot, owner);
+  let mnemonic: string;
+  if (fs.existsSync(file)) {
+    mnemonic = readSecretFile(file).trim();
+  } else if (create) {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    mnemonic = (await DirectSecp256k1HdWallet.generate(24, { prefix: "akash" })).mnemonic;
+    writeSecretFile(file, `${mnemonic}\n`);
+  } else {
+    return null;
+  }
+  return { mnemonic, address: await addressOf(mnemonic) };
+}
+
+/** The next key becomes the launcher's key; the old one is kept aside, never deleted. */
+export function adoptNextOpsKey(workRoot: string, owner: string, now = new Date()): void {
+  const current = keyFile(workRoot, owner);
+  const next = nextKeyFile(workRoot, owner);
+  if (!fs.existsSync(next)) return;
+  if (fs.existsSync(current)) {
+    fs.renameSync(current, current.replace(/\.mnemonic$/, `.retired-${now.toISOString().replace(/[:.]/g, "-")}.mnemonic`));
+  }
+  fs.renameSync(next, current);
 }
 
 // --- per-owner settings and the daily cap ---

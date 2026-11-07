@@ -348,35 +348,49 @@ describe("granting", () => {
     expect(fs.existsSync(path.join(work, "secrets"))).toBe(false);
   });
 
-  it("builds the grant for the launcher's key: four msg types and an Exec-only fee allowance", async () => {
+  it("builds the grant for a fresh key: four msg types and an Exec-only fee allowance, adopted once on chain", async () => {
     const w = await launched();
-    const { address } = await opsKey(w.work, OWNER);
+    const { address: first } = await opsKey(w.work, OWNER);
     const msgs = await w.fleet.unattendedMsgs(OWNER, "grant", 30);
     expect(msgs.filter((m) => m.typeUrl === TypeUrl.Grant).map((m) => (m.value as any).msg_type_url)).toEqual([
       ...UNATTENDED_MSG_TYPES,
     ]);
     const allowance = msgs.find((m) => m.typeUrl === TypeUrl.GrantAllowance)!.value as any;
-    expect(allowance.grantee).toBe(address);
+    const next = allowance.grantee as string;
+    expect(next).not.toBe(first);
     expect(allowance.allowed_messages).toEqual([TypeUrl.Exec]);
     // fees are paid in uakt, the only fee denom Akash nodes take
     expect(allowance.spend_limit).toEqual([{ denom: "uakt", amount: "5000000" }]);
-    // the same key every time, kept in the launcher's secrets
-    expect((await opsKey(w.work, OWNER)).address).toBe(address);
-    expect(fs.existsSync(path.join(w.work, "secrets", `unattended-${OWNER}.mnemonic`))).toBe(true);
-    // fresh: nothing to replace
-    expect(msgs.some((m) => m.typeUrl === TypeUrl.RevokeAllowance)).toBe(false);
+    // the current key holds nothing: nothing to withdraw
+    expect(msgs.some((m) => m.typeUrl === TypeUrl.Revoke || m.typeUrl === TypeUrl.RevokeAllowance)).toBe(false);
+    // an abandoned prompt asks again for the same next key
+    const again = await w.fleet.unattendedMsgs(OWNER, "grant", 30);
+    expect((again.find((m) => m.typeUrl === TypeUrl.GrantAllowance)!.value as any).grantee).toBe(next);
+    // not adopted until the grant is on chain
+    expect((await w.fleet.unattendedStatus(OWNER)).grantee).toBe(first);
+    w.chain.grantAll(OWNER, next, UNATTENDED_MSG_TYPES);
+    expect((await w.fleet.unattendedStatus(OWNER)).grantee).toBe(next);
+    expect((await opsKey(w.work, OWNER)).address).toBe(next);
+    const files = fs.readdirSync(path.join(w.work, "secrets")).filter((f) => f.startsWith(`unattended-${OWNER}`));
+    expect(files.some((f) => f.includes(".retired-"))).toBe(true);
+    expect(files.some((f) => f.includes(".next."))).toBe(false);
   }, 120_000);
 
-  it("a renewal replaces the live fee allowance, and a revoke names only what the chain holds", async () => {
+  it("a renewal moves to a new key and withdraws what the old one holds; a revoke names only what the chain holds", async () => {
     const w = await launched();
     const { address } = await opsKey(w.work, OWNER);
     const chain = w.chain;
     chain.grantAll(OWNER, address, UNATTENDED_MSG_TYPES.slice(0, 2));
-    chain.allowances.set(`${OWNER}/${address}`, { spendLimit: [{ denom: "uact", amount: "5000000" }], expiration: null });
+    chain.allowances.set(`${OWNER}/${address}`, { spendLimit: [{ denom: "uakt", amount: "5000000" }], expiration: null });
 
     const renew = await w.fleet.unattendedMsgs(OWNER, "grant", 30);
-    expect(renew[0]!.typeUrl).toBe(TypeUrl.RevokeAllowance);
-    expect(renew.filter((m) => m.typeUrl === TypeUrl.GrantAllowance)).toHaveLength(1);
+    // the old pair is withdrawn, never re-granted (feegrant's revoke leaves a
+    // stale expiry entry that would later delete the pair's new allowance)
+    expect(renew.filter((m) => m.typeUrl === TypeUrl.Revoke).map((m) => (m.value as any).grantee)).toEqual([address, address]);
+    expect(renew.filter((m) => m.typeUrl === TypeUrl.RevokeAllowance).map((m) => (m.value as any).grantee)).toEqual([address]);
+    const grantees = new Set(renew.filter((m) => m.typeUrl === TypeUrl.Grant || m.typeUrl === TypeUrl.GrantAllowance).map((m) => (m.value as any).grantee));
+    expect(grantees.size).toBe(1);
+    expect(grantees.has(address)).toBe(false);
 
     const revoke = await w.fleet.unattendedMsgs(OWNER, "revoke");
     expect(revoke.filter((m) => m.typeUrl === TypeUrl.Revoke).map((m) => (m.value as any).msg_type_url)).toEqual(
@@ -387,5 +401,13 @@ describe("granting", () => {
     chain.grantsByPair.clear();
     chain.allowances.clear();
     await expect(w.fleet.unattendedMsgs(OWNER, "revoke")).rejects.toThrow(/nothing to revoke/);
+  }, 120_000);
+
+  it("refuses to build a grant when the current key's grant cannot be read", async () => {
+    const w = await launched();
+    w.chain.grants = async () => {
+      throw new Error("HTTP 521");
+    };
+    await expect(w.fleet.unattendedMsgs(OWNER, "grant", 30)).rejects.toThrow(/could not read/);
   }, 120_000);
 });

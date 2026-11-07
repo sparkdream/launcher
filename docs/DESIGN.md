@@ -128,10 +128,17 @@ key the conductor holds (one per wallet, `secrets/unattended-<owner>.mnemonic`)
 `GenericAuthorization` for exactly `MsgCreateDeployment`,
 `MsgUpdateDeployment`, `MsgCloseDeployment` and `MsgCreateLease`, plus a fee
 allowance restricted to `MsgExec`, both expiring (30 days from the System
-panel; revocable there). The msgs are built from what the chain holds: a
-renewal revokes the live fee allowance first in the same tx (the feegrant
-module refuses a second one), and a revoke names only the grants still
-there (a missing one fails the whole tx). The conductor then signs, as `MsgExec` with the
+panel; revocable there). Every grant goes to a fresh key
+(`unattended-<owner>.next.mnemonic`, adopted once its grant is on chain;
+the old key is renamed `.retired-<time>`, never deleted) and withdraws what
+the current key holds in the same tx. The same granter/grantee pair is
+never granted twice because of a feegrant bug: `MsgRevokeAllowance` leaves
+the allowance's expiry-queue entry behind (the keeper builds its key with
+granter and grantee swapped), and on that date the end-blocker deletes
+whatever allowance the pair holds by then (November 2026: "no fee
+allowance" every few days after renewals). The msgs are built from what the
+chain holds: a revoke names only the grants still there (a missing one
+fails the whole tx), and a grant is refused while the chain cannot be read. The conductor then signs, as `MsgExec` with the
 owner as fee granter, only the pending txs of ops that a fleet's
 auto-recovery started (`auto: true` on the op), only those four msg types,
 only for the owner's own deployments, and only while new deployments'
