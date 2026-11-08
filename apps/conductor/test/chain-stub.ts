@@ -160,6 +160,10 @@ if (a0 === "tx" && a1 === "broadcast") {
   const run = (m) => {
     const t = m["@type"].split(".").pop();
     if (t === "MsgRegisterPeer") {
+      // the chain's ValidateBasic (v1.0.57+): required on Spark Dream peers, refused on others
+      const sd = m.type === "PEER_TYPE_SPARK_DREAM" || m.type === 1;
+      if (sd && !m.expected_chain_id) throw new Error("expected_chain_id is required for a Spark Dream peer: chain id is empty");
+      if (!sd && m.expected_chain_id) throw new Error("expected_chain_id is only for Spark Dream peers");
       chain.peers[m.peer_id] = { id: m.peer_id, type: m.type, status: "PEER_STATUS_PENDING",
         ibc_channel_id: m.ibc_channel_id, ibc_transfer_channel_id: m.ibc_transfer_channel_id || "",
         peer_identity: m.peer_identity };

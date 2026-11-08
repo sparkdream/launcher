@@ -106,6 +106,7 @@ describe("ensurePeerActive", () => {
       "@type": "/sparkdream.federation.v1.MsgRegisterPeer",
       authority: WALLET_SIGNER,
       ibc_transfer_channel_id: "channel-0",
+      expected_chain_id: "aurora-1",
     });
     expect(stub.state().log).toHaveLength(0);
 
@@ -200,7 +201,7 @@ describe("ensurePeerActive", () => {
     );
     expect(first!.registerHint).toBe(
       "peer id aurora-1, type Spark Dream, IBC channel channel-1 (this chain's end of the federation channel to aurora-1), " +
-        "transfer channel channel-0, peer chain API https://api.aurora.example",
+        "transfer channel channel-0, expected chain id aurora-1, peer chain API https://api.aurora.example",
     );
     expect(first!.links!.policy).toBe("https://app.phoenix.example/federation?policy=aurora-1");
     expect(first!.links!.activate).toBe("https://app.phoenix.example/federation?activate=aurora-1");

@@ -60,6 +60,10 @@ export interface PeerTarget {
   displayName: string;
   ibcChannelId?: string;
   ibcTransferChannelId?: string;
+  /** The chain id the peer's federation channel must lead to (MsgRegisterPeer
+   *  expected_chain_id, required for Spark Dream peers since v1.0.57). A Spark
+   *  Dream peer's id is its chain id, so it defaults to `id`. */
+  expectedChainId?: string;
   peerIdentity?: Record<string, unknown>;
   /** PeerPolicy JSON (proto field names), peer_id filled in by ensurePeerActive. */
   policy: Record<string, unknown>;
@@ -340,7 +344,14 @@ export async function peerProgress(rpc: RpcProber, rest: string, peerId: string)
   return progressOf(peer?.peer ?? null, policy?.policy);
 }
 
+/** MsgRegisterPeer.expected_chain_id: set for Spark Dream peers only (the
+ *  chain refuses it on any other type, and requires it on these). */
+function expectedChainId(target: PeerTarget): string | undefined {
+  return target.type === "PEER_TYPE_SPARK_DREAM" ? (target.expectedChainId ?? target.id) : undefined;
+}
+
 function registerMsg(target: PeerTarget, authority: string): Record<string, unknown> {
+  const expected = expectedChainId(target);
   return {
     "@type": "/sparkdream.federation.v1.MsgRegisterPeer",
     authority,
@@ -352,6 +363,7 @@ function registerMsg(target: PeerTarget, authority: string): Record<string, unkn
     controller_group: "",
     ...(target.peerIdentity ? { peer_identity: target.peerIdentity } : {}),
     ...(target.ibcTransferChannelId ? { ibc_transfer_channel_id: target.ibcTransferChannelId } : {}),
+    ...(expected ? { expected_chain_id: expected } : {}),
   };
 }
 
@@ -572,6 +584,7 @@ async function ensurePeerByWallet(
             `type Spark Dream`,
             ...(target.ibcChannelId ? [`IBC channel ${target.ibcChannelId} (this chain's end of the federation channel to ${target.id})`] : []),
             ...(target.ibcTransferChannelId ? [`transfer channel ${target.ibcTransferChannelId}`] : []),
+            ...(expectedChainId(target) ? [`expected chain id ${expectedChainId(target)}`] : []),
             ...(target.peerApi ? [`peer chain API ${target.peerApi}`] : []),
           ].join(", "),
         }
@@ -655,19 +668,7 @@ export async function ensurePeerActive(
 
   // 1. register
   if (!peer || peer.status === "PEER_STATUS_REMOVED") {
-    const register = (authority: string) => ({
-      "@type": "/sparkdream.federation.v1.MsgRegisterPeer",
-      authority,
-      peer_id: target.id,
-      display_name: target.displayName,
-      type: target.type,
-      ibc_channel_id: target.ibcChannelId ?? "",
-      metadata: "registered by the SparkDream launcher",
-      controller_group: "",
-      ...(target.peerIdentity ? { peer_identity: target.peerIdentity } : {}),
-      ...(target.ibcTransferChannelId ? { ibc_transfer_channel_id: target.ibcTransferChannelId } : {}),
-    });
-    await sendTx(ctx, chain, `${tag}-register`, [register(chain.signer.address)]);
+    await sendTx(ctx, chain, `${tag}-register`, [registerMsg(target, chain.signer.address)]);
     ctx.log(`${chain.chainId}: registered peer ${target.id} (PENDING)`);
     peer = await getPeer(chain, target.id);
     if (!peer) throw new Error(`${chain.chainId}: peer ${target.id} missing right after registration`);
