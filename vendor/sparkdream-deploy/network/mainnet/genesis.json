@@ -128,7 +128,7 @@
         {
           "@type": "/cosmos.auth.v1beta1.BaseAccount",
           "account_number": "6",
-          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "address": "sprkdrm1a7qwr6cvu5s37g6n23668rd9kmnq387h58aw5t",
           "pub_key": null,
           "sequence": "0"
         },
@@ -223,7 +223,7 @@
           ]
         },
         {
-          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "address": "sprkdrm1a7qwr6cvu5s37g6n23668rd9kmnq387h58aw5t",
           "coins": [
             {
               "amount": "450000000000",
@@ -1138,7 +1138,7 @@
           "zeroed_count": 0
         },
         {
-          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "address": "sprkdrm1a7qwr6cvu5s37g6n23668rd9kmnq387h58aw5t",
           "completed_initiatives_count": 0,
           "completed_interims_count": 0,
           "content_license": "CC0-1.0",
@@ -1669,7 +1669,7 @@
           "achievements": [
             "genesis_founder"
           ],
-          "address": "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu",
+          "address": "sprkdrm1a7qwr6cvu5s37g6n23668rd9kmnq387h58aw5t",
           "challenges_won": 0,
           "display_name": "Gilda",
           "display_title": "",

@@ -389,6 +389,92 @@ export function assertNoReferenceAccounts(
   }
 }
 
+/**
+ * Fail a spec that leans on the image's compiled-in founders but does not
+ * place them where the image expects.
+ *
+ * With no account flagged `council`, founding_members stays empty and the
+ * x/commons bootstrap seats the founder addresses compiled into the image
+ * (GenesisNames / GenesisHandles), giving each its council seat, display name
+ * and reserved handles. That only works for accounts the spec puts at exactly
+ * those addresses. The reference genesis vendored with the same chain version
+ * is generated from the same founder roster, so its members are the compiled
+ * list.
+ *
+ * The failure this catches is silent: when the chain repo swaps a founder's
+ * address (a lost key, 2026-11-09: gilda on v1.0.58) and a stored spec still
+ * carries the old one, the chain starts and runs, the member keeps her DREAM
+ * and profile at the old address, and the bootstrap finds no account at the
+ * new one, so she has no name, no handles and no seat.
+ *
+ * It applies only to a relaunch of the reference network itself: a spec that
+ * flags council accounts brings its own founders, and one that reuses no
+ * reference address is a different chain (validateSpec covers that case).
+ * Every reference member must then be at its reference address. A spec
+ * account carrying a founder's name at another address is named in the
+ * error.
+ */
+export function assertCompiledFoundersMatch(
+  spec: LaunchSpec,
+  reference: Json,
+  versionLabel?: string,
+): void {
+  if (spec.join) return;
+  if (spec.accounts.initial.some((a) => a.council)) return;
+
+  const app = (reference.app_state ?? {}) as Json;
+  const usernames = new Map<string, string>(
+    ((app.season?.member_profile_map ?? []) as Json[]).map((p) => [p.address, p.username ?? ""]),
+  );
+  const founders = ((app.rep?.member_map ?? []) as Json[])
+    .map((m) => m.address as string)
+    .filter(Boolean)
+    .map((address) => ({ address, username: usernames.get(address) ?? "" }));
+  if (founders.length === 0) return;
+
+  const explicit = spec.accounts.initial
+    .map((acct, i) => ({ acct, i }))
+    .filter(({ acct }) => Boolean(acct.address));
+  const founderSet = new Set(founders.map((f) => f.address));
+  // reusing no reference address means this is not a relaunch of that network
+  if (!explicit.some(({ acct }) => founderSet.has(acct.address!))) return;
+
+  const placed = new Set(explicit.map(({ acct }) => acct.address!));
+  const accountUsername = (acct: (typeof spec.accounts.initial)[number]): string | undefined =>
+    typeof acct.member === "object" ? acct.member.username : undefined;
+  const from = versionLabel ? `the ${versionLabel} reference genesis` : "the reference genesis";
+
+  const problems: string[] = [];
+  for (const founder of founders) {
+    if (placed.has(founder.address)) continue;
+    const label = founder.username || "an unnamed founder";
+    const stale = founder.username
+      ? explicit.find(
+          ({ acct }) =>
+            !founderSet.has(acct.address!) &&
+            (acct.name === founder.username || accountUsername(acct) === founder.username),
+        )
+      : undefined;
+    problems.push(
+      stale
+        ? `accounts.initial[${stale.i}] (${stale.acct.name}) is at ${stale.acct.address}, but ` +
+            `${from} and the image's compiled-in founders put ${label} at ${founder.address}`
+        : `${label} (${founder.address}) is a compiled-in founder in ${from} but is missing ` +
+            `from accounts.initial`,
+    );
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      "founder accounts do not match the image: " +
+        problems.join("; ") +
+        ". Fix: \"load spec into editor\", set those accounts' address to the image's, then " +
+        "reset from the edited spec (or flag council accounts to choose the founders " +
+        "explicitly). Otherwise the chain starts with those founders lacking their council " +
+        "seat, display name and handles, because the spec relaunches the reference network on " +
+        "the image's compiled-in founders (no account is flagged council).",
+    );
+  }
+}
 
 /**
  * Write x/commons founding_members from spec accounts flagged `council`.

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { applyReferenceGenesis, assertNoReferenceAccounts } from "../src/genesis-params.js";
+import { applyReferenceGenesis, assertCompiledFoundersMatch, assertNoReferenceAccounts } from "../src/genesis-params.js";
 
 /**
  * The guard that keeps the reference network's own accounts out of a launched
@@ -94,5 +94,76 @@ describe("applyReferenceGenesis / reference blog content", () => {
     expect(genesis.app_state.blog.posts).toHaveLength(1);
     expect(genesis.app_state.blog.posts[0].creator).toBe(author);
     expect(genesis.app_state.blog.post_count).toBe(reference.app_state.blog.post_count);
+  });
+});
+
+/**
+ * A relaunch of a reference network that leans on the image's compiled-in
+ * founders (no council accounts) must place every founder at the address the
+ * image compiles in. 2026-11-09: v1.0.58 moved gilda to a new address after a
+ * lost key; the stored testnet spec still carried the old one, and the chain
+ * started with her DREAM and profile at the old address and no name.
+ */
+describe("assertCompiledFoundersMatch", () => {
+  const reference = load("testnet");
+  const profiles = new Map<string, string>(
+    (reference.app_state.season.member_profile_map as { address: string; username: string }[]).map(
+      (p) => [p.address, p.username],
+    ),
+  );
+  const founders = (reference.app_state.rep.member_map as { address: string }[]).map((m, i) => ({
+    name: profiles.get(m.address) || `account${i + 1}`,
+    address: m.address,
+  }));
+  const gilda = founders.find((f) => f.name === "gilda")!;
+  const OLD_GILDA = "sprkdrm1x39wrr0l8x5lvxzuwff65t7zkw23fyyeres2mu";
+
+  const specOf = (accounts: { name: string; address: string; council?: boolean }[], extra: object = {}) =>
+    ({
+      accounts: {
+        initial: accounts.map((a) => ({
+          ...a,
+          amount: "1",
+          member: { trustLevel: "established", username: a.name.startsWith("account") ? undefined : a.name },
+        })),
+      },
+      ...extra,
+    }) as any;
+
+  it("passes when every compiled-in founder is at its reference address", () => {
+    expect(() => assertCompiledFoundersMatch(specOf(founders), reference)).not.toThrow();
+  });
+
+  it("names a founder whose account sits at a superseded address", () => {
+    const stale = founders.map((f) => (f.name === "gilda" ? { ...f, address: OLD_GILDA } : f));
+    expect(() => assertCompiledFoundersMatch(specOf(stale), reference, "v1.0.58")).toThrow(
+      new RegExp(`\\(gilda\\) is at ${OLD_GILDA}, but the v1.0.58 reference genesis .* ${gilda.address}`),
+    );
+  });
+
+  it("reports a compiled-in founder missing from the spec", () => {
+    const missing = founders.filter((f) => f.name !== "gilda");
+    expect(() => assertCompiledFoundersMatch(specOf(missing), reference)).toThrow(
+      new RegExp(`gilda \\(${gilda.address}\\) is a compiled-in founder .* missing`),
+    );
+  });
+
+  it("does not apply when the spec chooses its founders with council accounts", () => {
+    const stale = founders.map((f) =>
+      f.name === "gilda" ? { ...f, address: OLD_GILDA, council: true } : f,
+    );
+    expect(() => assertCompiledFoundersMatch(specOf(stale), reference)).not.toThrow();
+  });
+
+  it("does not apply to a chain that reuses no reference address", () => {
+    const other = [{ name: "phoenix", address: OLD_GILDA }];
+    expect(() => assertCompiledFoundersMatch(specOf(other), reference)).not.toThrow();
+  });
+
+  it("does not apply in join mode", () => {
+    const stale = founders.map((f) => (f.name === "gilda" ? { ...f, address: OLD_GILDA } : f));
+    expect(() =>
+      assertCompiledFoundersMatch(specOf(stale, { join: { chainId: "sparkdream-test-1" } }), reference),
+    ).not.toThrow();
   });
 });

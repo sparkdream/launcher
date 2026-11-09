@@ -200,7 +200,9 @@ import { bpsAmount, feeCoin, feeConfig } from "./fee.js";
 import { NODE_HOME, restartNode, rpcUrl, stalled } from "./node-ops.js";
 import { meshSocketFromSdl, sweepMeshStrays } from "./mesh-strays.js";
 import { sparkdreamd } from "./exec.js";
-import { resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
+import { imageSemver, resolveChainAssets, runWithAssets } from "./chain-assets/index.js";
+import { assertCompiledFoundersMatch } from "./genesis-params.js";
+import { referenceGenesisPath } from "./vendor.js";
 import { valoperAddress } from "./gentx.js";
 import { PRICING_DENOM } from "./render-sdl.js";
 import type { Services } from "./services.js";
@@ -5056,6 +5058,18 @@ export class FleetService {
     // same fields off the deployed spec so the editor can never contradict
     // the running fleet; report every violation at once, since fixing them
     // one 409 at a time is the slowest way to learn what a reset can move
+    // the founder check against the version's reference genesis, at once
+    // when its assets are local; otherwise the op's check-genesis step runs
+    // it after fetching them, still before the halt
+    const assets = resolveChainAssets(proposed, this.workRoot);
+    if (assets) {
+      runWithAssets(assets, () => {
+        const reference = JSON.parse(
+          fs.readFileSync(referenceGenesisPath(proposed.network.type), "utf8"),
+        );
+        assertCompiledFoundersMatch(proposed, reference, imageSemver(proposed.images.sparkdreamd) ?? undefined);
+      });
+    }
     const violations = frozenResetViolations(current, proposed);
     if (violations.length > 0) {
       throw new Error(

@@ -22,6 +22,7 @@ import {
   applyFoundingMembers,
   applyGenesisMembers,
   applyReferenceGenesis,
+  assertCompiledFoundersMatch,
   assertNoReferenceAccounts,
   commissionFlags,
 } from "../genesis-params.js";
@@ -50,6 +51,7 @@ import {
   bakedModeError,
   chainAssetMode,
   fetchChainAssets,
+  imageSemver,
   pruneCache,
   resolveChainAssets,
   type ChainAssets,
@@ -365,6 +367,9 @@ export async function buildGenesisFiles(
   const reference = JSON.parse(
     fs.readFileSync(referenceGenesisPath(spec.network.type), "utf8"),
   );
+  // A relaunch on the image's compiled-in founders must place them where
+  // the image expects, or they start without seat, name and handles.
+  assertCompiledFoundersMatch(spec, reference, imageSemver(spec.images.sparkdreamd) ?? undefined);
   applyReferenceGenesis(genesis, reference, spec);
   applyGenesisMembers(genesis, reference, spec, keys.accounts);
   applyFoundingMembers(genesis, spec, keys.accounts);

@@ -31,7 +31,9 @@ import {
   type MastodonBackupRecord,
   type MastodonRestoreParams,
 } from "./mastodon-backup.js";
-import { runWithAssets } from "./chain-assets/index.js";
+import { imageSemver, runWithAssets } from "./chain-assets/index.js";
+import { assertCompiledFoundersMatch } from "./genesis-params.js";
+import { referenceGenesisPath } from "./vendor.js";
 import { AwaitUser, launchDirs, RerunFrom, type StepCtx, type StepDef } from "./engine.js";
 import { sendMsg } from "@sparkdream/akash-tx";
 import { createDeploymentMsg, createLeaseMsg, TypeUrl, type Msg } from "./akash/messages.js";
@@ -4486,6 +4488,22 @@ export function resetChainSteps(opId: number, params: ResetChainParams, spec: La
     );
 
   const steps: StepDef[] = [
+    {
+      name: p("check-genesis"),
+      async run(ctx) {
+        // rebuild-genesis runs only after the halt; a spec it would refuse
+        // must fail here, while the chain is still running. Same assets
+        // (the spec's version) as rebuild-genesis reads.
+        const assets = await ensureChainAssets(ctx);
+        return runWithAssets(assets, async () => {
+          const reference = JSON.parse(
+            fs.readFileSync(referenceGenesisPath(spec.network.type), "utf8"),
+          );
+          assertCompiledFoundersMatch(spec, reference, imageSemver(spec.images.sparkdreamd) ?? undefined);
+          return { checked: true };
+        });
+      },
+    },
     {
       name: p("halt"),
       async run(ctx) {
