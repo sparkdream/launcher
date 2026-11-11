@@ -1,11 +1,12 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { fleetBridge, sessionDays, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { BRIDGE_OPERATOR } from "./components/mastodon-secrets.js";
 import { SCANNER_OPERATOR } from "./components/scanner-secrets.js";
 import type { ConductorDb, FleetComponentRow } from "./db.js";
-import { AwaitUser, WALLET_SIGNER, type StepCtx } from "./engine.js";
+import { AwaitUser, WALLET_SIGNER, launchDirs, type StepCtx } from "./engine.js";
 import { sparkdreamd } from "./exec.js";
 import { fleetActor, sendTx, walletPause, type ChainActor } from "./peering.js";
 import { readSecretFile, writeSecretFile } from "./secrets.js";
@@ -47,6 +48,15 @@ import { battleRelayer, battleTargetId } from "./battle.js";
  * of the key it replaces) pauses for that member's signature. The new key is
  * recorded, marked pending, before the pause, so the resume finds the grant
  * on chain and delivers that same key rather than minting another.
+ *
+ * From v1.0.58 the chain asks a session key's grantee to consent (SES-102):
+ * a grant from a granter the grantee has not allowed yet waits as PENDING,
+ * and every grant here goes to a fresh key, so every one of them does. The
+ * daemon's first use of the key would accept it, but a verifier may have
+ * nothing to verify for a day, and the chain drops a grant left pending
+ * for 24 hours (the granter's deposit with it). So the launcher, which holds
+ * the key, accepts each grant itself as soon as it is on chain
+ * (acceptGrant); the grant's send gives the key enough for that fee.
  */
 
 export type SessionRole = "verifier" | "bridge" | "scanner" | "battle";
@@ -147,15 +157,31 @@ function settings(spec: LaunchSpec, role: SessionRole): { days: number; spendLim
 /** Gas of the grant tx (account-creating send + MsgCreateSession). */
 const GRANT_TX_GAS = 400_000;
 
+/** Gas of the key's own MsgAcceptGrant (SES-102). */
+const ACCEPT_GAS = 200_000;
+
+function acceptFee(gasPrice: number): bigint {
+  return BigInt(Math.ceil(gasPrice * ACCEPT_GAS));
+}
+
+/**
+ * What the grant sends its key: 1 unit, which creates the key's auth
+ * account, plus the fee of the key's acceptance of the grant (the key pays
+ * that itself: an acceptance cannot go through the session).
+ */
+export function keyFunding(gasPrice: number): bigint {
+  return 1n + acceptFee(gasPrice);
+}
+
 /**
  * What the account granting a daemon's session key needs spendable, in the
- * gas denom: 1 unit sent to create the key's auth account, the grant tx's
- * fee, and, on a chain with a gas price, the key's fee budget (the account
- * pays the daemon's fees out of it). Anything bonded does not count.
+ * gas denom: what is sent to the key (keyFunding), the grant tx's fee, and,
+ * on a chain with a gas price, the key's fee budget (the account pays the
+ * daemon's fees out of it). Anything bonded does not count.
  */
 export function sessionReserve(gasPrice: number, spendLimit: string): bigint {
   const fee = BigInt(Math.ceil(gasPrice * GRANT_TX_GAS));
-  return 1n + fee + (gasPrice > 0 ? BigInt(spendLimit) : 0n);
+  return keyFunding(gasPrice) + fee + (gasPrice > 0 ? BigInt(spendLimit) : 0n);
 }
 
 /** The role's session settings, for callers sizing a funding request. */
@@ -243,10 +269,25 @@ async function querySession(chain: Pick<ChainActor, "rpc">, granter: string, gra
   }
 }
 
-/** The monitor's hourly look at a recorded grant: whether it still holds. */
+/**
+ * The id of the grant of `grantee`'s key from `granter` while it waits for
+ * the key's consent (SES-102), or undefined once accepted (or on a chain
+ * from before consent, which has no such query).
+ */
+async function pendingGrantId(chain: Pick<ChainActor, "rpc">, granter: string, grantee: string): Promise<string | undefined> {
+  const out = await queryJson(["query", "session", "pending-grants-for-grantee", grantee], chain.rpc).catch(() => undefined);
+  const grant = ((out?.grants ?? []) as Array<{ id?: string; granter?: string; type?: string }>).find(
+    (g) => g.granter === granter && g.type === "GRANT_TYPE_SESSION_KEY",
+  );
+  return grant?.id;
+}
+
+/** The monitor's hourly look at a recorded grant: whether it still holds,
+ *  accepted by its key. */
 export async function grantHolds(rpc: string, record: SessionRecord): Promise<boolean> {
   const onChain = await querySession({ rpc }, record.granter, record.grantee);
-  return Boolean(onChain) && !grantWornOut(onChain, record);
+  if (!onChain || grantWornOut(onChain, record)) return false;
+  return !(await pendingGrantId({ rpc }, record.granter, record.grantee));
 }
 
 /** The launch whose chain holds a role's grant. */
@@ -347,6 +388,96 @@ export interface SessionOutcome {
   expiresAt: string;
   rotated: boolean;
   reason?: string;
+  /** The key accepted its grant in this run (SES-102). */
+  accepted?: boolean;
+}
+
+/**
+ * An account the launcher holds on the grant's chain that can pay `amount`
+ * plus a send's fee: the granter itself when its key is here, else the
+ * chain fleet's founder, else its bridge or scanner operator. Only a grant
+ * a wallet signed before keys were funded for their acceptance needs one.
+ */
+async function launcherFunder(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  role: SessionRole,
+  chain: ChainActor,
+  amount: bigint,
+): Promise<ChainActor | undefined> {
+  const need = amount + BigInt(Math.ceil(chain.gasPrice * GRANT_TX_GAS));
+  const targetId = sessionChainLaunch(spec, ctx.launchId, role);
+  const candidates: Array<ChainActor["signer"]> = [chain.signer];
+  candidates.push((await fleetActor(ctx, targetId, chain.label).catch(() => undefined))?.signer);
+  const home = launchDirs(ctx.workRoot, targetId).node("val-0");
+  for (const key of [BRIDGE_OPERATOR, SCANNER_OPERATOR]) {
+    const shown = await sparkdreamd(["keys", "show", key, "-a", "--keyring-backend", "test", "--home", home]).catch(() => undefined);
+    if (shown) candidates.push({ home, key, address: shown.stdout.trim() });
+  }
+  for (const signer of candidates) {
+    if (signer && (await spendableOf(chain, signer.address)) >= need) return { ...chain, signer };
+  }
+  return undefined;
+}
+
+/**
+ * Accept the recorded key's grant as its grantee, when the chain holds it
+ * pending (SES-102). The launcher has the key, so nothing waits on the
+ * daemon's first use, which may be a day away. The key signs from a scratch
+ * keyring removed straight after. Returns whether it accepted one.
+ */
+async function acceptGrant(
+  ctx: StepCtx,
+  spec: LaunchSpec,
+  role: SessionRole,
+  chain: ChainActor,
+  record: SessionRecord,
+): Promise<boolean> {
+  const id = await pendingGrantId(chain, record.granter, record.grantee);
+  if (!id) return false;
+  const fee = acceptFee(chain.gasPrice);
+  const have = fee > 0n ? await spendableOf(chain, record.grantee) : 0n;
+  if (have < fee) {
+    // a key granted before its funding covered this fee
+    const funder = await launcherFunder(ctx, spec, role, chain, fee - have);
+    if (!funder) {
+      ctx.log(
+        `session: ${role} key ${record.grantee} waits for its acceptance, and no account the launcher holds on ` +
+          `${chain.chainId} can send it the ${fee - have} ${chain.gasDenom} fee: the daemon's first use accepts it, ` +
+          "if it comes within a day of the grant",
+      );
+      return false;
+    }
+    await sendTx(ctx, funder, `${chain.chainId}-fund-session-${record.grantee.slice(-8)}`, [
+      {
+        "@type": "/cosmos.bank.v1beta1.MsgSend",
+        from_address: funder.signer!.address,
+        to_address: record.grantee,
+        amount: [{ denom: chain.gasDenom, amount: (fee - have).toString() }],
+      },
+    ]);
+  }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "session-key-"));
+  try {
+    const keyring = ["--keyring-backend", "test", "--home", home];
+    // the mnemonic on stdin: never in argv, never in an error message
+    await sparkdreamd(["keys", "add", "session-key", "--recover", ...keyring, "--output", "json"], {
+      input: `${record.mnemonic}\n`,
+    });
+    const { stdout } = await sparkdreamd(["keys", "show", "session-key", "-a", ...keyring]);
+    if (stdout.trim() !== record.grantee) throw new Error(`the ${role} key's mnemonic does not derive ${record.grantee}`);
+    await sendTx(
+      ctx,
+      { ...chain, signer: { home, key: "session-key", address: record.grantee } },
+      `${chain.chainId}-accept-session-${record.grantee.slice(-8)}`,
+      [{ "@type": "/sparkdream.session.v1.MsgAcceptGrant", grantee: record.grantee, grant_id: id }],
+      { gas: ACCEPT_GAS },
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+  ctx.log(`session: ${role} key ${record.grantee} accepted its grant ${id} from ${record.granter}`);
+  return true;
 }
 
 /** What a new grant asks for: the component's settings within the chain's
@@ -380,7 +511,7 @@ async function spendableOf(chain: ChainActor, address: string): Promise<bigint> 
 
 /** The grant's messages. MsgCreateSession does not create the grantee's
  *  auth account, and an account that does not exist cannot sign: the send
- *  of one unit creates it. */
+ *  creates it, with the fee of the key's acceptance (keyFunding). */
 function grantMsgs(
   role: SessionRole,
   chain: ChainActor,
@@ -395,7 +526,7 @@ function grantMsgs(
       "@type": "/cosmos.bank.v1beta1.MsgSend",
       from_address: granter,
       to_address: grantee,
-      amount: [{ denom: chain.gasDenom, amount: "1" }],
+      amount: [{ denom: chain.gasDenom, amount: keyFunding(chain.gasPrice).toString() }],
     },
     {
       "@type": "/sparkdream.session.v1.MsgCreateSession",
@@ -420,6 +551,7 @@ export function grantLink(
   granter: string,
   next: SessionRecord,
   revoke: string[],
+  fund: bigint,
 ): string {
   const q = new URLSearchParams({
     session_request: role,
@@ -428,7 +560,7 @@ export function grantLink(
     spend: next.spendLimit,
     expires: new Date(next.expiresAt).toISOString().replace(/\.\d{3}Z$/, "Z"),
     execs: String(next.maxExecCount),
-    fund: "1",
+    fund: fund.toString(),
   });
   for (const t of MSG_TYPES[role]) q.append("type", t);
   for (const r of revoke) q.append("revoke", r);
@@ -492,7 +624,7 @@ async function walletGrant(
   const pause = await walletPause(ctx, `session-${role}`, chain, `grant the ${role}'s session key`, msgs, {
     signerRole: `the ${role} member`,
     signer: granter,
-    ...(chain.frontend ? { frontendLink: grantLink(chain.frontend, role, granter, next, revoke) } : {}),
+    ...(chain.frontend ? { frontendLink: grantLink(chain.frontend, role, granter, next, revoke, keyFunding(chain.gasPrice)) } : {}),
     awaitsSession: { granter, grantee: next.grantee },
   });
   ctx.log(`session: ${role} needs a new key (${reason}); waiting for ${granter} to sign the grant of ${next.grantee}`);
@@ -532,11 +664,13 @@ export async function ensureSession(
     if ((record!.pendingRevoke?.length ?? 0) !== left.length || record!.pending) {
       writeSession(ctx.dirs.secrets, role, { ...record!, pendingRevoke: left, pending: false });
     }
+    // a wallet's grant, signed since the pause, waits for the key's consent
+    const accepted = await acceptGrant(ctx, spec, role, chain, record!);
     if (record!.pending) {
       ctx.log(`session: ${role} key ${record!.grantee} granted by ${granter} until ${record!.expiresAt} (signed in the wallet)`);
-      return { role, grantee: record!.grantee, granter, expiresAt: record!.expiresAt, rotated: true, reason: "signed in the wallet" };
+      return { role, grantee: record!.grantee, granter, expiresAt: record!.expiresAt, rotated: true, reason: "signed in the wallet", accepted };
     }
-    return { role, grantee: record!.grantee, granter, expiresAt: record!.expiresAt, rotated: false };
+    return { role, grantee: record!.grantee, granter, expiresAt: record!.expiresAt, rotated: false, accepted };
   }
 
   if (!chain.signer) return walletGrant(ctx, spec, role, chain, granter, dseq, record, reason);
@@ -588,7 +722,8 @@ export async function ensureSession(
     const left = await revokeGrantees(ctx, chain, granter, replaced);
     writeSession(ctx.dirs.secrets, role, { ...next, pendingRevoke: left });
     ctx.log(`session: ${role} key ${grantee} granted by ${granter} until ${next.expiresAt} (${reason})`);
-    return { role, grantee, granter, expiresAt: next.expiresAt, rotated: true, reason };
+    const accepted = await acceptGrant(ctx, spec, role, chain, next);
+    return { role, grantee, granter, expiresAt: next.expiresAt, rotated: true, reason, accepted };
   }
 }
 
@@ -598,10 +733,14 @@ export async function retireSession(ctx: StepCtx, spec: LaunchSpec, role: Sessio
   if (!record) return;
   const actor = await granterActor(ctx, spec, role).catch(() => undefined);
   const grantees = [...(record.pending ? [] : [record.grantee]), ...(record.pendingRevoke ?? [])];
-  const left = actor && actor.granter === record.granter ? await revokeGrantees(ctx, actor.chain, actor.granter, grantees) : grantees;
-  if (left.length > 0 && actor && !actor.chain.signer) {
+  const own = actor && actor.granter === record.granter ? actor : undefined;
+  const left = own ? await revokeGrantees(ctx, own.chain, own.granter, grantees) : grantees;
+  if (left.length > 0 && !own?.chain.signer) {
     // a wallet's grants cannot be revoked unattended, and closing the
-    // daemon must not wait on a signature: they lapse at their expiry
+    // daemon must not wait on a signature: they lapse at their expiry. The
+    // same goes for an account the spec no longer names (a game whose
+    // onchain records were turned off): kept, the record would start
+    // another sessions op on every monitor pass, each unable to revoke
     ctx.log(
       `session: ${role} grants ${left.join(", ")} from ${record.granter} stay until they expire ` +
         `(${record.expiresAt}); revoke them from that wallet (tx session revoke-session) to end them sooner`,

@@ -28,8 +28,11 @@ export interface ChainStub {
 export interface StubChain {
   bindings?: Record<string, Record<string, unknown>>;
   roles?: Record<string, { current_bond: string; signer?: string }>;
-  /** x/session grants, keyed "<granter>/<grantee>". */
+  /** x/session grants, keyed "<granter>/<grantee>". One waiting for its
+   *  grantee's consent (SES-102, v1.0.58) carries pending_id. */
   sessions?: Record<string, Record<string, any>>;
+  /** grantee -> granters it accepted a grant from (no consent needed again). */
+  allowedGranters?: Record<string, string[]>;
   /** x/artifact classes, in creation order (the game's). */
   classes?: Array<{ id: string; owner: string; symbol: string; name: string; signer?: string }>;
   peers: Record<string, Record<string, unknown>>;
@@ -124,6 +127,10 @@ if (a0 === "query" && a1 === "service" && a2 === "service-type") out({ config: {
 if (a0 === "query" && a1 === "artifact" && a2 === "classes-by-owner") {
   if (st.classesUnprintable) fail("cannot marshal response classes:{...}: not supported: dont_omit_empty=true on invalid (nil?) message field: expiry");
   out({ classes: (chain.classes || []).filter((c) => c.owner === a3).map((c) => ({ class: c })) });
+}
+if (a0 === "query" && a1 === "session" && a2 === "pending-grants-for-grantee") {
+  out({ grants: Object.values(chain.sessions || {}).filter((g) => g.grantee === a3 && g.pending_id).map((g) => ({
+    id: g.pending_id, granter: g.granter, grantee: g.grantee, type: "GRANT_TYPE_SESSION_KEY", status: "GRANT_STATUS_PENDING" })) });
 }
 if (a0 === "query" && a1 === "session" && a2 === "grants-by-grantee") {
   out({ grants: Object.values(chain.grants || {}).filter((g) => g.grantee === a3) });
@@ -230,9 +237,26 @@ if (a0 === "tx" && a1 === "broadcast") {
       if (chain.sessions[k]) throw new Error("session already exists for (granter, grantee) pair");
       if (Date.parse(m.expiration) > Date.now() + sessionMaxMs()) throw new Error("requested expiration exceeds max_expiration");
       if (BigInt(m.spend_limit.amount) > 100000000n) throw new Error("requested spend limit exceeds max_spend_limit_amount");
+      // SES-102: a grant from a granter the grantee has not allowed waits for its consent
+      const allowed = ((chain.allowedGranters || {})[m.grantee] || []).includes(m.granter);
+      chain.sessionSeq = (chain.sessionSeq || 0) + 1;
       chain.sessions[k] = { granter: m.granter, grantee: m.grantee, allowed_msg_types: m.allowed_msg_types,
         spend_limit: m.spend_limit, spent: { denom: m.spend_limit.denom, amount: "0" }, expiration: m.expiration,
-        max_exec_count: m.max_exec_count, signer: doc.__from };
+        max_exec_count: m.max_exec_count, signer: doc.__from, ...(allowed ? {} : { pending_id: String(chain.sessionSeq) }) };
+    } else if (t === "MsgAcceptGrant") {
+      const g = Object.values(chain.sessions || {}).find((x) => x.pending_id === String(m.grant_id));
+      if (!g) throw new Error("grant not found");
+      if (g.grantee !== m.grantee) throw new Error("caller is not the grantee");
+      // the key pays its own fee (zero on a chain without a gas price)
+      const denom = g.spend_limit.denom;
+      const held = BigInt(((st.balances || {})[m.grantee] || {})[denom] || "0");
+      const fee = ((doc.auth_info && doc.auth_info.fee && doc.auth_info.fee.amount) || [])
+        .filter((c) => c.denom === denom).reduce((n, c) => n + BigInt(c.amount), 0n);
+      if (held < fee) throw new Error("insufficient funds to pay the fee");
+      delete g.pending_id;
+      g.accepted_by = doc.__from;
+      chain.allowedGranters ||= {};
+      (chain.allowedGranters[m.grantee] ||= []).push(g.granter);
     } else if (t === "MsgRevokeSession") {
       const k = m.granter + "/" + m.grantee;
       if (!chain.sessions || !chain.sessions[k]) throw new Error("no active session for (granter, grantee) pair");

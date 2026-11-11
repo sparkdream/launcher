@@ -15,7 +15,7 @@ import { battleWeb3Options } from "../src/battle-options.js";
 import { resolveBattleTarget } from "../src/battle.js";
 import { BATTLE_CLASSES, battleClassList } from "../src/steps/battle.js";
 import { writeSecretFile } from "../src/secrets.js";
-import { durationMs, grantLink, readSessions, renewAt, type SessionRecord } from "../src/sessions.js";
+import { durationMs, grantHolds, grantLink, keyFunding, readSessions, renewAt, type SessionRecord } from "../src/sessions.js";
 import { fakeServices, FakeSigner } from "./fakes.js";
 import { chainStub, withStub, type ChainStub } from "./chain-stub.js";
 
@@ -84,6 +84,7 @@ async function launched(components: Record<string, unknown>, chain: ChainStub, c
   return { work, db, services, fleet, secrets, spec: s, runOps };
 }
 
+const s0 = (db: ConductorDb): LaunchSpec => JSON.parse(db.getLaunch("fl")!.spec_json);
 const grants = (chain: ChainStub) => Object.values(chain.state().chains).flatMap((c) => Object.values(c.sessions ?? {}));
 
 function editRecord(secrets: string, role: string, patch: Partial<SessionRecord>): void {
@@ -417,9 +418,16 @@ describe("session keys at launch", () => {
       signer: "bridge-operator",
       allowed_msg_types: ["/sparkdream.federation.v1.MsgSubmitFederatedContent"],
     });
-    // the grantee's auth account is created with the grant: it must exist to sign
+    // the grantee's auth account is created with the grant: it must exist to
+    // sign, and holds the fee of its acceptance (SES-102)
     const balances = chain.state().balances!;
-    expect(Object.keys(balances[sessions.verifier!.grantee]!)).toHaveLength(1);
+    expect(balances[sessions.verifier!.grantee]).toEqual({ [s0(db).token.baseDenom]: keyFunding(Number(s0(db).token.minGasPrice)).toString() });
+    expect(keyFunding(Number(s0(db).token.minGasPrice))).toBeGreaterThan(1n);
+    // each key accepted its own grant: none is left waiting for consent
+    for (const role of ["verifier", "bridge"] as const) {
+      expect(byGrantee.get(sessions[role]!.grantee)).toMatchObject({ accepted_by: "session-key" });
+      expect(byGrantee.get(sessions[role]!.grantee)!.pending_id).toBeUndefined();
+    }
 
     // delivered into the right service of the right deployment
     const dseq = (key: string) => rows.find((c) => c.key === key)!.dseq;
@@ -542,6 +550,23 @@ describe("session keys on a running fleet", () => {
     expect(grants(chain).map((g) => g.grantee)).toEqual([rotated.bridge!.grantee]);
     db.close();
   }, 240_000);
+
+  it("forgets a retired daemon's session whose account the spec no longer names, instead of retrying on every pass", async () => {
+    const chain = chainStub();
+    const { db, fleet, secrets, runOps } = await launched({ verifier, mastodon }, chain);
+    // the verifier is gone from the spec (as a game's web3 block is when its
+    // onchain records are turned off), its record left behind
+    const stored = s0(db);
+    delete (stored.topology.components as Record<string, unknown>).verifier;
+    db.setLaunchSpec("fl", JSON.stringify(stored));
+    expect(await fleet.sessionsDue("fl")).toBe(true);
+    fleet.requestSessions(db.getLaunch("fl")!);
+    expect((await runOps()).status).toBe("completed");
+    expect(readSessions(secrets).verifier).toBeUndefined();
+    expect(readSessions(secrets).bridge).toBeDefined();
+    expect(await fleet.sessionsDue("fl")).toBe(false);
+    db.close();
+  }, 240_000);
 });
 
 describe("session key funding", () => {
@@ -586,7 +611,7 @@ describe("grantLink", () => {
       spendLimit: "5000000",
       maxExecCount: 1000,
     } as SessionRecord;
-    const url = new URL(grantLink("https://app.example.org/", "verifier", "sprkdrm1granter", record, ["sprkdrm1old"]));
+    const url = new URL(grantLink("https://app.example.org/", "verifier", "sprkdrm1granter", record, ["sprkdrm1old"], 5001n));
     expect(`${url.origin}${url.pathname}`).toBe("https://app.example.org/permissions");
     const q = url.searchParams;
     expect(q.get("session_request")).toBe("verifier");
@@ -595,7 +620,7 @@ describe("grantLink", () => {
     expect(q.get("spend")).toBe("5000000");
     expect(q.get("expires")).toBe("2026-10-24T12:00:00Z");
     expect(q.get("execs")).toBe("1000");
-    expect(q.get("fund")).toBe("1");
+    expect(q.get("fund")).toBe("5001");
     expect(q.getAll("type").length).toBeGreaterThan(0);
     expect(q.getAll("revoke")).toEqual(["sprkdrm1old"]);
   });
@@ -667,6 +692,35 @@ describe("a verifier acting as a wallet member", () => {
     expect(services.provider.sessionKeys.get(`${dseq}/verifier`)).toBe(granted.mnemonic);
     // the launcher never signed as the member
     expect(chain.state().log.filter((l) => l.types.some((t) => /MsgBondRole|MsgCreateSession/.test(t)) && l.from === member)).toHaveLength(2);
+    // but accepted the grant as its key, as soon as it found it on chain
+    expect(grants(chain).find((g) => g.grantee === granted.grantee)).toMatchObject({ accepted_by: "session-key" });
+    db.close();
+  }, 240_000);
+
+  it("accepts a wallet's grant whose key was sent only one unit, funding the fee from a key the launcher holds", async () => {
+    const chain = chainStub();
+    const { db, secrets, spec: s, run, waiting, sign } = await walletLaunch(chain);
+    expect((await run()).status).toBe("awaiting-user");
+    sign(); // the bond
+    expect((await run()).status).toBe("awaiting-user");
+    const req = waiting();
+    expect(req.msgs[0].amount).toEqual([{ denom: s.token.baseDenom, amount: keyFunding(Number(s.token.minGasPrice)).toString() }]);
+    // signed as a frontend from before keys were funded for consent did: one unit
+    req.msgs[0].amount = [{ denom: s.token.baseDenom, amount: "1" }];
+    const node = chain.state().log.at(-1)!.node;
+    const doc = path.join(tmp(), "tx.json");
+    fs.writeFileSync(doc, JSON.stringify({ body: { messages: req.msgs }, __from: req.signer }));
+    execFileSync(chain.bin, ["tx", "broadcast", doc, "--node", node]);
+    const key = readSessions(secrets).verifier!.grantee;
+    expect(grants(chain).find((g) => g.grantee === key)!.pending_id).toBeDefined();
+    // the monitor's hourly check sees a pending grant as one to act on
+    expect(await withStub(chain, () => grantHolds(node, readSessions(secrets).verifier!))).toBe(false);
+
+    expect((await run()).status).toBe("completed");
+    expect(grants(chain).find((g) => g.grantee === key)).toMatchObject({ accepted_by: "session-key" });
+    const topUp = chain.state().log.find((l) => l.from === "acct-founder" && l.types.includes("/cosmos.bank.v1beta1.MsgSend"));
+    expect(topUp).toBeDefined();
+    expect(await withStub(chain, () => grantHolds(node, readSessions(secrets).verifier!))).toBe(true);
     db.close();
   }, 240_000);
 
