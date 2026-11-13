@@ -50,6 +50,11 @@ import {
 /** Automatic recovery attempts per component per 24 hours before it gives up and alerts. */
 const AUTO_ATTEMPTS_PER_DAY = 2;
 
+/** Components on different providers that stop answering within this of each other count as one event. */
+const TOGETHER_WINDOW_MS = 10 * 60_000;
+/** How long such a group must stay down before any of it is moved automatically. */
+export const TOGETHER_HOLD_MS = 15 * 60_000;
+
 /** How long an automatic restart gets to bring a component back before its container is re-created. */
 export const RESTART_GRACE_MS = 5 * 60_000;
 
@@ -1996,6 +2001,21 @@ export class FleetService {
     // the rest is watched as usual (auto-recovery defers to the op)
     const scope = launch.status === "paused" ? this.pausedOpScope(launchId) : new Set<string>();
     if (scope === "all") return [];
+    // This machine stalled (local-health.ts): the probes of this pass timed
+    // out on its side, so its readings prove nothing about the fleet. No
+    // incident opens, counts, resolves or is acted on, and the ones still
+    // being counted start over, so an outage is only ever confirmed by
+    // checks taken in a row on a machine that was running smoothly.
+    const local = this.services.localHealth?.trouble() ?? null;
+    if (local) {
+      this.db.dropUnconfirmedIncidents(launchId);
+      if (!this.localHold.has(launchId)) {
+        this.localHold.add(launchId);
+        console.log(`[incidents] ${launchId.slice(0, 8)}: health readings set aside, ${local}`);
+      }
+      return [];
+    }
+    this.localHold.delete(launchId);
     const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
     const events: IncidentEvent[] = [];
     for (const h of this.db.listComponentHealth(launchId)) {
@@ -2015,6 +2035,7 @@ export class FleetService {
       }
     }
     for (const ev of events) {
+      if (ev.kind === "resolved") this.heldForLocal.delete(`${launchId}/${ev.incident.component}`);
       if (ev.kind === "opened") await this.autoRecover(launch, ev.incident).catch((e) => console.log(`[auto-recover] ${e}`));
     }
     // incidents that opened while another op ran: their turn once it is done
@@ -2077,6 +2098,46 @@ export class FleetService {
   /** "launchId/component" auto-recoveries held while Akash is down (alerted once). */
   private readonly heldForAkash = new Set<string>();
 
+  /** Launches whose readings are being set aside for a local stall (logged once). */
+  private readonly localHold = new Set<string>();
+  /** "launchId/component" auto-recoveries held for a local stall or a group outage (alerted once). */
+  private readonly heldForLocal = new Set<string>();
+
+  /** Put an auto-recovery off to a later pass (trackIncidents retries the deferred ones). */
+  private deferRecovery(launchId: string, key: string): void {
+    let deferred = this.deferredRecoveries.get(launchId);
+    if (!deferred) this.deferredRecoveries.set(launchId, (deferred = new Set()));
+    deferred.add(key);
+  }
+
+  /**
+   * Other components, of any fleet on this launcher, that stopped answering
+   * around the same time as `incident` on a different provider. Independent
+   * providers rarely fail in the same ten minutes; what they share is this
+   * machine and its network, which is the likelier thing to have failed.
+   * Returns when the youngest of the group opened, or null when `incident`
+   * stands alone.
+   */
+  private wentDownTogether(incident: IncidentRow, row: FleetComponentRow): { others: string[]; latest: number } | null {
+    const at = Date.parse(incident.opened_at);
+    const others: string[] = [];
+    let latest = at;
+    for (const l of this.db.listLaunches()) {
+      if (l.status !== "completed" && l.status !== "paused") continue;
+      for (const c of this.db.listFleetComponents(l.id) as FleetComponentRow[]) {
+        if (c.state === "closed" || c.provider === row.provider) continue;
+        if (l.id === incident.launch_id && c.key === incident.component) continue;
+        const other = this.db.openIncident(l.id, c.key);
+        if (!other || other.status !== "unreachable") continue;
+        const otherAt = Date.parse(other.opened_at);
+        if (Math.abs(otherAt - at) > TOGETHER_WINDOW_MS) continue;
+        others.push(c.key);
+        latest = Math.max(latest, otherAt);
+      }
+    }
+    return others.length > 0 ? { others, latest } : null;
+  }
+
   /** Automatic restarts of `key` in the last 24 hours (restarts are no op, so ops do not count them). */
   private recentAutoRestarts(launchId: string, key: string, record = false): number {
     const setting = `auto-restarts:${launchId}:${key}`;
@@ -2134,6 +2195,34 @@ export class FleetService {
     if (action !== "relaunch" && action !== "force-redeploy" && action !== "restart") return;
     const row = (this.db.listFleetComponents(launch.id) as FleetComponentRow[]).find((c) => c.key === key);
     if (!row || row.state === "closed") return;
+    // Nothing is touched on readings this machine may have caused itself.
+    // Two ways to tell: the launcher stalled (the pass that confirmed the
+    // incident may have ended just before the stall showed), or components
+    // on different providers stopped answering together, which is this
+    // machine's network far more often than several providers at once. The
+    // first waits for the machine to settle; the second for the group to
+    // have stayed down TOGETHER_HOLD_MS, long enough to be no passing local
+    // problem. A lease the chain itself reports closed is not a reading of
+    // that kind (it was read successfully), so it is only held for a stall.
+    const heldKey = `${launch.id}/${key}`;
+    const local = this.services.localHealth?.trouble() ?? null;
+    const together = !local && incident.status === "unreachable" ? this.wentDownTogether(incident, row) : null;
+    if (local || (together && Date.now() - together.latest < TOGETHER_HOLD_MS)) {
+      if (!opts.escalate) this.deferRecovery(launch.id, key);
+      if (!this.heldForLocal.has(heldKey)) {
+        this.heldForLocal.add(heldKey);
+        await this.notify(
+          launch,
+          key,
+          `${key} left alone: the problem may be on the launcher's side`,
+          local
+            ? `${incident.cause}, but the launcher's machine is overloaded or was suspended (${local}), so the reading is not trusted and nothing is done to ${key} until the machine has run smoothly for a few minutes and ${key} still reads down.`
+            : `${incident.cause}, but ${together!.others.join(", ")} on ${together!.others.length > 1 ? "other providers" : "another provider"} stopped answering at the same time, which points at the launcher's machine or its network. Nothing is done to ${key} unless they are all still down ${TOGETHER_HOLD_MS / 60_000} minutes on. If they really are down, use the fix button on the fleet card.`,
+        );
+      }
+      return;
+    }
+    this.heldForLocal.delete(heldKey);
     if (this.db.listFleetOps(launch.id, "active").length > 0) {
       // an escalation is looked for on every pass anyway
       if (opts.escalate) return;
@@ -2148,7 +2237,6 @@ export class FleetService {
     // with the deferred ones once it answers (the incident still open)
     if (action !== "restart") {
       const outage = await this.services.akashOutage?.().catch(() => null);
-      const heldKey = `${launch.id}/${key}`;
       if (outage) {
         if (!opts.escalate) {
           let deferred = this.deferredRecoveries.get(launch.id);

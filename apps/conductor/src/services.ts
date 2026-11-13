@@ -2,6 +2,7 @@ import type { AkashApi, MtlsCredentials } from "./akash/client.js";
 import type { LocalSignerHost, RemoteHost } from "./local-signer.js";
 import type { UnattendedChain } from "./unattended.js";
 import type { DnsUpdater } from "./dns.js";
+import type { LocalHealthGauge } from "./local-health.js";
 
 /** SSH target for a deployed node (forwarded port from lease status). */
 export interface SshTarget {
@@ -151,4 +152,8 @@ export interface Services {
    *  akashOutageProbe). Auto-recovery moves nothing while it is down. Absent:
    *  never checked. */
   akashOutage?: () => Promise<string | null>;
+  /** Whether the launcher's own machine is stalling (local-health.ts): while
+   *  it is, bad health readings are its own doing, so no incident is counted
+   *  and auto-recovery touches nothing. Absent: never checked. */
+  localHealth?: LocalHealthGauge;
 }

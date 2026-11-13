@@ -6,6 +6,7 @@ import { ConductorDb } from "./db.js";
 import { buildServer } from "./server.js";
 import { allSteps } from "./index.js";
 import { productionServices } from "./adapters.js";
+import { LocalHealth } from "./local-health.js";
 import { akashOutageProbe, DEFAULT_AKASH_LCDS, DEFAULT_AKASH_RPCS, parseLcds } from "./akash/rest.js";
 import { SshSignerHost, SystemdSignerHost } from "./local-signer.js";
 import { AkashUnattendedChain, UNATTENDED_FEE_DENOM } from "./unattended.js";
@@ -47,6 +48,12 @@ services.akashOutage = akashOutageProbe(
   parseLcds(process.env.AKASH_LCD ?? DEFAULT_AKASH_LCDS)[0]!,
   parseLcds(process.env.AKASH_RPC ?? DEFAULT_AKASH_RPCS)[0]!,
 );
+
+// this machine's own stalls (WSL swapping, a build on every core): bad
+// readings taken through one are not counted, and nothing is moved on them
+const localHealth = new LocalHealth();
+localHealth.start();
+services.localHealth = localHealth;
 
 // a tmkms signer on another machine (ssh_config alias, key auth), e.g. a Pi
 services.remoteSigner = (remote) => new SshSignerHost(services.ssh, remote);

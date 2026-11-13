@@ -767,6 +767,13 @@ export class ConductorDb {
     this.db.prepare("DELETE FROM component_incidents WHERE id = ?").run(id);
   }
 
+  /** Forget incidents still being counted toward confirmation (their checks were not trustworthy). */
+  dropUnconfirmedIncidents(launchId: string): void {
+    this.db
+      .prepare("DELETE FROM component_incidents WHERE launch_id = ? AND confirmed_at IS NULL AND closed_at IS NULL")
+      .run(launchId);
+  }
+
   /** Confirmed incidents, newest first: open ones, plus the last `closedLimit` closed. */
   listIncidents(launchId: string, closedLimit = 10): IncidentRow[] {
     const open = this.db

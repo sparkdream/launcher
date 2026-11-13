@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { TypeUrl, UNATTENDED_MSG_TYPES, type Msg } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runLaunch, runWithSigner } from "../src/engine.js";
-import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS } from "../src/fleet.js";
+import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS, TOGETHER_HOLD_MS } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { setAlertSettings } from "../src/incidents.js";
@@ -277,6 +277,95 @@ describe("automatic recovery", () => {
     const done = await driveUnattended(w);
     expect(done.status).toBe("completed");
     expect(w.chain.execs.flatMap((e) => e.msgs.map((m) => m.typeUrl))).toEqual([TypeUrl.UpdateDeployment]);
+  }, 240_000);
+
+  it("counts no check taken while the launcher's own machine stalls, and moves nothing on one", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    let stall: string | null = "the launcher's own one-second timer fired 9.0s late, 4s ago";
+    w.services.localHealth = { trouble: () => stall };
+    for (const c of w.db.listFleetComponents("fl")) {
+      w.services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+    // every probe of the stalled machine fails, pass after pass
+    w.services.rpc.chainHalted = true;
+    for (let i = 0; i < 5; i++) {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    }
+    expect(w.db.listIncidents("fl")).toHaveLength(0);
+    expect(w.db.openIncident("fl", "sentry-1")).toBeUndefined();
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+    expect(w.alerts).toHaveLength(0);
+
+    // the machine settles and the fleet reads fine: nothing ever happened
+    stall = null;
+    w.services.rpc.chainHalted = false;
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.openIncident("fl", "sentry-1")).toBeUndefined();
+    expect(w.alerts).toHaveLength(0);
+  }, 240_000);
+
+  it("a stall wipes the checks counted before it: confirming takes a full run of clean ones", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    let stall: string | null = null;
+    w.services.localHealth = { trouble: () => stall };
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    w.services.api.leaseStates.set(sentry.dseq, "closed");
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.openIncident("fl", "sentry-1")?.checks).toBe(1);
+    stall = "the launcher's own one-second timer fired 9.0s late, 1s ago";
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.openIncident("fl", "sentry-1")).toBeUndefined();
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+
+    // a real outage is still recovered once the machine runs smoothly
+    stall = null;
+    for (let i = 0; i < 2; i++) {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    }
+    expect(w.db.listFleetOps("fl", "active").map((o) => o.kind)).toEqual(["relaunch"]);
+  }, 240_000);
+
+  it("holds components on different providers that stop answering together, until they have stayed down", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    for (const c of w.db.listFleetComponents("fl")) {
+      w.services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+    const sentries = w.db.listFleetComponents("fl").filter((c) => c.key.startsWith("sentry-"));
+    expect(new Set(sentries.map((c) => c.provider)).size).toBe(2);
+    // no sentry's RPC answers: the launcher's network, as far as it can tell
+    w.services.rpc.chainHalted = true;
+    for (let i = 0; i < 4; i++) {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    }
+    expect(w.db.openIncident("fl", "sentry-0")?.confirmed_at).toBeTruthy();
+    expect(w.db.openIncident("fl", "sentry-1")?.confirmed_at).toBeTruthy();
+    const held = w.alerts.filter((a) => a.includes("left alone"));
+    expect(held).toContain("sparkdream: sentry-0 left alone: the problem may be on the launcher's side");
+    expect(held).toContain("sparkdream: sentry-1 left alone: the problem may be on the launcher's side");
+    // alerted once each, however many passes they are held
+    expect(new Set(held).size).toBe(held.length);
+    expect(w.alerts.some((a) => a.includes("restarted") || a.includes("recovering"))).toBe(false);
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+
+    // still down long after: no passing local problem, recovery goes ahead
+    const real = Date.now;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => real() + TOGETHER_HOLD_MS + 60_000);
+    try {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(w.alerts.some((a) => a.includes("restarted sentry-") || a.includes("recovering sentry-"))).toBe(true);
   }, 240_000);
 
   it("an outage that starts during another op is recovered once that op is done", async () => {
