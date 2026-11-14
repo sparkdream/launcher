@@ -65,10 +65,10 @@ describe("scanner spec", () => {
     expect(paths).toContain("topology.publicEndpoints.api");
   });
 
-  it("warns that media stays unchecked without a classifier", () => {
+  it("needs no model server: the image ships its own image-safety model", () => {
     const { errors, warnings } = validateSpec(spec({ enabled: true, domain: FEED }));
     expect(errors).toEqual([]);
-    expect(warnings.map((i) => i.path)).toContain("topology.components.scanner.classifierUrl");
+    expect(warnings.map((i) => i.path)).not.toContain("topology.components.scanner.classifierUrl");
   });
 
   it("rejects a controller address of another chain", () => {

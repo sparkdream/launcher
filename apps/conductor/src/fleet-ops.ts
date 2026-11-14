@@ -3696,11 +3696,70 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
         if (comp && !comp.domain) return { healthy: true };
         if (comp) {
           const url = `https://${comp.domain}/`;
+          // A service that dies at boot on the new image says why in its
+          // own log, and its provider reports no replica ready. Polling the
+          // URL alone waited the full five minutes for a container that was
+          // never going to answer, then failed without the reason
+          // (2026-11-14: the scanner could not read its model file). The
+          // container is looked at every sixth try: three looks in a row
+          // with nothing ready and a log to show end the wait, and the
+          // log's last lines go into the error either way.
+          const svc = componentRow(ctx, key);
+          let tail = "";
+          let notReady = 0;
+          // A component with a persistent volume runs as a Kubernetes
+          // StatefulSet, which does not replace a container that is failing:
+          // it waits for it to become ready first. So once one image dies at
+          // boot, no later image (a fixed one, or the old one) is ever
+          // started, and the same error keeps coming from the old container
+          // (2026-11-14: the scanner stayed on v1.0.58a under v1.0.58b).
+          let notRolled = false;
+          const stuck = () =>
+            notRolled
+              ? `. Its provider has not started the new image at all: this log is the previous container's, ` +
+                `which a deployment with a persistent volume keeps until it is healthy, so no upgrade can ` +
+                `replace it. Relaunch ${key} to start it fresh (its volume is not carried over), or ask the ` +
+                `provider to delete its pod`
+              : "";
+          const look = async (): Promise<void> => {
+            try {
+              const cert = loadCert(ctx);
+              const status = (await ctx.services.provider.leaseStatus(cert, svc.host_uri, svc.dseq, 1, 1)) as {
+                services?: Record<string, { total?: number; ready_replicas?: number; updated_replicas?: number } | null>;
+              };
+              // nothing ready and nothing on the new manifest: the log is
+              // still the previous container's (see `stuck` below)
+              notRolled = Object.values(status?.services ?? {}).some(
+                (s) => s && (s.total ?? 0) > 0 && s.ready_replicas === 0 && s.updated_replicas === 0,
+              );
+              const stopped = Object.values(status?.services ?? {}).some(
+                (s) => s && (s.total ?? 0) > 0 && s.ready_replicas === 0,
+              );
+              const logs = await ctx.services.provider.leaseLogs(cert, svc.host_uri, svc.dseq, 1, 1, 20);
+              tail = logs.split("\n").map((l) => l.trim()).filter(Boolean).slice(-3).join(" | ").slice(-600);
+              notReady = stopped && tail ? notReady + 1 : 0;
+            } catch {
+              notReady = 0; // mid-restart, or a provider that will not say: keep polling
+            }
+          };
+          let shown = "";
           for (let i = 0; i < 60; i++) {
             if (await ctx.services.rpc.httpOk(url)) return { healthy: true, url };
+            if (i % 6 === 5) {
+              await look();
+              if (tail && tail !== shown) ctx.log(`${key} verify: not answering yet, its log ends: ${(shown = tail)}`);
+              if (notReady >= 3) {
+                throw new Error(
+                  `${key} is not starting on the new image: its provider reports no replica ready, and its log ends: ${tail}${stuck()}`,
+                );
+              }
+            }
             await ctx.services.sleep(5000);
           }
-          throw new Error(`${key} did not answer at ${url} after upgrade`);
+          await look();
+          throw new Error(
+            `${key} did not answer at ${url} after upgrade` + (tail ? ` (its log ends: ${tail})${stuck()}` : ""),
+          );
         }
         const row = componentRow(ctx, key);
         // persistent volume → same tailnet IP, supervised restart (§5): the

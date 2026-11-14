@@ -249,6 +249,8 @@ export class FakeProviderGateway {
     _oseq = 1,
     _tail = 100,
   ): Promise<string> {
+    const crash = this.crashLooping.get(dseq);
+    if (crash) return `${crash}\n${crash}\n`;
     const ep = this.assigned.get(`${hostUri}/${dseq}`);
     const extra = ep ? this.onNodeLogs?.(`${ep.host}:${ep.port}`) : undefined;
     return `fake log line 1\nfake log line 2\n${extra ?? ""}`;
@@ -261,9 +263,19 @@ export class FakeProviderGateway {
     this.assigned.clear();
   }
 
+  /** dseq → the line its container logs each time it dies at boot: the
+   *  provider then reports no replica ready (a crash loop). */
+  crashLooping = new Map<string, string>();
+  /** The provider never started the pushed manifest: the failing container is the previous one. */
+  crashLoopNotRolled = false;
+
   async leaseStatus(_creds: MtlsCredentials, hostUri: string, dseq: string): Promise<unknown> {
     if (this.apiDownDseqs.has(dseq)) {
       throw new Error(`provider GET /lease/${dseq}/1/1/status: HTTP 503 dial tcp 10.233.0.1:443: connect: connection refused`);
+    }
+    if (this.crashLooping.has(dseq)) {
+      const updated = this.crashLoopNotRolled ? 0 : 1;
+      return { services: { app: { available: 1, total: 1, ready_replicas: 0, updated_replicas: updated } }, forwarded_ports: {} };
     }
     const key = `${hostUri}/${dseq}`;
     if (!this.assigned.has(key)) {

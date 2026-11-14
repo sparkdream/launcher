@@ -866,12 +866,8 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
     if (/^[a-z]+1[02-9ac-hj-np-z]{38,58}$/.test(ctl) && !ctl.startsWith(`${spec.network.bech32Prefix}1`)) {
       err("topology.components.scanner.controller", `"${ctl}" is not a ${spec.network.bech32Prefix} address`);
     }
-    if (!scanner.classifierUrl) {
-      warn(
-        "topology.components.scanner.classifierUrl",
-        "no classifier: the scanner clears text-only content, but media (images, video) stays unchecked",
-      );
-    }
+    // no classifierUrl is fine: contentscan then uses the image-safety model
+    // its image ships (images only; video and other media stay unchecked)
   }
 
   if ((pub?.api || pub?.rpc) && S === 0) {

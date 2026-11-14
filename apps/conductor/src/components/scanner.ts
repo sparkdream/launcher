@@ -19,16 +19,21 @@ export function scannerFeedUrl(spec: LaunchSpec): string {
 const resources: SdlResources = {
   // decoding a fetched body or image happens in memory (contentscan keeps no
   // media at rest), capped at CS_MAX_FETCH_BYTES (16 MiB); the persistent
-  // volume holds the feed, the state file, the verdict and session keys
-  cpu: { units: 0.5 },
-  memory: { size: "512Mi" },
+  // volume holds the feed, the state file, the verdict and session keys.
+  // The image-safety model runs in the worker itself, on the CPU: about two
+  // seconds of one core per view of an image, and a 40-megapixel picture
+  // (CS_MAX_IMAGE_PIXELS) decodes to a few hundred MiB
+  cpu: { units: 1 },
+  memory: { size: "1536Mi" },
   storage: [{ size: "1Gi" }, { name: "state", size: "1Gi", attributes: { persistent: true, class: "beta3" } }],
 };
 
 /**
  * contentscan (the sdap image), following this chain through its public
  * api and serving its signed verdict feed on the scanner's domain
- * (CS_LISTEN). args, not command: the image's entrypoint readies /data and
+ * (CS_LISTEN). Images are classified by the model the image ships
+ * (CS_IMAGE_MODEL, set in the image) unless the spec names a model server.
+ * args, not command: the image's entrypoint readies /data and
  * drops to its unprivileged user, then the shell writes the verdict key out
  * of the env (contentscan reads it from a file, outside the served feed
  * directory). It checkpoints through the session key the launcher writes to

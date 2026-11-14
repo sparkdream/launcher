@@ -559,8 +559,10 @@ const scannerComponent = z.object({
    *  operator bond (content-scanner min_bond, 100 SPARK by default) plus
    *  gas and the session key's fee budget. */
   genesisBalance: z.string().regex(/^[0-9]+$/).default("150000000"),
-  /** Model server for media (CS_CLASSIFIER_URL). Without one, text-only
-   *  content is still judged clean, but media stays unchecked. */
+  /** Model server for media (CS_CLASSIFIER_URL), replacing the image-safety
+   *  model the sdap image ships. Without one, images are checked by that
+   *  built-in model (sexual content only); video and other media stay
+   *  unchecked. */
   classifierUrl: z.string().url().optional(),
   /** Ruleset version stamped into verdicts and the operator metadata. */
   rulesetVersion: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).default("v1"),

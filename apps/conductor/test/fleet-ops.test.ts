@@ -1417,6 +1417,39 @@ describe("component upgrade", () => {
     expect(w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!.image).toBe(image);
     expect(w.db.listFleetOps("fl")[0]!.status).toBe("done");
   }, 120_000);
+
+  it("stops waiting on a service that dies at boot on the new image, and says why (2026-11-14: the scanner)", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const frontend = w.db.listFleetComponents("fl").find((c) => c.key === "frontend")!;
+    const died = "contentscan: weights: open /usr/share/contentscan/image-safety.safetensors: permission denied";
+    w.services.provider.crashLooping.set(frontend.dseq, died);
+    w.services.rpc.darkUrls.add("app.sparkdream.io");
+    let probes = 0;
+    const httpOk = w.services.rpc.httpOk.bind(w.services.rpc);
+    w.services.rpc.httpOk = async (url?: string) => {
+      if (url?.includes("app.sparkdream.io")) probes++;
+      return httpOk(url);
+    };
+    w.fleet.requestUpgrade(launch, ["frontend"], "sparkdreamnft/sparkdream-ui:v1.1.0");
+
+    const result = await driveOps(w);
+    expect(result.status).toBe("paused");
+    const step = w.db.listSteps("fl").find((x) => x.name.endsWith(":frontend:verify"))!;
+    expect(step.error).toContain("is not starting on the new image");
+    expect(step.error).toContain("image-safety.safetensors: permission denied");
+    expect(step.error).not.toContain("has not started the new image");
+    // three looks at the container, not the full sixty tries
+    expect(probes).toBe(18);
+
+    // a later image pushed onto the failing container is never started (a
+    // persistent volume's StatefulSet waits for the old one): said plainly
+    w.services.provider.crashLoopNotRolled = true;
+    await driveOps(w);
+    const again = w.db.listSteps("fl").find((x) => x.name.endsWith(":frontend:verify"))!;
+    expect(again.error).toContain("has not started the new image at all");
+    expect(again.error).toContain("Relaunch frontend");
+  }, 120_000);
 });
 
 describe("domain retarget", () => {

@@ -1891,8 +1891,10 @@ clean. The chain side is the chain repo's `docs/content-scanning.md`.
   key (below) granted by the operator. Until the key arrives and the
   operator is registered, checkpoints fail and are retried while the feed
   fills.
-- **Classifier.** Without `scanner.classifierUrl`, text-only content clears
-  but media stays unchecked; validate-spec warns.
+- **Classifier.** The sdap image ships an image-safety model that the
+  worker runs in-process (sexual content only), so images are checked with
+  no extra service; video and other media stay unchecked. A
+  `scanner.classifierUrl` replaces it with a model server.
 - **Pay.** The controller council pays the operator with a recurring
   payment (`MsgScheduleRecurringSpend` in a council proposal: an x/session
   RecurringPull grant). Each period must be claimed by the grantee, and only
