@@ -13,6 +13,7 @@ import type { ComponentDescriptor } from "./types.js";
 
 export type { ComponentDescriptor, RenderInput, SdlResources, Tunnel } from "./types.js";
 export { explorerChainEnv } from "./explorer.js";
+export { imageUploadsSecretProblem } from "./frontend.js";
 
 const REGISTRY: Record<ComponentKey, ComponentDescriptor> = { explorer, frontend, relayer, mastodon, verifier, bridge, scanner, hub, ntfy, battle };
 

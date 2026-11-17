@@ -34,7 +34,7 @@ import {
   type RelayerPath,
   imageRefProblem,
 } from "@sparkdream/launch-spec";
-import { descriptorFor } from "./components/index.js";
+import { descriptorFor, imageUploadsSecretProblem } from "./components/index.js";
 import { peerProgress, type PeerSetup } from "./peering.js";
 import { publicRelayEndpointStale, publicRelayFleets, RELAYER_ACCOUNT, relayerTunnels, resolveRelayCounterparty } from "./relayer.js";
 import {
@@ -5142,6 +5142,10 @@ export class FleetService {
         "spec invalid: " + check.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
       );
     }
+    // the reset re-renders the frontend in the step that resumes the chain:
+    // a storage secret it cannot read would leave the chain stopped there
+    const uploadsProblem = imageUploadsSecretProblem(proposed, launchDirs(this.workRoot, launch.id).secrets);
+    if (uploadsProblem) throw new Error(`${uploadsProblem}: the reset would stop the chain and fail to bring the frontend back`);
     // one list, shared with the web UI's reset flow, which projects these
     // same fields off the deployed spec so the editor can never contradict
     // the running fleet; report every violation at once, since fixing them

@@ -163,6 +163,22 @@ export function latestRestorable(
   return { record, blocker: record || !all[0] ? null : restoreBlocker(db, launchId, nodeDir, all[0]) };
 }
 
+/**
+ * A name for a new backup: the time to the second and the height, the time
+ * moved on a second at a time past any name already recorded. A backup named
+ * like a kept one would overwrite its object in the bucket and take its place
+ * in the list, which two backups of one height within a second, or a clock
+ * set back, would otherwise do.
+ */
+function newBackupName(db: ConductorDb, launchId: string, height: number, now = Date.now()): string {
+  const taken = new Set(dataBackups(db, launchId).map((r) => r.name));
+  for (let at = now; ; at += 1000) {
+    const stamp = new Date(at).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const name = `data-${stamp}-h${height}.tar.zst.age`;
+    if (!taken.has(name)) return name;
+  }
+}
+
 function recordBackup(db: ConductorDb, launchId: string, record: DataBackupRecord): void {
   const next = [record, ...dataBackups(db, launchId).filter((r) => r.name !== record.name)].slice(0, DATA_BACKUP_KEEP);
   db.setSetting(historyKey(launchId), JSON.stringify(next));
@@ -678,8 +694,7 @@ export function dataBackupSteps(opId: number, params: DataBackupParams, spec: La
           // so take the height the hold stopped it at.
           await ensureHeld(ctx, key);
           height = (await heldHeight(ctx, target(ctx))) || height;
-          const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-          name = `data-${stamp}-h${height}.tar.zst.age`;
+          name = newBackupName(ctx.db, ctx.launchId, height);
           const genesisSha = fleetGenesisSha(ctx.dirs.node);
           const record: DataBackupRecord = {
             name,

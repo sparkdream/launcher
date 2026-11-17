@@ -81,12 +81,14 @@ export interface ComponentDescriptor {
    * How upgrade and chain-reset refresh the chain identity in a deployed SDL:
    * - "rerender": the SDL holds nothing the spec doesn't (no resolved tunnel
    *   IPs or auth keys), so render it again from scratch.
-   * - "patch": set chainEnv(spec) on the image services in place, preserving
-   *   what persist-start resolved.
+   * - "patch": set chainEnv(spec, secretsDir) on the image services in place
+   *   (an undefined value removes the entry), preserving what persist-start
+   *   resolved. Also how a kind picks up settings that depend on another
+   *   component's spec (the scanner's pre-check token).
    * - "none": the env carries no chain identity.
    */
   envRefresh: "rerender" | "patch" | "none";
-  chainEnv?(spec: LaunchSpec): Record<string, string>;
+  chainEnv?(spec: LaunchSpec, secretsDir?: string): Record<string, string | undefined>;
   /**
    * Steps that configure the component once it is placed and healthy — after
    * every placement, since each one (add, relaunch) lands on a fresh volume.
@@ -125,6 +127,7 @@ export interface ComponentDescriptor {
   retargetDoc?(doc: any, spec: LaunchSpec): void;
   /** An image upgrade's catch-up for the deployed SDL, applied alongside the
    *  image swap: settings render() has gained since the deployment was made
-   *  (Mastodon's upload body size), since an upgrade never re-renders. */
-  upgradeDoc?(doc: any): void;
+   *  (Mastodon's upload body size, the scanner's pre-check body size), since
+   *  an upgrade never re-renders. */
+  upgradeDoc?(doc: any, spec: LaunchSpec): void;
 }

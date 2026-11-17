@@ -679,6 +679,13 @@ export function validateSpec(spec: LaunchSpec): ValidationResult {
       "frontend needs public api + rpc domains (LCD/RPC served by sentry-0 via accept-domain ingress)",
     );
   }
+  // Image uploads are stored only after the fleet's scanner has cleared them
+  if (comps.frontend.enabled && comps.frontend.imageUploads && !(comps.scanner?.enabled && comps.scanner.domain)) {
+    err(
+      "topology.components.frontend.imageUploads",
+      "image uploads are pre-checked by the fleet's scanner: enable topology.components.scanner with a domain",
+    );
+  }
   // Digests pin one release's files; without a pinned version the UI follows
   // the node's version, and the first chain upgrade would load a release the
   // digests do not describe, refusing every anonymous action.

@@ -167,13 +167,15 @@ describe("Mastodon backups: where they go", () => {
 describe("taking a Mastodon backup", () => {
   it("keeps a rolling pair, deleting the oldest from the bucket once a new one passes", async () => {
     const w = await launched(chainSpec());
+    // no waiting between them: a backup taken in the same second as a kept
+    // one gets a name of its own instead of replacing it
     await backUp(w);
-    await new Promise((r) => setTimeout(r, 1100)); // names are per second
     await backUp(w);
     const [second, first] = mastodonBackups(w.db, w.id);
-    await new Promise((r) => setTimeout(r, 1100));
+    expect(second!.name).not.toBe(first!.name);
     await backUp(w);
     const kept = mastodonBackups(w.db, w.id);
+    expect(new Set([first!.name, ...kept.map((r) => r.name)]).size).toBe(3);
     expect(kept.map((r) => r.name)).toEqual([expect.any(String), second!.name]);
     expect(objects(w).some((k) => k.includes(first!.name))).toBe(false);
     expect(objects(w)).toHaveLength(4);

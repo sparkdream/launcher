@@ -354,6 +354,32 @@ topology:
       # four; needs version). Unset, the UI follows the node's version and
       # trusts that release's own manifest.
       # prover: { version: v1.0.53, digests: { shield.wasm: <sha256>, ... } }
+      # optional member image uploads (IMAGE_S3_* / IMAGE_PUBLIC_BASE /
+      # IMAGE_PRECHECK_*): the UI stores a member's picture in this bucket
+      # once the fleet's scanner has cleared it, so it needs the scanner
+      # component; the launcher makes the pre-check token both share
+      # (secrets/scanner.json) and gives it to the scanner as
+      # CS_PRECHECK_TOKEN. Use a bucket of its own: its objects are public.
+      # On a running fleet, upgrade the scanner and the frontend after
+      # adding this: the scanner's deployment is updated in place (its
+      # volume is kept) and the frontend's is rendered again.
+      # imageUploads: { endpoint: https://endpoint.4everland.co, bucket: my-images,
+      #   publicBase: https://my-images.4everbucket.com, accessKeyId: <id>,
+      #   secretRef: "env:IMAGE_S3_SECRET" }   # or secret:<file in secrets/>
+      # inside imageUploads, copyMaxBytes: the largest full-size file kept
+      # for a permanent copy to be made from (default 4 MiB; the chain
+      # allows 10 MiB a file at launch). One number sets the UI's
+      # IMAGE_COPY_MAX_BYTES, the scanner's CS_PRECHECK_MAX_BYTES and the
+      # request body both ingresses accept (1 MiB when left alone). After
+      # changing it, upgrade the scanner and the frontend.
+      #   copyMaxBytes: 10485760
+      # inside imageUploads, optional settings for permanent copies. A
+      # member requests one on chain (x/storage) and an approved storage
+      # operator makes it, so the frontend needs no wallet or fee here.
+      # disabled: true stops the frontend offering new copies; gateway is
+      # where copies and ar:// images are read from (also given to the
+      # scanner).
+      #   arweave: { disabled: false, gateway: "https://arweave.net/{id}" }
     hub:      { enabled: false }     # landing page usually already live
   publicEndpoints:                   # sentry-0 serves these via accept-domain
     api: api.sparkdream.io           # ingress (LCD 1317; flips the sentry's

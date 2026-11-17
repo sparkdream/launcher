@@ -316,13 +316,17 @@ describe("taking a chain-data backup", () => {
   }, 240_000);
 
   it("keeps a rolling pair", async () => {
+    // no waiting between them: a backup taken in the same second as a kept
+    // one gets a name of its own instead of replacing it
     const w = await backedUp();
+    const names = [dataBackups(w.db, "fl")[0]!.name];
     for (let i = 0; i < 2; i++) {
       w.fleet.requestDataBackup(w.db.getLaunch("fl")!);
       expect((await driveOps(w)).status).toBe("completed");
-      await new Promise((r) => setTimeout(r, 1100)); // names carry the second
+      names.unshift(dataBackups(w.db, "fl")[0]!.name);
     }
-    expect(dataBackups(w.db, "fl")).toHaveLength(2);
+    expect(new Set(names).size).toBe(3);
+    expect(dataBackups(w.db, "fl").map((r) => r.name)).toEqual(names.slice(0, 2));
   }, 300_000);
 });
 

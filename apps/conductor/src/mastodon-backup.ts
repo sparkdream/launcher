@@ -276,7 +276,21 @@ async function stopScript(shell: Shell, name: string, cleanup = ""): Promise<voi
   await shell("mastodon", stopScriptCmd(name, cleanup)).catch(() => undefined);
 }
 
-const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+const stamp = (at: Date) => at.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+
+/**
+ * A name for a new backup: the time to the second, moved on a second at a
+ * time past any name already recorded. A backup named like a kept one would
+ * overwrite its objects in the bucket and take its place in the list, which
+ * two backups within one second, or a clock set back, would otherwise do.
+ */
+function newBackupName(db: ConductorDb, launchId: string, now = Date.now()): string {
+  const taken = new Set(mastodonBackups(db, launchId).map((r) => r.name));
+  for (let at = now; ; at += 1000) {
+    const name = `mastodon-${stamp(new Date(at))}`;
+    if (!taken.has(name)) return name;
+  }
+}
 
 /**
  * Take a backup of the running instance (resumable: a copy still running is
@@ -305,7 +319,7 @@ export async function uploadMastodonBackup(
     }
     const keys = ctx.output<GenerateKeysOutput>("generate-keys");
     if (!keys?.ageRecipient) throw new Error("this launch has no age key pair to encrypt the backup with");
-    record = { name: `mastodon-${stamp()}`, takenAt: new Date().toISOString(), dseq: lease.dseq };
+    record = { name: newBackupName(ctx.db, ctx.launchId), takenAt: new Date().toISOString(), dseq: lease.dseq };
     await writeFile(shell, "/tmp/sd-mbackup.env", envFile({ ...s3Env(storage), AGE_RECIPIENT: keys.ageRecipient, NAME: record.name }), "the backup settings");
     await writeFile(shell, "/tmp/sd-mbackup.sh", BACKUP_SCRIPT, "the backup script");
     ctx.db.setSetting(pendingKey(ctx.launchId), JSON.stringify(record));

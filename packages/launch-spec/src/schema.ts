@@ -110,6 +110,78 @@ const componentToggle = z.object({
 const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "lowercase sha256 hex");
 
 /**
+ * Member image uploads in the frontend: a member attaches a picture to a
+ * dream by uploading it, and the UI stores it in this S3-compatible bucket
+ * once the fleet's scanner has cleared the bytes (contentscan's pre-check,
+ * POST /precheck on the scanner's domain, guarded by a token the launcher
+ * makes and gives to both). Needs the scanner component. Rendered as the
+ * UI's IMAGE_S3_* / IMAGE_PUBLIC_BASE / IMAGE_PRECHECK_* environment and the
+ * scanner's CS_PRECHECK_TOKEN. Use a bucket of its own: every object in it
+ * is public.
+ */
+/** The UI's and the scanner's own default for a permanent copy's source file. */
+export const DEFAULT_COPY_MAX_BYTES = 4 * 1024 * 1024;
+/** The largest request body an Akash ingress can be told to accept. */
+export const UPLOAD_BODY_MAX = 104857600;
+
+/**
+ * The request body the frontend's and the scanner's ingress must let
+ * through for image uploads: the largest file either is sent, since both
+ * take the file as the whole body. An ingress left at its default refuses
+ * anything over 1 MiB.
+ */
+export function uploadBodySize(uploads: { maxBytes?: number | undefined; copyMaxBytes?: number | undefined }): number {
+  return Math.min(UPLOAD_BODY_MAX, Math.max(uploads.copyMaxBytes ?? DEFAULT_COPY_MAX_BYTES, uploads.maxBytes ?? 0));
+}
+
+const frontendImageUploads = z
+  .object({
+    endpoint: z.string().url(),
+    bucket: z.string().min(1),
+    region: z.string().default("us-west-2"),
+    /** Public https URL the bucket's objects are served under. */
+    publicBase: z.string().regex(/^https:\/\/\S+$/, "an https URL"),
+    accessKeyId: z.string().min(1),
+    /** Indirection only, never the secret itself: "env:NAME" (the
+     *  conductor's environment) or "secret:<name>" (a file in the launch's
+     *  secrets directory). */
+    secretRef: z.string().regex(/^(env:[A-Z][A-Z0-9_]*|secret:[a-z0-9][a-z0-9-]*)$/),
+    /** Largest stored image in bytes (the UI's default is 300000). */
+    maxBytes: z.number().int().min(10_000).max(4_000_000).optional(),
+    /**
+     * Largest full-size file kept for a permanent copy to be made from, in
+     * bytes (default 4 MiB). One number for the three places that have to
+     * agree: the UI's IMAGE_COPY_MAX_BYTES, the scanner's
+     * CS_PRECHECK_MAX_BYTES and the request body both ingresses let through.
+     * The chain has its own limit per file (10 MiB at launch); 100 MiB is
+     * the most an Akash ingress allows.
+     */
+    copyMaxBytes: z.number().int().min(300_000).max(UPLOAD_BODY_MAX).optional(),
+    /**
+     * Permanent copies of uploaded images. The chain's x/storage takes the
+     * request and the fee, and a storage operator approved on chain makes
+     * the copy, so the frontend needs no wallet, fee or node setting: only
+     * an off switch and where copies are read from.
+     */
+    arweave: z
+      .object({
+        /** true stops the frontend offering new permanent copies
+         *  (ARWEAVE_UPLOADS_DISABLED). */
+        disabled: z.boolean().optional(),
+        /** Where ar:// images and permanent copies are read from, with
+         *  {id}; also given to the scanner (CS_ARWEAVE_GATEWAY). Default
+         *  https://arweave.net/{id}. */
+        gateway: z
+          .string()
+          .regex(/^https:\/\/\S*\{id\}\S*$/, "an https URL holding {id}")
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+/**
  * The frontend's anonymous-action prover (x/shield): shield.wasm and the
  * ceremony keys, one directory per chain release (<assetsUrl>/<version>/,
  * built by the chain repo's prepare-release.sh into build/zk/<version>/). A
@@ -768,7 +840,10 @@ export const launchSpecSchema = z.object({
           .regex(/^[a-z0-9-]+$/i)
           .optional(),
       }),
-      frontend: componentToggle.extend({ prover: frontendProver.optional() }),
+      frontend: componentToggle.extend({
+        prover: frontendProver.optional(),
+        imageUploads: frontendImageUploads.optional(),
+      }),
       hub: componentToggle,
       relayer: relayerComponent.optional(),
       mastodon: mastodonComponent.optional(),

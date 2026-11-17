@@ -4412,7 +4412,7 @@ function refreshComponentEnv(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPat
     return;
   }
   const doc = yaml.load(fs.readFileSync(sdlPath, "utf8")) as any;
-  setServiceEnv(doc, d.imageServices, d.chainEnv?.(spec) ?? {});
+  setServiceEnv(doc, d.imageServices, d.chainEnv?.(spec, ctx.dirs.secrets) ?? {});
   fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
 }
 
@@ -4478,7 +4478,7 @@ function setComponentImage(sdlPath: string, key: string, image: string, spec: La
     if (!svc) throw new Error(`${key}.yaml has no services.${name}`);
     svc.image = image;
   }
-  d.upgradeDoc?.(doc);
+  d.upgradeDoc?.(doc, spec);
   fs.writeFileSync(sdlPath, yaml.dump(doc, { lineWidth: 120 }));
   return targets;
 }

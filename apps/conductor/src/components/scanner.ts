@@ -1,8 +1,8 @@
-import { chainId, type LaunchSpec } from "@sparkdream/launch-spec";
+import { chainId, uploadBodySize, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { StepCtx } from "../engine.js";
 import { SESSION_KEY_FILE, ensureSession } from "../sessions.js";
 import { registerScanner } from "../steps/scanner.js";
-import { SCANNER_OPERATOR, ensureVerdictSeed, readScannerOperatorAddress } from "./scanner-secrets.js";
+import { SCANNER_OPERATOR, ensurePrecheckToken, ensureVerdictSeed, readScannerOperatorAddress } from "./scanner-secrets.js";
 import type { ComponentDescriptor, RenderInput, SdlResources } from "./types.js";
 
 /** contentscan's CS_GAS: one MsgSubmitCheckpoint. */
@@ -27,6 +27,44 @@ const resources: SdlResources = {
   memory: { size: "1536Mi" },
   storage: [{ size: "1Gi" }, { name: "state", size: "1Gi", attributes: { persistent: true, class: "beta3" } }],
 };
+
+/**
+ * What the frontend's image uploads ask of the scanner: the pre-check token
+ * the two share (the frontend stores a member's picture only after this
+ * scanner has cleared its bytes, POST /precheck), the largest file it sends
+ * there when the spec raises it, and the gateway ar:// images are read from. Undefined values are ones a deployed scanner must drop.
+ * Rendered into a new deployment, and set in place on a running one
+ * (chainEnv), which would otherwise only learn them from a relaunch onto an
+ * empty volume.
+ */
+/** The frontend's image uploads, when the fleet has them. */
+function uploadsOf(spec: LaunchSpec) {
+  const frontend = spec.topology.components.frontend;
+  return frontend.enabled ? frontend.imageUploads : undefined;
+}
+
+/**
+ * The pre-check takes a file as the request's whole body, and the ingress
+ * refuses anything over 1 MiB unless told otherwise.
+ */
+function setUploadBodySize(expose: any, spec: LaunchSpec): void {
+  const uploads = uploadsOf(spec);
+  if (uploads) expose.http_options = { ...expose.http_options, max_body_size: uploadBodySize(uploads) };
+  else if (expose.http_options) {
+    delete expose.http_options.max_body_size;
+    if (Object.keys(expose.http_options).length === 0) delete expose.http_options;
+  }
+}
+
+function uploadsEnv(spec: LaunchSpec, secretsDir: string | undefined): Record<string, string | undefined> {
+  const uploads = uploadsOf(spec);
+  if (uploads && !secretsDir) throw new Error("the scanner's pre-check token needs the launch's secrets directory");
+  return {
+    CS_PRECHECK_TOKEN: uploads ? ensurePrecheckToken(secretsDir!) : undefined,
+    CS_PRECHECK_MAX_BYTES: uploads?.copyMaxBytes ? String(uploadBodySize(uploads)) : undefined,
+    CS_ARWEAVE_GATEWAY: uploads?.arweave?.gateway,
+  };
+}
 
 /**
  * contentscan (the sdap image), following this chain through its public
@@ -65,7 +103,10 @@ function render(input: RenderInput) {
     `CS_FEED_URL=${scannerFeedUrl(spec)}`,
     `CS_RULESET_VERSION=${s.rulesetVersion}`,
     ...(s.classifierUrl ? [`CS_CLASSIFIER_URL=${s.classifierUrl}`] : []),
+    ...Object.entries(uploadsEnv(spec, input.secretsDir)).flatMap(([k, v]) => (v === undefined ? [] : [`${k}=${v}`])),
   ];
+  const expose = { port: LISTEN_PORT, as: 80, accept: [component.domain!], to: [{ global: true }] };
+  setUploadBodySize(expose, spec);
   return {
     scanner: {
       service: {
@@ -76,7 +117,7 @@ function render(input: RenderInput) {
             "exec contentscan",
         ],
         env,
-        expose: [{ port: LISTEN_PORT, as: 80, accept: [component.domain!], to: [{ global: true }] }],
+        expose: [expose],
         params: { storage: { state: { mount: "/data", readOnly: false } } },
       },
       resources,
@@ -91,7 +132,14 @@ export const scanner: ComponentDescriptor = {
   imageServices: ["scanner"],
   shellService: "scanner",
   tunnels: () => [],
-  envRefresh: "none",
+  // an upgrade sets what the frontend's image uploads need on the running
+  // deployment, keeping its volume
+  envRefresh: "patch",
+  chainEnv: uploadsEnv,
+  // the env is set in place, so the ingress's body size is too
+  upgradeDoc: (doc, spec) => {
+    for (const e of doc.services?.scanner?.expose ?? []) if (e.port === LISTEN_PORT) setUploadBodySize(e, spec);
+  },
   // the manifest is the feed's root document: served means the feed is up
   ingress: (spec) => {
     const domain = spec.topology.components.scanner!.domain!;

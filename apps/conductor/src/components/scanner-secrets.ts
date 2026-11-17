@@ -36,6 +36,21 @@ export function ensureVerdictSeed(secretsDir: string): string {
   return verdictSeed;
 }
 
+/**
+ * The shared secret between the frontend and the scanner's pre-check
+ * endpoint (CS_PRECHECK_TOKEN / IMAGE_PRECHECK_TOKEN): made once per launch
+ * and kept with its secrets, so re-rendering either component keeps them in
+ * agreement.
+ */
+export function ensurePrecheckToken(secretsDir: string): string {
+  const file = path.join(secretsDir, SECRETS_FILE);
+  const stored = fs.existsSync(file) ? (JSON.parse(readSecretFile(file)) as { precheckToken?: string }) : {};
+  if (stored.precheckToken) return stored.precheckToken;
+  const precheckToken = crypto.randomBytes(32).toString("hex");
+  writeSecretFile(file, JSON.stringify({ ...stored, precheckToken }, null, 2));
+  return precheckToken;
+}
+
 /** The base64 ed25519 public key of a verdict seed (operator metadata). */
 export function verdictPublicKey(seedB64: string): string {
   const seed = Buffer.from(seedB64, "base64");
