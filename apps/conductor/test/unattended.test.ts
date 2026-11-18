@@ -6,11 +6,11 @@ import { TypeUrl, UNATTENDED_MSG_TYPES, type Msg } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runLaunch, runWithSigner } from "../src/engine.js";
-import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS, TOGETHER_HOLD_MS } from "../src/fleet.js";
+import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS, TOGETHER_HOLD_MS, UNREACHABLE_HOLD_MS } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { setAlertSettings } from "../src/incidents.js";
-import { opsKey, setUnattendedSettings, unattendedBlocker, unattendedSettings } from "../src/unattended.js";
+import { opsKey, setUnattendedSettings, unattendedBlocker, unattendedGas, unattendedSettings } from "../src/unattended.js";
 import { fakeServices, FakeSigner, FakeUnattendedChain, type FakeWorld } from "./fakes.js";
 
 const tmpDirs: string[] = [];
@@ -368,6 +368,83 @@ describe("automatic recovery", () => {
     expect(w.alerts.some((a) => a.includes("restarted sentry-") || a.includes("recovering sentry-"))).toBe(true);
   }, 240_000);
 
+  it("leaves a component that stopped answering alone while its lease is open, and moves it only if it stays down (2026-11-18)", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    for (const c of w.db.listFleetComponents("fl")) {
+      w.services.api.escrowBalances.set(c.dseq, { denom: "uact", amount: "100000000" });
+    }
+    // one sentry's provider stops answering the launcher; its lease stays open
+    const sentry = w.db.listFleetComponents("fl").find((c) => c.key === "sentry-1")!;
+    w.services.provider.apiDownDseqs.add(sentry.dseq);
+    for (let i = 0; i < 4; i++) {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    }
+    const incident = w.db.openIncident("fl", "sentry-1")!;
+    expect(incident.confirmed_at).toBeTruthy();
+    expect(incident.action).toBe("relaunch");
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+    expect(w.alerts.filter((a) => a.includes("left alone"))).toEqual(["sparkdream: sentry-1 left alone for now: its lease is still open"]);
+
+    // it answers again within the hold: nothing was ever done to it
+    w.services.provider.apiDownDseqs.delete(sentry.dseq);
+    const real = Date.now;
+    let spy = vi.spyOn(Date, "now").mockImplementation(() => real() + 120_000);
+    try {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(w.db.openIncident("fl", "sentry-1")).toBeUndefined();
+    expect(w.db.listFleetOps("fl")).toHaveLength(0);
+
+    // down again, and still down past the hold: now it is moved
+    w.services.provider.apiDownDseqs.add(sentry.dseq);
+    spy = vi.spyOn(Date, "now").mockImplementation(() => real() + 240_000);
+    try {
+      for (let i = 0; i < 4; i++) {
+        await w.fleet.tick("fl");
+        await w.fleet.trackIncidents("fl");
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+    spy = vi.spyOn(Date, "now").mockImplementation(() => real() + 240_000 + UNREACHABLE_HOLD_MS + 60_000);
+    try {
+      await w.fleet.tick("fl");
+      await w.fleet.trackIncidents("fl");
+    } finally {
+      spy.mockRestore();
+    }
+    const op = w.db.listFleetOps("fl", "active")[0];
+    expect(op?.kind).toBe("relaunch");
+    expect(JSON.parse(op!.params_json)).toMatchObject({ key: "sentry-1", auto: true });
+  }, 240_000);
+
+  it("does not move a component again on an incident from before a relaunch by hand (2026-11-18)", async () => {
+    const w = await launched();
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    const busy = w.db.createFleetOp("fl", "data-backup", { source: "sentry-0" });
+    const sentry = await sentryDies(w);
+    expect(w.db.openIncident("fl", "sentry-1")?.confirmed_at).toBeTruthy();
+    // the owner relaunches it by hand before the automatic recovery's turn comes
+    await new Promise((r) => setTimeout(r, 5));
+    const manual = await w.fleet.requestRelaunch(w.db.getLaunch("fl")!, sentry, { manualBid: true });
+    w.db.setFleetOpStatus(busy, "done");
+    // while that relaunch runs, the sentry is not judged at all
+    await w.fleet.tick("fl");
+    await w.fleet.trackIncidents("fl");
+    expect(w.db.listFleetOps("fl", "active").map((o) => o.id)).toEqual([manual]);
+    // and once it is done, the incident from before it starts nothing
+    w.db.setFleetOpStatus(manual, "done");
+    for (let i = 0; i < 3; i++) await w.fleet.trackIncidents("fl");
+    expect(w.db.listFleetOps("fl", "active")).toHaveLength(0);
+    expect(w.alerts.some((a) => a.includes("recovering sentry-1"))).toBe(false);
+  }, 240_000);
+
   it("an outage that starts during another op is recovered once that op is done", async () => {
     const w = await launched();
     w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
@@ -381,6 +458,17 @@ describe("automatic recovery", () => {
     expect(op?.kind).toBe("relaunch");
     expect(JSON.parse(op!.params_json)).toMatchObject({ key: "sentry-1", auto: true });
   }, 240_000);
+});
+
+describe("gas for a tx paid through the fee allowance", () => {
+  it("covers what the simulation leaves out, for small txs as for large ones (2026-11-18: out of gas at 1.4x)", () => {
+    // simulated, and what the tx then used on mainnet (about 32,000 more)
+    expect(unattendedGas(48_585)).toBeGreaterThan(48_585 + 32_000);
+    expect(unattendedGas(66_621)).toBeGreaterThan(66_621 + 32_000);
+    expect(unattendedGas(267_000)).toBeGreaterThan(300_000);
+    // the old limit, which every MsgUpdateDeployment ran past
+    expect(Math.ceil(48_585 * 1.4)).toBeLessThan(48_585 + 32_000);
+  });
 });
 
 describe("signing one pending tx at a time", () => {

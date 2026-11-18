@@ -20,7 +20,7 @@ afterAll(() => {
   for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
-async function fleet() {
+async function fleet(sentryCount = 1) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "conductor-height-"));
   tmpDirs.push(work);
   const db = new ConductorDb(path.join(work, "state.db"));
@@ -29,7 +29,7 @@ async function fleet() {
     network: { name: "sparkdream", type: "testnet", bech32Prefix: "sprkdrm" },
     topology: {
       validators: { count: 1 },
-      sentries: { count: 1 },
+      sentries: { count: sentryCount },
       components: { explorer: { enabled: false }, frontend: { enabled: false }, hub: { enabled: false } },
       headscale: { domain: "headscale.sparkdream.io" },
     },
@@ -71,6 +71,22 @@ describe("validator block height", () => {
     const h = await svc.componentHeight(launch, row("val-0"));
     expect(h).toMatchObject({ source: "node", catchingUp: false });
     expect(h!.height).toBeGreaterThan(0);
+    db.close();
+  }, 120_000);
+
+  it("asks another sentry for the chain's view when the first one's provider is out of reach too (2026-11-18)", async () => {
+    const { svc, launch, row, services, address, commit, db } = await fleet(2);
+    const sentries = db.listFleetComponents("fl").filter((c) => c.key.startsWith("sentry-"));
+    expect(sentries).toHaveLength(2);
+    // the validator and the first sentry cannot be reached; the second sentry can
+    services.provider.apiDownDseqs.add(row("val-0").dseq);
+    services.provider.apiDownDseqs.add(sentries[0]!.dseq);
+    commit(41000, [address]);
+    expect(await svc.componentHeight(launch, row("val-0"))).toMatchObject({ source: "chain", height: 41000, signed: true });
+    // with no sentry in reach there is no view to give
+    services.provider.apiDownDseqs.add(sentries[1]!.dseq);
+    (svc as any).rpcUrlCache.clear();
+    expect(await svc.componentHeight(launch, row("val-0"))).toBeNull();
     db.close();
   }, 120_000);
 

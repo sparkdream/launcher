@@ -32,6 +32,23 @@ import { readSecretFile, writeSecretFile } from "./secrets.js";
  */
 export const UNATTENDED_FEE_DENOM = "uakt";
 
+/**
+ * Gas the simulation does not count. It runs with no fee and no fee
+ * granter, so the work of paying through the allowance (reading it, spending
+ * from it, writing it back) is missing from its figure: on mainnet the txs
+ * of 2026-11-18 each used about 32,000 gas more than simulated, whatever
+ * their size (close 267k simulated and 300k used, create-deployment 132k
+ * and 164k). A multiplier alone covers that only for large txs: the small
+ * MsgUpdateDeployment (49k and 67k simulated) ran out of gas at 1.4x on
+ * every try, for two hours, with a fee paid each time.
+ */
+export const UNSIMULATED_GAS = 50_000;
+
+/** The gas limit for an unattended tx, from its simulated gas. */
+export function unattendedGas(simulated: number): number {
+  return Math.ceil((simulated + UNSIMULATED_GAS) * 1.3);
+}
+
 export interface GrantInfo {
   msgType: string;
   expiration: string | null;
@@ -98,11 +115,19 @@ export class AkashUnattendedChain implements UnattendedChain {
     const grantee = account!.address;
     const client = await this.connect(wallet);
     const exec = toEncodeObject({ typeUrl: TypeUrl.Exec, value: { grantee, msgs } });
-    const gas = Math.ceil((await client.simulate(grantee, [exec], "")) * 1.4);
-    const fee = { ...calculateFee(gas, GasPrice.fromString(this.opts.gasPrice)), granter };
-    const result = await client.signAndBroadcast(grantee, [exec], fee, "SparkDream launcher: unattended recovery");
-    if (result.code !== 0) throw new Error(`tx failed (code ${result.code}): ${result.rawLog ?? ""}`);
-    return result.transactionHash;
+    let gas = unattendedGas(await client.simulate(grantee, [exec], ""));
+    for (let attempt = 0; ; attempt++) {
+      const fee = { ...calculateFee(gas, GasPrice.fromString(this.opts.gasPrice)), granter };
+      const result = await client.signAndBroadcast(grantee, [exec], fee, "SparkDream launcher: unattended recovery");
+      if (result.code === 0) return result.transactionHash;
+      // out of gas (sdk code 11) changed nothing on chain: once more with
+      // twice the gas, in case the estimate is off by more than allowed for
+      if (result.code === 11 && attempt === 0) {
+        gas *= 2;
+        continue;
+      }
+      throw new Error(`tx failed (code ${result.code}): ${result.rawLog ?? ""}`);
+    }
   }
 
   /** A signing client on the first RPC that answers. */

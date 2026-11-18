@@ -55,6 +55,21 @@ const TOGETHER_WINDOW_MS = 10 * 60_000;
 /** How long such a group must stay down before any of it is moved automatically. */
 export const TOGETHER_HOLD_MS = 15 * 60_000;
 
+/**
+ * How long a component that stopped answering while its lease is still open
+ * must stay down before it is moved or re-created automatically. A lost
+ * route between the launcher and a provider's public ports reads exactly
+ * like a dead provider and is usually over in a minute or two (2026-11-18:
+ * 90 seconds, in which a sentry was closed and redeployed while the chain
+ * shows its validator neighbour on the same provider signing every block).
+ */
+export const UNREACHABLE_HOLD_MS = 10 * 60_000;
+
+/** After this many failed unattended broadcasts of one tx, further tries are spaced out. */
+const EXEC_RETRY_FAST = 3;
+/** The spacing: each failed broadcast that reaches the chain costs a fee. */
+const EXEC_RETRY_EVERY_MS = 10 * 60_000;
+
 /** How long an automatic restart gets to bring a component back before its container is re-created. */
 export const RESTART_GRACE_MS = 5 * 60_000;
 
@@ -906,7 +921,28 @@ export class FleetService {
    * provider cannot run the in-container probe.
    */
   private async chainView(launch: LaunchRow, component: FleetComponentRow, providerError: string): Promise<NodeHeight | null> {
-    const url = await this.sentryRpcUrl(launch).catch(() => null);
+    // Any sentry can show the chain, and the ones on another provider are
+    // asked first: the first sentry alone, when it shares the validator's
+    // provider, is unreachable for the same reason the validator is, and
+    // the validator then read "unreachable" while it signed every block
+    const sentries = this.db
+      .listFleetComponents(launch.id)
+      .filter((c) => c.key.startsWith("sentry-") && c.state === "active")
+      .sort((a, b) => Number(a.provider === component.provider) - Number(b.provider === component.provider));
+    for (const sentry of sentries) {
+      const view = await this.chainViewVia(launch, component, sentry, providerError);
+      if (view) return view;
+    }
+    return null;
+  }
+
+  private async chainViewVia(
+    launch: LaunchRow,
+    component: FleetComponentRow,
+    sentry: FleetComponentRow,
+    providerError: string,
+  ): Promise<NodeHeight | null> {
+    const url = await this.forwardedRpcUrl(launch, sentry).catch(() => null);
     if (!url) return null;
     try {
       const commit = JSON.parse(await this.services.rpc.getText(`${url}/commit`)) as any;
@@ -941,6 +977,11 @@ export class FleetService {
       .listFleetComponents(launch.id)
       .find((c) => c.key.startsWith("sentry-") && c.state === "active");
     if (!sentry) return null;
+    return this.forwardedRpcUrl(launch, sentry);
+  }
+
+  /** A sentry's forwarded RPC URL (cached), or null when its provider does not say. */
+  private async forwardedRpcUrl(launch: LaunchRow, sentry: FleetComponentRow): Promise<string | null> {
     let cached = this.rpcUrlCache.get(sentry.dseq);
     if (!cached || Date.now() - cached.at > 120_000) {
       let url: string | null = null;
@@ -1999,7 +2040,14 @@ export class FleetService {
     if (!launch) return [];
     // paused inside an op: what the op is moving reads down because of it;
     // the rest is watched as usual (auto-recovery defers to the op)
-    const scope = launch.status === "paused" ? this.pausedOpScope(launchId) : new Set<string>();
+    // The same goes for an op under way whatever the launch's status reads
+    // at this instant (the status changes while a pass is in flight): a
+    // component an op is moving is never judged, or the stale reading from
+    // before the op confirms an outage in the middle of its relaunch
+    const scope =
+      launch.status === "paused" || this.db.listFleetOps(launchId, "active").length > 0
+        ? this.pausedOpScope(launchId)
+        : new Set<string>();
     if (scope === "all") return [];
     // This machine stalled (local-health.ts): the probes of this pass timed
     // out on its side, so its readings prove nothing about the fleet. No
@@ -2020,7 +2068,13 @@ export class FleetService {
     const events: IncidentEvent[] = [];
     for (const h of this.db.listComponentHealth(launchId)) {
       const row = rows.find((r) => r.key === h.component);
-      if (!row || scope.has(h.component)) continue;
+      if (!row) continue;
+      if (scope.has(h.component)) {
+        // checks counted before the op say nothing about what it leaves behind
+        const counting = this.db.openIncident(launchId, h.component);
+        if (counting && !counting.confirmed_at) this.db.deleteIncident(counting.id);
+        continue;
+      }
       const ev = await trackIncident(this.db, launchId, h.component, h.status, h.detail, () =>
         this.probeProvider(launch, row),
       );
@@ -2044,7 +2098,10 @@ export class FleetService {
       for (const component of [...deferred]) {
         deferred.delete(component);
         const incident = this.db.openIncident(launchId, component);
-        if (incident?.confirmed_at) {
+        // only while it still reads down: a node catching up after the op
+        // that just moved it is on its way back, not an outage to act on
+        const reading = this.db.listComponentHealth(launchId).find((h) => h.component === component)?.status;
+        if (incident?.confirmed_at && reading === incident.status) {
           await this.autoRecover(launch, incident).catch((e) => console.log(`[auto-recover] ${e}`));
         }
       }
@@ -2138,6 +2195,12 @@ export class FleetService {
     return others.length > 0 ? { others, latest } : null;
   }
 
+  /** An op that names `key` among its components was started at or after `since`. */
+  private workedOnSince(launchId: string, key: string, since: string): boolean {
+    const at = Date.parse(since);
+    return this.db.listFleetOps(launchId).some((o) => Date.parse(o.created_at) >= at && (opComponents(o) ?? []).includes(key));
+  }
+
   /** Automatic restarts of `key` in the last 24 hours (restarts are no op, so ops do not count them). */
   private recentAutoRestarts(launchId: string, key: string, record = false): number {
     const setting = `auto-restarts:${launchId}:${key}`;
@@ -2205,18 +2268,37 @@ export class FleetService {
     // problem. A lease the chain itself reports closed is not a reading of
     // that kind (it was read successfully), so it is only held for a stall.
     const heldKey = `${launch.id}/${key}`;
+    // An op has worked on this component since the incident opened (a
+    // relaunch by hand, most often): what the incident recorded is the
+    // deployment that op replaced, and acting on it now would undo the op.
+    // 2026-11-18: a sentry relaunched by hand onto a chosen provider was
+    // moved again the moment that relaunch finished, on an incident opened
+    // before it began. If the component is down after the op, that is a new
+    // incident, confirmed by checks of its own.
+    if (!opts.escalate && this.workedOnSince(launch.id, key, incident.opened_at)) return;
     const local = this.services.localHealth?.trouble() ?? null;
     const together = !local && incident.status === "unreachable" ? this.wentDownTogether(incident, row) : null;
-    if (local || (together && Date.now() - together.latest < TOGETHER_HOLD_MS)) {
+    // the lease is open and the component has not been down for long: not
+    // yet told apart from a short loss of the route to its provider
+    // (an escalation follows a restart, which is only ever tried on a
+    // component whose provider answered, and has waited its own grace period)
+    const early =
+      !opts.escalate &&
+      action !== "restart" &&
+      incident.status === "unreachable" &&
+      Date.now() - Date.parse(incident.opened_at) < UNREACHABLE_HOLD_MS;
+    if (local || (together && Date.now() - together.latest < TOGETHER_HOLD_MS) || early) {
       if (!opts.escalate) this.deferRecovery(launch.id, key);
       if (!this.heldForLocal.has(heldKey)) {
         this.heldForLocal.add(heldKey);
         await this.notify(
           launch,
           key,
-          `${key} left alone: the problem may be on the launcher's side`,
+          local || together ? `${key} left alone: the problem may be on the launcher's side` : `${key} left alone for now: its lease is still open`,
           local
             ? `${incident.cause}, but the launcher's machine is overloaded or was suspended (${local}), so the reading is not trusted and nothing is done to ${key} until the machine has run smoothly for a few minutes and ${key} still reads down.`
+            : !together
+              ? `${incident.cause}, but the chain shows its lease open, and a short loss of the route between the launcher and its provider reads the same. Nothing is done to ${key} unless it is still down ${UNREACHABLE_HOLD_MS / 60_000} minutes after it stopped answering. If it really is down, use the fix button on the fleet card.`
             : `${incident.cause}, but ${together!.others.join(", ")} on ${together!.others.length > 1 ? "other providers" : "another provider"} stopped answering at the same time, which points at the launcher's machine or its network. Nothing is done to ${key} unless they are all still down ${TOGETHER_HOLD_MS / 60_000} minutes on. If they really are down, use the fix button on the fleet card.`,
         );
       }
@@ -2314,6 +2396,8 @@ export class FleetService {
 
   /** Grant info is a chain round trip; a minute's cache serves a whole relaunch. */
   private readonly grantCache = new Map<string, { at: number; grants: GrantInfo[]; allowance?: AllowanceInfo | null | undefined }>();
+  /** Failed unattended broadcasts per "launchId:step": how many, and when the last one was. */
+  private readonly execFailures = new Map<string, { count: number; at: number }>();
   /** Steps whose unattended refusal was already alerted. */
   private readonly refusedSteps = new Set<string>();
 
@@ -2376,10 +2460,17 @@ export class FleetService {
       }
       return false;
     }
+    // a tx the chain keeps refusing is tried less often: every refusal that
+    // reaches a block pays its fee (2026-11-18: one every 40s for two hours)
+    const execTag = `${launchId}:${pending.step}`;
+    const failed = this.execFailures.get(execTag);
+    if (failed && failed.count >= EXEC_RETRY_FAST && Date.now() - failed.at < EXEC_RETRY_EVERY_MS) return false;
     let hash: string;
     try {
       hash = await chain.exec(mnemonic, launch.owner, msgs);
+      this.execFailures.delete(execTag);
     } catch (e) {
+      this.execFailures.set(execTag, { count: (failed?.count ?? 0) + 1, at: Date.now() });
       // retried on every monitor pass, alerted once: a refused broadcast
       // (2026-10-07: fees in a denom the node does not take) otherwise
       // left the step on "Signature needed" for hours with no word why
