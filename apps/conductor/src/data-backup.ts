@@ -226,12 +226,12 @@ async function removeObject(
   if (!res.stdout.includes("removed")) throw new Error(`could not delete ${name} from the bucket: ${res.stdout.trim().slice(0, 300)}`);
 }
 
-/** Which node to copy: never a validator; a sentry other than sentry-0 when there is one. */
-export function backupSource(rows: FleetComponentRow[]): FleetComponentRow | undefined {
+/** Which node to copy: never a validator; a sentry other than the serving one (sentry-0 unless the fleet switched) when there is one. */
+export function backupSource(rows: FleetComponentRow[], serving = "sentry-0"): FleetComponentRow | undefined {
   const sentries = rows
     .filter((r) => r.key.startsWith("sentry-") && r.state === "active" && r.ssh_host)
     .sort((a, b) => Number(b.key.split("-")[1]) - Number(a.key.split("-")[1]));
-  return sentries.find((r) => r.key !== "sentry-0") ?? sentries[0];
+  return sentries.find((r) => r.key !== serving) ?? sentries[0];
 }
 
 /** A shell file of exported variables, values single-quoted. */

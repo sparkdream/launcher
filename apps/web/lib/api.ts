@@ -513,6 +513,9 @@ export interface FleetSummary {
     };
     /** Which components recover on their own (off unless turned on). */
     autoRecover: AutoRecoverPolicy;
+    /** Chain fleets: the sentry the public API/RPC, the explorer and the
+     *  relayers go through; sentry-0 unless the fleet switched. */
+    servingSentry?: string;
     /** Confirmed outages: open ones first, then the latest resolved. */
     incidents: Array<{
       id: number;
@@ -611,6 +614,9 @@ export type FleetAction =
    *  manifest (nonce-bumped so the manifest is genuinely new). For a
    *  deployment that is already correct while the container never was. */
   | "force-redeploy"
+  /** Make this sentry the serving one: the public API/RPC domains, the
+   *  explorer and the relayers move to it; the other sentry is not touched. */
+  | "serve"
   /** Reset halt-height to 0 across the chain nodes: the recovery path for a
    *  halt-height upgrade abandoned before it cleared the setting itself. */
   | "clear-halt-height"

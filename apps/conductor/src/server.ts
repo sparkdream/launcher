@@ -816,6 +816,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         | "restore-archive"
         | "repair"
         | "force-redeploy"
+        | "serve"
         | "clear-halt-height"
         | "reset-data"
         | "resize"
@@ -1153,6 +1154,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
           const opId = fleet.requestRepair(launch, component);
           drive(launchId, spec);
           return { status: "repair-started", opId };
+        } catch (e) {
+          return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+      case "serve": {
+        try {
+          // this sentry takes over the public endpoints, the explorer and
+          // the relayers; the one serving until now is left as it is
+          const opId = fleet.requestSwitchSentry(launch, component);
+          drive(launchId, spec);
+          return { status: "switch-sentry-started", opId };
         } catch (e) {
           return reply.status(409).send({ error: String(e instanceof Error ? e.message : e) });
         }

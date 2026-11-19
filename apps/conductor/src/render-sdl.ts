@@ -112,18 +112,26 @@ export function renderNodeSdl(input: RenderSdlInput): void {
   // manual testnet (prod SDLs, verified live). The rpc accept rides the
   // EXISTING 26657 expose so `global: true` keeps allocating the random
   // forwarded port the health probes and verify-chain depend on.
-  if (node.role === "sentry" && node.index === 0) {
+  //
+  // Every other sentry forwards the LCD port too, without the accept: the
+  // domains reach a sentry through its forwarded ports (a Cloudflare Origin
+  // Rule per domain), so any sentry holding both ports can take over as the
+  // serving one (serving-sentry.ts). A lease only ever forwards the ports
+  // it was created with, hence here and not at the switch. The accepts stay
+  // on sentry-0 alone: two leases claiming one hostname on the same
+  // provider collide.
+  if (node.role === "sentry") {
     const pub = spec.topology.publicEndpoints;
     if (pub?.api) {
       svc.expose.push({
         port: 1317,
         as: 1317,
-        accept: [pub.api],
+        ...(node.index === 0 ? { accept: [pub.api] } : {}),
         proto: "tcp",
         to: [{ global: true }],
       });
     }
-    if (pub?.rpc) {
+    if (pub?.rpc && node.index === 0) {
       const rpc = (svc.expose as any[]).find((e) => e.port === 26657);
       if (!rpc) throw new Error("vendored sentry SDL has no 26657 expose");
       rpc.accept = [pub.rpc];

@@ -14,6 +14,7 @@ import type { ConductorDb, FleetComponentRow, LaunchRow } from "./db.js";
 import type { Tunnel } from "./components/types.js";
 import { readSecretFile, writeSecretFile } from "./secrets.js";
 import { mayUseFleet } from "./bridge-target.js";
+import { servingPeer, servingSentryRow } from "./serving-sentry.js";
 
 /**
  * The relayer component: one Hermes process relaying every path in
@@ -94,15 +95,16 @@ export function savePublicRelayEndpoint(db: ConductorDb, launchId: string, ep: P
 export function publicRelayEndpointStale(db: ConductorDb, launchId: string): boolean {
   const raw = db.getSetting(publicEndpointSetting(launchId));
   if (!raw) return false;
-  const sentry = db.listFleetComponents(launchId).find((c) => c.key === "sentry-0");
-  return Boolean(sentry && sentry.state !== "closed" && sentry.dseq !== (JSON.parse(raw) as PublicRelayEndpoint).dseq);
+  // the serving sentry: a relaunch moves its ports, and so does a switch
+  const sentry = servingSentryRow(db, launchId);
+  return Boolean(sentry && sentry.dseq !== (JSON.parse(raw) as PublicRelayEndpoint).dseq);
 }
 
 export function publicRelayEndpoint(db: ConductorDb, launchId: string): PublicRelayEndpoint | undefined {
   const raw = db.getSetting(publicEndpointSetting(launchId));
   if (!raw) return undefined;
   const ep = JSON.parse(raw) as PublicRelayEndpoint;
-  const sentry = db.listFleetComponents(launchId).find((c) => c.key === "sentry-0");
+  const sentry = servingSentryRow(db, launchId);
   return sentry && sentry.dseq === ep.dseq ? ep : undefined;
 }
 
@@ -530,6 +532,12 @@ export function relayedBy(db: ConductorDb, launchId: string): string[] {
 export function peerRow(db: ConductorDb, launchId: string, peer: string): FleetComponentRow | undefined {
   const { key, launchId: other } = parseFleetPeer(peer);
   return (db.listFleetComponents(other ?? launchId) as FleetComponentRow[]).find((c) => c.key === key);
+}
+
+/** A descriptor's tunnel peer as a row: "sentry-0" there means the serving
+ *  sentry of the fleet it names (serving-sentry.ts). */
+export function servingPeerRow(db: ConductorDb, launchId: string, peer: string): FleetComponentRow | undefined {
+  return peerRow(db, launchId, servingPeer(db, launchId, peer));
 }
 
 /**

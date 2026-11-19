@@ -2042,6 +2042,7 @@ export default function Page() {
       | "restore-archive"
       | "repair"
       | "force-redeploy"
+      | "serve"
       | "clear-halt-height"
       | "reset-data"
       | "resize"
@@ -7325,6 +7326,23 @@ export default function Page() {
                                       onClick={() => setBattleWeb3For({ launchId: f.launchId, dseq: c.dseq, chainFleet })}
                                     >
                                       onchain{f.battleWeb3 ? " ✓" : ""}…
+                                    </button>
+                                  )}
+                                  {/^sentry-\d+$/.test(c.key) && f.servingSentry === c.key && (
+                                    <span
+                                      style={{ fontSize: 12, color: "#9a9bab", alignSelf: "center" }}
+                                      title="This sentry serves the fleet's public API and RPC domains, and the explorer and the relayers tunnel to it. Another sentry takes over automatically when this one goes down (with automatic recovery on), or when you make it the serving one."
+                                    >
+                                      serving
+                                    </span>
+                                  )}
+                                  {/^sentry-\d+$/.test(c.key) && f.servingSentry !== undefined && f.servingSentry !== c.key && (
+                                    <button
+                                      className="btn"
+                                      title={`Make ${c.key} the serving sentry: the public API and RPC domains are pointed at it, then the explorer and the relayers are re-aimed at it (one signature; they restart). ${f.servingSentry} is not touched and becomes the standby. Needs ${c.key}'s deployment to forward the API port, which a sentry deployed before this feature gets by being relaunched once.`}
+                                      onClick={() => fleetAction(f.launchId, c.dseq, "serve")}
+                                    >
+                                      make serving
                                     </button>
                                   )}
                                   <button

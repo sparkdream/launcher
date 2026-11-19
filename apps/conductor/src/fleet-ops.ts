@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { originInstruction, pointDns, pointOrigins, publicEndpointRecords, type OriginRecord } from "./dns-steps.js";
+import { originInstruction, pointDns, pointOrigins, PUBLIC_ENDPOINT_PORTS, publicEndpointRecords, type OriginRecord } from "./dns-steps.js";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -56,7 +56,8 @@ import { sparkdreamd } from "./exec.js";
 import { renderComponentSdl } from "./render-component-sdl.js";
 import { descriptorFor, setServiceEnv } from "./components/index.js";
 import { applyMinGasPrices, nodeMinGasPrices, patchNodeAppToml, patchSentryAppToml, readMinGasPrices, sentryServe } from "./sentry-serve.js";
-import { fleetPeer, peerRow, relayedBy, sisterChainApis } from "./relayer.js";
+import { fleetPeer, peerRow, relayedBy, servingPeerRow, sisterChainApis } from "./relayer.js";
+import { DEFAULT_SERVING_SENTRY, servingPeer, servingSentry, servingSentryRow, setServingSentry } from "./serving-sentry.js";
 import { linkFederationPeers, linkRelayer, openPublicGrpc } from "./steps/relayer-link.js";
 import { componentLease, reconcileSessions, type SessionRole } from "./sessions.js";
 import { claimPayments } from "./pay-claims.js";
@@ -122,6 +123,11 @@ export interface RelaunchParams {
   /** Operator picks the bid by hand: the lease step parks with the bid list
    *  on this op row instead of applying the selection policy. */
   manualBid?: boolean;
+  /** The component was the fleet's serving sentry when the op was requested
+   *  (serving-sentry.ts): its move takes the public domains and the mesh
+   *  clients along. Absent on ops from before the role could move, where
+   *  sentry-0 held it. */
+  serving?: boolean;
   /** The pick, once made. Scoped to the deployment the bids belong to — a
    *  later attempt (new dseq) draws new bids, so an old pick never applies. */
   bidChoice?: { dseq: string; provider: string };
@@ -182,7 +188,13 @@ function headscaleRef(ctx: StepCtx): { hostUri: string; dseq: string; gseq: numb
  * Everything that re-aims a tunnel env reads this map, so a component's
  * mesh dependencies are stated once.
  */
-function tunnelPeers(spec: LaunchSpec, key: string): Map<number, string> {
+function tunnelPeers(
+  spec: LaunchSpec,
+  key: string,
+  /** What a service component's descriptor peer means now: its "sentry-0"
+   *  is the serving sentry (serving-sentry.ts). Nodes' peers are literal. */
+  serving: (peer: string) => string = (peer) => peer,
+): Map<number, string> {
   const topo = resolveTopology(spec);
   const peers = new Map<number, string>();
   if (key.startsWith("val-")) {
@@ -199,7 +211,7 @@ function tunnelPeers(spec: LaunchSpec, key: string): Map<number, string> {
       peers.set(tunnelPort(v), `val-${v}`);
     }
   } else {
-    for (const t of descriptorFor(key)?.tunnels(spec) ?? []) peers.set(t.local, t.peer);
+    for (const t of descriptorFor(key)?.tunnels(spec) ?? []) peers.set(t.local, serving(t.peer));
   }
   return peers;
 }
@@ -225,7 +237,7 @@ function retargetTunnelEnv(
    *  this one); its own peers resolve against its rows. */
   fleetId: string = ctx.launchId,
 ): { text: string; changes: string[] } {
-  const peers = tunnelPeers(spec, key);
+  const peers = tunnelPeers(spec, key, (peer) => servingPeer(ctx.db, fleetId, peer));
   if (peers.size === 0) return { text, changes: [] };
   const rows = ctx.db.listFleetComponents(fleetId) as FleetComponentRow[];
   const changes: string[] = [];
@@ -247,10 +259,12 @@ function retargetTunnelEnv(
   return { text: out, changes };
 }
 
-/** Mesh components whose tunnel env dials `key` (the explorer, for a sentry). */
-function meshDependents(spec: LaunchSpec, key: string): string[] {
+/** Mesh components whose tunnel env dials `key` (the explorer, for the
+ *  serving sentry: `serving` names the sentry holding that role). */
+function meshDependents(spec: LaunchSpec, key: string, serving: string = DEFAULT_SERVING_SENTRY): string[] {
+  const now = (peer: string) => (peer === DEFAULT_SERVING_SENTRY ? serving : peer);
   return serviceComponents(spec)
-    .filter((c) => c.mesh && [...tunnelPeers(spec, c.key).values()].includes(key))
+    .filter((c) => c.mesh && [...tunnelPeers(spec, c.key, now).values()].includes(key))
     .map((c) => c.key);
 }
 
@@ -268,14 +282,16 @@ interface MeshDependent {
  * run time, since other fleets can start relaying after this op was built.
  */
 function allMeshDependents(ctx: StepCtx, spec: LaunchSpec, key: string): MeshDependent[] {
-  const out: MeshDependent[] = meshDependents(spec, key).map((k) => ({
+  const serving = servingSentry(ctx.db, ctx.launchId);
+  const out: MeshDependent[] = meshDependents(spec, key, serving).map((k) => ({
     fleetId: ctx.launchId,
     key: k,
     spec,
     sdlDir: ctx.dirs.sdl,
   }));
-  if (key !== "sentry-0") return out;
-  const peer = fleetPeer("sentry-0", ctx.launchId);
+  if (key !== serving) return out;
+  // descriptors name the serving sentry "sentry-0", whichever holds the role
+  const peer = fleetPeer(DEFAULT_SERVING_SENTRY, ctx.launchId);
   for (const other of relayedBy(ctx.db, ctx.launchId)) {
     const launch = ctx.db.getLaunch(other);
     if (!launch) continue;
@@ -1158,7 +1174,7 @@ export function addComponentSteps(opId: number, params: AddComponentParams, spec
         sshPublicKey: keys.sshPublicKey,
         outPath: sdlPathFor(ctx, key),
         placeholder,
-        peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+        peerTailnetIp: (peer) => servingPeerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
         secretsDir: ctx.dirs.secrets,
         resolveFleet: fleetResolver({ ...ctx, spec }),
         launchId: ctx.launchId,
@@ -1305,7 +1321,7 @@ export function relayerPathsSteps(opId: number, params: RelayerPathsParams, spec
         const tunnels = descriptorFor("relayer")!.tunnels(spec);
         const env: string[] = [];
         for (const [i, t] of tunnels.entries()) {
-          const peer = peerRow(ctx.db, ctx.launchId, t.peer);
+          const peer = servingPeerRow(ctx.db, ctx.launchId, t.peer);
           if (!peer?.tailnet_ip) throw new Error(`relayer: ${t.peer} has no recorded tailnet IP to tunnel to`);
           env.push(`TS_TUNNEL_${i + 1}=${t.local}:${peer.tailnet_ip}:${t.remote}`);
         }
@@ -1431,7 +1447,7 @@ export function mastodonResizeSteps(opId: number, params: MastodonResizeParams, 
           sshPublicKey: keys.sshPublicKey,
           outPath: sdlPathFor(ctx, key),
           placeholder,
-          peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+          peerTailnetIp: (peer) => servingPeerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
           secretsDir: ctx.dirs.secrets,
           resolveFleet: fleetResolver({ ...ctx, spec: sized }),
           launchId: ctx.launchId,
@@ -1967,12 +1983,16 @@ export function relaunchSteps(
   // node the explorer dials gets a mesh-client repoint), so which one closes
   // the op out varies — name it once instead of guessing in each step.
   const signerGate = isValidator && spec.security.keyMode === "tmkms";
-  // sentry-0 always gets the mesh-client pass: another fleet's relayer may
-  // dial it, which only the db (at run time) can tell
-  const meshClients = key === "sentry-0" || meshDependents(spec, key).length > 0;
-  // sentry-0 serves the fleet's public API/RPC domains: a move lands them on
-  // another provider's ingress, so their DNS has to follow
-  const publicDomains = key === "sentry-0" ? sentryPublicDomains(spec) : [];
+  // Is this the serving sentry (serving-sentry.ts)? Recorded on the op
+  // when it was requested, so a finished op's step list never changes under
+  // it; ops from before the role could move mean sentry-0.
+  const serving = params.serving ?? key === DEFAULT_SERVING_SENTRY;
+  // the serving sentry always gets the mesh-client pass: another fleet's
+  // relayer may dial it, which only the db (at run time) can tell
+  const meshClients = serving || meshDependents(spec, key, serving ? key : "").length > 0;
+  // it serves the fleet's public API/RPC domains: a move lands them on
+  // another provider's ports, so their DNS has to follow
+  const publicDomains = serving ? sentryPublicDomains(spec) : [];
   const lastStep = p(
     publicDomains.length > 0
       ? "public-dns"
@@ -2795,61 +2815,9 @@ export function relaunchSteps(
         // sentries: rewrite the env, one update tx, re-push the manifest —
         // which restarts them onto the live address. Left alone, they keep
         // dialing a dead IP until their own next relaunch.
-        const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
-        const cert = loadCert(ctx);
-        const msgs: Msg[] = [];
-        const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
-        for (const dep of allMeshDependents(ctx, spec, key)) {
-          const depKey = dep.key;
-          const row = (ctx.db.listFleetComponents(dep.fleetId) as FleetComponentRow[]).find(
-            (c) => c.key === depKey && c.state !== "closed",
-          );
-          if (!row) continue;
-          const sdlPath = path.join(dep.sdlDir, `${depKey}.yaml`);
-          const retarget = retargetTunnelEnv(ctx, dep.spec, depKey, fs.readFileSync(sdlPath, "utf8"), dep.fleetId);
-          const label = dep.fleetId === ctx.launchId ? depKey : fleetPeer(depKey, dep.fleetId);
-          for (const c of retarget.changes) ctx.log(`${label}: tunnel re-aimed at ${c}`);
-          if (retarget.changes.length > 0) fs.writeFileSync(sdlPath, retarget.text);
-          const artifacts = sdlArtifacts(loadSdl(sdlPath));
-          fs.writeFileSync(path.join(dep.sdlDir, `${depKey}.manifest.json`), artifacts.manifestJson);
-          // Pushed whether or not this run rewrote the SDL, as repair's
-          // mesh-env does: the update tx pauses this step for a signature,
-          // and the re-run after it finds the SDL already re-aimed. Skipping
-          // the push then left the update on chain and the provider never
-          // told, so the container kept dialing the old address. Seen live:
-          // a relayer tunnelling to a resized sentry-0's old IP for a day,
-          // its relinks hanging on the dead tunnel. A provider already
-          // running this manifest changes nothing.
-          pushes.push({ row, json: artifacts.manifestJson });
-          // convergent like retarget: a re-run finds the version already on
-          // chain and only re-sends the manifest
-          const wantHash = Buffer.from(artifacts.hash).toString("base64");
-          const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
-          if (onChain?.hash === wantHash) continue;
-          if (retarget.changes.length === 0 && !onChain?.hash) continue;
-          msgs.push({
-            typeUrl: TypeUrl.UpdateDeployment,
-            value: { id: { owner, dseq: row.dseq }, hash: wantHash },
-          });
-        }
-        if (msgs.length > 0) await ctx.requireTx(p("mesh-clients"), msgs);
-        else ctx.db.deletePendingTx(ctx.launchId, p("mesh-clients"));
-        for (const { row, json } of pushes) {
-          try {
-            await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
-          } catch (e) {
-            // same tolerance as the counterpart sentries above: a mesh client
-            // on an unreachable provider keeps dialing the old address until
-            // its own relaunch or a repair re-pushes, which beats failing a
-            // relaunch that otherwise finished
-            ctx.log(
-              `${row.key}: manifest push failed (${e instanceof Error ? e.message : String(e)}); ` +
-                `leaving its tunnel for its own relaunch or repair to re-aim`,
-            );
-          }
-        }
+        const repointed = await repointMeshClients(ctx, spec, key, p("mesh-clients"));
         if (lastStep === p("mesh-clients")) ctx.db.setFleetOpStatus(opId, "done");
-        return { repointed: pushes.map((p2) => p2.row.key) };
+        return { repointed };
       },
     });
   }
@@ -2858,6 +2826,13 @@ export function relaunchSteps(
     steps.push({
       name: p("public-dns"),
       async run(ctx) {
+        // the fleet switched to another sentry while this one was moved:
+        // the domains are that sentry's now and stay where they are
+        if (servingSentry(ctx.db, ctx.launchId) !== key) {
+          ctx.log(`${key} no longer serves the public endpoints (${servingSentry(ctx.db, ctx.launchId)} does): DNS left alone`);
+          ctx.db.setFleetOpStatus(opId, "done");
+          return { answering: [], skipped: "not the serving sentry" };
+        }
         // a re-placement this step started, back from its close signature
         {
           const placed = ctx.output<{ dseq: string }>(p("deploy"));
@@ -2944,6 +2919,182 @@ export { pointDns } from "./dns-steps.js";
 
 /** The fleet's public API/RPC domains, all served by sentry-0, with the URL
  *  that proves each one reaches the node (the same probes verify-chain uses). */
+/**
+ * Re-aim every mesh component that dials `key` (allMeshDependents) at its
+ * current tailnet address: rewrite the env, one update tx (`stepName` holds
+ * its signature), re-push the manifests. Shared by a relaunch of the
+ * serving sentry and by a switch to another one. Returns who was pushed.
+ */
+async function repointMeshClients(ctx: StepCtx, spec: LaunchSpec, key: string, stepName: string): Promise<string[]> {
+  const owner = ctx.db.getLaunch(ctx.launchId)!.owner;
+  const cert = loadCert(ctx);
+  const msgs: Msg[] = [];
+  const pushes: Array<{ row: FleetComponentRow; json: string }> = [];
+  for (const dep of allMeshDependents(ctx, spec, key)) {
+    const depKey = dep.key;
+    const row = (ctx.db.listFleetComponents(dep.fleetId) as FleetComponentRow[]).find(
+      (c) => c.key === depKey && c.state !== "closed",
+    );
+    if (!row) continue;
+    const sdlPath = path.join(dep.sdlDir, `${depKey}.yaml`);
+    const retarget = retargetTunnelEnv(ctx, dep.spec, depKey, fs.readFileSync(sdlPath, "utf8"), dep.fleetId);
+    const label = dep.fleetId === ctx.launchId ? depKey : fleetPeer(depKey, dep.fleetId);
+    for (const c of retarget.changes) ctx.log(`${label}: tunnel re-aimed at ${c}`);
+    if (retarget.changes.length > 0) fs.writeFileSync(sdlPath, retarget.text);
+    const artifacts = sdlArtifacts(loadSdl(sdlPath));
+    fs.writeFileSync(path.join(dep.sdlDir, `${depKey}.manifest.json`), artifacts.manifestJson);
+    // Pushed whether or not this run rewrote the SDL, as repair's
+    // mesh-env does: the update tx pauses this step for a signature,
+    // and the re-run after it finds the SDL already re-aimed. Skipping
+    // the push then left the update on chain and the provider never
+    // told, so the container kept dialing the old address. Seen live:
+    // a relayer tunnelling to a resized sentry-0's old IP for a day,
+    // its relinks hanging on the dead tunnel. A provider already
+    // running this manifest changes nothing.
+    pushes.push({ row, json: artifacts.manifestJson });
+    // convergent like retarget: a re-run finds the version already on
+    // chain and only re-sends the manifest
+    const wantHash = Buffer.from(artifacts.hash).toString("base64");
+    const onChain = await ctx.services.api.deploymentInfo(owner, row.dseq);
+    if (onChain?.hash === wantHash) continue;
+    if (retarget.changes.length === 0 && !onChain?.hash) continue;
+    msgs.push({
+      typeUrl: TypeUrl.UpdateDeployment,
+      value: { id: { owner, dseq: row.dseq }, hash: wantHash },
+    });
+  }
+  if (msgs.length > 0) await ctx.requireTx(stepName, msgs);
+  else ctx.db.deletePendingTx(ctx.launchId, stepName);
+  for (const { row, json } of pushes) {
+    try {
+      await ctx.services.provider.sendManifest(cert, row.host_uri, row.dseq, json);
+    } catch (e) {
+      // same tolerance as the counterpart sentries above: a mesh client
+      // on an unreachable provider keeps dialing the old address until
+      // its own relaunch or a repair re-pushes, which beats failing a
+      // relaunch that otherwise finished
+      ctx.log(
+        `${row.key}: manifest push failed (${e instanceof Error ? e.message : String(e)}); ` +
+          `leaving its tunnel for its own relaunch or repair to re-aim`,
+      );
+    }
+  }
+  return pushes.map((p2) => p2.row.key);
+}
+
+/** Params of a "switch-sentry" op. `key` is the sentry taking over (what the
+ *  op works on); `from` the one it takes over from, which the op never
+ *  touches: it may be down, and its own recovery is its incident's business. */
+export interface SwitchSentryParams {
+  key: string;
+  from: string;
+  /** started by the launcher itself: its txs may be signed with the grant */
+  auto?: boolean;
+  /** the owner was told which records to set by hand, and resumed */
+  dnsAsked?: boolean;
+}
+
+/**
+ * Why `row` cannot serve the fleet's public endpoints, or null when it can:
+ * its lease must forward the RPC port and, when the fleet has a public API,
+ * the LCD port. Ports come with a deployment, so a sentry short of one
+ * becomes ready by being relaunched once.
+ */
+export function standbyProblem(spec: LaunchSpec, key: string, status: unknown): string | null {
+  const need = sentryPublicDomains(spec).map((d) => ({ name: d.name, port: PUBLIC_ENDPOINT_PORTS[d.name as keyof typeof PUBLIC_ENDPOINT_PORTS] }));
+  for (const n of need) {
+    try {
+      extractForwardedPort(status, n.port);
+    } catch {
+      return `${key}'s deployment forwards no ${n.name} port (${n.port}), and a deployment only gets its ports when it is created: relaunch ${key} once, then it can serve`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Make another sentry the serving one (serving-sentry.ts): check it can
+ * serve, hand it the role, point the public domains at its forwarded ports,
+ * then re-aim the mesh components that tunnel to the serving sentry (the
+ * explorer, the relayers). The domains go first because they need no
+ * signature: the public API and RPC are back within seconds, the tunnels
+ * once the update tx is signed (by the grant, for a switch the launcher
+ * started). The sentry switched away from is not touched.
+ */
+export function switchSentrySteps(opId: number, params: SwitchSentryParams, spec: LaunchSpec): StepDef[] {
+  const p = (s: string) => `op${opId}:${s}`;
+  const { key } = params;
+  const domains = sentryPublicDomains(spec);
+  return [
+    {
+      name: p("check"),
+      async run(ctx) {
+        const row = componentRow(ctx, key);
+        if (row.state !== "active") throw new Error(`${key} is not running`);
+        const status = await ctx.services.provider.leaseStatus(loadCert(ctx), row.host_uri, row.dseq, 1, 1);
+        const problem = standbyProblem(spec, key, status);
+        if (problem) throw new Error(problem);
+        const rpc = extractForwardedPort(status, 26657);
+        const node = await ctx.services.rpc.status(`http://${rpc.host}:${rpc.port}`);
+        if (node.catchingUp) throw new Error(`${key} is still catching up with the chain: it would serve stale answers`);
+        // what the fleet's components and relayers need open (the LCD, gRPC)
+        const target = rowTarget(ctx, row);
+        if (await ensureSentryServes(ctx, spec, key, target)) {
+          ctx.log(`${key}: opened what the serving sentry must serve, restarting the node`);
+          await restartNode(ctx.services.ssh, target);
+        }
+        setServingSentry(ctx.db, ctx.launchId, key);
+        ctx.log(`${key} is the serving sentry now (was ${params.from})`);
+        return { serving: key, was: params.from, height: node.latestBlockHeight };
+      },
+    },
+    {
+      name: p("public-dns"),
+      async run(ctx) {
+        if (domains.length === 0) return { answering: [] };
+        const row = componentRow(ctx, key);
+        const status = await ctx.services.provider.leaseStatus(loadCert(ctx), row.host_uri, row.dseq, 1, 1);
+        const records = publicEndpointRecords(status, domains);
+        const pointed = await pointOrigins(ctx, records);
+        const byHand = records.filter((r) => !pointed.includes(r.domain));
+        const live = JSON.parse(ctx.db.listFleetOps(ctx.launchId).find((o) => o.id === opId)?.params_json ?? "{}") as SwitchSentryParams;
+        if (byHand.length > 0 && !live.dnsAsked) {
+          // the old sentry may still answer at these names, so nothing here
+          // can tell whether the records moved: asked once, then trusted
+          ctx.db.updateFleetOpParams(opId, { ...live, dnsAsked: true });
+          throw new AwaitUser(
+            p("public-dns"),
+            `${key} serves the fleet's public endpoints now, but the launcher could not move their DNS itself. ` +
+              `Set ${byHand.map(originInstruction).join("; ")} (Cloudflare: proxy on, SSL=Flexible), then resume.`,
+          );
+        }
+        let dark = domains;
+        for (let i = 0; i < 36 && dark.length > 0; i++) {
+          if (i > 0) await ctx.services.sleep(5000);
+          const answers = await Promise.all(dark.map((d) => ctx.services.rpc.httpOk(d.url)));
+          dark = dark.filter((_, j) => !answers[j]);
+        }
+        if (dark.length > 0) {
+          throw new AwaitUser(
+            p("public-dns"),
+            `${dark.map((d) => d.url).join(", ")} ${dark.length > 1 ? "do" : "does"} not answer through ${key}. ` +
+              `Check ${records.filter((r) => dark.some((d) => d.domain === r.domain)).map(originInstruction).join("; ")}, then resume.`,
+          );
+        }
+        return { answering: domains.map((d) => d.domain), dnsPointed: pointed };
+      },
+    },
+    {
+      name: p("mesh-clients"),
+      async run(ctx) {
+        const repointed = await repointMeshClients(ctx, spec, key, p("mesh-clients"));
+        ctx.db.setFleetOpStatus(opId, "done");
+        return { repointed };
+      },
+    },
+  ];
+}
+
 export function sentryPublicDomains(spec: LaunchSpec): { name: string; domain: string; url: string }[] {
   const pub = isServicesFleet(spec) ? undefined : spec.topology.publicEndpoints;
   const out: { name: string; domain: string; url: string }[] = [];
@@ -4350,7 +4501,7 @@ export function retargetSteps(opId: number, params: RetargetParams, spec: Launch
           const endpoints = sentryPublicDomains(spec).filter((d) => darkHosts.has(d.domain));
           let origins: OriginRecord[] = [];
           if (endpoints.length > 0 && params.components.some((k) => k.startsWith("sentry-"))) {
-            const s0 = componentRow(ctx, "sentry-0");
+            const s0 = componentRow(ctx, servingSentry(ctx.db, ctx.launchId));
             const status = await ctx.services.provider.leaseStatus(loadCert(ctx), s0.host_uri, s0.dseq, 1, 1).catch(() => undefined);
             if (status) {
               origins = publicEndpointRecords(status, endpoints);
@@ -4431,7 +4582,7 @@ function rerenderComponentSdl(ctx: StepCtx, spec: LaunchSpec, key: string, sdlPa
     sshPublicKey: keys.sshPublicKey,
     outPath: sdlPath,
     placeholder,
-    peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+    peerTailnetIp: (peer) => servingPeerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
     secretsDir: ctx.dirs.secrets,
     resolveFleet: fleetResolver({ ...ctx, spec }),
     launchId: ctx.launchId,
@@ -6241,7 +6392,7 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
           // key, which then reads as ok: the pin is what says it still needs
           // its push
           const rekeying = keyState !== "ok" || fs.existsSync(path.join(ctx.dirs.root, `op${opId}-authkey-${key}.pin`));
-          if (tunnelPeers(spec, key).size === 0 && !rekeying) continue;
+          if (tunnelPeers(spec, key).size === 0 && !rekeying) continue; // (how many, not whom: unmapped is fine)
           const added: string[] = [];
           if (rekeying) {
             // pinned: the update's signature pauses this step, and a key
@@ -6627,7 +6778,7 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             if (target) fixed.push(...(await pointDns(ctx, [{ domain: pr.domain, target }])));
           }
         }
-        const s0 = row("sentry-0");
+        const s0 = row(servingSentry(ctx.db, ctx.launchId));
         const endpoints = [];
         for (const d of sentryPublicDomains(spec)) if (await dark(d.url)) endpoints.push(d);
         if (s0 && endpoints.length > 0) {
@@ -6794,6 +6945,7 @@ function buildSteps(
     if (op.kind === "restore-archive") steps.push(...restoreArchiveSteps(op.id, params));
     if (op.kind === "repair") steps.push(...repairSteps(op.id, params, spec));
     if (op.kind === "force-redeploy") steps.push(...forceRedeploySteps(op.id, params, spec));
+    if (op.kind === "switch-sentry") steps.push(...switchSentrySteps(op.id, params as SwitchSentryParams, spec));
     // ...but only the steps it ran. Rebuilt from today's spec, a done op can
     // take another shape (its component since removed from the spec turns a
     // service relaunch into a node one, 2026-09-28), and a step it never had

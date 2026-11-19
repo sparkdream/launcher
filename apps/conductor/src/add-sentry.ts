@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { servingSentry } from "./serving-sentry.js";
 import { chainId, nodes, resolveTopology, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { LaunchDirs, StepDef } from "./engine.js";
 import type { ConductorDb } from "./db.js";
@@ -290,6 +291,9 @@ export async function removeSentry(
   if (!m) throw new Error(`${key} is not a sentry`);
   const index = Number(m[1]);
   if (index === 0) throw new Error("sentry-0 serves the public endpoints and is not removed: relaunch it instead");
+  if (servingSentry(db, launchId) === key) {
+    throw new Error(`${key} serves the public endpoints now: make another sentry the serving one first`);
+  }
   if (index !== spec.topology.sentries.count - 1) {
     throw new Error(`only the highest-numbered sentry (sentry-${spec.topology.sentries.count - 1}) can be removed`);
   }

@@ -40,7 +40,7 @@ import { fetchJoinGenesis, resolveStateSyncTrust } from "./join.js";
 import { referenceGenesisPath } from "../vendor.js";
 import { renderNodeSdl } from "../render-sdl.js";
 import { renderComponentSdl } from "../render-component-sdl.js";
-import { ensureRelayerMnemonic, peerRow, RELAYER_ACCOUNT, relayerAddress, sisterChainApis } from "../relayer.js";
+import { ensureRelayerMnemonic, RELAYER_ACCOUNT, relayerAddress, servingPeerRow, sisterChainApis } from "../relayer.js";
 import { descriptor } from "../components/index.js";
 import { BRIDGE_OPERATOR } from "../components/mastodon-secrets.js";
 import { SCANNER_OPERATOR } from "../components/scanner-secrets.js";
@@ -656,7 +656,7 @@ export const renderSdlsStep: StepDef = {
         sshPublicKey: keys.sshPublicKey,
         outPath,
         placeholder,
-        peerTailnetIp: (peer) => peerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
+        peerTailnetIp: (peer) => servingPeerRow(ctx.db, ctx.launchId, peer)?.tailnet_ip ?? undefined,
         secretsDir: ctx.dirs.secrets,
         resolveFleet: fleetResolver(ctx),
         launchId: ctx.launchId,

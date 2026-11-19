@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import yaml from "js-yaml";
 import { grpcRequired, lcdRequired, type LaunchSpec } from "@sparkdream/launch-spec";
 import type { StepCtx } from "./engine.js";
 import { NODE_HOME } from "./node-ops.js";
@@ -25,6 +26,23 @@ export interface SentryServe {
  *  fleet's relayer dialing this chain, which this spec cannot know about. */
 export function sentryServe(spec: LaunchSpec, relayedTo = false): SentryServe {
   return { lcd: lcdRequired(spec), grpc: grpcRequired(spec) || relayedTo };
+}
+
+/**
+ * A stored sentry SDL that also forwards the LCD port (1317), which is what
+ * a sentry needs, beside its RPC port, to take over the fleet's public API
+ * (serving-sentry.ts); unchanged when it already does, or when the fleet
+ * has no public API. For sentries deployed before every sentry carried the
+ * port: their next deployment (a relaunch) then forwards it, since a lease
+ * only ever forwards the ports it was created with.
+ */
+export function withStandbyApiPort(text: string, spec: LaunchSpec): string {
+  if (!spec.topology.publicEndpoints?.api) return text;
+  const doc = yaml.load(text) as any;
+  const expose: any[] | undefined = doc?.services?.sparkdreamd?.expose;
+  if (!expose || expose.some((e) => e.port === 1317)) return text;
+  expose.push({ port: 1317, as: 1317, proto: "tcp", to: [{ global: true }] });
+  return yaml.dump(doc, { lineWidth: 120 });
 }
 
 /** Set `key = value` inside `[section]`, replacing the key's first line.

@@ -37,6 +37,8 @@ import {
 import { descriptorFor, imageUploadsSecretProblem } from "./components/index.js";
 import { peerProgress, type PeerSetup } from "./peering.js";
 import { publicRelayEndpointStale, publicRelayFleets, RELAYER_ACCOUNT, relayerTunnels, resolveRelayCounterparty } from "./relayer.js";
+import { servingSentry } from "./serving-sentry.js";
+import { withStandbyApiPort } from "./sentry-serve.js";
 import {
   cosmjsWithdraw,
   lowFundsDetail,
@@ -69,6 +71,9 @@ export const UNREACHABLE_HOLD_MS = 10 * 60_000;
 const EXEC_RETRY_FAST = 3;
 /** The spacing: each failed broadcast that reaches the chain costs a fee. */
 const EXEC_RETRY_EVERY_MS = 10 * 60_000;
+
+/** Automatic switches of the serving sentry are at least this far apart, so two ailing sentries cannot trade the role back and forth. */
+export const SWITCH_EVERY_MS = 15 * 60_000;
 
 /** How long an automatic restart gets to bring a component back before its container is re-created. */
 export const RESTART_GRACE_MS = 5 * 60_000;
@@ -232,7 +237,7 @@ import { extractForwardedPort, headscaleBackupPath, providerUnreachable, resolve
 import { canonicalGenesisSha256 } from "./steps/join.js";
 import { serviceIngressHost } from "./steps/phase-ef.js";
 import { dependentFleets } from "./headscale-reuse.js";
-import { AUTO_BID, consensusAddress, imageRepo, sentryPublicDomains } from "./fleet-ops.js";
+import { AUTO_BID, consensusAddress, imageRepo, sentryPublicDomains, standbyProblem } from "./fleet-ops.js";
 import {
   keepPreviousS3Secret,
   markMeshBackupUnverified,
@@ -316,7 +321,7 @@ import {
 } from "./local-signer.js";
 import { probeSaysConnected, SIGNER_CONNECTED_PROBE } from "./tmkms.js";
 
-import type { AddComponentParams, BattleWeb3Params, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
+import type { AddComponentParams, BattleWeb3Params, GasPriceParams, MastodonResizeParams, ReconfigureParams, RelaunchParams, RelayerPathsParams, ResetChainParams, RetargetParams, SwitchSentryParams, UpgradeParams, HaltUpgradeParams } from "./fleet-ops.js";
 
 /**
  * Fleet layer (M5, §5 day-2): wallet-scoped read-model reconciled against
@@ -449,6 +454,9 @@ export interface FleetView {
   };
   /** Which components auto-recovery may act on (off unless turned on). */
   autoRecover: AutoRecoverPolicy;
+  /** Chain fleets: the sentry the public endpoints, the explorer and the
+   *  relayers go through (serving-sentry.ts); sentry-0 unless switched. */
+  servingSentry?: string;
   /** Confirmed outages (incidents.ts): open ones first, then the latest resolved. */
   incidents: Array<{
     id: number;
@@ -1164,6 +1172,7 @@ export class FleetService {
             }
           : {}),
         autoRecover: this.autoRecoverPolicy(launch.id),
+        ...(isServicesFleet(spec) ? {} : { servingSentry: servingSentry(this.db, launch.id) }),
         incidents: this.db.listIncidents(launch.id, 5).map((i) => ({
           id: i.id,
           component: i.component,
@@ -1575,11 +1584,11 @@ export class FleetService {
               : ", and you will be prompted to repoint your tmkms signer to the new node."
             : ", and the launcher waits a safety window before it signs again, so there is no double-sign risk."),
       );
-    } else if (component.key === "sentry-0") {
+    } else if (component.key === servingSentry(this.db, launch.id)) {
       const domains = sentryPublicDomains(spec).map((d) => d.domain);
       if (domains.length > 0) {
         warnings.push(
-          `sentry-0 serves the public ${domains.join(" and ")} domain${domains.length > 1 ? "s" : ""}: they go ` +
+          `${component.key} serves the public ${domains.join(" and ")} domain${domains.length > 1 ? "s" : ""}: they go ` +
             "dark until their DNS records point at the new provider, and the relaunch pauses at the end " +
             "with the records to set.",
         );
@@ -2287,7 +2296,22 @@ export class FleetService {
       action !== "restart" &&
       incident.status === "unreachable" &&
       Date.now() - Date.parse(incident.opened_at) < UNREACHABLE_HOLD_MS;
-    if (local || (together && Date.now() - together.latest < TOGETHER_HOLD_MS) || early) {
+    const heldTogether = Boolean(together && Date.now() - together.latest < TOGETHER_HOLD_MS);
+    // The serving sentry: a standby takes its role over first, which costs
+    // little and is easily switched back, so it does not wait out the hold
+    // on moving the sentry itself. Not on readings this machine may have
+    // caused; the sentry's own recovery follows on a later pass.
+    if (
+      !opts.escalate &&
+      !local &&
+      !heldTogether &&
+      this.db.listFleetOps(launch.id, "active").length === 0 &&
+      (await this.failOver(launch, incident))
+    ) {
+      this.deferRecovery(launch.id, key);
+      return;
+    }
+    if (local || heldTogether || early) {
       if (!opts.escalate) this.deferRecovery(launch.id, key);
       if (!this.heldForLocal.has(heldKey)) {
         this.heldForLocal.add(heldKey);
@@ -3013,11 +3037,35 @@ export class FleetService {
     // which the other op's manifest step just rewrote to its own new dseq, so
     // each closes what the other deployed — a deploy→lease→deploy loop. Supersede any stacked op first.
     await this.supersedeRelaunchOps(launch, component.key);
+    // The serving sentry, with a standby that can take over: the standby
+    // serves first (ops run in order), so the public endpoints, the explorer
+    // and the relayers stay up through the move, and this sentry comes back
+    // as the standby. Without one it moves as the serving sentry it is.
+    let serving = component.key === servingSentry(this.db, launch.id);
+    if (serving && this.db.listFleetOps(launch.id, "active").length === 0) {
+      const standby = await this.standbySentry(launch).catch(() => ({ reason: "not checked" }));
+      if ("row" in standby) {
+        this.requestSwitchSentry(launch, standby.row, opts.auto ? { auto: true } : {});
+        serving = false;
+      }
+    }
+    // a sentry deployed before every sentry forwarded the LCD port: its new
+    // deployment gets it, which is what lets it serve in sentry-0's place
+    if (component.key.startsWith("sentry-")) {
+      const sdlPath = path.join(launchDirs(this.workRoot, launch.id).sdl, `${component.key}.yaml`);
+      if (fs.existsSync(sdlPath)) {
+        const text = fs.readFileSync(sdlPath, "utf8");
+        const next = withStandbyApiPort(text, this.spec(launch));
+        if (next !== text) fs.writeFileSync(sdlPath, next);
+      }
+    }
     return this.db.createFleetOp(launch.id, "relaunch", {
       key: component.key,
       generation: component.generation + 1,
       avoidProviders,
       preferProviders: prefs.prefer,
+      // the serving sentry's move takes the public domains and mesh clients along
+      ...(component.key.startsWith("sentry-") ? { serving } : {}),
       ...(opts.manualBid ? { manualBid: true } : {}),
       // started by auto-recovery: its txs may be signed with the grant
       ...(opts.auto ? { auto: true } : {}),
@@ -3191,9 +3239,9 @@ export class FleetService {
       warnings.push(
         ...this.sentryIsolationWarnings(spec, component, "during the cutover (about a minute)"),
       );
-      if (component.key === "sentry-0" && (spec.topology.publicEndpoints?.api || spec.topology.publicEndpoints?.rpc)) {
+      if (component.key === servingSentry(this.db, launch.id) && (spec.topology.publicEndpoints?.api || spec.topology.publicEndpoints?.rpc)) {
         warnings.push(
-          "sentry-0 serves the public API/RPC domains: if the new deployment lands on another provider, " +
+          component.key + " serves the public API/RPC domains: if the new deployment lands on another provider, " +
             "their DNS records must be pointed at it.",
         );
       }
@@ -3218,6 +3266,7 @@ export class FleetService {
       preferProviders: [...new Set([component.provider, ...prefs.prefer])],
       // a provider on the wallet's avoid list is not one to stay on
       ...(prefs.avoid.includes(component.provider) ? {} : { stayOn: component.provider }),
+      ...(component.key.startsWith("sentry-") ? { serving: component.key === servingSentry(this.db, launch.id) } : {}),
       size,
     } satisfies NodeResizeParams);
   }
@@ -3246,11 +3295,11 @@ export class FleetService {
     }
     for (const w of this.sentryIsolationWarnings(spec, component, "for the minute of the cutover")) risks.push(`${w}.`);
     if (
-      component.key === "sentry-0" &&
+      component.key === servingSentry(this.db, launch.id) &&
       (spec.topology.publicEndpoints?.api || spec.topology.publicEndpoints?.rpc) &&
       !cloudflareToken(this.workRoot)
     ) {
-      risks.push("sentry-0 serves the public API/RPC: if it moves provider, point their DNS records at it.");
+      risks.push(component.key + " serves the public API/RPC: if it moves provider, point their DNS records at it.");
     }
     const disk = await this.componentDisk(launch, component).catch(() => null);
     let blocked: string | undefined;
@@ -3872,7 +3921,7 @@ export class FleetService {
     }
     const source = this.backupSourceFor(launch.id, opts);
     if (!source) throw new Error("no running sentry to copy the chain data from");
-    if (opts.auto && source.key === "sentry-0") throw new Error("scheduled backups need a second sentry");
+    if (opts.auto && source.key === servingSentry(this.db, launch.id)) throw new Error("scheduled backups need a second sentry");
     const opId = this.db.createFleetOp(launch.id, "data-backup", {
       source: source.key,
       ...(opts.auto ? { auto: true } : {}),
@@ -3890,8 +3939,9 @@ export class FleetService {
     const rows = this.db.listFleetComponents(launchId) as FleetComponentRow[];
     const chosen = this.db.getSetting(`data-backup-source:${launchId}`);
     const row = chosen ? rows.find((r) => r.key === chosen && r.state === "active" && r.ssh_host) : undefined;
-    if (row && !(opts.auto && row.key === "sentry-0")) return row;
-    return backupSource(rows);
+    const serving = servingSentry(this.db, launchId);
+    if (row && !(opts.auto && row.key === serving)) return row;
+    return backupSource(rows, serving);
   }
 
   /** Choose the sentry backups copy, or null for the automatic pick. */
@@ -3933,7 +3983,7 @@ export class FleetService {
       .listFleetOps(launch.id, "active")
       .find((o) => (o.kind === "data-backup" || o.kind === "data-restore") && o.params_json.includes(name));
     if (running) throw new Error(`op ${running.id} is using ${name}: delete it once that is done`);
-    const via = backupSource(this.db.listFleetComponents(launch.id) as FleetComponentRow[]);
+    const via = backupSource(this.db.listFleetComponents(launch.id) as FleetComponentRow[], servingSentry(this.db, launch.id));
     if (!via) throw new Error("no running sentry to reach the bucket through");
     await deleteDataBackup(
       this.db,
@@ -3981,7 +4031,7 @@ export class FleetService {
     // held sentry-1, the only node still up, an hour into a mesh outage
     if (this.db.listIncidents(launchId, 0).length > 0) return false;
     const source = this.backupSourceFor(launchId, { auto: true });
-    if (!source || source.key === "sentry-0") return false;
+    if (!source || source.key === servingSentry(this.db, launchId)) return false;
     // a backup that never passed its check does not count as taken
     const last = dataBackups(this.db, launchId).find((r) => r.verified);
     const every = schedule === "daily" ? 86_400_000 : 7 * 86_400_000;
@@ -4835,6 +4885,120 @@ export class FleetService {
    * manifest, so every convergent pass correctly does nothing, while the
    * running container still serves env from before the update landed.
    */
+  /**
+   * A sentry that can take over from the serving one right now, or why none
+   * can: it reads healthy, its lease forwards the ports the public domains
+   * need (asked of its provider), and the launcher can move those domains
+   * itself (nobody is there to set DNS by hand in a switch it starts).
+   * Sentries on another provider than the serving one are tried first.
+   */
+  async standbySentry(launch: LaunchRow): Promise<{ row: FleetComponentRow } | { reason: string }> {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) return { reason: "a services fleet has no sentries" };
+    const serving = servingSentry(this.db, launch.id);
+    const rows = this.db.listFleetComponents(launch.id) as FleetComponentRow[];
+    const servingProvider = rows.find((c) => c.key === serving)?.provider;
+    const health = new Map(this.db.listComponentHealth(launch.id).map((h) => [h.component, h.status]));
+    const others = rows
+      .filter((c) => c.key.startsWith("sentry-") && c.key !== serving && c.state === "active")
+      .sort((a, b) => Number(a.provider === servingProvider) - Number(b.provider === servingProvider));
+    if (others.length === 0) return { reason: "the fleet has no other sentry" };
+    if (sentryPublicDomains(spec).length > 0 && !(this.services.dns?.pointOrigin && cloudflareToken(this.workRoot))) {
+      return { reason: "the launcher has no Cloudflare token to move the public domains with" };
+    }
+    let reason = "";
+    for (const row of others) {
+      if (health.get(row.key) !== "healthy") {
+        reason ||= `${row.key} is not healthy (${health.get(row.key) ?? "not checked yet"})`;
+        continue;
+      }
+      const busy = this.db.listFleetOps(launch.id, "active").some((o) => {
+        const p = JSON.parse(o.params_json) as { key?: string; source?: string };
+        return p.key === row.key || p.source === row.key;
+      });
+      if (busy) {
+        reason ||= `${row.key} is being worked on`;
+        continue;
+      }
+      const status = await this.services.provider
+        .leaseStatus(this.mtlsCreds(launch), row.host_uri, row.dseq, 1, 1)
+        .catch(() => undefined);
+      const problem = status ? standbyProblem(spec, row.key, status) : `${row.key}'s provider does not answer`;
+      if (!problem) return { row };
+      reason ||= problem;
+    }
+    return { reason };
+  }
+
+  /** Why no sentry could take over, per "launchId/component" (alerted once per incident). */
+  private readonly noStandbyTold = new Set<string>();
+
+  /**
+   * The serving sentry is down: hand its role to a standby, when one can
+   * take it (standbySentry). True when a switch was started. The sentry
+   * itself is still recovered afterwards, by its own incident.
+   */
+  private async failOver(launch: LaunchRow, incident: IncidentRow): Promise<boolean> {
+    const key = incident.component;
+    if (key !== servingSentry(this.db, launch.id)) return false;
+    if (!["unreachable", "stalled", "lease-not-active"].includes(incident.status)) return false;
+    const last = this.db
+      .listFleetOps(launch.id)
+      .filter((o) => o.kind === "switch-sentry" && (JSON.parse(o.params_json) as { auto?: boolean }).auto)
+      .map((o) => Date.parse(o.created_at))
+      .sort((a, b) => b - a)[0];
+    if (last !== undefined && Date.now() - last < SWITCH_EVERY_MS) return false;
+    const standby = await this.standbySentry(launch);
+    const told = `${launch.id}/${key}/${incident.id}`;
+    if ("reason" in standby) {
+      if (!this.noStandbyTold.has(told) && standby.reason !== "the fleet has no other sentry") {
+        this.noStandbyTold.add(told);
+        await this.notify(
+          launch,
+          key,
+          `${key} is down and no sentry can take over`,
+          `${key} serves the public endpoints, the explorer and the relayers, and they stay down until it is back: ${standby.reason}.`,
+        );
+      }
+      return false;
+    }
+    this.requestSwitchSentry(launch, standby.row, { auto: true });
+    this.autoStarted.add(launch.id);
+    await this.notify(
+      launch,
+      key,
+      `${standby.row.key} takes over from ${key}`,
+      `${incident.cause}. ${standby.row.key} serves the public endpoints, the explorer and the relayers from now on; ${key} is recovered separately and becomes the standby.`,
+    );
+    return true;
+  }
+
+  /**
+   * Make `component` the fleet's serving sentry ("switch-sentry" op): the
+   * public API and RPC domains, the explorer and the relayers move to it,
+   * and the sentry that served until now is left as it is. Whether the
+   * sentry can serve (its lease must forward the ports) is checked by the
+   * op's first step, against its provider.
+   */
+  requestSwitchSentry(launch: LaunchRow, component: FleetComponentRow, opts: { auto?: boolean } = {}): number {
+    const spec = this.spec(launch);
+    if (isServicesFleet(spec)) throw new Error("a services fleet has no sentries");
+    if (!/^sentry-\d+$/.test(component.key)) throw new Error(`${component.key} is not a sentry`);
+    if (component.state !== "active") throw new Error(`${component.key} is not running`);
+    const from = servingSentry(this.db, launch.id);
+    if (from === component.key) throw new Error(`${component.key} is the serving sentry already`);
+    const busy = this.db.listFleetOps(launch.id, "active").find((o) => {
+      const p = JSON.parse(o.params_json) as { key?: string; source?: string };
+      return p.key === component.key || p.source === component.key;
+    });
+    if (busy) throw new Error(`${component.key} is being worked on (${busy.kind} op #${busy.id}): switch once that is done`);
+    return this.db.createFleetOp(launch.id, "switch-sentry", {
+      key: component.key,
+      from,
+      ...(opts.auto ? { auto: true } : {}),
+    } satisfies SwitchSentryParams);
+  }
+
   requestForceRedeploy(launch: LaunchRow, component: FleetComponentRow, opts: { auto?: boolean } = {}): number {
     const running = this.db
       .listFleetOps(launch.id)
@@ -5380,7 +5544,7 @@ export class FleetService {
     // silently void that check on the other side.
     const publicRpc = spec.topology.publicEndpoints?.rpc;
     const rpcSources = [
-      ...(publicRpc ? [{ sentry: "sentry-0", url: `https://${publicRpc}` }] : []),
+      ...(publicRpc ? [{ sentry: servingSentry(this.db, launch.id), url: `https://${publicRpc}` }] : []),
       ...forwardedRpcs,
     ].slice(0, 4);
     // the joiner's schema and CometBFT's own rpc_servers config both

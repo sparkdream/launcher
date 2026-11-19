@@ -22,6 +22,7 @@ import {
   type RelayChannel,
   type RelayPlan,
 } from "../relayer.js";
+import { servingSentry, servingSentryRow } from "../serving-sentry.js";
 import { readSecretFile } from "../secrets.js";
 import { relayerScriptPath } from "../vendor.js";
 import { patchSentryAppToml, sentryServe } from "../sentry-serve.js";
@@ -114,10 +115,10 @@ function relayerTarget(ctx: StepCtx): SshTarget {
   return sshTarget(ctx, ep.host, ep.port, fallback);
 }
 
-/** SSH into another fleet's sentry-0 with THAT fleet's key. */
+/** SSH into another fleet's serving sentry with THAT fleet's key. */
 function foreignSentryTarget(ctx: StepCtx, launchId: string): SshTarget {
-  const row = (ctx.db.listFleetComponents(launchId) as FleetComponentRow[]).find((c) => c.key === "sentry-0");
-  if (!row?.ssh_host || !row.ssh_port) throw new Error(`fleet ${launchId}: sentry-0 has no SSH endpoint recorded`);
+  const row = servingSentryRow(ctx.db, launchId);
+  if (!row?.ssh_host || !row.ssh_port) throw new Error(`fleet ${launchId}: its serving sentry has no SSH endpoint recorded`);
   const pem = readSecretFile(path.join(launchDirs(ctx.workRoot, launchId).secrets, "ssh_ed25519.pem"));
   return { host: row.ssh_host, port: row.ssh_port, user: "root", privateKeyPem: toSsh2CompatiblePrivateKey(pem) };
 }
@@ -136,7 +137,7 @@ async function openCounterpartySentries(ctx: StepCtx, plan: RelayPlan): Promise<
     const otherSpec = JSON.parse(other.spec_json) as LaunchSpec;
     const target = foreignSentryTarget(ctx, chain.launchId);
     const serve = { ...sentryServe(otherSpec), grpc: true };
-    if (await patchSentryAppToml(ctx, fleetPeer("sentry-0", chain.launchId), target, serve)) {
+    if (await patchSentryAppToml(ctx, fleetPeer(servingSentry(ctx.db, chain.launchId), chain.launchId), target, serve)) {
       await restartNode(ctx.services.ssh, target);
     }
   }
@@ -175,22 +176,29 @@ export async function openPublicGrpc(
   const other = ctx.db.getLaunch(id);
   if (!other) throw new Error(`relayer counterparty fleet ${id} is gone`);
   const otherSpec = JSON.parse(other.spec_json) as LaunchSpec;
-  const label = fleetPeer("sentry-0", id);
-  const row = (ctx.db.listFleetComponents(id) as FleetComponentRow[]).find((c) => c.key === "sentry-0");
-  if (!row || row.state === "closed") throw new Error(`fleet ${id} has no running sentry-0 to relay through`);
+  const row = servingSentryRow(ctx.db, id);
+  if (!row) throw new Error(`fleet ${id} has no running serving sentry to relay through`);
+  const label = fleetPeer(row.key, id);
   const target = id === ctx.launchId ? ownSentryTarget(ctx, row) : foreignSentryTarget(ctx, id);
   const serve = { ...sentryServe(otherSpec), grpc: true };
   if (await patchSentryAppToml(ctx, label, target, serve)) {
     await restartNode(ctx.services.ssh, target);
   }
-  const sdlPath = path.join(launchDirs(ctx.workRoot, id).sdl, "sentry-0.yaml");
-  const text = fs.readFileSync(sdlPath, "utf8");
-  const next = withPublicGrpc(text);
-  if (next !== text) {
-    // the next deployment of sentry-0 (its relaunch) forwards gRPC; the
-    // running one is not touched, so its on-chain version stays its own
-    fs.writeFileSync(sdlPath, next);
-    ctx.log(`${label}: stored SDL now exposes gRPC for relayers on other meshes`);
+  // every sentry's stored SDL, so whichever serves next (a switch) can be
+  // relayed through as well. The next deployment of each (its relaunch)
+  // forwards gRPC; the running ones are not touched, so their on-chain
+  // versions stay their own
+  const sdlDir = launchDirs(ctx.workRoot, id).sdl;
+  for (const c of ctx.db.listFleetComponents(id) as FleetComponentRow[]) {
+    if (!c.key.startsWith("sentry-") || c.state === "closed") continue;
+    const sdlPath = path.join(sdlDir, `${c.key}.yaml`);
+    if (!fs.existsSync(sdlPath)) continue;
+    const text = fs.readFileSync(sdlPath, "utf8");
+    const next = withPublicGrpc(text);
+    if (next !== text) {
+      fs.writeFileSync(sdlPath, next);
+      ctx.log(`${fleetPeer(c.key, id)}: stored SDL now exposes gRPC for relayers on other meshes`);
+    }
   }
 
   const cert = loadCertAt(launchDirs(ctx.workRoot, id).secrets);
@@ -201,8 +209,8 @@ export async function openPublicGrpc(
   } catch {
     const wallet = other.owner === ctx.db.getLaunch(ctx.launchId)?.owner ? "" : ` with its wallet (${other.owner})`;
     needRelaunch(
-      `${otherSpec.network.name}'s sentry-0 has no public gRPC port, and a deployment only gets one when it is ` +
-        `created. Relaunch sentry-0 on ${otherSpec.network.name}${wallet}: the relaunch deploys the stored SDL, ` +
+      `${otherSpec.network.name}'s ${row.key} has no public gRPC port, and a deployment only gets one when it is ` +
+        `created. Relaunch ${row.key} on ${otherSpec.network.name}${wallet}: the relaunch deploys the stored SDL, ` +
         "which now forwards gRPC (the sentry syncs from its validator on the new provider). Then resume here.",
     );
   }
