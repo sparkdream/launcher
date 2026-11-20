@@ -2959,6 +2959,56 @@ describe("halt-height upgrade", () => {
     w.db.close();
   }, 120_000);
 
+  it("waits for a scheduled x/upgrade plan's own halt and never sets halt-height", async () => {
+    // devnet 2026-11-20: the v1.1.1 upgrade adds a store, which the new binary
+    // only does when it finds the upgrade-info.json x/upgrade writes as it
+    // halts. halt-height at the plan height stops the node one step earlier in
+    // the same block, so the file would never exist.
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const image = "sparkdreamnft/sparkdreamd-testnet-ssh:v1.1.1";
+    const plan = "phoenix-stores";
+    // every node on the old binary stops with the plan's line; the tail still
+    // carries it after the swap, when it says nothing about the new image
+    const realLogs = w.services.provider.leaseLogs.bind(w.services.provider);
+    w.services.provider.leaseLogs = async (...args: Parameters<typeof realLogs>) =>
+      `${await realLogs(...args)}ERR UPGRADE "${plan}" NEEDED at height: 10: v1.1.1\n`;
+    const opId = w.fleet.requestHaltUpgrade(launch, image, 10, plan);
+
+    const result = await driveOps(w);
+    expect(result.failedStep, w.db.getStep("fl", result.failedStep ?? "")?.error ?? "").toBeUndefined();
+    expect(result.status).toBe("completed");
+
+    expect(w.db.stepOutput("fl", `op${opId}:halt-set`)).toMatchObject({ plan });
+    expect(w.db.stepOutput("fl", `op${opId}:halt-wait`)).toMatchObject({ haltedAt: 9 });
+    expect(w.db.stepOutput("fl", `op${opId}:halt-clear`)).toMatchObject({ cleared: false });
+    // halt-height was never touched on any node
+    expect(w.services.ssh.execLog.filter((e) => e.command.includes("halt-height ="))).toEqual([]);
+    for (const c of w.db.listFleetComponents("fl").filter((x) => /^(val|sentry)-/.test(x.key))) {
+      expect(c.image).toBe(image);
+    }
+    expect(w.db.listFleetOps("fl").find((o) => o.id === opId)!.status).toBe("done");
+    w.db.close();
+  }, 120_000);
+
+  it("a plan upgrade does not take another height's or name's halt line for its own", async () => {
+    const w = await launched(specWithComponents());
+    const launch = w.db.getLaunch("fl")!;
+    const realLogs = w.services.provider.leaseLogs.bind(w.services.provider);
+    w.services.provider.leaseLogs = async (...args: Parameters<typeof realLogs>) =>
+      `${await realLogs(...args)}ERR UPGRADE "aurora" NEEDED at height: 10: \n`;
+    // no node ever halts for "phoenix-stores": the wait must not pass
+    w.services.sleep = async () => {};
+    const opId = w.fleet.requestHaltUpgrade(
+      launch, "sparkdreamnft/sparkdreamd-testnet-ssh:v1.1.1", 10, "phoenix-stores",
+    );
+    const result = await driveOps(w);
+    expect(result.failedStep).toBe(`op${opId}:halt-wait`);
+    expect(w.db.getStep("fl", `op${opId}:halt-wait`)!.error).toContain('"phoenix-stores" upgrade at 10');
+    expect(w.services.ssh.execLog.filter((e) => e.command.includes("halt-height ="))).toEqual([]);
+    w.db.close();
+  }, 120_000);
+
   it("rolls every node back when the new binary cannot read the halted chain's state", async () => {
     const w = await launched(specWithComponents());
     const launch = w.db.getLaunch("fl")!;

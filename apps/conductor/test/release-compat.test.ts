@@ -33,5 +33,8 @@ describe("incompatibleReleaseReason", () => {
       "something new",
     );
     expect(incompatibleReleaseReason("INF committed state height=5\n")).toBeUndefined();
+    // the plan being installed: the old binary's line, not the new image's
+    expect(incompatibleReleaseReason('ERR UPGRADE "v2" NEEDED at height: 100: ', "v2")).toBeUndefined();
+    expect(incompatibleReleaseReason('ERR UPGRADE "v3" NEEDED at height: 100: ', "v2")).toContain("v3");
   });
 });

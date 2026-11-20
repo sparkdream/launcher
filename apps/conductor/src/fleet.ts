@@ -5400,13 +5400,15 @@ export class FleetService {
     } satisfies RetargetParams);
   }
 
-  /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7). */
-  requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number): number {
+  /** Consensus-breaking release: coordinated halt at H, swap all, resume (M7).
+   *  With `planName`, H is where the x/upgrade plan of that name halts the
+   *  chain itself. */
+  requestHaltUpgrade(launch: LaunchRow, image: string, haltHeight: number, planName?: string): number {
     if (isServicesFleet(this.spec(launch))) throw new Error("a services fleet runs no chain to upgrade");
     assertImageRef(image);
     const before = this.imagesBefore(launch, (key) => /^(val|sentry)-/.test(key));
     this.recordSpecImage(launch, ["val-0"], image); // halt-upgrade swaps every node
-    const params: HaltUpgradeParams = { image, haltHeight, ...before };
+    const params: HaltUpgradeParams = { image, haltHeight, ...(planName ? { planName } : {}), ...before };
     return this.db.createFleetOp(launch.id, "halt-upgrade", params);
   }
 

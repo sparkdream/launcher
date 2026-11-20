@@ -2046,7 +2046,15 @@ consensus-breaking upgrades, a guided coordinated flow: the user supplies a
 halt height, the conductor sets `halt-height` in `app.toml` across all
 nodes over SSH, waits for the chain to halt there, then updates every image
 and restarts validators near-simultaneously (same >2/3 rule as launch step
-20). Cosmovisor/gov-upgrade automation remains a non-goal for v1. The
+20). When the release is installed by a scheduled x/upgrade plan (a
+governance or council upgrade), the user also names the plan: the chain then
+halts itself at the plan height, and the conductor leaves `halt-height` alone
+and waits for every node's `UPGRADE "<name>" NEEDED at height: <h>` line
+before the swap. It must not set `halt-height` there, because only x/upgrade's
+own halt writes the `upgrade-info.json` the new binary reads to add or remove
+stores, and `halt-height` stops the node earlier in the same block. Scheduling
+the plan stays with the chain's governance; cosmovisor remains a non-goal for
+v1. The
 monitor records each node's running version (RPC `/abci_info`), and the
 dashboard warns on mixed versions lingering past an upgrade or on an
 attempted downgrade.

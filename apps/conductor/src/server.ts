@@ -846,6 +846,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       components?: string[];
       amount?: string;
       haltHeight?: number;
+      /** halt-upgrade: the x/upgrade plan scheduled at haltHeight, when the
+       *  chain halts itself there. */
+      planName?: string;
       /** restore-archive: where the blocks_*.jsonl.gz live, and how far to
        *  replay (both resolved on the node when absent). */
       archiveDir?: string;
@@ -1093,7 +1096,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         }
         const badHaltImage = imageRefProblem(body.image);
         if (badHaltImage) return reply.status(400).send({ error: `"${body.image}" is not a valid image: ${badHaltImage}` });
-        const opId = fleet.requestHaltUpgrade(launch, body.image, body.haltHeight);
+        const planName = typeof body.planName === "string" ? body.planName.trim() : "";
+        if (planName.length > 140 || /["\n\r]/.test(planName)) {
+          return reply.status(400).send({ error: "planName is not a valid upgrade name" });
+        }
+        const opId = fleet.requestHaltUpgrade(launch, body.image, body.haltHeight, planName || undefined);
         drive(launchId, spec);
         return { status: "halt-upgrade-started", opId };
       }

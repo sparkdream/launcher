@@ -941,7 +941,7 @@ export async function nodeSelfHeight(
  * registered upgrade the chain has not reached. Each surfaces while comet
  * replays blocks into the app at boot, before the node serves RPC.
  */
-export function incompatibleReleaseReason(logs: string): string | undefined {
+export function incompatibleReleaseReason(logs: string, awaitedPlan?: string): string | undefined {
   const binaryEarly = /BINARY UPDATED BEFORE TRIGGER! UPGRADE "([^"]+)"/.exec(logs);
   if (binaryEarly) {
     return (
@@ -950,7 +950,10 @@ export function incompatibleReleaseReason(logs: string): string | undefined {
     );
   }
   const needed = /UPGRADE "([^"]+)" NEEDED at height/.exec(logs);
-  if (needed) {
+  // during a plan upgrade the old binary printed this very line on its way
+  // down, and a log tail read after the swap may still carry it: it says
+  // nothing about the new image, so only the wait running out decides
+  if (needed && needed[1] !== awaitedPlan) {
     return `the chain is waiting for the "${needed[1]}" upgrade, which this release does not carry`;
   }
   const handshake = /error during handshake: ([^\n]*)/.exec(logs);
@@ -974,6 +977,12 @@ export function incompatibleReleaseReason(logs: string): string | undefined {
 /** The line cosmos prints on its way down when `halt-height` fires. */
 export function haltLogLine(haltHeight: number): string {
   return `halt per configuration height ${haltHeight}`;
+}
+
+/** The line x/upgrade panics with when a scheduled plan's height arrives on a
+ *  binary that does not carry its handler. */
+export function planHaltLogLine(planName: string, height: number): string {
+  return `UPGRADE "${planName}" NEEDED at height: ${height}`;
 }
 
 /** Log tail pulled when looking for the halt line: a boot prints a lot. */
@@ -1020,6 +1029,7 @@ async function haltObserved(
   ctx: StepCtx,
   row: FleetComponentRow,
   haltHeight: number,
+  planName?: string,
 ): Promise<boolean> {
   const logs = await ctx.services.provider.leaseLogs(
     loadCert(ctx),
@@ -1029,7 +1039,7 @@ async function haltObserved(
     1,
     HALT_LOG_TAIL,
   );
-  return logs.includes(haltLogLine(haltHeight));
+  return logs.includes(planName ? planHaltLogLine(planName, haltHeight) : haltLogLine(haltHeight));
 }
 
 /**
@@ -4082,6 +4092,13 @@ export function upgradeSteps(opId: number, params: UpgradeParams, spec: LaunchSp
 export interface HaltUpgradeParams {
   image: string;
   haltHeight: number;
+  /** Name of the x/upgrade plan scheduled at `haltHeight` (a governance or
+   *  council upgrade). The chain then halts itself there, and must: only
+   *  x/upgrade's own halt writes the upgrade-info.json the new binary reads to
+   *  add or remove stores. `halt-height` fires one step earlier in the same
+   *  block and would leave that file unwritten, so with a plan the op never
+   *  sets it and waits for the plan's halt instead. */
+  planName?: string;
   /** Image each chain node ran when the op was requested (rollback target).
    *  Absent on older ops. */
   previous?: Record<string, string>;
@@ -4149,6 +4166,10 @@ function restoreSpecImages(
 /**
  * Coordinated halt-height upgrade (§5 "Node upgrades", consensus-breaking
  * releases; M7): halt every node at H, swap every image, resume together.
+ *
+ * With `params.planName` the halt is the chain's own: an x/upgrade plan of
+ * that name stops every node at H, and the op only waits for it, swaps and
+ * verifies.
  */
 export function haltUpgradeSteps(
   opId: number,
@@ -4167,6 +4188,9 @@ export function haltUpgradeSteps(
     {
       name: p("halt-set"),
       async run(ctx) {
+        // a scheduled plan halts the chain itself; setting halt-height too
+        // would stop the nodes before x/upgrade writes upgrade-info.json
+        if (params.planName) return { haltHeight: params.haltHeight, plan: params.planName };
         // halt-height is read at process start → set it, restart each node
         for (const row of nodeRows(ctx)) {
           const target = rowTarget(ctx, row);
@@ -4196,7 +4220,7 @@ export function haltUpgradeSteps(
           for (const row of nodeRows(ctx)) {
             if (halted.has(row.key)) continue;
             try {
-              if (await haltObserved(ctx, row, params.haltHeight)) halted.add(row.key);
+              if (await haltObserved(ctx, row, params.haltHeight, params.planName)) halted.add(row.key);
               else problems.push(`${row.key} still running`);
             } catch (e) {
               // no logs to read: mid-restart, or the provider is unhappy.
@@ -4208,8 +4232,9 @@ export function haltUpgradeSteps(
           }
           const keys = nodeRows(ctx).map((r) => r.key);
           if (keys.length > 0 && keys.every((k) => halted.has(k))) {
-            // FinalizeBlock refuses the halt-height block, so the committed
-            // head is the one below it
+            // FinalizeBlock refuses the halt-height block (and a plan panics
+            // in that block's PreBlocker), so the committed head is the one
+            // below it
             return { haltedAt: params.haltHeight - 1, nodes: keys };
           }
           note = problems.join(", ") || "no chain nodes to halt";
@@ -4220,13 +4245,19 @@ export function haltUpgradeSteps(
           await ctx.services.sleep(5000);
         }
         throw new Error(
-          `nodes never halted at ${params.haltHeight} (last: ${note})`,
+          params.planName
+            ? `nodes never halted for the "${params.planName}" upgrade at ${params.haltHeight} ` +
+              `(last: ${note}). Check that a plan of exactly that name and height is scheduled ` +
+              "on the chain, then retry."
+            : `nodes never halted at ${params.haltHeight} (last: ${note})`,
         );
       },
     },
     {
       name: p("halt-clear"),
       async run(ctx) {
+        // a plan upgrade never set it
+        if (params.planName) return { cleared: false };
         // clear BEFORE the image swap restarts containers, or the new
         // binary comes up and halts again immediately. Every node is crash
         // looping by now, so this has to wait for a boot window rather than
@@ -4283,7 +4314,7 @@ export function haltUpgradeSteps(
               const logs = await ctx.services.provider.leaseLogs(
                 cert, row.host_uri, row.dseq, 1, 1, HALT_LOG_TAIL,
               );
-              const reason = incompatibleReleaseReason(logs);
+              const reason = incompatibleReleaseReason(logs, params.planName);
               if (reason) return `${row.key}: ${reason}`;
             } catch {
               // mid-restart: no stream to read yet
@@ -4344,7 +4375,9 @@ export function haltUpgradeSteps(
         // the chain only runs again once the old binary is back on enough
         // power; wait for it so the op's closing message can say so
         let resumedAt: number | undefined;
-        for (let i = 0; i < 120 && resumedAt === undefined; i++) {
+        // back on the old binary a plan halts the chain again at once, so
+        // there is no resume to wait for
+        for (let i = 0; i < 120 && resumedAt === undefined && !params.planName; i++) {
           if (i > 0) await ctx.services.sleep(5000);
           try {
             const h = await sentryRpcHeight(ctx);
@@ -4375,7 +4408,10 @@ export function haltUpgradeSteps(
               `on ${rb.to}` +
               (rb.resumedAt !== undefined
                 ? ` and the chain resumed (height ${rb.resumedAt})`
-                : ", but the chain has not resumed yet: check the nodes") +
+                : params.planName
+                  ? `, where the chain stays halted at ${params.haltHeight} until an image that ` +
+                    `carries the "${params.planName}" upgrade is installed`
+                  : ", but the chain has not resumed yet: check the nodes") +
               ". Abort this operation to dismiss it.",
           );
         }

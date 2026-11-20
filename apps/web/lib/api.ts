@@ -647,6 +647,7 @@ export async function postFleetAction(
     components?: string[];
     amount?: string;
     haltHeight?: number;
+    planName?: string;
     manualBid?: boolean;
     archiveDir?: string;
     validate?: boolean;

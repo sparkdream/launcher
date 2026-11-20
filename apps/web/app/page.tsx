@@ -2055,6 +2055,7 @@ export default function Page() {
       components?: string[];
       amount?: string;
       haltHeight?: number;
+      planName?: string;
       manualBid?: boolean;
       size?: "small" | "standard" | "large";
       /** already confirmed in a dialog (resize): skip the warnings round trip */
@@ -5917,7 +5918,20 @@ export default function Page() {
                                       // would halt consensus to install what is installed;
                                       // a mixed fleet is the aborted-upgrade retry path
                                       if (!image || !nodes.some((c) => c.image !== image)) return;
-                                      const h = window.prompt("Halt height:");
+                                      // a governance or council upgrade halts the chain
+                                      // itself and must, or the new binary never learns
+                                      // which stores to add; naming the plan makes the op
+                                      // wait for that halt instead of setting halt-height
+                                      const plan = window.prompt(
+                                        "Name of the scheduled x/upgrade plan this image carries. " +
+                                          "Leave empty only for a release with no upgrade plan " +
+                                          "(the launcher then halts the chain itself with halt-height):",
+                                      );
+                                      if (plan === null) return;
+                                      const planName = plan.trim();
+                                      const h = window.prompt(
+                                        planName ? `Height of the "${planName}" plan:` : "Halt height:",
+                                      );
                                       const first = f.components.find(
                                         (c) => c.state === "active" && c.key !== "headscale",
                                       );
@@ -5926,6 +5940,7 @@ export default function Page() {
                                         await post(f.launchId, first.dseq, "halt-upgrade", {
                                           image,
                                           haltHeight: Number(h),
+                                          ...(planName ? { planName } : {}),
                                         }).catch((e) => setError(String(e)));
                                         openLaunch(f.launchId);
                                       }
