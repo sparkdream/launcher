@@ -43,7 +43,7 @@ import { pollBids } from "./akash/client.js";
 import { describeBids, exclusionEntries, manualBidRequired, selectProvider, type Bid, type OfferedBid, type PolicyDecision, type ProviderInfo } from "./akash/policy.js";
 import { loadSdl, sdlArtifacts, sortedJson } from "./akash/sdl-groups.js";
 import { gateForFreshVolume } from "./akash/update.js";
-import { ageIdentityAt, clearPin, extractForwardedPort, headscaleUserId, loadCert, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
+import { ageIdentityAt, clearPin, extractForwardedPort, headscaleUserId, loadCert, mintPreauthKey, nodeRpcUrl, nodeShellFallback, pinnedValue, sshTarget, templateHeadscaleSdl, waitLeaseStatus, type HeadscaleOutput } from "./steps/phase-bcd.js";
 import {
   buildGenesisFiles,
   createNamedAccounts,
@@ -1656,6 +1656,53 @@ export async function acceptMeshPeers(ctx: StepCtx, target: SshTarget, opts: { r
   return changed;
 }
 
+/**
+ * Wait until a freshly deployed container takes commands.
+ *
+ * A lease reports its forwarded SSH port as soon as the workload exists,
+ * which on a provider slow to pull the image (quanglong, every relaunch) is
+ * well before anything listens on it: the upload that followed was refused,
+ * fell back to the provider's shell, found no running replica there either,
+ * and failed the step with the whole upload command as its error. Retry
+ * went through only because by then the container was up.
+ *
+ * SSH answering is the signal. The provider's shell answering instead counts
+ * only once it has done so for a minute, for the providers whose forwarded
+ * ports never carry SSH: sshd starts a moment after the container, and
+ * settling for the shell at once would send the upload the slow way round.
+ */
+export async function awaitContainer(ctx: StepCtx, key: string, target: SshTarget): Promise<void> {
+  const { shellFallback: _shell, ...direct } = target;
+  const CHECKS = 48; // x 5s = 4 min, a slow image pull
+  let shellAnswers = 0;
+  let last = "";
+  for (let i = 0; i < CHECKS; i++) {
+    if (i > 0) await ctx.services.sleep(5000);
+    try {
+      await ctx.services.ssh.exec(direct, "true", { quick: true });
+      return;
+    } catch (e) {
+      last = e instanceof Error ? e.message : String(e);
+    }
+    if (!target.shellFallback) continue;
+    try {
+      await ctx.services.ssh.exec(target, "true", { quick: true });
+      if (++shellAnswers > 12) {
+        ctx.log(`${key}: SSH does not answer on its forwarded port (${last.split("\n")[0]}); using the provider's shell`);
+        return;
+      }
+    } catch (e) {
+      shellAnswers = 0;
+      last = e instanceof Error ? e.message : String(e);
+    }
+    if (i === 0) ctx.log(`${key}: waiting for its container to start`);
+  }
+  throw new Error(
+    `${key}: its container took no command for ${(CHECKS * 5) / 60} minutes after the manifest was sent ` +
+      `(${last.split("\n").pop()}). The image may still be pulling, or the provider failed to start it: retry, or relaunch onto another provider.`,
+  );
+}
+
 export async function prepareNodeHome(
   ctx: StepCtx,
   spec: LaunchSpec,
@@ -1667,6 +1714,7 @@ export async function prepareNodeHome(
   const valIndex = isValidator ? Number(key.split("-")[1]) : -1;
   // upload node data (same node key → same node ID, §5) — new volume
   const bundle = path.join(ctx.dirs.bundles, `${key}.tgz`);
+  await awaitContainer(ctx, key, target);
   await ctx.services.ssh.upload(target, bundle, "/tmp/node-data.tgz");
   await ctx.services.ssh.exec(
     target,
@@ -2111,19 +2159,7 @@ export function relaunchSteps(
         // deployment's hash (the provider then 422s the manifest)
         const authkey = await pinnedValue(ctx, `op${opId}-authkey`, async () => {
           const userId = await headscaleUserId(ctx, hsRef, spec.network.name);
-          const mint = await ctx.services.provider.shellExec(
-            loadCert(ctx),
-            hsRef.hostUri,
-            hsRef.dseq,
-            hsRef.gseq,
-            hsRef.oseq,
-            "headscale",
-            ["sh", "-c", `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`],
-          );
-          const parsedKey = JSON.parse(mint.stdout.trim());
-          const k: string = typeof parsedKey === "string" ? parsedKey : parsedKey.key;
-          if (!k) throw new Error("no preauth key in mint output");
-          return k;
+          return mintPreauthKey(ctx, hsRef, userId, key);
         });
 
         const sdlPath = sdlOf(ctx);
@@ -3423,17 +3459,7 @@ export function headscaleRelaunchSteps(opId: number, params: RelaunchParams, spe
       // step output so the tmkms panel and later ops see them.
       await hsShell(ctx, hs, `headscale users create ${spec.network.name} 2>/dev/null || true`);
       const userId = await headscaleUserId(ctx, hs, spec.network.name);
-      const mint = async (label: string) => {
-        const res = await hsShell(
-          ctx,
-          hs,
-          `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
-        );
-        const parsed = JSON.parse(res.stdout.trim());
-        const k: string = typeof parsed === "string" ? parsed : parsed.key;
-        if (!k) throw new Error(`no preauth key in mint output for ${label}`);
-        return k;
-      };
+      const mint = (label: string) => mintPreauthKey(ctx, hs, userId, label);
       const perNode: Record<string, string> = {};
       for (const k of meshKeys) perNode[k] = await mint(k);
       const home = await mint("home");
@@ -6400,13 +6426,7 @@ export function repairSteps(opId: number, params: RepairParams, spec: LaunchSpec
             const fresh = await pinnedValue(ctx, `op${opId}-authkey-${key}`, async () => {
               const hs = headscaleRef(ctx);
               const userId = await headscaleUserId(ctx, hs, spec.network.name);
-              const out = await meshStrayDeps(ctx).headscale(
-                `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
-              );
-              const parsed = JSON.parse(out.trim());
-              const k: string = typeof parsed === "string" ? parsed : parsed.key;
-              if (!k) throw new Error(`no preauth key in mint output for ${key}`);
-              return k;
+              return mintPreauthKey(ctx, hs, userId, key);
             });
             text = text.replace(/TS_AUTHKEY=[^\n"']*/g, `TS_AUTHKEY=${fresh}`);
             if (keyState !== "ok") {

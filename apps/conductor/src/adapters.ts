@@ -15,6 +15,7 @@ import type {
   SshTarget,
 } from "./services.js";
 import { RestAkashApi, type RestEndpoints } from "./akash/rest.js";
+import { TRANSIENT_SHELL_ERROR } from "./transient.js";
 
 /** Connection-level failures — the cases the lease-shell fallback can rescue. */
 function isConnectFailure(e: unknown): boolean {
@@ -22,6 +23,15 @@ function isConnectFailure(e: unknown): boolean {
   return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|Timed out while waiting for handshake|Connection lost before handshake|closed before the SSH handshake/i.test(
     s,
   );
+}
+
+/**
+ * A command as an error message carries it: its start, enough to tell which
+ * one failed. Whole, an upload's fallback command put the file itself
+ * (tens of thousands of base64 characters) on the launch panel.
+ */
+function brief(command: string): string {
+  return command.length <= 200 ? command : `${command.slice(0, 200)}… (${command.length - 200} more characters)`;
 }
 
 /**
@@ -77,7 +87,7 @@ export class Ssh2Runner implements SshRunner {
               ? undefined
               : setTimeout(() => {
                   stream?.destroy();
-                  reject(new SshStreamTimeout(`ssh timeout after ${streamTimeout}ms: ${command}`));
+                  reject(new SshStreamTimeout(`ssh timeout after ${streamTimeout}ms: ${brief(command)}`));
                 }, streamTimeout);
           conn.exec(command, (err, ch) => {
             if (err) {
@@ -94,7 +104,7 @@ export class Ssh2Runner implements SshRunner {
             ch.on("close", (code: number) => {
               clearTimeout(timer);
               if (code === 0 || code === null) resolve({ stdout, code: code ?? 0 });
-              else reject(new Error(`ssh exit ${code}: ${command}\n${stderr.slice(-1000)}`));
+              else reject(new Error(`ssh exit ${code}: ${brief(command)}\n${stderr.slice(-1000)}`));
             });
           });
         }),
@@ -120,7 +130,10 @@ export class Ssh2Runner implements SshRunner {
       // base64 through the shell, chunked to stay under argv limits
       const b64 = fs.readFileSync(localPath).toString("base64");
       const tmp = `${remotePath}.b64`;
-      const CHUNK = 200_000;
+      // each command is one argument to sh -c, and Linux refuses a single
+      // argument past 128 KiB ("argument list too long", checked live at
+      // 200,000 on two providers): any file over about 150 kB failed here
+      const CHUNK = 96_000;
       for (let i = 0; i < b64.length || i === 0; i += CHUNK) {
         const op = i === 0 ? ">" : ">>";
         await this.fallbackExec(target, `printf '%s' '${b64.slice(i, i + CHUNK)}' ${op} ${tmp}`);
@@ -146,19 +159,10 @@ export class Ssh2Runner implements SshRunner {
     }
   }
 
-  /** Gateway/pod-level failures worth retrying, seen live as "Unexpected
-   *  server response: 500" (handshake), "provider reported a failure"
-   *  (frame 103, pod mid-restart), and "no active replicase for service"
-   *  (pod not yet running — hit when a relaunch upload raced the fresh
-   *  container's first boot). A command that ran and exited non-zero
-   *  surfaces as "lease shell: exit N" and is never retried. */
   /** Ceiling on a quick probe's command stream (the handshake has its own
    *  readyTimeout); a probe that cannot answer inside this is unreachable
    *  as far as its caller's poll is concerned. */
   private static readonly QUICK_STREAM_MS = 20_000;
-
-  private static readonly TRANSIENT_SHELL_ERROR =
-    /Unexpected server response: 5\d\d|ECONNRESET|socket hang up|provider reported a failure|no active replicase/;
 
   private async fallbackExec(
     target: SshTarget,
@@ -188,11 +192,11 @@ export class Ssh2Runner implements SshRunner {
         return { stdout: r.stdout, code: 0 };
       } catch (e) {
         lastError = e;
-        if (!Ssh2Runner.TRANSIENT_SHELL_ERROR.test(String(e))) break;
+        if (!TRANSIENT_SHELL_ERROR.test(String(e))) break;
       }
     }
     // keep the ssh-exit error shape callers already match on
-    throw new Error(`ssh exit 1 (via lease-shell): ${command}\n${String(lastError).slice(-500)}`);
+    throw new Error(`ssh exit 1 (via lease-shell): ${brief(command)}\n${String(lastError).slice(-500)}`);
   }
 
   private withConnection<T>(target: SshTarget, fn: (conn: Client) => Promise<T>): Promise<T> {

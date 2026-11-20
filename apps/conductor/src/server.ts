@@ -266,6 +266,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             ) {
               // an auto-recovery op parked on a signature the grant now covers
               drive(launch.id, JSON.parse(launch.spec_json));
+            } else if (await fleet.autoRetryDue(launch.id).catch(() => false)) {
+              // an auto-recovery op stopped by a broken connection: nobody
+              // is there to press Retry, so the failed step is run again
+              app.log.info(`launch ${launch.id}: re-running an automatic op's step that failed on a network error`);
+              drive(launch.id, JSON.parse(launch.spec_json));
             } else {
               // a fleet paused inside an op (failed, or waiting on the user)
               // is still running: keep its health current and its outages

@@ -5,6 +5,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Server } from "ssh2";
 import { Ssh2Runner } from "../src/adapters.js";
+import type { StepCtx } from "../src/engine.js";
+import { awaitContainer } from "../src/fleet-ops.js";
 import { generateSshKeypair } from "../src/keys.js";
 import type { SshTarget } from "../src/services.js";
 
@@ -82,8 +84,25 @@ describe("lease-shell SSH fallback", () => {
     fs.writeFileSync(tmp, payload);
     await runner.upload(deadTarget(), tmp, "/tmp/data.bin");
     expect(Buffer.from(stub.files.get("/tmp/data.bin")!, "latin1").equals(payload)).toBe(true);
-    // multiple chunks were needed (base64 of 300KB > one 200k chunk)
+    // multiple chunks were needed (base64 of 300KB > one chunk)
     expect(stub.calls.filter((c) => c.startsWith("printf")).length).toBeGreaterThan(1);
+    // each command is one argument to sh -c, which Linux caps at 128 KiB
+    expect(Math.max(...stub.calls.map((c) => c.length))).toBeLessThan(131_072);
+  });
+
+  it("names a failed command by its start, not the file an upload carries in it", async () => {
+    const failing = {
+      async shellExec(): Promise<{ stdout: string; stderr: string }> {
+        throw new Error("lease shell: no active replicas for service");
+      },
+    };
+    const runner = new Ssh2Runner(() => failing);
+    const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "sshfb-")), "data.bin");
+    fs.writeFileSync(tmp, Buffer.alloc(27_000, 7));
+    const error = await runner.upload(deadTarget(), tmp, "/tmp/data.bin").catch((e) => String(e));
+    expect(error).toMatch(/via lease-shell\): printf '%s' '/);
+    expect(error).toMatch(/more characters\)\nError: lease shell: no active replicas for service$/);
+    expect(error.length).toBeLessThan(400);
   });
 
   it("downloads via base64", async () => {
@@ -198,5 +217,56 @@ describe("lease-shell SSH fallback", () => {
     const runner = new Ssh2Runner(() => failing);
     await expect(runner.exec(deadTarget(), "false")).rejects.toThrow(/via lease-shell/);
     expect(attempts).toBe(1);
+  });
+});
+
+describe("waiting for a fresh container before the first upload (quanglong relaunches)", () => {
+  /** A container whose SSH answers from check `sshFrom` and whose provider shell answers from `shellFrom`. */
+  function world(sshFrom: number, shellFrom: number) {
+    const state = { checks: 0, sleeps: 0, logs: [] as string[] };
+    const ctx = {
+      log: (m: string) => state.logs.push(m),
+      services: {
+        sleep: async () => void state.sleeps++,
+        ssh: {
+          async exec(target: SshTarget) {
+            if (!target.shellFallback) {
+              if (++state.checks >= sshFrom) return { stdout: "", code: 0 };
+              throw new Error("connect ECONNREFUSED 1.2.3.4:31537");
+            }
+            if (state.checks >= shellFrom) return { stdout: "", code: 0 };
+            throw new Error("ssh exit 1 (via lease-shell): true\nError: lease shell: no active replicas for service");
+          },
+        },
+      },
+    } as unknown as StepCtx;
+    return { ctx, state };
+  }
+
+  it("goes on at once when SSH answers", async () => {
+    const { ctx, state } = world(1, 1);
+    await awaitContainer(ctx, "sentry-1", deadTarget());
+    expect(state.sleeps).toBe(0);
+  });
+
+  it("waits out an image pull, and for sshd even once the provider's shell answers", async () => {
+    const { ctx, state } = world(10, 7);
+    await awaitContainer(ctx, "sentry-1", deadTarget());
+    expect(state.checks).toBe(10);
+    expect(state.logs).toEqual(["sentry-1: waiting for its container to start"]);
+  });
+
+  it("settles for the provider's shell after a minute of it answering alone", async () => {
+    const { ctx, state } = world(Infinity, 3);
+    await awaitContainer(ctx, "sentry-1", deadTarget());
+    expect(state.checks).toBe(15);
+    expect(state.logs.at(-1)).toMatch(/SSH does not answer on its forwarded port \(connect ECONNREFUSED.*using the provider's shell/);
+  });
+
+  it("fails with a short reason when nothing ever answers", async () => {
+    const { ctx } = world(Infinity, Infinity);
+    await expect(awaitContainer(ctx, "sentry-1", deadTarget())).rejects.toThrow(
+      /^sentry-1: its container took no command for 4 minutes after the manifest was sent \(Error: lease shell: no active replicas for service\)/,
+    );
   });
 });

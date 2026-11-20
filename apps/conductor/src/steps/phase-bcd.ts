@@ -18,6 +18,7 @@ import {
 } from "../akash/messages.js";
 import { feeCoin, feeConfig, launchFeeAmount } from "../fee.js";
 import { PRICING_DENOM } from "../render-sdl.js";
+import { retryTransientShell } from "../transient.js";
 import { pollBids } from "../akash/client.js";
 import {
   describeBids,
@@ -126,13 +127,49 @@ export async function headscaleUserId(
   hs: Pick<HeadscaleOutput, "hostUri" | "dseq" | "gseq" | "oseq">,
   name: string,
 ): Promise<string> {
-  const res = await headscaleShell(ctx, hs, "headscale users list --output json");
+  const res = await retryTransientShell(
+    ctx.services.sleep,
+    () => headscaleShell(ctx, hs, "headscale users list --output json"),
+    (e) => ctx.log(`headscale users list: ${e}; trying again`),
+  );
   const users = JSON.parse(res.stdout.trim() || "[]");
   const user = (users as Array<{ id: number | string; name: string }>).find(
     (u) => u.name === name,
   );
   if (!user) throw new Error(`headscale user ${name} not found after create`);
   return String(user.id);
+}
+
+/**
+ * Mint a reusable one-year mesh join key for headscale user `userId`.
+ *
+ * The lease-shell goes through the provider's gateway, which drops a
+ * connection now and then, so a passing failure is tried again: this is the
+ * first network call of a relaunch's deploy step, and on 2026-11-19 one
+ * "socket hang up" here left an automatic sentry relaunch stopped for six
+ * hours with the old deployment already closed. A key minted by a call whose
+ * answer was lost is simply never used.
+ */
+export async function mintPreauthKey(
+  ctx: StepCtx,
+  hs: Pick<HeadscaleOutput, "hostUri" | "dseq" | "gseq" | "oseq">,
+  userId: string,
+  label: string,
+): Promise<string> {
+  const res = await retryTransientShell(
+    ctx.services.sleep,
+    () =>
+      headscaleShell(
+        ctx,
+        hs,
+        `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
+      ),
+    (e) => ctx.log(`mesh join key for ${label}: ${e}; trying again`),
+  );
+  const parsed = JSON.parse(res.stdout.trim());
+  const key: string = typeof parsed === "string" ? parsed : parsed.key;
+  if (!key) throw new Error(`no preauth key in mint output for ${label}`);
+  return key;
 }
 
 /**
@@ -554,17 +591,7 @@ export const configureHeadscaleStep: StepDef = {
     // "note the numeric user ID from headscale users list")
     const userId = await headscaleUserId(ctx, hs, ctx.spec.network.name);
 
-    const mint = async (label: string) => {
-      const res = await headscaleShell(
-        ctx,
-        hs,
-        `headscale preauthkeys create --user ${userId} --reusable --expiration 8760h --output json`,
-      );
-      const parsed = JSON.parse(res.stdout.trim());
-      const key = typeof parsed === "string" ? parsed : parsed.key;
-      if (!key) throw new Error(`no preauth key in output for ${label}`);
-      return key as string;
-    };
+    const mint = (label: string) => mintPreauthKey(ctx, hs, userId, label);
 
     const perNode: Record<string, string> = {};
     for (const node of nodes(ctx.spec)) perNode[node.key] = await mint(node.key);

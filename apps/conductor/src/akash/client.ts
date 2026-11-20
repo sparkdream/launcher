@@ -166,7 +166,7 @@ export class ProviderClient {
         fn();
       };
       const timer = setTimeout(
-        () => done(() => reject(new Error(`lease shell: timeout running ${cmd.join(" ")}`))),
+        () => done(() => reject(new Error(`lease shell: timeout running ${cmd.join(" ").slice(0, 200)}`))),
         opts.timeoutMs ?? 60_000,
       );
       ws.on("message", (data: Buffer) => {

@@ -75,6 +75,11 @@ const EXEC_RETRY_EVERY_MS = 10 * 60_000;
 /** Automatic switches of the serving sentry are at least this far apart, so two ailing sentries cannot trade the role back and forth. */
 export const SWITCH_EVERY_MS = 15 * 60_000;
 
+/** Minutes an automatic op's step waits after each network failure before it is re-run (the last one repeats). */
+const AUTO_RETRY_DELAYS_MIN = [1, 2, 5, 10];
+/** Automatic re-runs of one step before it is left for the user: about three hours. */
+export const AUTO_RETRY_LIMIT = 20;
+
 /** How long an automatic restart gets to bring a component back before its container is re-created. */
 export const RESTART_GRACE_MS = 5 * 60_000;
 
@@ -294,6 +299,7 @@ import {
   type GrantInfo,
   type UnattendedSettings,
 } from "./unattended.js";
+import { isNetworkError } from "./transient.js";
 import { UNATTENDED_MSG_TYPES, unattendedGrantMsgs, unattendedRevokeMsgs, type Msg } from "@sparkdream/akash-tx";
 import {
   alertFor,
@@ -2416,6 +2422,61 @@ export class FleetService {
         : `${incident.cause}: started ${action} of ${key}.`) +
         (signing ? " Its transactions are signed with the launcher's grant." : " Its transactions wait for your Keplr signature (unattended signing is off)."),
     );
+  }
+
+  /** Automatic re-runs of a failed step per "launchId:step": how many so far. */
+  private readonly stepRetries = new Map<string, number>();
+
+  /**
+   * Whether a paused launch should be driven again by itself: true when the
+   * step it stopped at belongs to an op automatic recovery started, failed
+   * on a broken connection (isNetworkError) and has waited out its delay
+   * (1, 2, 5, then 10 minutes after each failure).
+   *
+   * Nobody is watching an automatic op, and a failed step waits for a click
+   * on Retry: on 2026-11-19 a sentry relaunch closed the old deployment,
+   * hit one "socket hang up" on the next call, and left the fleet a sentry
+   * short for six hours. Re-running is what Retry does, and steps are
+   * written to be re-run. Any other error still waits for the user, as does
+   * one that keeps failing: after AUTO_RETRY_LIMIT re-runs (about three
+   * hours) it is alerted once and left alone.
+   */
+  async autoRetryDue(launchId: string, now = Date.now()): Promise<boolean> {
+    const launch = this.db.getLaunch(launchId);
+    if (!launch || launch.status !== "paused") return false;
+    const failed = this.db.listSteps(launchId).filter((s) => s.status === "error");
+    // settled steps leave the count behind
+    for (const k of this.stepRetries.keys()) {
+      if (k.startsWith(`${launchId}:`) && !failed.some((s) => `${launchId}:${s.name}` === k)) {
+        this.stepRetries.delete(k);
+      }
+    }
+    // the drive stops at its first failure: an error it cannot retry holds
+    // the launch whatever the others are
+    if (failed.length !== 1) return false;
+    const step = failed[0]!;
+    const m = /^op(\d+):/.exec(step.name);
+    if (!m || !step.error || !isNetworkError(step.error)) return false;
+    const op = this.db.listFleetOps(launchId, "active").find((o) => o.id === Number(m[1]));
+    if (!op || !(JSON.parse(op.params_json) as { auto?: boolean }).auto) return false;
+    const key = `${launchId}:${step.name}`;
+    const count = this.stepRetries.get(key) ?? 0;
+    if (count > AUTO_RETRY_LIMIT) return false;
+    if (count === AUTO_RETRY_LIMIT) {
+      this.stepRetries.set(key, count + 1);
+      await this.notify(
+        launch,
+        op.kind,
+        "automatic recovery needs you",
+        `${step.name} failed ${count + 1} times in a row (${step.error}) and is no longer retried automatically. Press Retry in the launcher once the connection is back.`,
+      ).catch(() => {});
+      return false;
+    }
+    const delayMs = AUTO_RETRY_DELAYS_MIN[Math.min(count, AUTO_RETRY_DELAYS_MIN.length - 1)]! * 60_000;
+    const failedAt = step.finished_at ? Date.parse(step.finished_at) : now;
+    if (now - failedAt < delayMs) return false;
+    this.stepRetries.set(key, count + 1);
+    return true;
   }
 
   /** Grant info is a chain round trip; a minute's cache serves a whole relaunch. */

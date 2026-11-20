@@ -6,7 +6,7 @@ import { TypeUrl, UNATTENDED_MSG_TYPES, type Msg } from "@sparkdream/akash-tx";
 import { testnetSpec, withDefaults, type LaunchSpec } from "@sparkdream/launch-spec";
 import { ConductorDb } from "../src/db.js";
 import { runLaunch, runWithSigner } from "../src/engine.js";
-import { FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS, TOGETHER_HOLD_MS, UNREACHABLE_HOLD_MS } from "../src/fleet.js";
+import { AUTO_RETRY_LIMIT, FleetService, HEADSCALE_RESTART, RESTART_GRACE_MS, TOGETHER_HOLD_MS, UNREACHABLE_HOLD_MS } from "../src/fleet.js";
 import { buildOpSteps, buildPreLaunchOpSteps } from "../src/fleet-ops.js";
 import { allSteps } from "../src/index.js";
 import { setAlertSettings } from "../src/incidents.js";
@@ -587,4 +587,79 @@ describe("granting", () => {
     };
     await expect(w.fleet.unattendedMsgs(OWNER, "grant", 30)).rejects.toThrow(/could not read/);
   }, 120_000);
+});
+
+describe("a broken connection during an automatic op (2026-11-19)", () => {
+  /** An auto relaunch of sentry-1 whose join-key mint hangs up `times` times. */
+  async function mintHangsUp(times: number) {
+    const w = await launched();
+    const { address } = await opsKey(w.work, OWNER);
+    w.chain.grantAll(OWNER, address, UNATTENDED_MSG_TYPES);
+    setUnattendedSettings(w.db, OWNER, { enabled: true });
+    w.fleet.setAutoRecoverPolicy(w.db.getLaunch("fl")!, { enabled: true });
+    await sentryDies(w);
+    const shell = w.services.provider.shellExec.bind(w.services.provider);
+    const state = { left: times, hangUps: 0 };
+    w.services.provider.shellExec = async (...a: Parameters<typeof shell>) => {
+      if (String(a[6].at(-1)).includes("preauthkeys create") && state.left > 0) {
+        state.left--;
+        state.hangUps++;
+        throw new Error("socket hang up");
+      }
+      return shell(...a);
+    };
+    return { w, state };
+  }
+  const failedStep = (w: World) => w.db.listSteps("fl").find((s) => s.status === "error");
+
+  it("the join-key mint is tried again within the step", async () => {
+    const { w, state } = await mintHangsUp(2);
+    expect((await driveUnattended(w)).status).toBe("completed");
+    expect(state.hangUps).toBe(2);
+  }, 240_000);
+
+  it("a step that still fails is re-run by itself after a minute, where it waited for a click", async () => {
+    const { w, state } = await mintHangsUp(4);
+    expect((await driveUnattended(w)).status).toBe("paused");
+    const step = failedStep(w)!;
+    expect(step.name).toMatch(/^op\d+:deploy$/);
+    expect(step.error).toBe("socket hang up");
+    const failedAt = Date.parse(step.finished_at!);
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 30_000)).toBe(false);
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 61_000)).toBe(true);
+    expect((await driveUnattended(w)).status).toBe("completed");
+    expect(state.hangUps).toBe(4);
+    expect(await w.fleet.autoRetryDue("fl")).toBe(false);
+  }, 240_000);
+
+  it("waits longer after each failure, then alerts once and leaves it to the user", async () => {
+    const { w } = await mintHangsUp(Infinity);
+    expect((await driveUnattended(w)).status).toBe("paused");
+    const failedAt = Date.parse(failedStep(w)!.finished_at!);
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 61_000)).toBe(true);
+    // the second re-run waits two minutes
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 61_000)).toBe(false);
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 121_000)).toBe(true);
+    for (let i = 2; i < AUTO_RETRY_LIMIT; i++) {
+      expect(await w.fleet.autoRetryDue("fl", failedAt + 3_600_000)).toBe(true);
+    }
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 3_600_000)).toBe(false);
+    expect(await w.fleet.autoRetryDue("fl", failedAt + 7_200_000)).toBe(false);
+    expect(w.alerts.filter((a) => a === "sparkdream: automatic recovery needs you")).toHaveLength(1);
+  }, 240_000);
+
+  it("leaves any other error, and an op the user started, waiting for Retry", async () => {
+    const { w } = await mintHangsUp(Infinity);
+    expect((await driveUnattended(w)).status).toBe("paused");
+    const step = failedStep(w)!;
+    const later = Date.parse(step.finished_at!) + 3_600_000;
+    w.db.stepFailed("fl", step.name, "lease shell: exit 1");
+    expect(await w.fleet.autoRetryDue("fl", later)).toBe(false);
+    w.db.stepFailed("fl", step.name, "socket hang up");
+    const op = w.db.listFleetOps("fl", "active")[0]!;
+    const params = JSON.parse(op.params_json);
+    delete params.auto;
+    w.db.updateFleetOpParams(op.id, params);
+    expect(await w.fleet.autoRetryDue("fl", later)).toBe(false);
+  }, 240_000);
 });
