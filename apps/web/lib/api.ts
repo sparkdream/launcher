@@ -447,6 +447,9 @@ export interface ComponentView {
   state: string;
   /** Deployed image reference (upgrades update it). */
   image?: string | null;
+  /** Other images the deployment runs beside the main one, each upgraded on
+   *  its own (Mastodon: sdap for bridge and sign-in, upstream streaming). */
+  sideImages?: Array<{ services: string[]; image: string }>;
   /** Address on the headscale mesh (100.x), when the component joined it. */
   tailnetIp?: string | null;
   /** True when the component runs sshd with a recorded endpoint — eligible

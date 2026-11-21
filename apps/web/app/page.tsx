@@ -6727,6 +6727,19 @@ export default function Page() {
                                   </span>
                                 </span>
                               )}
+                              {/* each of these is upgraded separately from the
+                                  main image, so its version has to be visible */}
+                              {(c.sideImages ?? []).map((side) => (
+                                <span className="f-wide f-image" key={side.image}>
+                                  Image ({side.services.join(", ")}){" "}
+                                  <span className="v" title={side.image}>
+                                    {shortImage(side.image)}{" "}
+                                    <button className="copy" onClick={() => void navigator.clipboard.writeText(side.image)}>
+                                      copy
+                                    </button>
+                                  </span>
+                                </span>
+                              ))}
                               {c.size && (
                                 <span>
                                   Size <span className="v">{c.size}</span>

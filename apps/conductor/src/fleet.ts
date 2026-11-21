@@ -1097,6 +1097,7 @@ export class FleetService {
             escrow,
             state: c.state,
             image: c.image,
+            ...(c.state === "closed" ? {} : this.sideImagesView(launch.id, c.key)),
             tailnetIp: c.tailnet_ip,
             ssh: c.ssh_host != null && c.ssh_port != null,
             ...(/^(val|sentry)-\d+$/.test(c.key) ? { size: nodeSize(spec, c.key) } : {}),
@@ -5294,6 +5295,37 @@ export class FleetService {
       ),
     );
     return { previous, previousSpecImages };
+  }
+
+  /**
+   * The other images a component's deployment runs beside its main one
+   * (Mastodon: sdap for the bridge and sign-in services, upstream streaming),
+   * read from the deployed SDL so only services that actually run are listed.
+   * Each is upgraded on its own, so the dashboard has to show each version.
+   */
+  private sideImagesView(
+    launchId: string,
+    key: string,
+  ): { sideImages?: Array<{ services: string[]; image: string }> } {
+    const side = descriptorFor(key)?.sideImages;
+    if (!side) return {};
+    try {
+      const file = path.join(launchDirs(this.workRoot, launchId).sdl, `${key}.yaml`);
+      const doc = yaml.load(fs.readFileSync(file, "utf8")) as {
+        services?: Record<string, { image?: string }>;
+      };
+      const byImage = new Map<string, string[]>();
+      for (const service of Object.keys(side)) {
+        const image = doc.services?.[service]?.image;
+        if (!image) continue;
+        byImage.set(image, [...(byImage.get(image) ?? []), service]);
+      }
+      if (byImage.size === 0) return {};
+      return { sideImages: [...byImage].map(([image, services]) => ({ services, image })) };
+    } catch {
+      // no SDL on disk (a component still deploying): nothing to add
+      return {};
+    }
   }
 
   /**
