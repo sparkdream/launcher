@@ -113,6 +113,12 @@ The mode is a toggle in the launch panel, persisted server-side. Setting
 or mainnet launcher's offline guarantee is deployment config, not a browser
 click.
 
+Upgrades are checked in either mode: before an upgrade starts, the launcher
+asks the new image's registry whether a provider could pull it, and refuses
+the upgrade when the tag is not there (not pushed, misspelled, private, or
+without a linux/amd64 build). Only `CHAIN_ASSET_MODE=baked` set in the
+environment turns that lookup off.
+
 `SPARKDREAM_CHAIN_REPO` sets the clone source (URL or local path; default
 `~/cosmos/sparkdream/sparkdream`). Fetched assets are cached under
 `DATA_DIR/chain-assets/<image-tag>/` and pruned automatically to the three

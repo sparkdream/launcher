@@ -174,6 +174,21 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   );
   const running = new Set<string>();
   const fleet = new FleetService(deps.db, deps.services, deps.workRoot);
+
+  /** Why no op may be started for `image`, or null: its registry says a
+   *  provider could not pull it (image-probe.ts). A registry that cannot be
+   *  asked refuses nothing, and a launcher whose environment pins offline
+   *  mode (CHAIN_ASSET_MODE=baked) asks no registry at all. */
+  const imageUnavailable = async (image: string): Promise<string | null> => {
+    if (chainAssetModeLocked() && chainAssetMode(deps.db) === "baked") return null;
+    const found = await deps.services.images?.(image);
+    if (!found || found.state === "available") return null;
+    if (found.state === "unknown") {
+      app.log.warn(`image ${image}: availability not checked: ${found.why}`);
+      return null;
+    }
+    return `Nothing was started: providers could not pull "${image}": ${found.why}. Push the image, or correct the name, and try again.`;
+  };
   const backup = new BackupService(deps.db, deps.workRoot);
   const auth = deps.auth ? new AuthService(deps.auth.allowlist) : undefined;
 
@@ -1086,6 +1101,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
             .listFleetComponents(launchId)
             .filter((c) => c.state === "active" && /^(val|sentry)-/.test(c.key))
             .map((c) => c.key);
+        const gone = await imageUnavailable(body.image);
+        if (gone) return reply.status(409).send({ error: gone });
         const opId = fleet.requestUpgrade(launch, components, body.image);
         drive(launchId, spec);
         return { status: "upgrade-started", opId, components };
@@ -1100,6 +1117,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         if (planName.length > 140 || /["\n\r]/.test(planName)) {
           return reply.status(400).send({ error: "planName is not a valid upgrade name" });
         }
+        const goneHalt = await imageUnavailable(body.image);
+        if (goneHalt) return reply.status(409).send({ error: goneHalt });
         const opId = fleet.requestHaltUpgrade(launch, body.image, body.haltHeight, planName || undefined);
         drive(launchId, spec);
         return { status: "halt-upgrade-started", opId };
@@ -1614,6 +1633,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       manualBid?: boolean;
     };
     if (!body.key) return reply.status(400).send({ error: "key is required" });
+    const gone = body.image ? await imageUnavailable(body.image) : null;
+    if (gone) return reply.status(409).send({ error: gone });
     try {
       const opId = fleet.requestAddComponent(launch, body.key, {
         ...(body.domain ? { domain: body.domain } : {}),
@@ -2120,6 +2141,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     if (!launch) return reply.status(404).send({ error: "launch not found" });
     if (denyForeign(req, reply, launch)) return;
     const body = (req.body ?? {}) as { spec?: unknown };
+    // a reset onto a new chain image swaps every node to it
+    const resetImage = (body.spec as { images?: { sparkdreamd?: unknown } } | undefined)?.images?.sparkdreamd;
+    if (typeof resetImage === "string" && resetImage !== (JSON.parse(launch.spec_json) as LaunchSpec).images.sparkdreamd) {
+      const gone = await imageUnavailable(resetImage);
+      if (gone) return reply.status(409).send({ error: gone });
+    }
     try {
       const opId = fleet.requestChainReset(launch, body.spec ?? JSON.parse(launch.spec_json));
       // drive with the UPDATED spec — requestChainReset just rewrote it

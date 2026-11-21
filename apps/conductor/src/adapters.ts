@@ -1,3 +1,4 @@
+import { registryImageProber } from "./image-probe.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { Client, type ClientChannel } from "ssh2";
@@ -369,5 +370,6 @@ export function productionServices(endpoints: RestEndpoints): Services {
     certs: new OpensslCertProvider(),
     encryptBackup: ageEncryptDir,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    images: registryImageProber(),
   };
 }

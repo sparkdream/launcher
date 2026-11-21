@@ -1,3 +1,4 @@
+import type { ImageProber } from "./image-probe.js";
 import type { AkashApi, MtlsCredentials } from "./akash/client.js";
 import type { LocalSignerHost, RemoteHost } from "./local-signer.js";
 import type { UnattendedChain } from "./unattended.js";
@@ -156,4 +157,7 @@ export interface Services {
    *  it is, bad health readings are its own doing, so no incident is counted
    *  and auto-recovery touches nothing. Absent: never checked. */
   localHealth?: LocalHealthGauge;
+  /** Whether a provider could pull an image (image-probe.ts), asked before an
+   *  upgrade is started. Absent: never checked. */
+  images?: ImageProber;
 }

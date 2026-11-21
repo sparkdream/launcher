@@ -2013,6 +2013,18 @@ Mechanism: `MsgUpdateDeployment` with the new image tag (1 signature) +
 manifest re-PUT to the **same provider** — no re-bid, lease and price
 unchanged. The provider pulls the new image and restarts the container.
 
+Before any op is created for a new image (upgrade, halt-height upgrade,
+add-component with an image override, a chain reset onto another chain
+image), the conductor asks the image's own registry for it
+(`image-probe.ts`: Docker Hub, ghcr.io or any registry speaking the
+standard API, with its anonymous token). An image the registry does not
+have, serves only to a logged-in client (providers pull without
+credentials), or has no linux/amd64 build is refused with nothing signed
+and the spec untouched: Akash would accept it and leave the container in
+ImagePullBackOff. A registry that cannot be reached or throttles refuses
+nothing, and a launcher with `CHAIN_ASSET_MODE=baked` set in its
+environment asks no registry.
+
 What the restart costs depends on the role's storage:
 
 - **Persistent volume (sentries and validators, the default)**: the `data`

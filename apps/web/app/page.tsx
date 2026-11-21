@@ -5937,11 +5937,17 @@ export default function Page() {
                                       );
                                       if (h && first) {
                                         const { postFleetAction: post } = await import("../lib/api");
-                                        await post(f.launchId, first.dseq, "halt-upgrade", {
+                                        // a refusal (an image no provider could pull) comes
+                                        // back as an error, with nothing started to open
+                                        const res = await post(f.launchId, first.dseq, "halt-upgrade", {
                                           image,
                                           haltHeight: Number(h),
                                           ...(planName ? { planName } : {}),
-                                        }).catch((e) => setError(String(e)));
+                                        }).catch((e) => ({ error: String(e) }));
+                                        if (res.error) {
+                                          setError(res.error);
+                                          return;
+                                        }
                                         openLaunch(f.launchId);
                                       }
                                     }}
